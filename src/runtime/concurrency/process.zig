@@ -110,6 +110,16 @@ pub const ProcessState = enum(u8) {
     running,
     /// Suspended awaiting an event (receive/timer/IO); off the run queues.
     waiting,
+    /// Evacuated to the blocking / dirty-scheduler pool (P4-J3): the process
+    /// yielded a `Process.blocking` call, its fiber runs on a dedicated
+    /// blocking-pool OS thread, and its core scheduler is freed to run its
+    /// other processes. Off the core run queues for the whole blocking episode;
+    /// a completed blocking op RE-ATTACHES the process (`.blocking → .runnable`)
+    /// onto a core. Distinct from `.waiting`: a `.waiting` process is parked on
+    /// an event its own core will observe, whereas a `.blocking` process is
+    /// executing native code on ANOTHER thread and cannot be torn down until it
+    /// re-attaches (its fiber stack is live off-core).
+    blocking,
     /// Tearing down (normal exit, crash, or kill). Terminal.
     exiting,
 };
@@ -123,17 +133,25 @@ pub const ProcessState = enum(u8) {
 /// * `runnable → exiting` — killed while queued (untrappable `kill`).
 /// * `running → runnable` — preempted (budget exhausted) or yielded.
 /// * `running → waiting` — suspended in receive/timer/IO.
+/// * `running → blocking` — evacuated to the blocking pool by a
+///   `Process.blocking` call (P4-J3).
 /// * `running → exiting` — returned from its entry, crashed, or was
 ///   killed at a safepoint.
 /// * `waiting → runnable` — woken by message/timer/IO completion.
 /// * `waiting → exiting` — killed while suspended.
+/// * `blocking → runnable` — the blocking op completed and the process
+///   re-attached onto a core (P4-J3).
+/// * `blocking → exiting` — killed / reaped after re-attach (the kill takes
+///   effect once the off-core fiber returns; a `.blocking` process is never
+///   torn down while its fiber is live on a pool thread).
 /// * `exiting` is terminal — nothing leaves it.
 pub fn isLegalTransition(from: ProcessState, to: ProcessState) bool {
     return switch (from) {
         .embryo => to == .runnable or to == .exiting,
         .runnable => to == .running or to == .exiting,
-        .running => to == .runnable or to == .waiting or to == .exiting,
+        .running => to == .runnable or to == .waiting or to == .blocking or to == .exiting,
         .waiting => to == .runnable or to == .exiting,
+        .blocking => to == .runnable or to == .exiting,
         .exiting => false,
     };
 }

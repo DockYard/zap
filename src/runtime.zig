@@ -3790,6 +3790,16 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void;
     extern fn zap_proc_exit(process: *anyopaque) callconv(.c) noreturn;
     extern fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void;
+    /// `Process.blocking` (P4-J3): run `operation` on the blocking / dirty-
+    /// scheduler pool, off this process's core, returning its opaque result once
+    /// the process re-attaches. The `ProcessRuntime.blocking_*` wrappers box a
+    /// typed result around the opaque ABI.
+    const BlockingOperation = *const fn (operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque;
+    extern fn zap_proc_blocking(
+        process: *anyopaque,
+        operation: BlockingOperation,
+        operation_argument: ?*anyopaque,
+    ) callconv(.c) ?*anyopaque;
     extern fn zap_proc_receive_wait_timeout(
         process: *anyopaque,
         timeout_nanoseconds: u64,
@@ -5034,6 +5044,53 @@ pub const ProcessRuntime = struct {
         @panic("zap: internal error — a per-spawn manager selection was not lowered by the spawn-manager pass (compiler bug)");
     }
 
+    /// `Process.blocking(&f/0)` for an `f() -> i64` (P4-J3, plan item 4.3): run
+    /// the blocking / long-running computation `entry` on the dirty-scheduler
+    /// pool — evacuating THIS process's fiber off its core so the core is freed
+    /// to run its other processes — and return `entry`'s `i64` result once the
+    /// process has re-attached. The un-annotated alternative (calling a blocking
+    /// primitive directly) stalls the core exactly as an over-long BEAM NIF
+    /// stalls a scheduler; `Process.blocking` is how a program avoids that.
+    ///
+    /// `entry` is a named / capture-less zero-parameter function returning `i64`
+    /// — the shape that lowers to a bare function value — mirroring
+    /// `spawn_process`'s scope. Its `i64` result is bit-boxed through the opaque
+    /// C-ABI (`zap_proc_blocking`) and unboxed here, so it round-trips exactly
+    /// across the off-core detour.
+    pub fn blocking_i64(entry: anytype) i64 {
+        requireConcurrencyRuntimeGate();
+        const EntryType = @TypeOf(entry);
+        const entry_info = @typeInfo(EntryType);
+        const process = requireCurrentProcessHandle();
+        const result_pointer = switch (entry_info) {
+            .@"fn" => |function_info| blk: {
+                comptime validateBlockingEntrySignature(EntryType, function_info, i64);
+                // A comptime-known function value: bake it into the trampoline,
+                // no argument needed.
+                const Trampoline = ComptimeBlockingTrampolineI64(entry);
+                break :blk ZapConcurrencyKernel.zap_proc_blocking(process, Trampoline.run, null);
+            },
+            .pointer => |pointer_info| blk: {
+                const child_info = @typeInfo(pointer_info.child);
+                if (child_info != .@"fn") rejectBlockingEntryType(EntryType);
+                comptime validateBlockingEntrySignature(pointer_info.child, child_info.@"fn", i64);
+                // A runtime function pointer rides the op argument (as an
+                // address, reconstructed via ptrFromInt in the trampoline —
+                // never dereferenced as data), mirroring `spawn_process_at`.
+                const Trampoline = PointerBlockingTrampolineI64(EntryType);
+                break :blk ZapConcurrencyKernel.zap_proc_blocking(
+                    process,
+                    Trampoline.run,
+                    @ptrFromInt(@intFromPtr(entry)),
+                );
+            },
+            else => rejectBlockingEntryType(EntryType),
+        };
+        // Unbox: the trampoline bit-boxed the i64 into the pointer bits (0 → null).
+        const result_bits: usize = if (result_pointer) |pointer| @intFromPtr(pointer) else 0;
+        return @bitCast(result_bits);
+    }
+
     /// Send `message` to the process identified by `target_pid_bits`.
     /// Returns `true` when the message was delivered to a live mailbox
     /// and `false` when it was dead-lettered (target dead or stale —
@@ -5327,6 +5384,72 @@ fn ComptimeEntryTrampoline(comptime entry_function: anytype) type {
             _ = process;
             _ = argument;
             _ = entry_function();
+        }
+    };
+}
+
+/// Validate a `Process.blocking` entry: a zero-parameter function returning
+/// `ExpectedReturn` (the shape that lowers to a bare function value).
+fn validateBlockingEntrySignature(
+    comptime EntryType: type,
+    comptime function_info: std.builtin.Type.Fn,
+    comptime ExpectedReturn: type,
+) void {
+    if (function_info.params.len != 0) {
+        @compileError(
+            "Process.blocking entry `" ++ @typeName(EntryType) ++ "` must take zero parameters — " ++
+                "hand it its inputs by capturing them at the call site once closures land, or via globals for now.",
+        );
+    }
+    const actual_return = function_info.return_type orelse @compileError(
+        "Process.blocking entry `" ++ @typeName(EntryType) ++ "` must return `" ++
+            @typeName(ExpectedReturn) ++ "` (it has no concrete return type).",
+    );
+    if (actual_return != ExpectedReturn) {
+        @compileError(
+            "Process.blocking entry `" ++ @typeName(EntryType) ++ "` must return `" ++
+                @typeName(ExpectedReturn) ++ "` for this typed variant.",
+        );
+    }
+}
+
+fn rejectBlockingEntryType(comptime EntryType: type) noreturn {
+    @compileError(
+        "Process.blocking requires a named (or capture-less) zero-parameter function; got `" ++
+            @typeName(EntryType) ++ "`.",
+    );
+}
+
+/// Trampoline adapting a comptime-known `entry() -> i64` to the opaque blocking
+/// C-ABI (`BlockingOperation`): call the entry off-core and BIT-BOX its `i64`
+/// result into the pointer-sized return (0 → null); `blocking_i64` unboxes it.
+/// The i64→pointer-bits cast is a pure reinterpretation (never dereferenced),
+/// so it round-trips every value including negatives and zero.
+fn ComptimeBlockingTrampolineI64(comptime entry_function: anytype) type {
+    return struct {
+        fn run(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+            _ = operation_argument;
+            const result: i64 = entry_function();
+            const result_bits: usize = @bitCast(result);
+            if (result_bits == 0) return null;
+            return @ptrFromInt(result_bits);
+        }
+    };
+}
+
+/// Trampoline adapting a runtime `entry() -> i64` function POINTER (the shape a
+/// `&Module.f/0` reference lowers to) to the opaque blocking C-ABI: the pointer
+/// travels as the op argument (as an address, reconstructed here — never
+/// dereferenced as data), and its `i64` result is bit-boxed exactly as the
+/// comptime variant. Mirrors `PointerEntryTrampoline` for spawn.
+fn PointerBlockingTrampolineI64(comptime EntryPointerType: type) type {
+    return struct {
+        fn run(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+            const entry_function: EntryPointerType = @ptrFromInt(@intFromPtr(operation_argument.?));
+            const result: i64 = entry_function();
+            const result_bits: usize = @bitCast(result);
+            if (result_bits == 0) return null;
+            return @ptrFromInt(result_bits);
         }
     };
 }

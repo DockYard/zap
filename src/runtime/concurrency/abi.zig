@@ -969,6 +969,24 @@ export fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void {
     contextFromHandle(process).yieldCheck();
 }
 
+/// `Process.blocking` (P4-J3, plan item 4.3): run `operation` on the blocking /
+/// dirty-scheduler pool, evacuating THIS process's fiber off its core for the
+/// duration so the core is freed to run its other processes. Returns the
+/// operation's opaque result once the process has re-attached onto a core. See
+/// `ProcessContext.blocking` for the full detach/re-attach mechanism and the
+/// blocking-op contract (a leaf native call that must not re-enter the
+/// scheduler). `operation` and its result are opaque pointer-sized values; the
+/// `lib/process.zap` `Process.blocking` surface boxes/unboxes a typed result
+/// (e.g. `i64`) around this ABI. On a runtime with no blocking pool the call
+/// degrades to running the operation inline (documented single-core fallback).
+export fn zap_proc_blocking(
+    process: *anyopaque,
+    operation: concurrency.BlockingOperation,
+    operation_argument: ?*anyopaque,
+) callconv(.c) ?*anyopaque {
+    return contextFromHandle(process).blocking(operation, operation_argument);
+}
+
 /// Slow path of the compiler-emitted three-layer preemption safepoints
 /// (plan item 2.5, P2-J6). The ZIR-emitted layer-2 bare back-edge poll
 /// and the runtime's layer-1 alloc piggyback both call this — with NO

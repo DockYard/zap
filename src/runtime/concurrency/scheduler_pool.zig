@@ -61,6 +61,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const scheduler_module = @import("scheduler.zig");
+const blocking_pool_module = @import("blocking_pool.zig");
 const pid_table_module = @import("pid_table.zig");
 const envelope_pool_module = @import("envelope_pool.zig");
 const process_module = @import("process.zig");
@@ -69,6 +70,8 @@ const Scheduler = scheduler_module.Scheduler;
 const ProcessRecord = scheduler_module.ProcessRecord;
 const GlobalRunQueue = scheduler_module.GlobalRunQueue;
 const PoolHooks = scheduler_module.PoolHooks;
+const BlockingHandoff = scheduler_module.BlockingHandoff;
+const BlockingPool = blocking_pool_module.BlockingPool;
 const Pid = pid_table_module.Pid;
 const PidTable = pid_table_module.PidTable;
 const EnvelopePool = envelope_pool_module.EnvelopePool;
@@ -100,6 +103,16 @@ pub const SchedulerPool = struct {
     /// The orchestration seam installed into every core (see `PoolHooks`).
     /// `context` is this pool; pinned for the pool's lifetime.
     hooks: PoolHooks,
+    /// The shared blocking / dirty-scheduler pool (P4-J3, `blocking_pool.zig`):
+    /// ONE pool serving every core, onto which a `Process.blocking` call
+    /// evacuates the calling process's fiber so the core is freed. Owned;
+    /// pinned (its worker threads hold `&pool.blocking_pool`).
+    blocking_pool: BlockingPool,
+    /// The blocking handoff seam installed into every core (the offload path).
+    /// Points at `blocking_pool`; pinned for the pool's lifetime. A core's
+    /// `Options.blocking_handoff` is `&pool.blocking_handoff` when the blocking
+    /// pool is live, else null (inline degradation).
+    blocking_handoff: BlockingHandoff,
     /// Worker OS threads for cores 1..N−1 (core 0 runs on the driver thread).
     /// Empty for a single-core pool. Owned.
     worker_threads: []std.Thread,
@@ -162,6 +175,8 @@ pub const SchedulerPool = struct {
                 .notifyWork = notifyWorkHook,
                 .onProcessExit = onProcessExitHook,
             },
+            .blocking_pool = undefined,
+            .blocking_handoff = undefined,
             .worker_threads = worker_threads,
             .live_count = .init(0),
             .idle_count = .init(0),
@@ -169,12 +184,31 @@ pub const SchedulerPool = struct {
             .root_target_bits = 0,
         };
 
+        // Bring up the shared blocking / dirty-scheduler pool AFTER `pool.*` is
+        // set so `&pool.blocking_pool` is its final address (its workers pin it),
+        // then build its handoff seam. `Scheduler.blockingPoolExecute` is the
+        // real execute hook: a worker resumes the offloaded fiber, runs the
+        // blocking op, and re-attaches it. OOM here unwinds the core/worker
+        // arrays via the errdefers above.
+        try BlockingPool.init(
+            &pool.blocking_pool,
+            allocator,
+            Scheduler.blockingPoolExecute,
+            null,
+            .{},
+        );
+        pool.blocking_handoff = pool.blocking_pool.handoff();
+
         // Build each core AFTER `pool.*` is set so `&pool.hooks`/
-        // `&pool.global_queue` are their final addresses.
+        // `&pool.global_queue`/`&pool.blocking_handoff` are their final
+        // addresses. The blocking handoff is wired only when the pool is live
+        // (has ≥1 worker); if it could not start any, cores leave it null and a
+        // `Process.blocking` call degrades to inline (documented).
         var core_options = options.core_options;
         core_options.work_stealing = true;
         core_options.pool_hooks = &pool.hooks;
         core_options.global_queue = &pool.global_queue;
+        core_options.blocking_handoff = if (pool.blocking_pool.isLive()) &pool.blocking_handoff else null;
         for (pool.cores) |*core| {
             core.* = Scheduler.init(allocator, pid_table, envelope_pool, core_options);
         }
@@ -186,6 +220,12 @@ pub const SchedulerPool = struct {
     pub fn deinit(pool: *SchedulerPool) void {
         std.debug.assert(pool.live_count.load(.acquire) == 0);
         std.debug.assert(pool.global_queue.isEmptyApprox());
+        // Stop and join the blocking-pool workers FIRST, so no blocking-pool
+        // thread can touch a core (via re-attach) after the cores are freed. By
+        // here every blocking episode has quiesced (`drive` quiesces at run end)
+        // and every re-attach has been drained (`shutdownAllProcesses`), so this
+        // only joins idle, parked workers.
+        pool.blocking_pool.deinit();
         for (pool.cores) |*core| core.deinit();
         pool.allocator.free(pool.cores);
         pool.allocator.free(pool.worker_threads);
@@ -221,6 +261,12 @@ pub const SchedulerPool = struct {
         unexpected_message_total: u64,
         park_count: u64,
         wake_signal_count: u64,
+        /// `Process.blocking` evacuations to the blocking pool (P4-J3), summed
+        /// across cores (whichever core offloaded counts it).
+        blocking_offload_total: u64,
+        /// Blocking-pool re-attaches drained back to runnable (P4-J3), summed
+        /// across cores (whichever core the process re-attached onto counts it).
+        blocking_reattach_total: u64,
     };
 
     pub fn statistics(pool: *const SchedulerPool) Statistics {
@@ -233,6 +279,8 @@ pub const SchedulerPool = struct {
             .unexpected_message_total = 0,
             .park_count = 0,
             .wake_signal_count = 0,
+            .blocking_offload_total = 0,
+            .blocking_reattach_total = 0,
         };
         for (pool.cores) |*core| {
             const core_stats = core.statistics();
@@ -243,8 +291,17 @@ pub const SchedulerPool = struct {
             totals.unexpected_message_total += core_stats.unexpected_message_total;
             totals.park_count += core_stats.park_count;
             totals.wake_signal_count += core_stats.wake_signal_count;
+            totals.blocking_offload_total += core_stats.blocking_offload_total;
+            totals.blocking_reattach_total += core_stats.blocking_reattach_total;
         }
         return totals;
+    }
+
+    /// Snapshot of the shared blocking / dirty-scheduler pool's statistics
+    /// (P4-J3): submit/execute/park totals and the worker-population high-water
+    /// mark. See `blocking_pool.BlockingPool.Statistics`.
+    pub fn blockingPoolStatistics(pool: *SchedulerPool) BlockingPool.Statistics {
+        return pool.blocking_pool.statistics();
     }
 
     // -------------------------------------------------------------------------
@@ -292,6 +349,14 @@ pub const SchedulerPool = struct {
         pool.stopping.store(true, .release);
         pool.wakeAll();
         for (pool.worker_threads[0..started]) |thread| thread.join();
+        // The core workers have joined. QUIESCE the blocking pool before
+        // returning: a process that was mid-`Process.blocking` when the run
+        // stopped has its op run to completion off-core (native code is never
+        // interrupted) and re-attaches onto a — now stopped — core's reattach
+        // stack. After this returns no blocking op is in flight, and every
+        // re-attached straggler is on a core's reattach stack for
+        // `shutdownAllProcesses` to drain and reap (Erlang halt).
+        pool.blocking_pool.quiesce();
         // The workers have joined; the pool is single-threaded and STOPPED. In
         // quiescent mode nothing is live (the loop ran until the count hit
         // zero); in root mode the root's children remain as stragglers for
@@ -390,6 +455,7 @@ pub const SchedulerPool = struct {
         // the earlier window.
         if (pool.stopping.load(.acquire) or
             core.hasLocalWork() or
+            core.hasPendingReattach() or
             !pool.global_queue.isEmptyApprox() or
             pool.tryStealFor(core, steal_rng))
         {
@@ -413,7 +479,16 @@ pub const SchedulerPool = struct {
     /// tears down every runnable process (per core and in the global queue) and
     /// every waiting process (via the pid table).
     pub fn shutdownAllProcesses(pool: *SchedulerPool) void {
-        for (pool.cores) |*core| core.drainPendingWakes();
+        // Flush every core's cross-thread revive channels single-threaded (the
+        // blocking pool is already quiesced by `drive`, so no new re-attach can
+        // land): pending message wakes AND pending blocking-pool re-attaches, so
+        // no straggler is missed and no stale entry references a record about to
+        // recycle. A re-attach converts its process `.blocking → .runnable`, and
+        // the reap sweep below tears it down.
+        for (pool.cores) |*core| {
+            core.drainPendingWakes();
+            core.drainPendingReattach();
+        }
 
         // Reap until the pool-wide live count reaches zero. Each pass tears down
         // all currently-runnable and one waiting straggler; a killed process may

@@ -711,7 +711,7 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
 | E3 TSan copy matrix + sender-dies | 1 (same-model), 3 (full) | any cross-scheduler refcount race → stop-ship |
 | E4 post-ICF code size | 3 | exceeds CLBG size budget → shift more paths to vtable dispatch |
 | E8 fiber-stack scan | 3 | unbounded cost / high false retention → mark-sweep out of v1, ORC only. **PASS (P3-J6, 2026-07-08)**: ~1 µs/KiB bounded scan, 0.00000% coincidental false-retention, complete root coverage on Darwin/aarch64 → `Memory.GC` (TRACED) ships as a per-process option; ORC remains the recommended cyclic model (no stale-pointer hazard). See ledger § E8. |
-| E7 manager-call blocking | 4 | stalls beyond watchdog tick → mandatory handoff |
+| E7 manager-call blocking | 4 | stalls beyond watchdog tick → mandatory handoff. **PASS (P4-J3, 2026-07-09)**: bounded manager calls (lazy-commit fault ~5 µs co-scheduled delay in ReleaseFast, ~200× under the 1 ms tick; ARC/ORC/Arena allocate has no collection pause) do NOT stall a co-scheduled fiber beyond the tick → NO auto-handoff for manager calls (that would be pure hot-path dispatch overhead, cf. E10). The ONE unbounded manager call — a `Memory.GC` stop-the-world collect — crosses the tick at ~1 MB of live heap (E8-confirmed ~1 µs/KiB scan) and is itself a `Process.blocking` client. Only explicit `Process.blocking` FFI (+ GC collect) uses the handoff. See ledger § E7. |
 
 ## 7. Risks (top 5; full list in rev 2 §8)
 

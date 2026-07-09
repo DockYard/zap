@@ -145,6 +145,45 @@ pub struct Process {
   }
 
   @doc = """
+    Runs the blocking (or long-running) computation `entry` on the dirty-
+    scheduler pool and returns its `i64` result — the `Process.blocking`
+    intrinsic (concurrency plan Phase 4, item 4.3).
+
+    Zap runs green processes M:N over a small set of core scheduler threads. A
+    native call that BLOCKS — a crypto routine, a database driver, `getaddrinfo`,
+    or any long CPU-bound leaf — holds its core for its whole duration, stalling
+    every other green process co-scheduled on that core, exactly as an over-long
+    BEAM NIF stalls a scheduler. `Process.blocking(&Slow.work/0)` avoids that: it
+    moves the calling process's fiber onto a DEDICATED blocking-pool OS thread for
+    the duration of `work`, freeing the core to run its other processes; when
+    `work` returns, the process re-attaches onto a core and this call yields its
+    result. This is BEAM's dirty schedulers / Go's syscall handoff / Tokio's
+    `spawn_blocking`, in Zap.
+
+    Contract: `entry` is a named (or capture-less) zero-parameter function
+    returning `i64`, and it must be a LEAF — it runs off-core, so it must not
+    itself `spawn`, `send`, `receive`, or otherwise re-enter the process runtime
+    (a blocking FFI call or a pure computation is exactly right). Un-annotated
+    blocking calls are NOT rewritten automatically: calling a blocking primitive
+    WITHOUT `Process.blocking` stalls the core (the honest BEAM-parity contract) —
+    wrapping it in `Process.blocking` is how you keep the scheduler responsive.
+
+    ## Example
+
+        pub fn hash_rounds() -> i64 {
+          # a long CPU-bound leaf — runs on the blocking pool, off the core
+          Crypto.pbkdf2_cost(1_000_000)
+        }
+
+        digest = Process.blocking(&MyServer.hash_rounds/0)
+
+    """
+
+  pub fn blocking(entry :: fn() -> i64) -> i64 {
+    :zig.ProcessRuntime.blocking_i64(entry)
+  }
+
+  @doc = """
     Sends `message` to the process behind `pid`, type-checked against
     the handle's message type: `Process.send(pid :: Pid(m), m)`.
     Returns `true` when the message was enqueued on a live mailbox

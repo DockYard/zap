@@ -336,6 +336,12 @@ pub const TraceEvent = struct {
         wait,
         /// A waiting process was made runnable by a wake signal.
         wake,
+        /// A process was evacuated to the blocking / dirty-scheduler pool by a
+        /// `Process.blocking` call (P4-J3); its core is freed.
+        block,
+        /// A process re-attached from the blocking pool (its blocking op
+        /// finished off-core) and became runnable again (P4-J3).
+        unblock,
         /// A process exited normally (teardown complete).
         exit,
         /// A process was killed (teardown complete).
@@ -462,6 +468,16 @@ const YieldReason = enum(u8) {
     /// made runnable by a wake signal, a kill, OR the scheduler observing
     /// `wake_deadline_nanoseconds` elapse (which sets `receive_timed_out`).
     waiting_for_message_deadline,
+    /// Evacuating to the blocking / dirty-scheduler pool (P4-J3): a
+    /// `Process.blocking` call yielded to hand its fiber to a blocking-pool
+    /// OS thread. The scheduler does NOT re-enqueue it (it goes to `.blocking`)
+    /// — it submits the record to the blocking pool and frees this core.
+    blocking_offload,
+    /// A `Process.blocking` op finished on the pool thread (P4-J3): the fiber
+    /// yielded on the POOL thread to hand control back so the pool thread can
+    /// re-attach the process onto a core. Observed only by the blocking-pool
+    /// worker's `runBlockingPhase`, never by a core's `runQuantum`.
+    blocking_complete,
 };
 
 /// The cross-thread wake handshake state of a process (P4-J1). Under M:N a
@@ -613,6 +629,14 @@ pub const ProcessRecord = struct {
     /// Intrusive Treiber link in the target scheduler's wake stack. Written by
     /// the revival CAS winner before the head CAS publishes it.
     wake_next: ?*ProcessRecord,
+    /// Intrusive link for the blocking / dirty-scheduler pool (P4-J3), serving
+    /// two NON-overlapping roles across a blocking episode: (a) the FIFO link in
+    /// the `BlockingPool`'s submit queue from offload until a worker pops it,
+    /// then (b) the Treiber link in the offloading core's `reattach_stack_head`
+    /// from the op's completion until the core drains it. A record is never in
+    /// both structures at once, so one link suffices. Untouched (and null)
+    /// except during a blocking episode.
+    blocking_next: ?*ProcessRecord,
     /// The `ProcessContext` living on this process's fiber stack, or
     /// null before the first quantum (the context is built by
     /// `processFiberEntry` at first schedule). This is the plan-A.2.4
@@ -841,6 +865,68 @@ pub const ProcessContext = struct {
         return context.scheduler.kill(target);
     }
 
+    /// Run `operation` on the blocking / dirty-scheduler pool (P4-J3,
+    /// research.md §6.1) — the `Process.blocking` intrinsic. Moves THIS
+    /// process's fiber onto a dedicated blocking-pool OS thread for the
+    /// duration of the (blocking or long-running) native call, so its core
+    /// scheduler is FREED to run its other processes / be stolen from. This is
+    /// Zap's answer to a blocking FFI call: an un-annotated blocking call stalls
+    /// a core scheduler exactly as an over-long NIF stalls a BEAM scheduler;
+    /// wrapping it in `Process.blocking` evacuates it instead (BEAM dirty
+    /// schedulers / Go's syscall handoff / Tokio's `spawn_blocking`).
+    ///
+    /// Mechanism (the fiber-evacuation / detach–reattach handoff):
+    ///   * (A) on the core, request evacuation (`.blocking_offload`) and yield —
+    ///     the core submits this record to the blocking pool and moves on;
+    ///   * (B) a blocking-pool thread resumes this fiber and runs `operation`
+    ///     ON ITS OWN STACK, off-core;
+    ///   * (C) request re-attach (`.blocking_complete`) and yield — the pool
+    ///     thread makes this process runnable again on a core;
+    ///   * (D) a core resumes this fiber and this call returns `operation`'s
+    ///     result.
+    /// Across the whole episode the process's manager/heap/refcounts are touched
+    /// by exactly ONE thread at a time — the pool thread while blocking, then a
+    /// core — ordered by the two handoff edges (the scheduler-local invariant,
+    /// TSan-proven in `mn_refcount_stress.zig`).
+    ///
+    /// Contract: `operation` is a LEAF (see `BlockingOperation`) — it must not
+    /// re-enter the scheduler (no `send`/`spawn`/`receive`/`kill`/`exit`), since
+    /// it runs off-core; it may allocate into this process's own heap. A kill
+    /// requested while blocking is deferred (native code is never interrupted —
+    /// BEAM dirty-NIF semantics) and takes effect at re-attach.
+    ///
+    /// Degradation: on a STANDALONE scheduler with no blocking pool wired
+    /// (`options.blocking_handoff == null`) the operation runs INLINE on this
+    /// scheduler thread — correct, but it stalls this scheduler for the call's
+    /// duration (the documented single-core fallback). The gate-ON runtime
+    /// always wires a `SchedulerPool`, so it always evacuates.
+    pub fn blocking(
+        context: *ProcessContext,
+        operation: BlockingOperation,
+        operation_argument: ?*anyopaque,
+    ) ?*anyopaque {
+        // Standalone-scheduler degradation: no pool → run inline (see doc).
+        if (context.scheduler.options.blocking_handoff == null) {
+            return operation(operation_argument);
+        }
+        const record = context.record;
+        // (A) On the CORE: request evacuation. The yield switches back to this
+        // core's `runQuantum`, which submits the record to the blocking pool and
+        // frees the core. This `yield()` RETURNS on a blocking-pool thread.
+        record.yield_reason = .blocking_offload;
+        context.execution.yield();
+        // (B) On a BLOCKING-POOL thread: run the operation off-core, on this
+        // fiber's own stack and into this process's own heap.
+        const result = operation(operation_argument);
+        // (C) Hand control back to the pool thread to re-attach onto a core.
+        // This `yield()` RETURNS on a core scheduler thread.
+        record.yield_reason = .blocking_complete;
+        context.execution.yield();
+        // (D) Back on a CORE: `result` lives on this fiber's stack, preserved
+        // across both migrations, so it is returned directly.
+        return result;
+    }
+
     /// Route a mailbox message that matched no `receive` arm to the
     /// dead-letter path (plan item 2.3 unexpected-message posture): record
     /// non-silent telemetry (`unexpected_message_total`) and terminate THIS
@@ -1011,6 +1097,41 @@ pub const PoolHooks = struct {
     onProcessExit: *const fn (context: ?*anyopaque, exited_pid_bits: u64) void,
 };
 
+/// The blocking / dirty-scheduler handoff seam (P4-J3, research.md §6.1
+/// "Blocking operations and FFI"): the seam a `SchedulerPool` installs into
+/// each core so a `Scheduler` classifying a `.blocking_offload` yield can hand
+/// the calling process off to the shared blocking-pool OS-thread pool WITHOUT
+/// importing the pool's concrete type (mirroring `PoolHooks`, and keeping the
+/// scheduler↔blocking-pool dependency one-directional).
+///
+/// `submit(context, record)` transfers the record — whose fiber is suspended at
+/// its `Process.blocking` offload point — to the blocking pool. The transfer is
+/// a release edge (the pool's submit-queue lock): the offloading core's writes
+/// to the record (its `.blocking` state, its heap) happen-before the pool
+/// worker that pops and resumes the fiber. After `submit` returns, the core
+/// MUST NOT touch the record again this episode — the pool owns it until it
+/// re-attaches (`reattachFromBlocking`). This is the first half of the P4-J3
+/// scheduler-local-invariant handoff (core → pool); the re-attach is the second
+/// half (pool → core).
+pub const BlockingHandoff = struct {
+    /// Opaque pool context passed back to `submit` (the `*BlockingPool`).
+    context: ?*anyopaque,
+    /// Evacuate `record` to the blocking pool. Called by the offloading core's
+    /// `runQuantum` as the LAST act of the `.blocking_offload` classification.
+    submit: *const fn (context: ?*anyopaque, record: *ProcessRecord) void,
+};
+
+/// A blocking operation run through `Process.blocking` (P4-J3): a leaf native
+/// call — expected to block or run long — given an opaque argument and
+/// returning an opaque result. It executes on a blocking-pool thread, on the
+/// calling process's own fiber stack. The C-ABI shape (`callconv(.c)`) so
+/// compiled Zap reaches it through `zap_proc_blocking` unchanged. Contract: the
+/// operation must RETURN normally (it must not exit the process, spawn, send,
+/// receive, or otherwise re-enter the scheduler — it runs off-core where those
+/// would violate the scheduler-local invariant); it may allocate into the
+/// process's own heap (its manager context is published on the pool thread).
+pub const BlockingOperation = *const fn (operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque;
+
 /// The M:N run-queue scheduler (plan 1.4/1.5 + Phase 4.1; instance-based — see
 /// the module doc). A single `Scheduler` is NOT thread-safe as a whole:
 /// exactly one thread runs its `runQuantum`/`spawn`/`dequeue` loop. Its
@@ -1108,6 +1229,19 @@ pub const Scheduler = struct {
     /// thread pushes (mailbox wake seam), only the scheduler pops (pop-all
     /// swap — no ABA).
     wake_stack_head: std.atomic.Value(?*ProcessRecord),
+    /// Lock-free Treiber stack of records RE-ATTACHING from the blocking /
+    /// dirty-scheduler pool (P4-J3): a blocking-pool worker pushes a record here
+    /// after its `Process.blocking` op finishes off-core, and this scheduler
+    /// (the record's offloading core) drains it in `serviceLocalEvents` /
+    /// `drainReattachStack`, transitioning it `.blocking → .runnable`. Distinct
+    /// from `wake_stack_head` because a blocking re-attach carries none of the
+    /// message-park handshake's `park_control`/epoch/timer semantics — it is a
+    /// plain "this suspended process is runnable again" edge — so keeping it on
+    /// its own stack leaves the delicate park/epoch logic in `drainWakeStack`
+    /// untouched. Links through `ProcessRecord.blocking_next`. Woken via the
+    /// SAME `wake()` eventcount, so a re-attach that races a park is never lost
+    /// (the pre-park re-checks read this stack too).
+    reattach_stack_head: std.atomic.Value(?*ProcessRecord),
     /// The futex word (eventcount epoch) idle parking waits on.
     wake_epoch: std.atomic.Value(u32),
     /// Syscall-elision hint: true while the scheduler is (about to be)
@@ -1137,6 +1271,12 @@ pub const Scheduler = struct {
     /// the dead-letter path (`receive`'s unexpected-message posture, plan
     /// item 2.3). Non-silent telemetry (scheduler-thread only).
     unexpected_message_total: u64,
+    /// `Process.blocking` calls this core evacuated to the blocking pool
+    /// (P4-J3; scheduler-thread only — the offloading core counts it).
+    blocking_offload_total: u64,
+    /// Blocking-pool re-attaches this core drained back to runnable (P4-J3;
+    /// scheduler-thread only — the re-attach-target core counts it).
+    blocking_reattach_total: u64,
 
     /// Construction options.
     pub const Options = struct {
@@ -1168,6 +1308,15 @@ pub const Scheduler = struct {
         /// Local-FIFO length past which `readyEnqueue` spills half the backlog
         /// to `global_queue` (only when both are set). Zero disables spilling.
         spill_threshold: usize = default_spill_threshold,
+        /// The blocking / dirty-scheduler handoff seam (P4-J3; see
+        /// `BlockingHandoff`). Null for a standalone scheduler, in which case a
+        /// `Process.blocking` call runs the blocking op INLINE on this scheduler
+        /// thread (the documented single-core degradation — it stalls this
+        /// scheduler exactly as an un-annotated blocking FFI call would). Set by
+        /// a `SchedulerPool` to a handoff that evacuates the calling process's
+        /// fiber onto the shared blocking-pool OS-thread pool so the core is
+        /// freed to run its other processes.
+        blocking_handoff: ?*const BlockingHandoff = null,
         /// The nondeterminism seam (see `Decisions`).
         decisions: Decisions = .production_fifo,
         /// Trace seam (see `TraceHook`); null = zero-cost no trace.
@@ -1228,6 +1377,10 @@ pub const Scheduler = struct {
         park_count: u64,
         /// `wake()` invocations.
         wake_signal_count: u64,
+        /// `Process.blocking` evacuations to the blocking pool (P4-J3).
+        blocking_offload_total: u64,
+        /// Blocking-pool re-attaches drained back to runnable (P4-J3).
+        blocking_reattach_total: u64,
     };
 
     /// Create a scheduler over a shared pid table and envelope reservoir.
@@ -1267,6 +1420,7 @@ pub const Scheduler = struct {
             .live_record_count = 0,
             .live_record_peak = 0,
             .wake_stack_head = .init(null),
+            .reattach_stack_head = .init(null),
             .wake_epoch = .init(0),
             .parked_hint = .init(false),
             .watchdog_preempt_flag = .init(false),
@@ -1277,6 +1431,8 @@ pub const Scheduler = struct {
             .kill_total = 0,
             .quantum_total = 0,
             .unexpected_message_total = 0,
+            .blocking_offload_total = 0,
+            .blocking_reattach_total = 0,
         };
     }
 
@@ -1288,6 +1444,7 @@ pub const Scheduler = struct {
         std.debug.assert(scheduler.ready_count == 0);
         std.debug.assert(scheduler.runnext == null);
         std.debug.assert(scheduler.wake_stack_head.load(.acquire) == null);
+        std.debug.assert(scheduler.reattach_stack_head.load(.acquire) == null);
         while (scheduler.free_records) |record| {
             scheduler.free_records = record.ready_next;
             scheduler.backing_allocator.destroy(record);
@@ -1335,6 +1492,7 @@ pub const Scheduler = struct {
         // record's new episode); only reset the state bits to `.running`.
         record.park_control = .init(packParkControl(parkControlEpoch(record.park_control.raw), .running));
         record.wake_next = null;
+        record.blocking_next = null;
         record.active_context = null;
         record.wake_deadline_nanoseconds = 0;
         record.receive_timed_out = false;
@@ -1389,7 +1547,15 @@ pub const Scheduler = struct {
                 scheduler.teardownProcess(record, .killed);
                 return .killed;
             },
-            .runnable, .running => {
+            .runnable, .running, .blocking => {
+                // `.blocking` (P4-J3): the process's fiber is executing native
+                // code on a blocking-pool thread and CANNOT be torn down here —
+                // its stack is live off-core. Like `.running`, the kill is
+                // recorded and takes effect at the process's next scheduling
+                // point: the blocking op finishes (native code is never
+                // interrupted — BEAM's dirty-NIF semantics), the process
+                // re-attaches, and `runNext` observes `pending_kill` and tears
+                // it down before its next quantum.
                 record.pending_kill = true;
                 return .kill_pending;
             },
@@ -1547,6 +1713,7 @@ pub const Scheduler = struct {
         defer current_scheduler = previous_scheduler;
         while (true) {
             scheduler.drainWakeStack();
+            scheduler.drainReattachStack();
             scheduler.advanceReceiveTimers();
             if (scheduler.dequeueNextRunnable()) |record| {
                 if (record.pending_kill) {
@@ -1601,6 +1768,7 @@ pub const Scheduler = struct {
             // every join of an exited process).
             if (!scheduler.pid_table.isAlive(target)) return;
             scheduler.drainWakeStack();
+            scheduler.drainReattachStack();
             scheduler.advanceReceiveTimers();
             if (scheduler.dequeueNextRunnable()) |record| {
                 if (record.pending_kill) {
@@ -1665,6 +1833,7 @@ pub const Scheduler = struct {
     /// `receive … after` deadlines. Run at the top of every worker iteration.
     pub fn serviceLocalEvents(scheduler: *Scheduler) void {
         scheduler.drainWakeStack();
+        scheduler.drainReattachStack();
         scheduler.advanceReceiveTimers();
     }
 
@@ -1710,6 +1879,14 @@ pub const Scheduler = struct {
         scheduler.lockRunQueue();
         defer scheduler.unlockRunQueue();
         return scheduler.ready_count != 0;
+    }
+
+    /// Whether a blocking-pool re-attach is pending for this core (P4-J3) — a
+    /// blocking op finished off-core and pushed its process onto this core's
+    /// `reattach_stack`. The pool's `parkWorker` re-checks it so a re-attach that
+    /// lands just before a park is not slept through.
+    pub fn hasPendingReattach(scheduler: *Scheduler) bool {
+        return scheduler.reattach_stack_head.load(.acquire) != null;
     }
 
     /// Drain this core's cross-thread wake stack without running anything — the
@@ -1793,6 +1970,8 @@ pub const Scheduler = struct {
             .unexpected_message_total = scheduler.unexpected_message_total,
             .park_count = scheduler.park_count.load(.monotonic),
             .wake_signal_count = scheduler.wake_signal_count.load(.monotonic),
+            .blocking_offload_total = scheduler.blocking_offload_total,
+            .blocking_reattach_total = scheduler.blocking_reattach_total,
         };
     }
 
@@ -1920,9 +2099,163 @@ pub const Scheduler = struct {
                             scheduler.readyEnqueue(record);
                         }
                     },
+                    .blocking_offload => {
+                        // `Process.blocking` (P4-J3): evacuate this process to
+                        // the blocking / dirty-scheduler pool and free this core.
+                        // `blocking_handoff` is guaranteed non-null here —
+                        // `ProcessContext.blocking` only emits `.blocking_offload`
+                        // when a pool is wired (else it runs inline and never
+                        // yields). `submit` is the release edge that transfers
+                        // ownership of the record to the pool; it MUST be the last
+                        // touch of `record` on this core this episode.
+                        scheduler.emitTrace(.block, pcb.pid);
+                        scheduler.blocking_offload_total += 1;
+                        pcb.transitionTo(.blocking);
+                        const handoff = scheduler.options.blocking_handoff.?;
+                        handoff.submit(handoff.context, record);
+                    },
+                    // A core never observes `.blocking_complete`: that yield
+                    // happens on a blocking-pool thread and is consumed by
+                    // `runBlockingPhase`, which switches back to the pool
+                    // thread's own scheduler context, not a core's.
+                    .blocking_complete => unreachable,
                 }
             },
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Blocking / dirty-scheduler pool integration (P4-J3, `blocking_pool.zig`)
+    // -------------------------------------------------------------------------
+
+    /// Run one process's `Process.blocking` operation to completion on the
+    /// CALLING (blocking-pool) thread, then return so the caller can re-attach
+    /// it (P4-J3). Entered by a `BlockingPool` worker after it pops `record`
+    /// from the submit queue (the acquire edge that pairs with the offloading
+    /// core's `submit` release — so this thread sees the record's `.blocking`
+    /// state and heap coherently). Resumes the fiber, which was suspended at
+    /// its `.blocking_offload` point; the fiber runs the blocking op on its own
+    /// stack and yields `.blocking_complete`. Publishes the process's manager
+    /// context and a saturated reduction budget on THIS thread first, so the
+    /// op's allocations route into the process's own heap and its
+    /// compiler-emitted safepoints never yield (an off-core fiber has no core to
+    /// yield to — it runs the dirty op to completion, BEAM dirty-scheduler
+    /// semantics). Not re-entrant: the pool thread runs exactly one blocking
+    /// phase at a time on its own `SchedulerContext`.
+    pub fn runBlockingPhase(record: *ProcessRecord, pool_context: *fiber_context.SchedulerContext) void {
+        const pcb = &record.pcb;
+        // Publish this process's private manager context on the pool thread so
+        // the op's allocations route into its own heap (mirrors `runQuantum`'s
+        // publish; threadlocals are per-thread, so this never disturbs a core).
+        const previous_arc_context = process_module.zap_proc_active_arc_context;
+        process_module.zap_proc_active_arc_context = pcb.manager.manager_state;
+        // Saturate the reduction counters so the op's compiler-emitted
+        // safepoints (`reductionSafepoint`) never reach zero and thus never
+        // yield: the dirty op is meant to run to completion off-core.
+        const previous_budget = process_module.zap_proc_reductions_budget;
+        const previous_remaining = process_module.zap_proc_reductions_remaining;
+        process_module.zap_proc_reductions_budget = std.math.maxInt(u32);
+        process_module.zap_proc_reductions_remaining = std.math.maxInt(u32);
+
+        const outcome = fiber_context.resumeFiber(pool_context, &pcb.fiber);
+
+        process_module.zap_proc_active_arc_context = previous_arc_context;
+        process_module.zap_proc_reductions_budget = previous_budget;
+        process_module.zap_proc_reductions_remaining = previous_remaining;
+
+        // The op returns via a second `.blocking_complete` yield — never a fiber
+        // finish (the intrinsic yields again before the entry can return) and
+        // never any other reason. A violation means the blocking-op contract was
+        // broken (it exited the process or re-entered the scheduler off-core).
+        std.debug.assert(outcome == .yielded);
+        std.debug.assert(record.yield_reason == .blocking_complete);
+    }
+
+    /// Re-attach a process whose blocking op has finished onto a core (P4-J3),
+    /// the pool → core half of the handoff. Called by a `BlockingPool` worker on
+    /// its own thread AFTER `runBlockingPhase` returns. Pushes the record onto
+    /// its offloading core's `reattach_stack` (a release edge — the pool thread's
+    /// off-core touches of the process heap happen-before the core's next
+    /// quantum) and wakes that core. The core drains it in `serviceLocalEvents`
+    /// (`drainReattachStack`), transitioning `.blocking → .runnable`. Re-attach
+    /// targets the OFFLOADING core (`record.scheduler`) for locality; stealing
+    /// rebalances, and shutdown drains any core's reattach stack single-threaded.
+    pub fn reattachFromBlocking(record: *ProcessRecord) void {
+        record.scheduler.pushReattach(record);
+    }
+
+    /// The real blocking-pool `execute` hook (`blocking_pool.ExecuteFn`): run one
+    /// record's blocking phase and re-attach it. A `BlockingPool` worker calls
+    /// this per popped record on its own thread. Each call uses a FRESH
+    /// `SchedulerContext` on the worker's own stack — the resumed fiber yields
+    /// back to THIS thread's context, so a worker may run any process's blocking
+    /// phase (they never share a context). `execute_context` is unused (the
+    /// record carries everything the phase needs).
+    pub fn blockingPoolExecute(execute_context: ?*anyopaque, record: *ProcessRecord) void {
+        _ = execute_context;
+        var pool_context: fiber_context.SchedulerContext = .{};
+        runBlockingPhase(record, &pool_context);
+        reattachFromBlocking(record);
+    }
+
+    /// Push a re-attaching record onto this scheduler's reattach stack
+    /// (lock-free Treiber) and wake it. Only the blocking-pool worker that ran
+    /// the record's blocking phase calls this (exactly once per episode), so a
+    /// record is on at most one reattach stack at a time. The `wake()` reuses the
+    /// idle-park eventcount, so a re-attach that races the core's park is never
+    /// lost (the pre-park re-checks read `reattach_stack_head` too).
+    fn pushReattach(target: *Scheduler, record: *ProcessRecord) void {
+        var observed_head = target.reattach_stack_head.load(.monotonic);
+        while (true) {
+            record.blocking_next = observed_head;
+            observed_head = target.reattach_stack_head.cmpxchgWeak(
+                observed_head,
+                record,
+                .release,
+                .monotonic,
+            ) orelse break;
+        }
+        target.wake();
+    }
+
+    /// Drain every pending blocking-pool re-attach: pop-all (swap — no ABA),
+    /// restore push order, and make each re-attached process runnable
+    /// (`.blocking → .runnable`, enqueued via the LIFO slot for locality under
+    /// work stealing). Run at the top of every worker iteration
+    /// (`serviceLocalEvents`) and in the standalone run loops. Runs on this
+    /// scheduler's own thread. Cheap no-op when the stack is empty (the common
+    /// case — a program that never blocks pays one relaxed load per iteration).
+    fn drainReattachStack(scheduler: *Scheduler) void {
+        var popped: ?*ProcessRecord = scheduler.reattach_stack_head.swap(null, .acquire) orelse return;
+        // The Treiber stack yields newest-first; reverse to arrival order.
+        var oldest_first: ?*ProcessRecord = null;
+        while (popped) |record| {
+            popped = record.blocking_next;
+            record.blocking_next = oldest_first;
+            oldest_first = record;
+        }
+        while (oldest_first) |record| {
+            oldest_first = record.blocking_next;
+            record.blocking_next = null;
+            const pcb = &record.pcb;
+            // The unique pool-worker re-attacher pushed this record; this core is
+            // its sole reviver. A `.blocking` record becomes runnable; any other
+            // state is impossible (only a `.blocking` record is ever pushed here).
+            std.debug.assert(pcb.currentState() == .blocking);
+            pcb.transitionTo(.runnable);
+            scheduler.blocking_reattach_total += 1;
+            scheduler.reviveEnqueue(record);
+            scheduler.emitTrace(.unblock, pcb.pid);
+        }
+    }
+
+    /// Drain this core's pending re-attaches without running anything — the
+    /// pool's shutdown flushes every core's reattach stack (single-threaded, all
+    /// blocking-pool workers already quiesced) so no in-flight blocking episode
+    /// is lost and every re-attached straggler is reaped. Companion to
+    /// `drainPendingWakes`.
+    pub fn drainPendingReattach(scheduler: *Scheduler) void {
+        scheduler.drainReattachStack();
     }
 
     /// The parking side of the cross-thread wake handshake (P4-J1). The caller
@@ -2455,20 +2788,33 @@ pub const Scheduler = struct {
     // Idle parking (module doc, "Idle parking")
     // -------------------------------------------------------------------------
 
+    /// Whether a cross-thread producer has left this core work to revive — a
+    /// pending message wake (`wake_stack_head`) or a pending blocking-pool
+    /// re-attach (`reattach_stack_head`). The pre-park re-check reads both so no
+    /// wake source is slept through; the `wake()` epoch bump each producer pairs
+    /// with its push closes the race with an already-committed park.
+    inline fn hasPendingCrossThreadWork(scheduler: *Scheduler) bool {
+        return scheduler.wake_stack_head.load(.acquire) != null or
+            scheduler.reattach_stack_head.load(.acquire) != null;
+    }
+
     fn parkUntilWakeSignal(scheduler: *Scheduler) void {
         // Spin phase: E9 crossover — a handoff lands in ~83 ns while a
         // parked wake costs ~900 ns, so spend up to ~1–2 µs spinning
         // before paying a park.
         var spin_iteration: u32 = 0;
         while (spin_iteration < scheduler.options.spin_iterations_before_park) : (spin_iteration += 1) {
-            if (scheduler.wake_stack_head.load(.acquire) != null) return;
+            if (scheduler.hasPendingCrossThreadWork()) return;
             std.atomic.spinLoopHint();
         }
 
         // Eventcount park: the futex value check closes the race between
-        // the work re-check and the wait entry (module doc).
+        // the work re-check and the wait entry (module doc). A blocking-pool
+        // re-attach (`reattach_stack_head`) is a wake source too — checked here
+        // AND paired with the `wake()` epoch bump `pushReattach` issues, so a
+        // re-attach that races this park is never slept through.
         const observed_epoch = scheduler.wake_epoch.load(.seq_cst);
-        if (scheduler.wake_stack_head.load(.acquire) != null) return;
+        if (scheduler.hasPendingCrossThreadWork()) return;
         scheduler.parked_hint.store(true, .seq_cst);
         _ = scheduler.park_count.fetchAdd(1, .monotonic);
         parking_futex.waitBounded(
@@ -2548,157 +2894,13 @@ fn processFiberEntry(execution: *fiber_context.FiberExecution, argument: ?*anyop
 // Futex parking primitives (module doc, "Darwin futex mapping")
 // ---------------------------------------------------------------------------
 
-/// OS futex wait/wake over a 32-bit word. Darwin: `os_sync_*` (macOS ≥
-/// 14.4 minimum-target) or `__ulock_*` (the fork's own `Io.Threaded`
-/// primitive pair, comptime-gated the same way). Linux: `futex(2)`.
-/// Waits are always time-bounded and may return spuriously — callers
-/// re-check their condition in a loop (the scheduler's run loop does).
-const parking_futex = struct {
-    fn waitBounded(word: *std.atomic.Value(u32), expected: u32, timeout_nanoseconds: u64) void {
-        switch (comptime builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => {
-                darwinWaitBounded(word, expected, timeout_nanoseconds);
-            },
-            .linux => linuxWaitBounded(word, expected, timeout_nanoseconds),
-            else => @compileError(
-                "scheduler idle parking is not implemented for this OS (Phase 4/7 ports)",
-            ),
-        }
-    }
-
-    fn wakeOne(word: *std.atomic.Value(u32)) void {
-        switch (comptime builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => darwinWakeOne(word),
-            .linux => linuxWakeOne(word),
-            else => @compileError(
-                "scheduler idle parking is not implemented for this OS (Phase 4/7 ports)",
-            ),
-        }
-    }
-
-    // -- Darwin ---------------------------------------------------------------
-
-    /// Whether the minimum targeted Darwin version has the public
-    /// `os_sync_wait_on_address` family (macOS 14.4). Gated at comptime
-    /// on `builtin.os.version_range` exactly as the fork's `Io.Threaded`
-    /// gates `__ulock_wait2` (macOS 11).
-    const darwin_minimum_target_has_os_sync = darwin_gate: {
-        if (!builtin.os.tag.isDarwin()) break :darwin_gate false;
-        const minimum = builtin.os.version_range.semver.min;
-        break :darwin_gate minimum.order(.{ .major = 14, .minor = 4, .patch = 0 }) != .lt;
-    };
-
-    /// See the fork's `Io/Threaded.zig` `darwin_supports_ulock_wait2`.
-    const darwin_minimum_target_has_ulock_wait2 = darwin_gate: {
-        if (!builtin.os.tag.isDarwin()) break :darwin_gate false;
-        break :darwin_gate builtin.os.version_range.semver.min.major >= 11;
-    };
-
-    /// `OS_SYNC_WAIT_ON_ADDRESS_NONE` / `OS_SYNC_WAKE_BY_ADDRESS_NONE`
-    /// from `<os/os_sync_wait_on_address.h>`.
-    const os_sync_flags_none: u32 = 0;
-    /// `OS_CLOCK_MACH_ABSOLUTE_TIME` from `<os/clock.h>` — the only clock
-    /// id the os_sync timeout API accepts as of macOS 14.4.
-    const os_clock_mach_absolute_time: u32 = 32;
-
-    extern "c" fn os_sync_wait_on_address_with_timeout(
-        addr: *anyopaque,
-        value: u64,
-        size: usize,
-        flags: u32,
-        clockid: u32,
-        timeout_ns: u64,
-    ) c_int;
-    extern "c" fn os_sync_wake_by_address_any(addr: *anyopaque, size: usize, flags: u32) c_int;
-
-    const darwin_ulock_flags: std.c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
-
-    fn darwinWaitBounded(word: *std.atomic.Value(u32), expected: u32, timeout_nanoseconds: u64) void {
-        // Timeout 0 means "infinite" to both APIs; the caller always
-        // bounds the wait, and a zero bound degenerates to a re-check.
-        const bounded_timeout = @max(timeout_nanoseconds, 1);
-        if (comptime darwin_minimum_target_has_os_sync) {
-            const return_code = os_sync_wait_on_address_with_timeout(
-                &word.raw,
-                expected,
-                @sizeOf(u32),
-                os_sync_flags_none,
-                os_clock_mach_absolute_time,
-                bounded_timeout,
-            );
-            if (return_code >= 0) return;
-            switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
-                // Spurious return, paged-out word, or timeout: the caller
-                // re-checks its condition either way.
-                .INTR, .FAULT, .TIMEDOUT => {},
-                else => unreachable, // misuse of the futex word — kernel bug
-            }
-            return;
-        }
-        const status = if (comptime darwin_minimum_target_has_ulock_wait2)
-            std.c.__ulock_wait2(darwin_ulock_flags, &word.raw, expected, bounded_timeout, 0)
-        else
-            std.c.__ulock_wait(
-                darwin_ulock_flags,
-                &word.raw,
-                expected,
-                @max(std.math.lossyCast(u32, bounded_timeout / std.time.ns_per_us), 1),
-            );
-        if (status >= 0) return;
-        switch (@as(std.c.E, @enumFromInt(-status))) {
-            .INTR, .FAULT, .TIMEDOUT => {},
-            else => unreachable, // misuse of the futex word — kernel bug
-        }
-    }
-
-    fn darwinWakeOne(word: *std.atomic.Value(u32)) void {
-        if (comptime darwin_minimum_target_has_os_sync) {
-            const return_code = os_sync_wake_by_address_any(&word.raw, @sizeOf(u32), os_sync_flags_none);
-            if (return_code >= 0) return;
-            switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
-                .NOENT => {}, // nobody parked — the desired no-op
-                else => unreachable,
-            }
-            return;
-        }
-        while (true) {
-            const status = std.c.__ulock_wake(darwin_ulock_flags, &word.raw, 0);
-            if (status >= 0) return;
-            switch (@as(std.c.E, @enumFromInt(-status))) {
-                .INTR, .CANCELED => continue,
-                .NOENT => return, // nobody parked — the desired no-op
-                else => unreachable,
-            }
-        }
-    }
-
-    // -- Linux ------------------------------------------------------------------
-
-    fn linuxWaitBounded(word: *std.atomic.Value(u32), expected: u32, timeout_nanoseconds: u64) void {
-        const linux = std.os.linux;
-        const timeout = linux.timespec{
-            .sec = @intCast(timeout_nanoseconds / std.time.ns_per_s),
-            .nsec = @intCast(timeout_nanoseconds % std.time.ns_per_s),
-        };
-        const return_code = linux.futex_4arg(
-            &word.raw,
-            .{ .cmd = .WAIT, .private = true },
-            expected,
-            &timeout,
-        );
-        switch (linux.errno(return_code)) {
-            // Woken, raced (word already changed), interrupted, or timed
-            // out: the caller re-checks its condition either way.
-            .SUCCESS, .AGAIN, .INTR, .TIMEDOUT => {},
-            else => unreachable, // misuse of the futex word — kernel bug
-        }
-    }
-
-    fn linuxWakeOne(word: *std.atomic.Value(u32)) void {
-        const linux = std.os.linux;
-        _ = linux.futex_3arg(&word.raw, .{ .cmd = .WAKE, .private = true }, 1);
-    }
-};
+/// OS futex wait/wake over a 32-bit eventcount word. Extracted (P4-J3) to the
+/// shared leaf module `futex.zig` so the M:N core schedulers (idle parking,
+/// here) and the blocking / dirty-scheduler pool (`blocking_pool.zig`, worker
+/// parking) share ONE OS-portable surface. Waits are always time-bounded and
+/// may return spuriously — callers re-check their condition in a loop (the
+/// scheduler's run loop does).
+const parking_futex = @import("futex.zig");
 
 // ---------------------------------------------------------------------------
 // Tests

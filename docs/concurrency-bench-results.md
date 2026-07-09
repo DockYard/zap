@@ -1717,6 +1717,81 @@ collection is **dormant-until-mutation** (see plan item 3.4). **Hypothesis:
 CONFIRMED — ORC shares the REFCOUNTED specialization exactly, zero additional
 monomorphized code.**
 
+## E7 — manager-call blocking / dirty-scheduler handoff (P4-J3, 2026-07-09) — GATE: PASS (no auto-handoff; explicit `Process.blocking` is the mechanism)
+
+E7 decides whether a fiber that blocks INSIDE a manager call (a GC pause inside
+`allocate`, a page fault under lazy commit) delays a co-scheduled fiber on the
+same core BEYOND the watchdog tick — and thus whether blockable manager calls
+must use the P4-J3 dirty-scheduler handoff, or whether only explicit
+`Process.blocking` FFI does. Kill criterion (plan §6): co-scheduled fibers
+stalled beyond the watchdog tick → mandatory handoff for blockable manager calls.
+
+### Why the co-scheduled delay equals the manager-call duration
+
+Zap's cores are cooperative: a running fiber holds its core until a safepoint or
+yield. A manager call runs to completion with NO safepoint (straight-line native
+code), so on one core a co-scheduled runnable fiber cannot run until the manager
+call returns — its delay IS the manager call's duration. E7 measures both the
+manager-call durations directly and the co-scheduled delay (two fibers, one
+scheduler), comparing each to the watchdog-tick reference.
+
+### The watchdog-tick reference
+
+No wired watchdog TIMER exists yet (the P4 watchdog is flag-only; the timer
+thread is a later item). E7 uses the state of the art's "long enough to need a
+dirty scheduler" thresholds: BEAM says a NIF expected to run **> 1 ms** should be
+dirty; Go's sysmon preempts a goroutine running **> 10 ms**. E7 takes the
+conservative **1 ms** (BEAM's dirty threshold) as the reference.
+
+### Methodology
+
+`src/runtime/concurrency/e7_manager_blocking.zig` (wired into the kernel suite).
+Two measurements: (1) the conservative mark-scan rate (E8's shape — a 512-object
+table, a 1 MiB mixed span) projected to a collect pause across live-heap sizes;
+(2) a direct co-scheduled delay — a standalone scheduler runs a first fiber whose
+inline manager call is a real fresh-slab (64 KiB) lazy-commit fault while a
+second fiber waits, measuring how long the inline call held the core.
+
+### Numbers (representative; Debug and ReleaseFast)
+
+| Measurement | Debug | ReleaseFast |
+|---|---|---|
+| Conservative mark-scan rate | ~6.5 µs/KiB | ~0.86 µs/KiB (matches E8) |
+| Projected collect-pause crossover (== 1 ms tick) | ~130–170 KiB live heap | **~1.16 MiB live heap** |
+| 16 MiB-heap collect pause | ~100–130 ms | ~14 ms |
+| Fresh-slab (64 KiB) lazy-commit fault (manager call) | ~22–37 µs | ~2 µs |
+| Co-scheduled fiber delay from that fault | ~130–185 µs | ~5 µs |
+
+In the optimized build the scan rate lands at E8's ~1 µs/KiB and the collect-pause
+crossover is ~1.1 MiB — i.e. a GC collect over a live heap beyond ~1 MB exceeds
+the 1 ms tick, while every bounded manager call is orders of magnitude under it.
+
+### Verdict: PASS — bounded manager calls need NO auto-handoff; explicit `Process.blocking` is the mechanism
+
+- **Bounded manager calls do NOT stall a co-scheduled fiber beyond the tick.** A
+  fresh-slab lazy-commit fault (the manager-internal block on EVERY reclamation
+  model) delays a co-scheduled fiber by ~5 µs (ReleaseFast) — ~200× under the
+  1 ms tick. The default models' `allocate` (ARC/ORC deterministic refcount,
+  Arena bump) has no collection pause at all. So the runtime does **not**
+  auto-detach manager calls: auto-detaching every allocate would be pure hot-path
+  dispatch overhead (exactly the cost E10 warns against) to hide a delay that is
+  already ~1000× under the tick.
+- **The ONE unbounded manager call is a `Memory.GC` stop-the-world collect**,
+  whose pause is the conservative scan (E8-confirmed ~1 µs/KiB) and CROSSES the
+  1 ms tick at ~1 MB of live heap. That is a real stall — but `Memory.GC` is an
+  opt-in per-process model whose pauses are its documented tradeoff, and the
+  correct remedy is that a GC-heavy process routes its long work through the SAME
+  explicit `Process.blocking` handoff (it is a dirty-scheduler client), NOT that
+  the runtime auto-detaches every allocate.
+
+**So E7 lands on the "NOT stalled beyond the tick → manager calls don't need an
+automatic handoff" branch** (kill criterion NOT triggered), with the honest
+nuance that the one unbounded manager call (GC collect) is itself a
+`Process.blocking` client. The mechanism that discharges the handoff — the
+blocking / dirty-scheduler pool + the `Process.blocking` fiber-evacuation handoff
+— is what P4-J3 built (`src/runtime/concurrency/blocking_pool.zig`,
+`ProcessContext.blocking`; proven in `blocking_stress.zig`).
+
 ## Baseline comparison yardstick
 
 External systems' spawn/RTT numbers (from `research-round-2.md` Q10) — the

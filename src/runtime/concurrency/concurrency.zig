@@ -164,6 +164,8 @@ pub const envelope_pool = @import("envelope_pool.zig");
 pub const timing_wheel = @import("timing_wheel.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const scheduler_pool = @import("scheduler_pool.zig");
+pub const blocking_pool = @import("blocking_pool.zig");
+pub const futex = @import("futex.zig");
 pub const deterministic = @import("deterministic.zig");
 pub const introspection = @import("introspection.zig");
 pub const crash_report = @import("crash_report.zig");
@@ -189,6 +191,9 @@ pub const EnvelopePool = envelope_pool.EnvelopePool;
 pub const EnvelopePage = envelope_pool.EnvelopePage;
 pub const Scheduler = scheduler.Scheduler;
 pub const SchedulerPool = scheduler_pool.SchedulerPool;
+pub const BlockingPool = blocking_pool.BlockingPool;
+pub const BlockingHandoff = scheduler.BlockingHandoff;
+pub const BlockingOperation = scheduler.BlockingOperation;
 pub const GlobalRunQueue = scheduler.GlobalRunQueue;
 pub const ProcessContext = scheduler.ProcessContext;
 pub const ProcessEntry = scheduler.ProcessEntry;
@@ -225,6 +230,8 @@ test {
     _ = timing_wheel;
     _ = scheduler;
     _ = scheduler_pool;
+    _ = blocking_pool;
+    _ = futex;
     _ = deterministic;
     _ = introspection;
     _ = crash_report;
@@ -233,9 +240,17 @@ test {
     // P4-J1: the scheduler-local-refcount invariant under REAL M:N scheduling
     // (gate E3's full half by measurement — run under `-fsanitize-thread`).
     _ = @import("mn_refcount_stress.zig");
+    // P4-J3: the blocking / dirty-scheduler pool + `Process.blocking` handoff
+    // (co-scheduled progress during a block, re-attach, pool sizing, and the
+    // detach/re-attach scheduler-local-invariant handoff under TSan).
+    _ = @import("blocking_stress.zig");
     _ = @import("abi.zig");
     // E8: conservative fiber-stack scan cost + false-retention (plan §7 /
     // risk #1) — decides whether conservative mark-sweep ships as a TRACED
     // per-process model. ORC ships regardless (no stack scan).
     _ = @import("e8_fiber_scan.zig");
+    // E7: manager-call blocking / dirty-scheduler handoff (plan §7 / risk #6)
+    // — measures whether a blocking manager call stalls co-scheduled fibers
+    // beyond the watchdog tick; records the verdict.
+    _ = @import("e7_manager_blocking.zig");
 }
