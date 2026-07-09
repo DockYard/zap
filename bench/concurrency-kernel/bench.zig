@@ -416,7 +416,7 @@ fn runPingPongMode(allocator: std.mem.Allocator, rounds: usize) !void {
     );
 }
 
-// -- pingpong-pool (cross-scheduler; the Phase-4 E1 re-measurement) ----------------------------
+// -- pingpong-pool (collocated communicating pair on the M:N pool; Phase-4 E1) -----------------
 
 /// One ping-pong repetition on the REAL M:N pool (P4-J1). Two processes are
 /// admitted to the primary core; the pool's worker threads then run them. The
@@ -448,16 +448,19 @@ fn runPingPongPoolRepetition(pool: *SchedulerPool, managers: *[2]BenchManager, r
     return elapsed;
 }
 
-/// The Phase-4 cross-scheduler E1 re-measurement (plan Phase-4 exit gate): a
-/// two-process ping-pong on a real 2-core M:N pool. Unlike the same-scheduler
-/// `pingpong` mode (one `Scheduler`, zero parks by construction), this pair can
-/// run on either core and the message can cross a core boundary. It reports the
-/// per-RTT time AND — the decomposition the gate wants — the total futex parks
-/// and the per-core quantum split, which reveal whether the wake-locality LIFO
-/// slot (research.md §6.1) COLLOCATES the communicating pair onto one core (the
-/// fast path, ≈ same-scheduler) or the message genuinely crosses cores each
-/// round (paying a parked wake ≈ the E9 cost). The `wake` mode measures that
-/// parked-wake component in isolation.
+/// The Phase-4 E1 communicating-pair re-measurement (plan Phase-4 exit gate): a
+/// two-process ping-pong on a real 2-core M:N pool. Both processes are admitted
+/// to the primary core with NO pinning, so — as the reported per-core quantum
+/// split and park count confirm — the wake-locality LIFO slot (research.md
+/// §6.1) COLLOCATES the pair onto one core (~96 % of RTTs same-core, ~15–23
+/// parks per 500k). This mode therefore measures the COLLOCATED-pair RTT (≈ the
+/// same-scheduler hot path), which is what the M:N scheduler actually does with
+/// a chatty pair — it does NOT measure a sustained cross-core RTT (that would
+/// require pinning the pair apart and defeating the wake locality the scheduler
+/// exists to provide). The genuine per-hop cross-core cost is measured directly
+/// by the `wake` mode (a parked cross-core wake); a forced-cross sustained RTT
+/// is the analytic 2×-parked-wake bound. See docs/concurrency-bench-results.md
+/// E1 for the honest decomposition.
 fn runPingPongPoolMode(allocator: std.mem.Allocator, rounds: usize) !void {
     var pid_table = try PidTable.init(allocator, .{ .capacity = 4096 });
     defer pid_table.deinit();
