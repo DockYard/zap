@@ -1659,10 +1659,19 @@ pub const Scheduler = struct {
         record.pcb.mailbox.wake_context = record;
 
         record.pcb.transitionTo(.runnable);
-        scheduler.readyEnqueue(record);
-        // Live count: the pool's authoritative count under M:N (a stolen
-        // process is torn down on a different core, so a per-scheduler count
-        // would drift); the per-scheduler count for a standalone scheduler.
+        // Live count FIRST — BEFORE `readyEnqueue` makes the record stealable
+        // (P4-R2). Under work stealing `readyEnqueue` publishes the record to
+        // the FIFO, where a thief can steal, run, AND tear it down —
+        // decrementing the live count — before THIS spawn's increment lands. If
+        // the increment came second, that stolen `-1` could bring the pool's
+        // live count to a spurious transient 0 while the parent is still live,
+        // tripping premature quiescence (`SchedulerPool` stops the instant the
+        // count hits 0) and LOSING the just-spawned process. Counting before
+        // publishing keeps the count ≥ the true live count at every instant.
+        // The pool count is authoritative under M:N (a stolen process is torn
+        // down on a different core, so a per-scheduler count would drift); a
+        // standalone scheduler keeps its own per-scheduler count (no stealing,
+        // so ordering is moot there — kept uniform for simplicity).
         if (scheduler.pool_hooks) |hooks| {
             hooks.liveCountDelta(hooks.context, 1);
         } else {
@@ -1671,6 +1680,7 @@ pub const Scheduler = struct {
                 scheduler.live_record_peak = scheduler.live_record_count;
             }
         }
+        scheduler.readyEnqueue(record);
         scheduler.spawn_total += 1;
         scheduler.emitTrace(.spawn, pid);
         // Exercise the admission wake edge from day one (no-op syscall-
