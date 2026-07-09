@@ -368,6 +368,10 @@ pub const MnSimulator = struct {
         /// or null (signal-free scenarios). The ABI's seeded backend passes the
         /// runtime's shared instance so seeded signal runs work.
         signal_runtime: ?*@import("signal.zig").SignalRuntime = null,
+        /// The local process registry (P5-J2) shared across the simulated cores,
+        /// or null (registry-free scenarios). The ABI's seeded backend passes the
+        /// runtime's shared instance so seeded register/whereis runs work.
+        registry: ?*@import("registry.zig").ProcessRegistry = null,
     };
 
     /// Build a seeded M:N simulator for `seed` over a BORROWED pid table and
@@ -442,6 +446,7 @@ pub const MnSimulator = struct {
                 .trace_context = &simulator.core_taps[core_index],
                 .stack_usable_size = options.stack_usable_size,
                 .signal_runtime = options.signal_runtime,
+                .registry = options.registry,
             });
         }
         return simulator;

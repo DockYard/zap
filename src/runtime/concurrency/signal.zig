@@ -368,6 +368,24 @@ pub const SignalState = struct {
         return state.trap_exit.swap(value, .acq_rel);
     }
 
+    /// Push a CALLER-PROVIDED, pre-allocated node into the link set for
+    /// `peer_bits`, WITHOUT dedup or allocation — the infallible half of the
+    /// atomic `spawn_link` path (P5-J2). `spawn` pre-allocates the two link
+    /// nodes BEFORE minting the child's pid (so an OOM fails the spawn cleanly),
+    /// then inserts them here once the pid exists but before the child is
+    /// admitted — so the link is in place before the child can run and exit. No
+    /// dedup is needed: the child's pid is freshly minted, so no peer can already
+    /// be linked to it. Self-locking (the parent side may be mutated by a third
+    /// core concurrently).
+    pub fn insertLinkNode(state: *SignalState, node: *SignalNode, peer_bits: u64) void {
+        node.pid_bits = peer_bits;
+        node.ref = 0;
+        state.acquire();
+        defer state.lock.unlock();
+        node.next = state.links;
+        state.links = node;
+    }
+
     /// Add `peer_bits` to the link set if absent (idempotent — one node per
     /// peer, so `link` twice is a no-op). Returns whether a node was added.
     /// Self-locking. Allocates from `pool` on insert.
@@ -413,6 +431,20 @@ pub const SignalState = struct {
         return head;
     }
 
+    /// Push a CALLER-PROVIDED, pre-allocated node into the incoming-monitor set
+    /// (`{ref, monitor_bits}`), WITHOUT allocation — the infallible half of the
+    /// atomic `spawn_monitor` path (P5-J2), inserted after the child's pid is
+    /// minted but before it is admitted. Stackable, like `addMonitoredBy`.
+    /// Self-locking.
+    pub fn insertMonitoredByNode(state: *SignalState, node: *SignalNode, ref: Ref, monitor_bits: u64) void {
+        node.pid_bits = monitor_bits;
+        node.ref = ref;
+        state.acquire();
+        defer state.lock.unlock();
+        node.next = state.monitored_by;
+        state.monitored_by = node;
+    }
+
     /// Record that `monitor_bits` monitors this process under `ref`. Stackable —
     /// no dedup (N monitors ⇒ N entries ⇒ N `DOWN`s). Self-locking.
     pub fn addMonitoredBy(state: *SignalState, pool: *SignalNodePool, ref: Ref, monitor_bits: u64) error{OutOfMemory}!void {
@@ -450,6 +482,19 @@ pub const SignalState = struct {
         const head = state.monitored_by;
         state.monitored_by = null;
         return head;
+    }
+
+    /// Push a CALLER-PROVIDED, pre-allocated node into the outgoing-monitor set
+    /// (`{ref → target_bits}`), WITHOUT allocation — the infallible half of the
+    /// atomic `spawn_monitor` path (P5-J2) for the PARENT (monitoring) side. The
+    /// parent's `monitors` set is owner-only, but the parent is the running
+    /// spawner, so the insert races nothing; still, the insert must be sequenced
+    /// before the child is admitted. No lock (owner-only), like `addMonitor`.
+    pub fn insertMonitorNode(state: *SignalState, node: *SignalNode, ref: Ref, target_bits: u64) void {
+        node.pid_bits = target_bits;
+        node.ref = ref;
+        node.next = state.monitors;
+        state.monitors = node;
     }
 
     /// Record an outgoing monitor `{ref → target_bits}` (owner-only; no lock).

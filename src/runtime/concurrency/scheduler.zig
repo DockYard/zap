@@ -290,6 +290,7 @@ const process_module = @import("process.zig");
 const crash_report_module = @import("crash_report.zig");
 const timing_wheel_module = @import("timing_wheel.zig");
 const signal_module = @import("signal.zig");
+const registry_module = @import("registry.zig");
 
 const Pid = pid_table_module.Pid;
 const PidTable = pid_table_module.PidTable;
@@ -1076,6 +1077,29 @@ pub const ProcessContext = struct {
         return @intFromEnum(context.record.last_signal_kind);
     }
 
+    // -- Local process registry (P5-J2, `registry.zig`) -----------------------
+
+    /// `register(name)`: register the CALLING process under `name` (an atom id).
+    /// Returns false if the name is taken by a live process or this process
+    /// already holds a name (Erlang one-name-per-process). See
+    /// `Scheduler.registryRegister`.
+    pub fn registerName(context: *ProcessContext, name: u64) bool {
+        return context.scheduler.registryRegister(context.record, name);
+    }
+
+    /// `unregister(name)`: release `name` if this process holds it (idempotent).
+    /// See `Scheduler.registryUnregister`.
+    pub fn unregisterName(context: *ProcessContext, name: u64) bool {
+        return context.scheduler.registryUnregister(context.record, name);
+    }
+
+    /// `whereis(name) -> pid bits`: resolve `name` to the raw pid bits of its
+    /// LIVE registrant, or `0` (the invalid pid) when unregistered or resolving
+    /// to a dead pid. See `Scheduler.registryWhereis`.
+    pub fn whereisName(context: *const ProcessContext, name: u64) u64 {
+        return context.scheduler.registryWhereis(name);
+    }
+
     /// Run `operation` on the blocking / dirty-scheduler pool (P4-J3,
     /// research.md §6.1) — the `Process.blocking` intrinsic. Moves THIS
     /// process's fiber onto a dedicated blocking-pool OS thread for the
@@ -1585,6 +1609,16 @@ pub const Scheduler = struct {
         /// processes have empty signal sets, so teardown propagation is a
         /// no-op). Signal intrinsics require it.
         signal_runtime: ?*signal_module.SignalRuntime = null,
+        /// The local process registry (P5-J2, `registry.zig`): the shared
+        /// name→pid table `Process.register`/`whereis`/`unregister` and
+        /// send-by-name stand on. A `SchedulerPool` creates ONE and shares it
+        /// across every core (like the pid table and signal runtime); a
+        /// standalone scheduler with no registry usage leaves it null (its
+        /// processes register no names, so teardown name-release is a no-op).
+        /// The registry validates pid liveness through this scheduler's
+        /// `pid_table` (`registryLiveness`), giving registration and lookup
+        /// their generation validation.
+        registry: ?*registry_module.ProcessRegistry = null,
     };
 
     /// Per-spawn options.
@@ -1600,6 +1634,20 @@ pub const Scheduler = struct {
         /// Reclamation model stamped into the pid (plan §2.4; Phase 1's
         /// manifest model is `.refcounted`).
         model: ReclamationModel = .refcounted,
+        /// `spawn_link` (P5-J2): the PARENT record to atomically bidirectional-
+        /// link this child to BEFORE it is admitted to a run queue. Establishing
+        /// the link before the child can run is what makes `spawn_link` atomic —
+        /// a child that exits immediately still propagates its exit to the parent
+        /// (Erlang `spawn_link`). Null for a plain spawn. Requires the signal
+        /// runtime.
+        link_parent: ?*ProcessRecord = null,
+        /// `spawn_monitor` (P5-J2): the PARENT record to atomically install a
+        /// monitor FROM, on this child, before admission; the minted reference is
+        /// written to `monitor_ref_out`. Null for a plain spawn. Requires the
+        /// signal runtime.
+        monitor_parent: ?*ProcessRecord = null,
+        /// Out-param receiving the monitor reference minted for `monitor_parent`.
+        monitor_ref_out: ?*signal_module.Ref = null,
     };
 
     /// Scheduler-thread-only statistics snapshot (Phase 1.6 skeleton).
@@ -1766,12 +1814,59 @@ pub const Scheduler = struct {
         ProcessControlBlock.init(&record.pcb, kernel_fiber, options.manager);
         errdefer fiber_context.reclaimWithoutResume(&record.pcb.fiber);
 
+        // spawn_link / spawn_monitor (P5-J2): pre-allocate the relationship nodes
+        // BEFORE the pid is minted, so the post-register insertion below — which
+        // must complete before the child is admitted and can exit — is
+        // infallible. An OOM here fails the spawn cleanly (before any pid) via the
+        // errdefers above. The signal runtime backs the node pool.
+        var spawn_link_child_node: ?*signal_module.SignalNode = null;
+        var spawn_link_parent_node: ?*signal_module.SignalNode = null;
+        var spawn_monitor_target_node: ?*signal_module.SignalNode = null;
+        var spawn_monitor_holder_node: ?*signal_module.SignalNode = null;
+        errdefer if (scheduler.signalRuntimePtr()) |sr| {
+            if (spawn_link_child_node) |node| sr.node_pool.free(node);
+            if (spawn_link_parent_node) |node| sr.node_pool.free(node);
+            if (spawn_monitor_target_node) |node| sr.node_pool.free(node);
+            if (spawn_monitor_holder_node) |node| sr.node_pool.free(node);
+        };
+        if (options.link_parent != null) {
+            const sr = scheduler.signalRuntimePtr().?;
+            spawn_link_child_node = try sr.node_pool.allocate();
+            spawn_link_parent_node = try sr.node_pool.allocate();
+        }
+        if (options.monitor_parent != null) {
+            const sr = scheduler.signalRuntimePtr().?;
+            spawn_monitor_target_node = try sr.node_pool.allocate();
+            spawn_monitor_holder_node = try sr.node_pool.allocate();
+        }
+
         const pid = try record.pcb.register(scheduler.pid_table, options.model);
         record.envelope_handle = EnvelopePool.Handle.init(scheduler.envelope_pool);
         record.pcb.mailbox.wake_callback = mailboxWakeCallback;
         record.pcb.mailbox.wake_context = record;
 
         record.pcb.transitionTo(.runnable);
+        // spawn_link / spawn_monitor (P5-J2): establish the relationship NOW —
+        // the child is registered (has a pid) but NOT yet admitted, so it cannot
+        // run or exit until `readyEnqueue` below. Inserting the pre-allocated
+        // nodes here is the atomicity guarantee: a `spawn_link` child that exits
+        // immediately still finds the link in its set at teardown and propagates
+        // its exit to the parent (Erlang `spawn_link` atomicity). Infallible — the
+        // nodes were reserved above.
+        if (options.link_parent) |parent| {
+            record.pcb.signal_state.insertLinkNode(spawn_link_child_node.?, parent.pcb.pid.toBits());
+            parent.pcb.signal_state.insertLinkNode(spawn_link_parent_node.?, pid.toBits());
+            spawn_link_child_node = null;
+            spawn_link_parent_node = null;
+        }
+        if (options.monitor_parent) |parent| {
+            const ref = scheduler.signalRuntimePtr().?.mintRef();
+            record.pcb.signal_state.insertMonitoredByNode(spawn_monitor_target_node.?, ref, parent.pcb.pid.toBits());
+            parent.pcb.signal_state.insertMonitorNode(spawn_monitor_holder_node.?, ref, pid.toBits());
+            spawn_monitor_target_node = null;
+            spawn_monitor_holder_node = null;
+            if (options.monitor_ref_out) |out| out.* = ref;
+        }
         // Live count FIRST — BEFORE `readyEnqueue` makes the record stealable
         // (P4-R2). Under work stealing `readyEnqueue` publishes the record to
         // the FIFO, where a thief can steal, run, AND tear it down —
@@ -3048,6 +3143,82 @@ pub const Scheduler = struct {
     }
 
     // -------------------------------------------------------------------------
+    // Local process registry (P5-J2, `registry.zig`): the registry table is a
+    // pure name→pid map; these methods COMPOSE it with the pid table so
+    // registration and lookup are generation-validated (a name resolving to a
+    // dead/reused pid is a miss, never a stale hit).
+    // -------------------------------------------------------------------------
+
+    /// This scheduler's pid-liveness predicate for the registry, wrapping
+    /// `PidTable.isAlive` (shared across cores under M:N). A registry entry's pid
+    /// is "alive" iff the pid table still holds exactly that slot+generation
+    /// occupied — the same §2.4 validation a send does.
+    fn registryLivenessIsAlive(context: ?*anyopaque, pid_bits: u64) bool {
+        const table: *PidTable = @ptrCast(@alignCast(context.?));
+        return table.isAlive(Pid.fromBits(pid_bits));
+    }
+
+    fn registryLiveness(scheduler: *Scheduler) registry_module.Liveness {
+        return .{ .context = scheduler.pid_table, .is_alive = registryLivenessIsAlive };
+    }
+
+    /// `register(name)`: register `self_record` under `name`. Fails (false) when
+    /// the process already holds a name (one-name-per-process, Erlang), when the
+    /// name is taken by another live process, or when the registry is saturated.
+    /// On success the name is recorded in the PCB's `registered_name` so teardown
+    /// releases it (the register-then-crash race resolution). A no-op returning
+    /// false when this scheduler has no registry wired.
+    fn registryRegister(scheduler: *Scheduler, self_record: *ProcessRecord, name: u64) bool {
+        const registry = scheduler.options.registry orelse return false;
+        // One name per process: refuse a second registration.
+        if (self_record.pcb.registered_name != 0) return false;
+        const outcome = registry.register(name, self_record.pcb.pid.toBits(), scheduler.registryLiveness()) catch
+            return false; // RegistryFull — documented capacity policy
+        switch (outcome) {
+            .registered => {
+                self_record.pcb.registered_name = name;
+                return true;
+            },
+            .name_taken => return false,
+        }
+    }
+
+    /// `unregister(name)`: release `name` if `self_record` holds it. Returns
+    /// whether an entry was removed. Owner-scoped: the registry removal is
+    /// guarded by this process's pid bits, so it never clobbers another process's
+    /// (re-)registration of the same name.
+    fn registryUnregister(scheduler: *Scheduler, self_record: *ProcessRecord, name: u64) bool {
+        const registry = scheduler.options.registry orelse return false;
+        const removed = registry.unregister(name, self_record.pcb.pid.toBits());
+        if (removed and self_record.pcb.registered_name == name) {
+            self_record.pcb.registered_name = 0;
+        }
+        return removed;
+    }
+
+    /// `whereis(name) -> pid bits`: resolve `name` to the raw bits of its LIVE
+    /// registrant, or `Pid.invalid` bits (`0`) when unregistered or resolving to
+    /// a dead pid (generation-validated). Lock-free.
+    fn registryWhereis(scheduler: *Scheduler, name: u64) u64 {
+        const registry = scheduler.options.registry orelse return Pid.invalid.toBits();
+        return registry.whereis(name, scheduler.registryLiveness()) orelse Pid.invalid.toBits();
+    }
+
+    /// Release `record`'s registered name at teardown (the register-then-crash
+    /// race resolution — research.md §6.7): a registered process that exits or
+    /// crashes frees its name so it becomes re-registrable. The removal is
+    /// guarded by the process's own pid bits (`exit_pid_bits`), so a name already
+    /// re-registered to a successor is left untouched. A no-op when the process
+    /// held no name or this scheduler has no registry.
+    fn releaseRegisteredName(scheduler: *Scheduler, record: *ProcessRecord, exit_pid_bits: u64) void {
+        const registry = scheduler.options.registry orelse return;
+        const name = record.pcb.registered_name;
+        if (name == 0) return;
+        _ = registry.unregister(name, exit_pid_bits);
+        record.pcb.registered_name = 0;
+    }
+
+    // -------------------------------------------------------------------------
     // Teardown (module doc, "Exit and crash teardown" — the ONE path)
     // -------------------------------------------------------------------------
 
@@ -3079,6 +3250,14 @@ pub const Scheduler = struct {
         }
 
         pcb.transitionTo(.exiting);
+
+        // (1b) Release this process's registered name (P5-J2): a registered
+        // process that exits/crashes frees its name so it becomes re-registrable
+        // — the register-then-crash race resolution (research.md §6.7). Done
+        // BEFORE the pid is released (2), so the name never lingers pointing at a
+        // reused slot; the removal is pid-guarded, so a name a successor already
+        // re-registered is left intact.
+        scheduler.releaseRegisteredName(record, exit_pid.toBits());
 
         // (2) Pid first: every outstanding copy dead-letters from here on.
         pcb.unregister(scheduler.pid_table);

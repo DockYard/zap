@@ -347,6 +347,14 @@ pub const ProcessControlBlock = struct {
     /// process from another core). Empty at `init`; the scheduler drains it at
     /// teardown (propagating exit signals and `DOWN`s, then freeing its nodes).
     signal_state: signal_module.SignalState,
+    /// The local-registry name this process is registered under (P5-J2,
+    /// `registry.zig`), or `0` for none. A process holds AT MOST ONE name
+    /// (Erlang/Elixir `register/2` semantics), so a single owner-only field
+    /// suffices: `Process.register` sets it, `Process.unregister` clears it,
+    /// and the scheduler releases the name at teardown (the register-then-crash
+    /// race resolution — research.md §6.7). Owner-only like `drop_list_head`
+    /// (only this process registers/unregisters its own name).
+    registered_name: u64,
 
     /// Assemble a PCB IN PLACE — at its final address, which the mailbox
     /// pins from this call on (its empty state references its embedded
@@ -369,6 +377,7 @@ pub const ProcessControlBlock = struct {
         process.mailbox.init();
         process.drop_list_head = null;
         process.signal_state = .{};
+        process.registered_name = 0;
     }
 
     /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot

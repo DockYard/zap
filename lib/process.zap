@@ -145,6 +145,46 @@ pub struct Process {
   }
 
   @doc = """
+    Spawns `entry` and ATOMICALLY links the calling process to the child, as one
+    indivisible operation (Erlang `spawn_link`): the link is established BEFORE
+    the child can run, so a child that exits immediately still propagates its
+    exit to the parent — there is no race window a plain `spawn` then `link`
+    would have (where the child could exit before the link, delivering a `:noproc`
+    instead of the child's real reason). Returns the child's raw pid bits.
+
+    Because the link is bidirectional, an abnormal child exit cascades to a
+    non-trapping parent (both die), and a trapping parent instead receives an
+    `{'EXIT', Child, Reason}` message. `entry` is the same named/capture-less
+    zero-parameter function `Process.spawn/1` accepts. This is the ergonomic
+    layer over the raw `Process.link` primitive.
+    """
+
+  pub fn spawn_link(entry :: fn() -> Nil) -> u64 {
+    :zig.ProcessRuntime.spawn_link_process(entry)
+  }
+
+  @doc = """
+    Spawns `entry` and ATOMICALLY installs a monitor from the calling process on
+    the child, returning `{pid, ref}` (Erlang `spawn_monitor`): the monitor is
+    established BEFORE the child can run, so a child that exits immediately still
+    fires a `{'DOWN', ref, :process, pid, reason}` carrying its REAL exit reason
+    (not `:noproc`, which a racy `spawn` then `monitor` could deliver). The
+    returned `ref` is the monitor reference to match the eventual `DOWN` against
+    (`Process.last_signal_ref` after `Process.await_signal`); the returned `pid`
+    is the child's raw bits (type them with `Process.pid`).
+
+    Unlike a link, a monitor is unidirectional and never kills the monitoring
+    process — it only delivers the `DOWN` message. `entry` is the same
+    named/capture-less zero-parameter function `Process.spawn/1` accepts.
+    """
+
+  pub fn spawn_monitor(entry :: fn() -> Nil) -> {u64, u64} {
+    pid = :zig.ProcessRuntime.spawn_monitor_process(entry)
+    ref = :zig.ProcessRuntime.spawn_monitor_ref()
+    {pid, ref}
+  }
+
+  @doc = """
     Runs the blocking (or long-running) computation `entry` on the dirty-
     scheduler pool and returns its `i64` result — the `Process.blocking`
     intrinsic (concurrency plan Phase 4, item 4.3).
@@ -184,19 +224,34 @@ pub struct Process {
   }
 
   @doc = """
-    Sends `message` to the process behind `pid`, type-checked against
-    the handle's message type: `Process.send(pid :: Pid(m), m)`.
-    Returns `true` when the message was enqueued on a live mailbox
-    and `false` when it was dead-lettered (the target has exited or
-    the pid is stale — Erlang semantics: not an error). The message
-    type must be sendable (struct doc): a scalar, `String`, `List`/
-    `Map`, or a by-value struct of those — a rich value is deep-copied
-    so the receiver gets an independent copy. An unsendable type (a
-    closure, a payload-bearing union) is a compile error.
+    Sends `message` to a process, addressed EITHER by a typed pid handle OR by a
+    registered name (an atom) — the `send/2` family.
+
+    `Process.send(pid :: Pid(m), message :: m)` sends to the process behind `pid`,
+    type-checked against the handle's message type. `Process.send(name :: Atom,
+    message)` is send-by-NAME: it resolves `name` through `Process.whereis` then
+    delivers to the registered process (the common "named server" send); it is
+    UNTYPED (a registered name carries no message type), so the caller is
+    responsible for sending a value the named process expects.
+
+    Both forms return `true` when the message was enqueued on a live mailbox and
+    `false` when it was dead-lettered (the target has exited, the pid is stale, or
+    the name is unregistered — Erlang semantics: not an error). The message type
+    must be sendable (struct doc): a scalar, `String`, `List`/`Map`, or a by-value
+    struct of those — a rich value is deep-copied so the receiver gets an
+    independent copy. An unsendable type (a closure, a payload-bearing union) is a
+    compile error.
     """
 
   pub fn send(pid :: Pid(message_type), message :: message_type) -> Bool {
     :zig.ProcessRuntime.send_message(pid.raw, message)
+  }
+
+  pub fn send(name :: Atom, message :: message_type) -> Bool {
+    case :zig.ProcessRuntime.whereis(name) {
+      0 -> false
+      resolved -> Process.send((Pid.of(resolved) :: Pid(message_type)), message)
+    }
   }
 
   @doc = """
@@ -220,6 +275,47 @@ pub struct Process {
 
   pub fn send_move(pid :: Pid(message_type), message :: unique message_type) -> Bool {
     :zig.ProcessRuntime.send_message_moved(pid.raw, message)
+  }
+
+  @doc = """
+    Registers the CALLING process in the local registry under `name` (an atom),
+    the "named server" pattern — thereafter `Process.whereis(name)` resolves to
+    this process and `Process.send(name, msg)` reaches it. Returns `true` on
+    success, or `false` when the name is already held by another LIVE process, or
+    when this process already holds a name (Erlang/Elixir: a process may hold at
+    most ONE registered name). The registration is RELEASED AUTOMATICALLY when
+    this process exits or crashes (the classic register-then-crash race: the name
+    becomes free again on teardown), and it can be released early with
+    `Process.unregister`.
+    """
+
+  pub fn register(name :: Atom) -> Bool {
+    :zig.ProcessRuntime.register_name(name)
+  }
+
+  @doc = """
+    Releases `name` if the calling process holds it (idempotent — unregistering a
+    name this process does not hold is a `false`-returning no-op). Returns whether
+    a registration was removed. A process's name is also released automatically at
+    its teardown, so explicit `unregister` is only needed to free a name while the
+    process keeps running.
+    """
+
+  pub fn unregister(name :: Atom) -> Bool {
+    :zig.ProcessRuntime.unregister_name(name)
+  }
+
+  @doc = """
+    Resolves `name` to the raw pid bits of its LIVE registrant, or `0` (the
+    never-issued invalid pid) when `name` is unregistered — or registered to a
+    process that has since died (the lookup is generation-validated, so a name
+    pointing at a dead or reused pid resolves to `0`, never a stale process).
+    Type the nonzero result with `Process.pid`/`Pid.of` to send to it; prefer the
+    `Process.send(name, msg)` send-by-name form for the common case.
+    """
+
+  pub fn whereis(name :: Atom) -> u64 {
+    :zig.ProcessRuntime.whereis(name)
   }
 
   @doc = """

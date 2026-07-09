@@ -3756,6 +3756,12 @@ const ZapConcurrencyKernel = struct {
     // 0 is the manifest default (also `zap_proc_bind_manager`/`zap_proc_spawn`).
     extern fn zap_proc_register_manager(manager_index: u32, core_vtable: *const anyopaque) callconv(.c) i32;
     extern fn zap_proc_spawn_at(entry: ProcEntry, argument: ?*anyopaque, manager_index: u32) callconv(.c) u64;
+    // P5-J2 ergonomic spawn: atomically link/monitor the caller to the child
+    // BEFORE it is admitted (Erlang spawn_link/spawn_monitor atomicity — the
+    // relationship exists before the child can exit). `spawn_monitor` writes the
+    // minted ref through `ref_out`.
+    extern fn zap_proc_spawn_link(entry: ProcEntry, argument: ?*anyopaque) callconv(.c) u64;
+    extern fn zap_proc_spawn_monitor(entry: ProcEntry, argument: ?*anyopaque, ref_out: *u64) callconv(.c) u64;
     extern fn zap_proc_self(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_send(
         process: *anyopaque,
@@ -3824,6 +3830,13 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_last_signal_from(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_last_signal_ref(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64;
+
+    // Local process registry (P5-J2, `src/runtime/concurrency/registry.zig`):
+    // the atomic name→pid table `Process.register`/`whereis`/`unregister` and
+    // send-by-name stand on. A name is an atom id (`u32`, widened to `u64` here).
+    extern fn zap_proc_register(process: *anyopaque, name: u64) callconv(.c) bool;
+    extern fn zap_proc_unregister(process: *anyopaque, name: u64) callconv(.c) bool;
+    extern fn zap_proc_whereis(process: *anyopaque, name: u64) callconv(.c) u64;
 
     // P2-J6 three-layer cooperative safepoints (plan item 2.5). The
     // per-quantum reduction budget the scheduler publishes (`_budget`,
@@ -5023,28 +5036,50 @@ pub const ProcessRuntime = struct {
     /// discharged before this bridge; a non-comptime manager never reaches it.
     pub fn spawn_process_at(entry: anytype, comptime manager_index: u32) u64 {
         requireConcurrencyRuntimeGate();
-        const EntryType = @TypeOf(entry);
-        const entry_info = @typeInfo(EntryType);
-        switch (entry_info) {
-            .@"fn" => |function_info| {
-                comptime validateSpawnEntrySignature(EntryType, function_info);
-                // A direct function value is comptime-known: bake it
-                // into a dedicated trampoline, no argument needed.
-                const Trampoline = ComptimeEntryTrampoline(entry);
-                return spawnWithTrampolineAt(Trampoline.run, null, manager_index);
-            },
-            .pointer => |pointer_info| {
-                const child_info = @typeInfo(pointer_info.child);
-                if (child_info != .@"fn") rejectSpawnEntryType(EntryType);
-                comptime validateSpawnEntrySignature(pointer_info.child, child_info.@"fn");
-                // A runtime function pointer rides the spawn argument
-                // (never dereferenced as data — reconstructed via
-                // ptrFromInt in the trampoline).
-                const Trampoline = PointerEntryTrampoline(EntryType);
-                return spawnWithTrampolineAt(Trampoline.run, @ptrFromInt(@intFromPtr(entry)), manager_index);
-            },
-            else => rejectSpawnEntryType(EntryType),
+        const resolved = resolveSpawnEntry(entry);
+        return spawnWithTrampolineAt(resolved.run, resolved.argument, manager_index);
+    }
+
+    /// `spawn_link(f)` (P5-J2): spawn under the manifest manager and ATOMICALLY
+    /// link the caller to the child before it is admitted, so a child that exits
+    /// immediately still propagates its exit to the caller (Erlang `spawn_link`).
+    /// Same entry scope as `spawn_process`. Panics on spawn failure.
+    pub fn spawn_link_process(entry: anytype) u64 {
+        requireConcurrencyRuntimeGate();
+        const resolved = resolveSpawnEntry(entry);
+        const pid_bits = ZapConcurrencyKernel.zap_proc_spawn_link(resolved.run, resolved.argument);
+        if (pid_bits == 0) {
+            @panic("zap: Process.spawn_link failed (concurrency runtime not initialized, called outside a process, out of memory, or process table exhausted)");
         }
+        return pid_bits;
+    }
+
+    /// `spawn_monitor(f)` (P5-J2): spawn under the manifest manager and ATOMICALLY
+    /// install a monitor from the caller on the child before it is admitted, so a
+    /// child that exits immediately still fires a `DOWN` carrying its real exit
+    /// reason (not `noproc`). Returns the child's pid bits; the minted monitor
+    /// reference is stashed for the immediately-following `spawn_monitor_ref`
+    /// (the `lib/process.zap` `spawn_monitor` builds the `{pid, ref}` tuple from
+    /// the two back-to-back calls). Panics on spawn failure.
+    pub fn spawn_monitor_process(entry: anytype) u64 {
+        requireConcurrencyRuntimeGate();
+        const resolved = resolveSpawnEntry(entry);
+        var ref: u64 = 0;
+        const pid_bits = ZapConcurrencyKernel.zap_proc_spawn_monitor(resolved.run, resolved.argument, &ref);
+        if (pid_bits == 0) {
+            @panic("zap: Process.spawn_monitor failed (concurrency runtime not initialized, called outside a process, out of memory, or process table exhausted)");
+        }
+        pending_spawn_monitor_ref = ref;
+        return pid_bits;
+    }
+
+    /// The monitor reference minted by the most recent `spawn_monitor_process` on
+    /// this scheduler thread — read by `lib/process.zap`'s `spawn_monitor`
+    /// immediately after it, with no intervening yield, to pair the ref with the
+    /// pid. See `pending_spawn_monitor_ref`.
+    pub fn spawn_monitor_ref() u64 {
+        requireConcurrencyRuntimeGate();
+        return pending_spawn_monitor_ref;
     }
 
     /// Compiler-internal marker for `spawn(f, .{ .manager = X })` (plan item
@@ -5442,6 +5477,32 @@ pub const ProcessRuntime = struct {
         return ZapConcurrencyKernel.zap_proc_last_signal_kind(requireCurrentProcessHandle());
     }
 
+    // -- Local process registry (P5-J2) ---------------------------------------
+
+    /// `register(name)`: register the CALLING process under `name` (an atom id,
+    /// widened to `u64` at the kernel ABI). Returns false when the name is held
+    /// by another live process or this process already holds a name. The name is
+    /// released automatically at teardown (the register-then-crash race).
+    pub fn register_name(name: anytype) bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_register(requireCurrentProcessHandle(), @as(u64, name));
+    }
+
+    /// `unregister(name)`: release `name` if the calling process holds it
+    /// (idempotent). Returns whether an entry was removed.
+    pub fn unregister_name(name: anytype) bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_unregister(requireCurrentProcessHandle(), @as(u64, name));
+    }
+
+    /// `whereis(name) -> pid bits`: resolve `name` to the raw pid bits of its
+    /// LIVE registrant, or `0` (the invalid pid) when unregistered or resolving
+    /// to a dead pid (generation-validated).
+    pub fn whereis(name: anytype) u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_whereis(requireCurrentProcessHandle(), @as(u64, name));
+    }
+
     /// Park the calling process until a message is at the mailbox head or
     /// `timeout_milliseconds` elapses — the `receive … after` timeout
     /// mechanism. Returns `true` when a message is now deliverable (a
@@ -5603,6 +5664,47 @@ fn spawnWithTrampolineAt(trampoline: ZapConcurrencyKernel.ProcEntry, argument: ?
     }
     return pid_bits;
 }
+
+/// The (trampoline, argument) pair a `Process.spawn*` entry resolves to — the
+/// shared entry-boxing for `spawn`, `spawn_link`, and `spawn_monitor` (they
+/// differ only in which kernel spawn intrinsic they call). A comptime function
+/// value bakes into a dedicated trampoline (no argument); a runtime function
+/// pointer rides the spawn argument (reconstructed via `ptrFromInt` in the
+/// trampoline, never dereferenced as data).
+const ResolvedSpawnEntry = struct {
+    run: ZapConcurrencyKernel.ProcEntry,
+    argument: ?*anyopaque,
+};
+
+fn resolveSpawnEntry(entry: anytype) ResolvedSpawnEntry {
+    const EntryType = @TypeOf(entry);
+    const entry_info = @typeInfo(EntryType);
+    switch (entry_info) {
+        .@"fn" => |function_info| {
+            comptime validateSpawnEntrySignature(EntryType, function_info);
+            const Trampoline = ComptimeEntryTrampoline(entry);
+            return .{ .run = Trampoline.run, .argument = null };
+        },
+        .pointer => |pointer_info| {
+            const child_info = @typeInfo(pointer_info.child);
+            if (child_info != .@"fn") rejectSpawnEntryType(EntryType);
+            comptime validateSpawnEntrySignature(pointer_info.child, child_info.@"fn");
+            const Trampoline = PointerEntryTrampoline(EntryType);
+            return .{ .run = Trampoline.run, .argument = @ptrFromInt(@intFromPtr(entry)) };
+        },
+        else => rejectSpawnEntryType(EntryType),
+    }
+}
+
+/// Thread-local out-slot carrying the monitor reference minted by the most
+/// recent `ProcessRuntime.spawn_monitor_process` on THIS scheduler thread, read
+/// by the immediately-following `ProcessRuntime.spawn_monitor_ref`. The
+/// `lib/process.zap` `spawn_monitor` macro emits the two calls back-to-back with
+/// no intervening yield, so the same thread runs both and no other process's
+/// `spawn_monitor` can interleave — the ref is returned alongside the pid
+/// without a Zig→Zap aggregate return (the `List.pop` "build the tuple in Zap"
+/// idiom).
+threadlocal var pending_spawn_monitor_ref: u64 = 0;
 
 /// The raw-receive contract shared by the `ProcessRuntime.receive_*`
 /// set: park until the mailbox is nonempty, then decode the oldest

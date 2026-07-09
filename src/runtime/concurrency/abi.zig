@@ -541,6 +541,11 @@ const RuntimeState = struct {
     /// (wired to `ledger` below). Shared across every scheduler core via
     /// `Scheduler.Options.signal_runtime`.
     signal_runtime: concurrency.SignalRuntime,
+    /// The local process registry (P5-J2, `registry.zig`): the shared
+    /// name→pid table `Process.register`/`whereis`/`unregister` and send-by-name
+    /// stand on. Shared across every scheduler core via
+    /// `Scheduler.Options.registry`; validated against `pid_table` for liveness.
+    registry: concurrency.ProcessRegistry,
     /// The per-spawn manager registry (plan item 3.1/3.3, P3-J3): core
     /// vtables indexed by manager id. Slot 0 is the manifest default (bound by
     /// `zap_proc_bind_manager`); slots 1.. are the distinct `spawn(f, .{
@@ -716,6 +721,12 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
         return ZapProcStatus.out_of_memory;
     runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
     installSignalRuntime();
+    runtime_state.registry = concurrency.ProcessRegistry.init(backing_allocator, .{}) catch {
+        runtime_state.signal_runtime.deinit();
+        runtime_state.envelope_pool.deinit();
+        runtime_state.pid_table.deinit();
+        return ZapProcStatus.out_of_memory;
+    };
 
     if (readSeededSchedulerSeed()) |seed| {
         // Seeded deterministic M:N backend (P4-J4): a single-threaded,
@@ -727,8 +738,14 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
             &runtime_state.pid_table,
             &runtime_state.envelope_pool,
             seed,
-            .{ .core_count = core_count, .signal_runtime = &runtime_state.signal_runtime },
+            .{
+                .core_count = core_count,
+                .signal_runtime = &runtime_state.signal_runtime,
+                .registry = &runtime_state.registry,
+            },
         ) catch {
+            runtime_state.registry.deinit();
+            runtime_state.signal_runtime.deinit();
             runtime_state.envelope_pool.deinit();
             runtime_state.pid_table.deinit();
             return ZapProcStatus.out_of_memory;
@@ -749,8 +766,13 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
             backing_allocator,
             &runtime_state.pid_table,
             &runtime_state.envelope_pool,
-            .{ .core_options = .{ .signal_runtime = &runtime_state.signal_runtime } },
+            .{ .core_options = .{
+                .signal_runtime = &runtime_state.signal_runtime,
+                .registry = &runtime_state.registry,
+            } },
         ) catch {
+            runtime_state.registry.deinit();
+            runtime_state.signal_runtime.deinit();
             runtime_state.envelope_pool.deinit();
             runtime_state.pid_table.deinit();
             return ZapProcStatus.out_of_memory;
@@ -772,13 +794,25 @@ fn runtimeInitSeededForTest(seed: u64, core_count: usize) i32 {
         return ZapProcStatus.out_of_memory;
     runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
     installSignalRuntime();
+    runtime_state.registry = concurrency.ProcessRegistry.init(backing_allocator, .{}) catch {
+        runtime_state.signal_runtime.deinit();
+        runtime_state.envelope_pool.deinit();
+        runtime_state.pid_table.deinit();
+        return ZapProcStatus.out_of_memory;
+    };
     const simulator = concurrency.MnSimulator.create(
         backing_allocator,
         &runtime_state.pid_table,
         &runtime_state.envelope_pool,
         seed,
-        .{ .core_count = core_count, .signal_runtime = &runtime_state.signal_runtime },
+        .{
+            .core_count = core_count,
+            .signal_runtime = &runtime_state.signal_runtime,
+            .registry = &runtime_state.registry,
+        },
     ) catch {
+        runtime_state.registry.deinit();
+        runtime_state.signal_runtime.deinit();
         runtime_state.envelope_pool.deinit();
         runtime_state.pid_table.deinit();
         return ZapProcStatus.out_of_memory;
@@ -849,6 +883,10 @@ export fn zap_proc_runtime_deinit() callconv(.c) void {
     // Every process's signal sets were drained at its teardown (above), so no
     // signal node is live — `deinit` asserts that and returns the pool's blocks.
     runtime_state.signal_runtime.deinit();
+    // Every registered process released its name at teardown (above), so no
+    // registration is live — `deinit` asserts that (the leak oracle) and frees
+    // the slot storage.
+    runtime_state.registry.deinit();
     runtime_initialized = false;
 }
 
@@ -908,26 +946,38 @@ export fn zap_proc_current() callconv(.c) ?*anyopaque {
 // Intrinsics — spawn (driver thread or process body; same OS thread)
 // ---------------------------------------------------------------------------
 
-/// Spawn a process under the MANIFEST default manager (registry slot 0) — the
-/// no-option `Process.spawn(f)` path. Equivalent to `zap_proc_spawn_at(entry,
-/// argument, 0)`; kept as the ABI-stable convenience the Phase-2 surface and
-/// the root-process bootstrap already call.
-export fn zap_proc_spawn(entry: ZapProcEntry, argument: ?*anyopaque) callconv(.c) u64 {
-    return zap_proc_spawn_at(entry, argument, 0);
-}
+/// The optional parent relationship a spawn establishes ATOMICALLY, before the
+/// child is admitted and can run/exit (Erlang `spawn_link`/`spawn_monitor`
+/// atomicity — the relationship must exist before the child can exit, so a
+/// child that exits immediately still propagates to the parent). Carried by
+/// value from the `spawn_link`/`spawn_monitor` intrinsics through `spawnAtWith`.
+const SpawnRelationship = union(enum) {
+    /// A plain spawn — no parent relationship.
+    none,
+    /// `spawn_link`: bidirectionally link the child to this parent process.
+    link: *concurrency.ProcessContext,
+    /// `spawn_monitor`: install a monitor from `parent` on the child; the minted
+    /// reference is written to `ref_out`.
+    monitor: struct { parent: *concurrency.ProcessContext, ref_out: *u64 },
+};
 
 /// Spawn a process running `entry(process_handle, argument)` under the manager
-/// in registry slot `manager_index` (plan item 3.1/3.3, P3-J3 — the
-/// `spawn(f, .{ .manager = X })` surface). The spawn mints a FRESH private
-/// per-process context from that manager's core vtable (wholesale-freed at the
-/// process's teardown) and stamps the pid's model bits from the manager's
-/// `declared_caps` (`reclamationModelForCaps`) so a sender reads the target's
-/// reclamation model together with its generation (§2.4 invariant). The
-/// returned `u64` is the new pid's raw encoding; `0` (the invalid pid — never
-/// issued) signals failure: runtime not initialized, `manager_index` out of
-/// range or unregistered (no manager selected — the no-fallbacks spawn gate),
-/// manager `init` failure, allocation failure, or process-table exhaustion.
-export fn zap_proc_spawn_at(entry: ZapProcEntry, argument: ?*anyopaque, manager_index: u32) callconv(.c) u64 {
+/// in registry slot `manager_index`, optionally establishing a parent
+/// `relationship` (`spawn_link`/`spawn_monitor`) ATOMICALLY before the child is
+/// admitted. The spawn mints a FRESH private per-process context from that
+/// manager's core vtable (wholesale-freed at the process's teardown) and stamps
+/// the pid's model bits from the manager's `declared_caps`
+/// (`reclamationModelForCaps`) so a sender reads the target's reclamation model
+/// together with its generation (§2.4 invariant). Returns the new pid's raw
+/// encoding, or `0` (the invalid pid) on failure: runtime not initialized,
+/// `manager_index` out of range/unregistered, an unsound manager model on this
+/// target, manager `init`/allocation failure, or process-table exhaustion.
+fn spawnAtWith(
+    entry: ZapProcEntry,
+    argument: ?*anyopaque,
+    manager_index: u32,
+    relationship: SpawnRelationship,
+) u64 {
     if (!runtime_initialized) return concurrency.Pid.invalid.toBits();
     if (manager_index >= MAX_MANAGER_SLOTS) return concurrency.Pid.invalid.toBits();
     // No fallback bootstrap arena (the no-fallbacks rule): a process cannot
@@ -964,7 +1014,9 @@ export fn zap_proc_spawn_at(entry: ZapProcEntry, argument: ?*anyopaque, manager_
     // stealing rebalances) and to core 0 for an external spawn from the driver
     // (its stack pool + record cache are the driver thread's own — see
     // `SchedulerPool.primaryCore`). Either core's `spawn` touches only that
-    // core's per-scheduler resources on its own thread.
+    // core's per-scheduler resources on its own thread. A `spawn_link`/
+    // `spawn_monitor` parent runs on THIS core (it is the caller), so the
+    // relationship record is resolved on the same core the spawn runs on.
     const spawn_core = concurrency.Scheduler.currentThreadScheduler() orelse runtime_state.backend.primaryCore();
     const pid = spawn_core.spawn(.{
         .entry = spawnTrampoline,
@@ -973,12 +1025,64 @@ export fn zap_proc_spawn_at(entry: ZapProcEntry, argument: ?*anyopaque, manager_
         // teardown wholesale-frees it at exit (`ProcessManagerBinding`).
         .manager = manager_context,
         .model = model,
+        .link_parent = switch (relationship) {
+            .link => |parent| parent.record,
+            else => null,
+        },
+        .monitor_parent = switch (relationship) {
+            .monitor => |m| m.parent.record,
+            else => null,
+        },
+        .monitor_ref_out = switch (relationship) {
+            .monitor => |m| m.ref_out,
+            else => null,
+        },
     }) catch {
         runtime_state.ledger.free(closure_block);
         manager_context.teardown();
         return concurrency.Pid.invalid.toBits();
     };
     return pid.toBits();
+}
+
+/// Spawn a process under the MANIFEST default manager (registry slot 0) — the
+/// no-option `Process.spawn(f)` path. Kept as the ABI-stable convenience the
+/// Phase-2 surface and the root-process bootstrap already call.
+export fn zap_proc_spawn(entry: ZapProcEntry, argument: ?*anyopaque) callconv(.c) u64 {
+    return spawnAtWith(entry, argument, 0, .none);
+}
+
+/// Spawn under the manager in registry slot `manager_index` (plan item 3.1/3.3,
+/// P3-J3 — the `spawn(f, .{ .manager = X })` surface). See `spawnAtWith`.
+export fn zap_proc_spawn_at(entry: ZapProcEntry, argument: ?*anyopaque, manager_index: u32) callconv(.c) u64 {
+    return spawnAtWith(entry, argument, manager_index, .none);
+}
+
+/// `spawn_link(f)` (P5-J2): spawn under the manifest manager and ATOMICALLY link
+/// the caller to the child before it is admitted, so a child that exits
+/// immediately still propagates its exit to the caller (Erlang `spawn_link`
+/// atomicity — no racy link-after-spawn). Returns the child's pid bits, or `0`
+/// on failure or when called outside a process (no parent to link).
+export fn zap_proc_spawn_link(entry: ZapProcEntry, argument: ?*anyopaque) callconv(.c) u64 {
+    const spawn_core = concurrency.Scheduler.currentThreadScheduler() orelse
+        return concurrency.Pid.invalid.toBits();
+    const parent = spawn_core.currentProcessContext() orelse
+        return concurrency.Pid.invalid.toBits();
+    return spawnAtWith(entry, argument, 0, .{ .link = parent });
+}
+
+/// `spawn_monitor(f) -> {pid, ref}` (P5-J2): spawn under the manifest manager
+/// and ATOMICALLY install a monitor from the caller on the child before it is
+/// admitted; the minted reference is written to `ref_out`. Returns the child's
+/// pid bits (and the ref via `ref_out`), or `0`/`ref_out = 0` on failure or when
+/// called outside a process.
+export fn zap_proc_spawn_monitor(entry: ZapProcEntry, argument: ?*anyopaque, ref_out: *u64) callconv(.c) u64 {
+    ref_out.* = 0;
+    const spawn_core = concurrency.Scheduler.currentThreadScheduler() orelse
+        return concurrency.Pid.invalid.toBits();
+    const parent = spawn_core.currentProcessContext() orelse
+        return concurrency.Pid.invalid.toBits();
+    return spawnAtWith(entry, argument, 0, .{ .monitor = .{ .parent = parent, .ref_out = ref_out } });
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,6 +1452,35 @@ export fn zap_proc_last_signal_ref(process: *anyopaque) callconv(.c) u64 {
 /// The kind of the most recently consumed signal (1 = exit, 2 = down).
 export fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64 {
     return contextFromHandle(process).lastSignalKind();
+}
+
+// ---------------------------------------------------------------------------
+// Local process registry (P5-J2, `registry.zig`): the atomic name→pid table the
+// Zap `Process.register`/`whereis`/`unregister` and send-by-name surface stand
+// on. A name is an atom id (`u64`); the registry validates pid liveness through
+// the pid table, so a name resolving to a dead/reused pid is a lookup MISS.
+// ---------------------------------------------------------------------------
+
+/// `register(name)`: register the CALLING process under `name` (an atom id).
+/// Returns false when the name is held by another live process, or when this
+/// process already holds a name (Erlang one-name-per-process). The name is
+/// released automatically at this process's teardown.
+export fn zap_proc_register(process: *anyopaque, name: u64) callconv(.c) bool {
+    return contextFromHandle(process).registerName(name);
+}
+
+/// `unregister(name)`: release `name` if the calling process holds it
+/// (idempotent). Returns whether an entry was removed.
+export fn zap_proc_unregister(process: *anyopaque, name: u64) callconv(.c) bool {
+    return contextFromHandle(process).unregisterName(name);
+}
+
+/// `whereis(name) -> pid bits`: resolve `name` to the raw pid bits of its LIVE
+/// registrant, or `0` (the invalid pid) when unregistered or resolving to a
+/// dead pid (generation-validated). The lock-free lookup path (send-by-name and
+/// `Process.whereis` ride it).
+export fn zap_proc_whereis(process: *anyopaque, name: u64) callconv(.c) u64 {
+    return contextFromHandle(process).whereisName(name);
 }
 
 // Per-envelope signal accessors (the J2/J3 receive-lowering surface): given an
