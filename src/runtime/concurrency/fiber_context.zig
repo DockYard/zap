@@ -99,6 +99,87 @@ comptime {
     }
 }
 
+/// ThreadSanitizer stackful-fiber annotations.
+///
+/// TSan models each OS thread as owning its machine stack for the thread's whole
+/// life: its shadow stack (built by `__tsan_func_entry`/`_exit`) and per-thread
+/// vector clock assume the stack pointer never changes owner. A manual fiber
+/// context switch (`switchOneWay`) breaks that assumption — it swaps the machine
+/// stack out from under TSan, whose instrumentation then walks a shadow stack
+/// that no longer matches the real one. The symptom is not a false race but a
+/// runtime HANG/fault deep inside TSan itself (a forced-TSan kernel run wedged
+/// for hours inside `__tsan_func_entry`→`_sigtramp`), which is why the marquee
+/// refcount proof and the timer tests were previously SKIPPED under TSan.
+///
+/// The fix is the documented fiber API every stackful runtime uses (Go, Rust,
+/// Boost.Context/Boost.Fiber): give each kernel fiber its own TSan fiber context
+/// (`__tsan_create_fiber`), leave the scheduler side on the OS thread's default
+/// context (`__tsan_get_current_fiber`), and bracket EVERY machine switch with
+/// `__tsan_switch_to_fiber` IMMEDIATELY before it so TSan moves its notion of the
+/// running context in lockstep with the stack. A fiber that migrates between OS
+/// threads then carries its own happens-before history with it, so its
+/// non-atomic per-cell refcounts are tracked correctly across a steal.
+///
+/// The default (sync) switch also lays down a happens-before edge from the
+/// switching context to the one switched to — exactly the cooperative-handoff
+/// ordering the scheduler relies on. Crucially this does NOT weaken the
+/// scheduler-local-refcount proof: a resume edge is scheduler→fiber and a
+/// yield edge is fiber→scheduler, so chaining one process's quantum on core A to
+/// its next quantum on core B still REQUIRES the run-queue/steal/wake atomics to
+/// connect scheduler A to scheduler B — a fiber switch never links two
+/// schedulers directly. A missing scheduler fence would still surface as a race.
+///
+/// Only linked under `-fsanitize-thread`: `enabled` is a comptime-false constant
+/// otherwise, so every call and field folds away and the `extern` symbols are
+/// never referenced (zero cost, nothing to link).
+const tsan = struct {
+    const enabled = builtin.sanitize_thread;
+
+    /// A TSan fiber handle — a real opaque pointer under TSan, a zero-size value
+    /// otherwise so non-TSan builds carry no per-fiber / per-scheduler field.
+    const FiberHandle = if (enabled) ?*anyopaque else void;
+
+    /// The empty handle (a fresh scheduler context has not captured one yet).
+    const none: FiberHandle = if (enabled) null else {};
+
+    // Standard TSan fiber runtime exports (compiler-rt `tsan_interface.cpp`);
+    // referenced only from the `if (enabled)` bodies below, so never linked
+    // outside `-fsanitize-thread`.
+    extern fn __tsan_get_current_fiber() ?*anyopaque;
+    extern fn __tsan_create_fiber(flags: c_uint) ?*anyopaque;
+    extern fn __tsan_destroy_fiber(fiber: ?*anyopaque) void;
+    extern fn __tsan_switch_to_fiber(fiber: ?*anyopaque, flags: c_uint) void;
+
+    /// Create a fresh TSan fiber context for a newly-`init`ed kernel fiber.
+    inline fn createFiber() FiberHandle {
+        return if (enabled) __tsan_create_fiber(0) else {};
+    }
+
+    /// Destroy a kernel fiber's TSan context. Legal only once the fiber has
+    /// provably left its stack and TSan's current context is NOT this one (the
+    /// same release condition as the fiber's stack) — the reclaim sites.
+    inline fn destroyFiber(handle: FiberHandle) void {
+        if (enabled) __tsan_destroy_fiber(handle);
+    }
+
+    /// `resumeFiber`, immediately before switching INTO `kernel_fiber`: remember
+    /// the resuming OS thread's own TSan context on `scheduler` (so the fiber's
+    /// yield/finish switch hands control back to the right thread even after a
+    /// cross-core steal), then move TSan into the fiber's context.
+    inline fn enterFiber(scheduler: *SchedulerContext, kernel_fiber: *KernelFiber) void {
+        if (enabled) {
+            scheduler.tsan_fiber = __tsan_get_current_fiber();
+            __tsan_switch_to_fiber(kernel_fiber.tsan_fiber, 0);
+        }
+    }
+
+    /// A fiber, immediately before switching back to its scheduler (yield or
+    /// finish): move TSan back to the resuming thread's remembered context.
+    inline fn leaveToScheduler(kernel_fiber: *KernelFiber) void {
+        if (enabled) __tsan_switch_to_fiber(kernel_fiber.scheduler.?.tsan_fiber, 0);
+    }
+};
+
 /// A kernel fiber's entry point. Runs on the fiber's own stack; receives
 /// the yield capability and the opaque argument passed to `init`.
 /// Returning from this function finishes the fiber.
@@ -141,6 +222,12 @@ pub const SchedulerContext = struct {
     /// Where the running fiber's yield/finish switches return to. Filled
     /// by the context switch inside `resumeFiber`.
     resume_context: fork_fiber.Context = undefined,
+    /// The resuming OS thread's own (scheduler-side) TSan fiber context,
+    /// captured by `resumeFiber` before every switch-in so a fiber's
+    /// yield/finish switch hands TSan's current context back to the thread now
+    /// driving it (which may differ from spawn-time after a cross-core steal).
+    /// Zero-size outside `-fsanitize-thread` (see the `tsan` namespace doc).
+    tsan_fiber: tsan.FiberHandle = tsan.none,
 };
 
 /// The kernel fiber object: cpu context + pooled stack + lifecycle state.
@@ -167,6 +254,12 @@ pub const KernelFiber = struct {
     /// `resumeFiber` before every switch-in so yield/finish know where to
     /// switch back to.
     scheduler: ?*SchedulerContext,
+    /// This fiber's own TSan fiber context (zero-size outside
+    /// `-fsanitize-thread`). Created at `init`, switched INTO on every resume
+    /// and OUT of on every yield/finish, destroyed at reclaim — the annotation
+    /// that keeps TSan tracking this fiber's happens-before across its manual
+    /// stack switches and its migration between OS threads (`tsan` namespace).
+    tsan_fiber: tsan.FiberHandle,
 };
 
 /// The capability handed to a fiber's entry function. Deliberately narrow:
@@ -183,6 +276,9 @@ pub const FiberExecution = struct {
         const kernel_fiber = execution.kernel_fiber;
         std.debug.assert(kernel_fiber.lifecycle_state == .running);
         kernel_fiber.lifecycle_state = .suspended;
+        // TSan: hand the current context back to the resuming thread's context
+        // immediately before the machine switch away.
+        tsan.leaveToScheduler(kernel_fiber);
         switchOneWay(&kernel_fiber.switch_context, &kernel_fiber.scheduler.?.resume_context);
         // Resumed: resumeFiber restored `.running` before switching in.
         std.debug.assert(kernel_fiber.lifecycle_state == .running);
@@ -207,6 +303,7 @@ pub fn init(
         .entry_function = entry_function,
         .entry_argument = entry_argument,
         .scheduler = null,
+        .tsan_fiber = tsan.createFiber(),
     };
 }
 
@@ -234,6 +331,10 @@ pub fn resumeFiber(scheduler: *SchedulerContext, kernel_fiber: *KernelFiber) Res
     }
     kernel_fiber.scheduler = scheduler;
     kernel_fiber.lifecycle_state = .running;
+    // TSan: move the current context into the fiber (and remember this thread's
+    // own context on `scheduler` for the fiber to switch back to) IMMEDIATELY
+    // before the machine switch — no instrumented access happens in between.
+    tsan.enterFiber(scheduler, kernel_fiber);
     switchOneWay(&scheduler.resume_context, &kernel_fiber.switch_context);
 
     // Control is back on the scheduler's stack. The fiber either yielded
@@ -251,6 +352,11 @@ pub fn resumeFiber(scheduler: *SchedulerContext, kernel_fiber: *KernelFiber) Res
             // that this frame is not on the released stack.
             kernel_fiber.origin_stack_pool.release(kernel_fiber.stack);
             kernel_fiber.lifecycle_state = .reclaimed;
+            // The finishing fiber switched TSan back to this scheduler's context
+            // before its final machine switch (see `fiberMain`), so its own TSan
+            // context is no longer current and is safe to destroy here — the
+            // same "has provably left its stack" condition as the release above.
+            tsan.destroyFiber(kernel_fiber.tsan_fiber);
             return .finished;
         },
         // No fiber-side path switches back while `.running`/`.ready`, and
@@ -294,6 +400,10 @@ pub fn reclaimWithoutResume(kernel_fiber: *KernelFiber) void {
     }
     kernel_fiber.origin_stack_pool.release(kernel_fiber.stack);
     kernel_fiber.lifecycle_state = .reclaimed;
+    // A `.ready` fiber's TSan context was never switched into; a `.suspended`
+    // one switched back to its scheduler at its last yield — neither is the
+    // current context, so both are safe to destroy on this reclaim path.
+    tsan.destroyFiber(kernel_fiber.tsan_fiber);
 }
 
 /// The architecture-neutral view of a suspended fiber's saved cpu state
@@ -491,6 +601,10 @@ fn fiberMain(
 
     kernel_fiber.lifecycle_state = .finished;
     while (true) {
+        // TSan: hand the current context back to the resuming thread before the
+        // final machine switch away (so `resumeFiber` can then destroy this
+        // fiber's TSan context off the current path).
+        tsan.leaveToScheduler(kernel_fiber);
         // Final act: leave this stack for good. Control re-entering this
         // loop would mean the scheduler resumed a finished fiber —
         // `resumeFiber`'s entry check panics before that can happen; the

@@ -99,10 +99,16 @@
 //! On process exit the owner drains its mailbox (`pop` until `.empty`,
 //! bounded-retrying `.transient_gap`), frees every envelope back to the
 //! pool (`envelope_pool.free` — dead-lettering the payloads), and only
-//! then tears the PCB down. Unregistering the pid FIRST
-//! (`process.zig`) makes new senders dead-letter; a sender already past
-//! lookup is the Phase 4 PCB-lifetime caveat documented in
-//! `pid_table.zig` and is out of scope for the single-scheduler Phase 1.
+//! then tears the PCB down. Unregistering the pid FIRST (`process.zig`)
+//! makes new senders dead-letter. A sender that already passed lookup —
+//! the borrowed-PCB window `pid_table.zig` defers to Phase 4 — is closed
+//! by the scheduler's cross-thread send grace period: BEFORE the drain,
+//! teardown closes the mailbox to not-yet-pinned senders and waits for
+//! every in-flight send to finish its push (`scheduler.zig`
+//! `ProcessRecord.beginSend`/`endSend`/`closeAndQuiesce`), so no push can
+//! land after the drain. Without it a push racing the drain orphaned its
+//! envelope — and the sender's abandoned page — the message-vs-timer
+//! envelope-page leak.
 //!
 //! ## Toolchain
 //!

@@ -852,7 +852,16 @@ test "SchedulerPool: an idle core parks and a cross-thread send wakes it (netpol
     // Cores genuinely PARKED on the futex while idle (not busy-waiting): with a
     // parked responder and a periodically-yielding sender, the surplus cores run
     // out of work and sleep. (Multi-core only — one core always has the sender.)
-    if (pool.coreCount() >= 2) {
+    //
+    // This is a TIMING property, not a correctness one, so it is not asserted
+    // under ThreadSanitizer: TSan's ~20× uniform slowdown collapses the idle
+    // windows the netpoller parks in — the surplus cores stay in their bounded
+    // pre-park spin for the whole (logically-shortened) run and never commit to a
+    // futex sleep, so the park COUNT is unobservable. The park/WAKE CORRECTNESS
+    // this test exists for is fully asserted above and DOES run under TSan: all 64
+    // messages crossed a park/wake handshake (a lost wake would hang the run), and
+    // teardown/leak accounting is exact.
+    if (pool.coreCount() >= 2 and !@import("builtin").sanitize_thread) {
         var total_parks: u64 = 0;
         for (pool.cores) |*core| total_parks += core.statistics().park_count;
         try testing.expect(total_parks > 0);
@@ -949,16 +958,10 @@ fn timeoutWaiterBody(context: *ProcessContext, argument: ?*anyopaque) void {
 }
 
 test "SchedulerPool: receive-after timed waiters fire and tear down race-free across cores" {
-    // SKIPPED under ThreadSanitizer: firing a timeout RESUMES the waiter's fiber,
-    // and TSan's own trace machinery intermittently faults (SEGV/ILL inside
-    // `__tsan::`) on manual fiber context-switch volume — even at a handful of
-    // fibers — a documented TSan-runtime limitation, NOT a kernel race (see
-    // `mn_refcount_stress.zig`). Crashing TSan proves nothing; the timing-wheel
-    // fire path is instead proven by (a) the cross-thread wake handshake it rides
-    // on — the message-passing `SchedulerPool` tests above run TSan-clean — and
-    // (b) high-volume non-TSan assertion runs (this test at 128, and the
-    // cross-scheduler race tests below at 256 pairs).
-    if (@import("builtin").sanitize_thread) return error.SkipZigTest;
+    // Runs under ThreadSanitizer: firing a timeout RESUMES the waiter's fiber,
+    // and the `fiber_context.zig` `__tsan_switch_to_fiber` annotations now let
+    // TSan follow that resume (and the subsequent fire-then-steal-then-teardown
+    // migration) across the manual context switch instead of faulting on it.
 
     var pid_table = try PidTable.init(testing.allocator, .{ .capacity = 1024 });
     defer pid_table.deinit();
@@ -1039,14 +1042,10 @@ fn cancelRaceSenderBody(context: *ProcessContext, argument: ?*anyopaque) void {
 }
 
 test "SchedulerPool: a cross-core message cancels an armed after-timer every round (no spurious timeout)" {
-    // SKIPPED under ThreadSanitizer: each round a cross-core message wake RESUMES
-    // the receiver's fiber, and TSan's trace machinery faults on fiber
-    // context-switch volume (a documented TSan-runtime limitation, not a kernel
-    // race — see `mn_refcount_stress.zig` / the timed-waiter test above). The
-    // cross-scheduler CANCEL path is proven instead by the TSan-clean cross-thread
-    // wake handshake it rides on plus this test's high-volume (64-round)
-    // assertions under the normal build.
-    if (@import("builtin").sanitize_thread) return error.SkipZigTest;
+    // Runs under ThreadSanitizer: each round a cross-core message wake RESUMES
+    // the receiver's fiber, which the `fiber_context.zig` fiber annotations now
+    // let TSan track across the manual context switch. The cross-scheduler
+    // timer-CANCEL path is thus exercised under TSan, not merely inferred.
 
     var pid_table = try PidTable.init(testing.allocator, .{ .capacity = 16 });
     defer pid_table.deinit();
@@ -1139,20 +1138,12 @@ test "SchedulerPool: message-vs-after-timer race across cores yields exactly one
 
     // A SHORT deadline tuned near the cross-core send latency so both outcomes
     // (message wins / timer fires) genuinely occur — the subtle M:N race. The
-    // invariant asserted holds regardless of who wins each pair. Fewer pairs
-    // under ThreadSanitizer (its fiber-trace machinery faults on park/fire
-    // switch volume — see `mn_refcount_stress.zig`); a non-TSan high-volume run
-    // proves the skip is honest.
-    // SKIPPED under ThreadSanitizer: the race is decided by a fiber RESUME on
-    // either outcome (a message wake or a timeout fire), and TSan's trace
-    // machinery faults on fiber context-switch volume (documented TSan-runtime
-    // limitation, not a kernel race — see `mn_refcount_stress.zig`). The
-    // message-vs-timer arbitration is a single seq_cst CAS on the packed
-    // `park_control`; its two ingredients ARE TSan-instrumentable and proven
-    // clean elsewhere (cross-thread wake handshake tests above; the epoch-CAS is
-    // pure atomics). The invariant here — exactly one outcome, no double-delivery,
-    // no lost wake — is proven by the 256-pair non-TSan assertion run below.
-    if (@import("builtin").sanitize_thread) return error.SkipZigTest;
+    // invariant asserted holds regardless of who wins each pair. Runs under
+    // ThreadSanitizer: the race is decided by a fiber RESUME on either outcome
+    // (a message wake or a timeout fire), which the `fiber_context.zig` fiber
+    // annotations now let TSan follow across the manual context switch. The
+    // arbitration itself is a single seq_cst CAS on the packed `park_control`,
+    // so TSan validates exactly-one-outcome / no-double-delivery directly here.
 
     const pair_count: usize = 256;
     var state = TimerRaceState{ .manager = &manager, .timeout_nanoseconds = 200 * std.time.ns_per_us };

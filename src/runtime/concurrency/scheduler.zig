@@ -658,6 +658,28 @@ pub const ProcessRecord = struct {
     /// alongside the state (see `packParkControl`) so the wheel's cross-scheduler
     /// timeout-fire is race-free.
     park_control: std.atomic.Value(u64),
+    /// Cross-thread send grace period (P4 PCB-lifetime — `pid_table.zig`
+    /// "Deferred to Phase 4", `mailbox.zig` "Teardown protocol"): the number of
+    /// producers currently inside `send`'s pin→push→unpin bracket for THIS
+    /// process (`beginSend` … `endSend`). Teardown's `closeAndQuiesce` waits for
+    /// it to reach zero before the mailbox is drained, so no producer's push can
+    /// land in an already-drained mailbox (the message-vs-timer envelope-page
+    /// leak). PRESERVED across recycle — like `park_control`'s epoch, and for the
+    /// same reason: a stale cross-core sender holding a borrowed PCB pointer may
+    /// still touch it after the record recycles, so a destructive per-spawn reset
+    /// could underflow it. Every `beginSend` is balanced by an `endSend`, so it
+    /// is provably zero at recycle (that very wait guarantees it) and a recycled
+    /// record inherits zero; initialized once at record allocation.
+    in_flight_send_count: std.atomic.Value(u32),
+    /// Set true by `closeAndQuiesce` at teardown to reject producers that have
+    /// not yet pinned; reset false at each `spawn` (a fresh incarnation accepts
+    /// sends). Paired with `in_flight_send_count` in a seq_cst StoreLoad — the
+    /// same Dekker shape as the park/wake handshake — so a producer that observes
+    /// the mailbox open is always waited for by teardown. The per-spawn reset is
+    /// ordered before the incarnation is registered, so a legitimate sender
+    /// (which looks the pid up only AFTER registration) never observes a stale
+    /// `true`.
+    send_closed: std.atomic.Value(bool),
     /// Intrusive Treiber link in the target scheduler's wake stack. Written by
     /// the revival CAS winner before the head CAS publishes it.
     wake_next: ?*ProcessRecord,
@@ -681,6 +703,42 @@ pub const ProcessRecord = struct {
     /// of the process — it dies only with the fiber stack at teardown,
     /// after which the record is recycled and `spawn` resets the field.
     active_context: ?*ProcessContext,
+
+    /// Producer side of the cross-thread send grace period: announce an
+    /// in-flight send to this process and return whether it may proceed. Returns
+    /// false if the process is tearing down (its mailbox is closed) — the caller
+    /// must dead-letter WITHOUT pushing. Balanced by `endSend` on the true path.
+    ///
+    /// The seq_cst increment and the `send_closed` observation form a StoreLoad
+    /// with `closeAndQuiesce` (the Dekker shape of the park/wake handshake): if
+    /// this observes the mailbox OPEN, then in the single seq_cst total order its
+    /// increment precedes teardown's `in_flight_send_count` read, so teardown is
+    /// guaranteed to wait for this send's `endSend`. Conversely if teardown's
+    /// close precedes this observation, this reports closed and never pushes.
+    fn beginSend(record: *ProcessRecord) bool {
+        _ = record.in_flight_send_count.fetchAdd(1, .seq_cst);
+        if (record.send_closed.load(.seq_cst)) {
+            _ = record.in_flight_send_count.fetchSub(1, .seq_cst);
+            return false;
+        }
+        return true;
+    }
+
+    /// Producer side: retire an in-flight send announced by `beginSend`.
+    fn endSend(record: *ProcessRecord) void {
+        _ = record.in_flight_send_count.fetchSub(1, .seq_cst);
+    }
+
+    /// Consumer side (teardown): close the mailbox to producers that have not yet
+    /// pinned, then wait for every already-pinned producer to finish its push, so
+    /// the following `drainMailboxForTeardown` reclaims every enqueued envelope.
+    /// The wait is bounded by the longest in-flight push (a wait-free XCHG+store),
+    /// the same spin discipline the teardown drain already uses. Scheduler-thread
+    /// only (the tearing-down core).
+    fn closeAndQuiesce(record: *ProcessRecord) void {
+        record.send_closed.store(true, .seq_cst);
+        while (record.in_flight_send_count.load(.seq_cst) != 0) std.atomic.spinLoopHint();
+    }
 };
 
 /// The per-quantum kernel capability handed to a process body: the
@@ -879,6 +937,26 @@ pub const ProcessContext = struct {
     ) error{OutOfMemory}!SendOutcome {
         const target_pcb = context.scheduler.pid_table.lookup(target) orelse
             return .dead_lettered;
+        const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
+        // Cross-thread send grace period (P4 PCB-lifetime — `pid_table.zig`
+        // "Deferred to Phase 4", `mailbox.zig` "Teardown protocol"). `lookup`
+        // borrowed a PCB pointer; between here and the push the target can
+        // time-out/exit and tear down on another core, draining and recycling its
+        // mailbox. Two hazards, both closed here:
+        //   * a push landing AFTER the target's teardown drain orphans its
+        //     envelope (and the sender's abandoned page) — a leak. `beginSend`
+        //     pins the target so its `closeAndQuiesce` waits for THIS push before
+        //     draining; a mailbox already closed rejects the send (dead-letter).
+        //   * a record recycled AND reused for a new process in the lookup→pin
+        //     window would mis-deliver. The pin holds the pinned incarnation
+        //     stable; `isAlive` then re-confirms the pid is still the same live
+        //     generation (generations are monotone and never reissued), so a
+        //     reused record fails the check and the send dead-letters.
+        // Nothing is allocated until both checks pass, so a dead-letter leaks
+        // nothing.
+        if (!target_record.beginSend()) return .dead_lettered;
+        defer target_record.endSend();
+        if (!context.scheduler.pid_table.isAlive(target)) return .dead_lettered;
         const envelope = try context.record.envelope_handle.allocate();
         envelope.fragment = fragment;
         _ = target_pcb.mailbox.push(envelope);
@@ -1527,6 +1605,14 @@ pub const Scheduler = struct {
         // the record's whole life so a stale timer can never alias a reused
         // record's new episode); only reset the state bits to `.running`.
         record.park_control = .init(packParkControl(parkControlEpoch(record.park_control.raw), .running));
+        // Open this incarnation to sends (teardown left it closed). Ordered
+        // before `register` below, so a legitimate sender — which looks the pid
+        // up only after registration — never observes a stale `true`. The
+        // companion `in_flight_send_count` is deliberately NOT reset (it is
+        // preserved across recycle like the park epoch — see its field doc — and
+        // is provably zero here because teardown's `closeAndQuiesce` waited it to
+        // zero before this record could recycle).
+        record.send_closed.store(false, .seq_cst);
         record.wake_next = null;
         record.blocking_next = null;
         record.active_context = null;
@@ -2432,14 +2518,23 @@ pub const Scheduler = struct {
             node.destructor(node);
         }
 
-        // (5) Drain the mailbox: every envelope back to its origin page.
+        // (5) Close the mailbox to cross-core senders and wait out every send
+        // that passed lookup before the unregister above (the P4 PCB-lifetime
+        // grace period — `pid_table.zig` "Deferred to Phase 4"). unregister (2)
+        // stopped NEW lookups; this stops in-flight senders, so the drain below
+        // reclaims every envelope any of them pushes. Without it a push landing
+        // after the drain orphans its envelope — and the sender's abandoned
+        // page — the message-vs-timer envelope-page leak.
+        record.closeAndQuiesce();
+
+        // (6) Drain the mailbox: every envelope back to its origin page.
         drainMailboxForTeardown(&pcb.mailbox);
 
-        // (6) Abandon the sender side: empty pages return now; in-flight
+        // (7) Abandon the sender side: empty pages return now; in-flight
         // pages flip to `.abandoned` for their receivers to reclaim.
         record.envelope_handle.abandon();
 
-        // (7) Stack via the invariant path.
+        // (8) Stack via the invariant path.
         switch (pcb.fiber.lifecycle_state) {
             // Normal exit: resumeFiber's post-switch path already
             // released the stack.
@@ -2452,7 +2547,7 @@ pub const Scheduler = struct {
             .running, .finished => unreachable,
         }
 
-        // (8) Wholesale heap free (plan Phase 1 item 1.4: bulk arena/slab
+        // (9) Wholesale heap free (plan Phase 1 item 1.4: bulk arena/slab
         // free on exit — module doc, "Exit and crash teardown").
         pcb.manager.teardown();
 
@@ -2934,9 +3029,13 @@ pub const Scheduler = struct {
             return record;
         }
         const record = try scheduler.backing_allocator.create(ProcessRecord);
-        // A brand-new record starts at park epoch 0 (recycled records retain
-        // their monotonic epoch — see `spawn`); `spawn` sets every other field.
+        // A brand-new record starts at park epoch 0 and an empty send grace
+        // count (recycled records retain both — the monotonic epoch and the
+        // provably-zero in-flight count — see `spawn`); `spawn` sets every other
+        // field and re-opens `send_closed`.
         record.park_control = .init(packParkControl(0, .running));
+        record.in_flight_send_count = .init(0);
+        record.send_closed = .init(false);
         return record;
     }
 
@@ -3999,6 +4098,64 @@ test "Scheduler: teardown with a non-empty mailbox frees foreign envelopes and r
     try testing.expectEqual(@as(usize, 2), manager.teardown_count);
     // Pages actually flowed (the burst spanned several).
     try testing.expect(kernel.envelope_pool.statistics().live_page_peak >= 2);
+}
+
+// Deterministic proof of the cross-thread send grace period — the fix for the
+// message-vs-timer envelope-page leak. A message that raced a receiver's
+// timeout-and-teardown could push into the mailbox AFTER the teardown drain had
+// already run, orphaning the envelope (and its sender's abandoned page). The
+// grace period closes it: `closeAndQuiesce` (in teardown, before the drain) must
+// wait for every already-pinned sender to finish, and a mailbox closed first
+// rejects the sender so it dead-letters instead of orphaning. This drives both
+// halves across two real threads, forcing the exact previously-leaking ordering.
+test "Scheduler: send grace period — teardown waits out an in-flight sender, and a closed mailbox rejects new sends" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    // Only the grace-period fields participate; the rest of the record is inert
+    // for `beginSend`/`endSend`/`closeAndQuiesce` (they touch nothing else).
+    var record: ProcessRecord = undefined;
+    record.in_flight_send_count = .init(0);
+    record.send_closed = .init(false);
+
+    // A sender pins the target while its mailbox is still open: a send is now in
+    // flight, exactly as when a message races the receiver's deadline.
+    try testing.expect(record.beginSend());
+    try testing.expectEqual(@as(u32, 1), record.in_flight_send_count.load(.seq_cst));
+
+    // Teardown closes-and-quiesces on another thread. It MUST block until the
+    // in-flight send retires: were it to proceed, the drain could run before the
+    // sender's push lands — the leak.
+    const Closer = struct {
+        record: *ProcessRecord,
+        returned: std.atomic.Value(bool) = .init(false),
+
+        fn run(closer: *@This()) void {
+            closer.record.closeAndQuiesce();
+            closer.returned.store(true, .release);
+        }
+    };
+    var closer = Closer{ .record = &record };
+    const closer_thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+
+    // While the pin is held, `closeAndQuiesce` cannot return. Observe it stay
+    // blocked across a bounded window (a broken wait would return early and trip
+    // this) — the parked-observer discipline the pool/pool-family tests use.
+    var observation_spins: u32 = 0;
+    while (observation_spins < 200_000) : (observation_spins += 1) {
+        try testing.expect(!closer.returned.load(.acquire));
+        std.atomic.spinLoopHint();
+    }
+
+    // Retiring the send releases the quiesce wait: teardown may now drain.
+    record.endSend();
+    closer_thread.join();
+    try testing.expect(closer.returned.load(.acquire));
+
+    // The mailbox is now closed. A sender that arrives after the close is
+    // rejected (it dead-letters rather than orphaning an envelope), and the
+    // rejection leaves the in-flight count balanced at zero.
+    try testing.expect(!record.beginSend());
+    try testing.expectEqual(@as(u32, 0), record.in_flight_send_count.load(.seq_cst));
 }
 
 // -- shutdown -------------------------------------------------------------------------

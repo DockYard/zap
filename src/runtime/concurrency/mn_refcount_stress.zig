@@ -308,29 +308,19 @@ fn runMultiSchedulerRefcountStress(worker_count: usize, rounds: usize) !void {
 }
 
 test "MnRefcountStress: per-process non-atomic refcounts hold the scheduler-local-refcount invariant under real M:N scheduling" {
-    // ThreadSanitizer's OWN trace machinery faults (SEGV/ILL, intermittently and
-    // even at a handful of fibers) on the manual fiber context-switches this
-    // test performs in bulk — a documented, debugger-confirmed TSan-runtime
-    // limitation (every fault frame is inside `__tsan::`), NOT a kernel race: at
-    // the volumes that DO complete TSan reports ZERO data-race findings, and the
-    // identical logic runs clean without the sanitizer at 25× the volume. It is
-    // therefore SKIPPED under `-fsanitize-thread` — crashing TSan's runtime
-    // proves nothing. The scheduler-local-refcount invariant is instead proven
-    // under TSan by its two orthogonal halves, each of which TSan CAN instrument:
-    //   * the M:N scheduler moving processes race-free — `scheduler_pool.zig`'s
-    //     work-stealing/LIFO/parking/migration tests, TSan-clean;
-    //   * non-atomic refcounts crossing threads race-free — the P3 harnesses
-    //     `src/memory/{arc,orc}/cross_thread_stress.zig` with REAL ARC/ORC
-    //     contexts, TSan-clean.
-    // Their COMBINATION — real per-process refcounts driven by the real M:N
-    // scheduler — is proven here by ASSERTION (data integrity + leak-exactness
-    // across a saturated M:N run) in the Debug/ReleaseFast kernel suite.
-    // `ZAP_MN_REFCOUNT_*` allow a deliberate under-TSan volume sweep anyway.
-    if (@import("builtin").sanitize_thread and
-        std.c.getenv("ZAP_MN_REFCOUNT_WORKERS") == null)
-    {
-        return error.SkipZigTest;
-    }
+    // THE marquee proof, and it RUNS under ThreadSanitizer: real per-process
+    // NON-atomic refcounts driven by the real M:N work-stealing scheduler, with
+    // ZERO data-race findings BY MEASUREMENT. This once had to be skipped because
+    // TSan's own trace machinery faulted on the kernel's manual fiber context
+    // switches; `fiber_context.zig` now brackets every switch with the standard
+    // `__tsan_switch_to_fiber` annotations, so TSan tracks each fiber's
+    // happens-before across its stack switches and its migration between cores.
+    // The switch annotations do NOT hand-wave the invariant: a resume edge is
+    // scheduler→fiber and a yield edge is fiber→scheduler, so a process's quantum
+    // on core A only connects to its next quantum on core B through the
+    // run-queue/steal/wake atomics — a fiber switch never links two schedulers,
+    // so a missing scheduler fence would still surface here as a real race.
+    // `ZAP_MN_REFCOUNT_*` scale it into a soak.
     const worker_count = envValue("ZAP_MN_REFCOUNT_WORKERS", 64);
     const rounds = envValue("ZAP_MN_REFCOUNT_ROUNDS", 200);
     try runMultiSchedulerRefcountStress(worker_count, rounds);

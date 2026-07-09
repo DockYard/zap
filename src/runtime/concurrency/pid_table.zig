@@ -90,15 +90,21 @@
 //!   generation. Retries only occur when the slot is concurrently
 //!   released/reacquired mid-read, and each retry observes strictly newer
 //!   metadata.
-//! * **Deferred to Phase 4 (documented, not claimed):** the LIFETIME of
+//! * **Borrowed-PCB lifetime (Phase 4 grace period):** the LIFETIME of
 //!   the `*ProcessControlBlock` a lookup or iteration returns. Under a
 //!   single scheduler the pointer is valid for the current scheduling
-//!   quantum; under M:N schedulers a process could exit and its PCB be
-//!   torn down while another scheduler still holds the pointer. Fixing
-//!   that requires the Phase 4 cross-scheduler quiescence/grace-period
-//!   discipline (plan §5 Phase 4) — the table's identity checks are
-//!   already race-free, the borrowed pointer's lifetime is not. Also
-//!   deferred: per-slot cache-line padding against false sharing between
+//!   quantum; under M:N schedulers a process can exit and its PCB drain,
+//!   recycle, or reuse while another scheduler still holds the pointer.
+//!   The `send` path closes this with a cross-scheduler grace period: it
+//!   pins the target across the push and re-validates identity under the
+//!   pin, and teardown waits every in-flight send out before draining
+//!   (`scheduler.zig` `ProcessRecord.beginSend`/`endSend`/`closeAndQuiesce`;
+//!   `mailbox.zig` "Teardown protocol"). The table's identity checks were
+//!   always race-free; that discipline now covers the borrowed pointer's
+//!   lifetime on the message path. Still deferred: a general borrowed-PCB
+//!   reclamation for lookups OTHER than `send` (introspection snapshots
+//!   read best-effort by contract), and per-slot cache-line padding
+//!   against false sharing between
 //!   adjacent slots (24-byte slots share lines ~2.6:1); a Phase 4
 //!   measurement decides whether the memory trade is worth it.
 //!
