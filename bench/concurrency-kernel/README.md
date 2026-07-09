@@ -20,7 +20,8 @@ per-manager, both against these same modes.
 | `spawn-serial` | spawn one trivial process, run to quiescence, repeat | full spawn→run→exit→teardown round trip |
 | `spawn-lifecycle` | timed (spawn 256 + run all to quiescence) batches | amortized full lifecycle |
 | `pingpong` | two kernel processes exchange envelopes via `ProcessContext.send`/`receive` through the real scheduler and real mailboxes | one same-scheduler message round trip |
-| `wake` | a producer THREAD pushes to a parked scheduler's blocked receiver; wake-to-receive latency (the Phase 4 cross-scheduler RTT bound) | one parked-wake delivery: futex wake → unpark → wake-stack drain → schedule → receive returns |
+| `pingpong-pool` | the SAME two-process ping-pong on a real 2-core M:N `SchedulerPool` (P4-J1); reports per-RTT ns + futex parks + the per-core quantum split | the Phase-4 cross-scheduler E1 re-measurement — reveals whether the wake-locality LIFO slot collocates the pair (fast, ≈ same-scheduler) or the message crosses cores each round (paying a parked wake) |
+| `wake` | a producer THREAD pushes to a parked scheduler's blocked receiver; wake-to-receive latency (the cross-core parked-wake component) | one parked-wake delivery: futex wake → unpark → wake-stack drain → schedule → receive returns |
 
 The spawn batch size (256) equals the stack pool's cache ceiling and a
 512-process warmup wave raises the pool peak so the whole ceiling is

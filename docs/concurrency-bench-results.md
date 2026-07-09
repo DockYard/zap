@@ -508,6 +508,120 @@ floor" caveat for RTT specifically.
   manager, and the remaining Phase 3 risk is manager cost, not kernel
   structure.
 
+### Phase-4 cross-scheduler re-measurement (P4-J4, 2026-07-09) — GATE: PASS
+
+The Phase-4 exit-gate re-run of E1 on the REAL M:N scheduler (`SchedulerPool`,
+P4-J1), delivering the same-vs-cross-scheduler ping-pong RTT decomposition the
+plan deferred from S0.1 to here ("measurable only once the M:N scheduler
+exists; until then bounded analytically by E9's parked-wake cost"). The new
+`pingpong-pool` bench mode runs a two-process ping-pong on a real 2-core pool
+and reports, alongside the per-RTT time, the total futex parks and the per-core
+quantum split — the decomposition that reveals where the cross-scheduler cost
+goes.
+
+#### Methodology
+
+- **Date:** 2026-07-09. Same machine as the whole series (MacBook Air
+  `Mac16,13`, Apple M4, 10 cores, 32 GB, macOS 26.2).
+- **Benchmark:** `bench/concurrency-kernel/bench.zig` (the SAME bench the P1-J6
+  re-run extended — not throwaway), compiled with the fork compiler
+  (`~/projects/zig` @ `6a425dbaeb`) at `-OReleaseFast` against the kernel tree
+  at the P4-J4 working state (zap `fcbf5a15` + P4-J4). Build command unchanged
+  (see the README / P1-J6 block).
+- **Protocol (item 2.9 / P3-R3 paired-run discipline):** one measurement at a
+  time, foreground; `uptime` recorded immediately before every run; PAIRED
+  same-session runs (each mode run twice back-to-back); medians AND minima
+  reported, minima the load-robust floor. Other agent sessions were active —
+  1-minute load **3.2–3.9** across the timed runs (recorded per run). The
+  machine was NOT quiet (22 login sessions, load ~3.4), so per the discipline
+  the **minima bound the floor** and the loaded medians are re-derived below.
+- **Modes:** `pingpong` = same-scheduler RTT (one `Scheduler`, both processes
+  on one core — zero parks by construction, the fast-path floor). `pingpong-pool`
+  = the two-process pair on a real 2-core M:N pool (either core may run either
+  process; the message can cross a core boundary), 100,000 rounds × 5 reps,
+  reporting per-RTT ns + parks/rep + the per-core quantum split. `wake` =
+  100,000 parked cross-core wake deliveries (a producer THREAD wakes a
+  genuinely PARKED scheduler receiver) — the cross-core wake cost in isolation.
+
+#### Results (ReleaseFast, 5 reps each, two paired runs, 2026-07-09)
+
+| Metric | Median (run A / run B) | Min (A / B) | Load | Parks |
+|---|---:|---:|---:|---:|
+| same-scheduler RTT (`pingpong`, ns/round-trip) | 86.9 / 83.5 | 84.0 / 78.4 | 3.9 | 0 (by construction) |
+| **cross-scheduler pair RTT (`pingpong-pool`, ns/round-trip)** | **88.2 / 85.5** | **73.2 / 77.9** | 3.9 | **15–23 over 500k RTTs** |
+| parked cross-core wake → receive (`wake`, ns) | 5,125 / 5,084 | 1,791 / 1,958 | 3.4 | 510,006 |
+
+`pingpong-pool` per-core quantum split (of 1,020,012 total): **~820k / ~200k**
+across the two cores (run A: core0 820,227 / core1 199,785; run B mirrored:
+core0 202,416 / core1 817,596) — with only **15–23 futex parks over the entire
+500,000-round run**.
+
+#### The decomposition (the gate's headline)
+
+**The cross-scheduler pair RTT equals the same-scheduler RTT** (~85 ns median,
+~75 ns min — within measurement noise of `pingpong`'s ~85/80). The per-core
+split + park count explain why, and decompose the cross-scheduler cost exactly:
+
+- **Wake locality collocates the pair.** The just-woken partner lands in the
+  waker core's owner-only LIFO slot (research.md §6.1), so a `send`-then-block
+  hop keeps running on the SAME core — the pair does not fan out one-process-
+  per-core. Hence one core carries ~80% of the quanta.
+- **The ~20% cross-core migration rides the AWAKE fast path, not a parked
+  wake.** Only 15–23 parks occurred across 500,000 round-trips (≈ 0.004 % of
+  hops). When the pair does migrate cores, the sibling is still SPINNING (it
+  has not yet spun down to a futex sleep), so the wake is a userspace
+  flag/handoff — the "userspace-wake-when-awake" fast path (P4-J1 / Appendix
+  A) — costing tens of ns, not the µs of a parked wake. This is precisely the
+  cost the LIFO-slot + spin-then-park design exists to keep off the hot path.
+- **The parked-wake cost is the ONLY cross-scheduler premium, and it is paid
+  only on a genuine idle→active transition.** `wake` isolates it: min **1.79 µs**,
+  median **5.1 µs**, p99 **11–16.5 µs** — the cost when a message hits a core
+  that has actually gone to futex sleep. A full cross-scheduler RTT in the WORST
+  case (both directions hit parked cores) is two parked wakes ≈ **3.6 µs floor**
+  (2 × 1.79 µs), ~10 µs median under this session's load — matching E9's analytic
+  bound ("two parked wakes") re-measured directly.
+
+#### 2.9 discipline: median-vs-min and the re-derived budget
+
+The `wake` median (5.1 µs) is **2.8× its min** (1.79 µs) — above the ~2×
+acceptance ratio, i.e. the median carries this session's background load (22
+sessions, load ~3.4), exactly as the discipline anticipates for the parked-wake
+distribution (P1-J6 saw the same). Per the rule ("or the cross-scheduler budget
+explicitly re-derived from the loaded numbers"), the budget is re-derived from
+the **minima** (the load-robust floor): one parked wake **1.79 µs**, a two-wake
+cross-scheduler RTT **≈ 3.6 µs floor**. The `pingpong`/`pingpong-pool` medians,
+by contrast, ARE within ~1.1× of their minima (86.9 vs 78.4; 88.2 vs 73.2), so
+those RTT numbers are load-robust as reported.
+
+#### Verdict vs targets and the BEAM/Go yardstick
+
+| Path | This measurement | Plan target | Verdict |
+|---|---:|---:|---|
+| same-scheduler RTT | 85 ns med / 78 ns min | ≤ 2–3 µs (2–3× BEAM) | PASS, ~25–38× inside |
+| cross-scheduler pair RTT | 85 ns med / 73 ns min | ≤ documented multiple of same | PASS — **≈ 1× same-scheduler** (far below the >10× "poor" bar) |
+| cross-scheduler worst case (parked sibling) | 1.79 µs floor / 5.1 µs med per wake; ~3.6 µs floor per RTT | bounded by 2× E9 parked wake | PASS — matches the E9 analytic bound |
+
+- **Cross-scheduler RTT is NOT poor — it is ≈ same-scheduler** for a real
+  communicating pair, ~1× (the plan's ">10× same ⇒ finding" bar is not
+  approached). The M:N scheduler adds essentially zero premium to a
+  communicating pair because the LIFO wake-slot collocates it and the awake
+  fast path handles the residual migrations. This is the P4-J1 design working
+  exactly as intended: the parked-wake cost is confined to genuine idle-core
+  wakeups.
+- **vs BEAM/Go (research-round-2 Q10):** BEAM's same-scheduler send is sub-µs
+  and a cross-scheduler send (to a process parked on another scheduler) is
+  ~1–3 µs; Go's cross-`P` channel op is ~0.2–1 µs plus park/unpark on an idle
+  P. Our communicating-pair cross-scheduler RTT (~85 ns) beats BEAM's
+  cross-scheduler send by ~10–30× and is competitive with Go's hot path; our
+  parked-wake tail (~1.79 µs floor) is the same order as BEAM's/Go's idle-P
+  unpark — expected, since it IS a futex wake.
+- **Verdict: E1 cross-scheduler gate PASS.** The same-vs-cross decomposition
+  is measured, not merely bounded: same ≈ cross ≈ 85 ns for an active pair;
+  the parked-wake premium (1.79 µs floor) is isolated and paid only on
+  idle→active transitions, bounded at ~3.6 µs floor for a two-wake RTT —
+  inside the documented multiple of same-scheduler and competitive with the
+  BEAM/Go cross-scheduler yardstick.
+
 ## E9 — fiber-switch floor + Darwin wakeup mechanism (S0.3, 2026-07-04)
 
 Reframed after E1: both fork `std.Io` backends failed the E1 targets, so the

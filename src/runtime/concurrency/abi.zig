@@ -528,11 +528,13 @@ fn spawnTrampoline(context: *concurrency.ProcessContext, argument: ?*anyopaque) 
 const RuntimeState = struct {
     pid_table: concurrency.PidTable,
     envelope_pool: concurrency.EnvelopePool,
-    /// The M:N work-stealing scheduler pool (P4-J1): N cores (default = CPU
-    /// count) over the shared pid table and envelope pool. Replaces the Phase-2
-    /// single scheduler; the ABI is otherwise unchanged (an in-process spawn
-    /// routes to the running core, an external spawn to core 0).
-    pool: concurrency.SchedulerPool,
+    /// The scheduler backend over the shared pid table + envelope pool: the
+    /// production M:N pool by default, or — when `ZAP_SCHED_SEED` is set — the
+    /// seeded deterministic M:N simulator (P4-J4). Both drive the SAME
+    /// instance-based `Scheduler` cores and honor the SAME `zap_proc_*`
+    /// intrinsics; only the driver differs (real OS threads vs a single-threaded
+    /// seed-reproducible interleaving). See `SchedulerBackend`.
+    backend: SchedulerBackend,
     ledger: Ledger,
     /// The per-spawn manager registry (plan item 3.1/3.3, P3-J3): core
     /// vtables indexed by manager id. Slot 0 is the manifest default (bound by
@@ -544,6 +546,97 @@ const RuntimeState = struct {
     /// is gone, not layered over).
     manager_registry: [MAX_MANAGER_SLOTS]?*const ZapMemoryManagerCoreV1,
 };
+
+/// The scheduler backend the runtime drives. Selected once at
+/// `zap_proc_runtime_init` and fixed for the runtime's lifetime; every
+/// `zap_proc_*` intrinsic that reaches the scheduler goes through these
+/// helpers, so the two backends are interchangeable behind the ABI.
+///
+/// The seeded backend (P4-J4, plan item 4.4) is the payoff of exposing the
+/// seeded deterministic scheduler to the Zap layer: with `ZAP_SCHED_SEED` set,
+/// a concurrency program (or Zest concurrency suite) runs as a single-threaded,
+/// seed-reproducible M:N interleaving — a failing run replays EXACTLY by
+/// re-running with the same seed. P2-J8 deferred this on two obstacles;
+/// P4-J1's `Scheduler.currentThreadScheduler` (which the simulator publishes
+/// per step via `swapCurrentThreadScheduler`) resolves the first
+/// (scheduler-relative process intrinsics — `zap_proc_current`/`zap_proc_spawn`
+/// resolve on the stepping core exactly as under the pool). The residual
+/// constraint is scope, not mechanism: the runtime is a process-wide singleton,
+/// so a seeded run is whole-program; a sibling test that asserts a PRODUCTION
+/// interleaving (e.g. `test_concurrency/safepoint_test.zap`'s "quick replies
+/// before slow" ordering) can be legitimately violated by a seeded schedule, so
+/// seeded runs target interleaving-ROBUST tests (invariants that hold under any
+/// schedule — ping-pong, pairwise FIFO, teardown exactness, after-timeout),
+/// while ordering-assertion tests stay in the default production run.
+const SchedulerBackend = union(enum) {
+    /// Production: the M:N work-stealing pool (P4-J1) over real OS threads
+    /// (default = CPU count). An in-process spawn routes to the running core, an
+    /// external spawn to core 0.
+    production_pool: concurrency.SchedulerPool,
+    /// Seeded deterministic M:N simulator (P4-J4): N logical cores on ONE
+    /// thread, every scheduling decision a pure function of the seed. Owned
+    /// (heap-allocated by `MnSimulator.create`); borrows the runtime's pid table
+    /// + envelope pool.
+    seeded_simulator: *concurrency.MnSimulator,
+
+    /// The core an external (driver-thread) spawn admits to.
+    fn primaryCore(backend: *SchedulerBackend) *concurrency.Scheduler {
+        return switch (backend.*) {
+            .production_pool => |*pool| pool.primaryCore(),
+            .seeded_simulator => |simulator| simulator.primaryCore(),
+        };
+    }
+
+    /// Drive until every process has exited. A seeded run that deadlocks
+    /// (`AllProcessesWaiting`) terminates here instead of hanging — the seed
+    /// reproduces the deadlock; stragglers are reaped at deinit (Erlang halt).
+    fn runUntilQuiescent(backend: *SchedulerBackend) void {
+        switch (backend.*) {
+            .production_pool => |*pool| pool.runUntilQuiescent(),
+            .seeded_simulator => |simulator| simulator.runToQuiescence() catch {},
+        }
+    }
+
+    /// Drive until `root` exits (Erlang halt model).
+    fn runUntilRootExits(backend: *SchedulerBackend, root: concurrency.Pid) void {
+        switch (backend.*) {
+            .production_pool => |*pool| pool.runUntilRootExits(root),
+            .seeded_simulator => |simulator| simulator.runUntilRootExits(root) catch {},
+        }
+    }
+
+    /// Reap every straggler and tear the backend down (`runtime_deinit`).
+    fn shutdownAndDeinit(backend: *SchedulerBackend) void {
+        switch (backend.*) {
+            .production_pool => |*pool| {
+                pool.shutdownAllProcesses();
+                pool.deinit();
+            },
+            .seeded_simulator => |simulator| simulator.destroy(),
+        }
+    }
+};
+
+/// Read `ZAP_SCHED_SEED` — the opt-in seeded deterministic scheduler seam
+/// (P4-J4). Null (unset/empty/unparseable) selects the production pool. Accepts
+/// decimal or `0x`-prefixed hex (base 0). Uses `std.c.getenv`, matching the
+/// kernel's other env knobs (module doc: the Linux CI leg links libc).
+fn readSeededSchedulerSeed() ?u64 {
+    const raw = std.c.getenv("ZAP_SCHED_SEED") orelse return null;
+    const text = std.mem.sliceTo(raw, 0);
+    if (text.len == 0) return null;
+    return std.fmt.parseInt(u64, text, 0) catch null;
+}
+
+/// Read `ZAP_SCHED_CORES` — the number of logical cores the seeded simulator
+/// models. Default 2 (the smallest genuinely-M:N configuration); clamped ≥ 1.
+fn readSeededSchedulerCoreCount() usize {
+    const default_core_count: usize = 2;
+    const raw = std.c.getenv("ZAP_SCHED_CORES") orelse return default_core_count;
+    const text = std.mem.sliceTo(raw, 0);
+    const parsed = std.fmt.parseInt(usize, text, 10) catch return default_core_count;
+    return @max(parsed, 1);
+}
 
 var runtime_state_storage: RuntimeState = undefined;
 var runtime_initialized: bool = false;
@@ -586,17 +679,73 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
     runtime_state.pid_table = concurrency.PidTable.init(backing_allocator, .{}) catch
         return ZapProcStatus.out_of_memory;
     runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
-    concurrency.SchedulerPool.init(
-        &runtime_state.pool,
+
+    if (readSeededSchedulerSeed()) |seed| {
+        // Seeded deterministic M:N backend (P4-J4): a single-threaded,
+        // seed-reproducible interleaving over the shared structures. A failing
+        // concurrency run replays exactly by re-running with the same seed.
+        const core_count = readSeededSchedulerCoreCount();
+        const simulator = concurrency.MnSimulator.create(
+            backing_allocator,
+            &runtime_state.pid_table,
+            &runtime_state.envelope_pool,
+            seed,
+            .{ .core_count = core_count },
+        ) catch {
+            runtime_state.envelope_pool.deinit();
+            runtime_state.pid_table.deinit();
+            return ZapProcStatus.out_of_memory;
+        };
+        runtime_state.backend = .{ .seeded_simulator = simulator };
+        // Announce the active seed so a failing run is replayable (the plan-4.4
+        // failing-seed contract at the program level). Suppressed under `zig
+        // test` so a kernel-test build never writes to stderr (build-runner
+        // capture would flag it as failure noise).
+        if (!@import("builtin").is_test) std.debug.print(
+            "[zap] seeded deterministic scheduler ACTIVE — ZAP_SCHED_SEED={d} (0x{x}) cores={d}: single-threaded reproducible M:N; re-run with this seed to replay exactly\n",
+            .{ seed, seed, core_count },
+        );
+    } else {
+        runtime_state.backend = .{ .production_pool = undefined };
+        concurrency.SchedulerPool.init(
+            &runtime_state.backend.production_pool,
+            backing_allocator,
+            &runtime_state.pid_table,
+            &runtime_state.envelope_pool,
+            .{},
+        ) catch {
+            runtime_state.envelope_pool.deinit();
+            runtime_state.pid_table.deinit();
+            return ZapProcStatus.out_of_memory;
+        };
+    }
+    runtime_initialized = true;
+    return ZapProcStatus.ok;
+}
+
+/// Test-only: initialize the runtime with the seeded deterministic M:N backend
+/// DIRECTLY (no env var, no stderr banner) — the seam the abi-level seeded
+/// reproducibility test drives, so it need not mutate process-global
+/// environment. Mirrors the seeded branch of `zap_proc_runtime_init`.
+fn runtimeInitSeededForTest(seed: u64, core_count: usize) i32 {
+    if (runtime_initialized) return ZapProcStatus.already_initialized;
+    runtime_state.ledger = .{};
+    runtime_state.manager_registry = @splat(null);
+    runtime_state.pid_table = concurrency.PidTable.init(backing_allocator, .{}) catch
+        return ZapProcStatus.out_of_memory;
+    runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
+    const simulator = concurrency.MnSimulator.create(
         backing_allocator,
         &runtime_state.pid_table,
         &runtime_state.envelope_pool,
-        .{},
+        seed,
+        .{ .core_count = core_count },
     ) catch {
         runtime_state.envelope_pool.deinit();
         runtime_state.pid_table.deinit();
         return ZapProcStatus.out_of_memory;
     };
+    runtime_state.backend = .{ .seeded_simulator = simulator };
     runtime_initialized = true;
     return ZapProcStatus.ok;
 }
@@ -655,8 +804,7 @@ export fn zap_proc_runtime_deinit() callconv(.c) void {
     // Reap stragglers (a root-mode run leaves the root's children live per the
     // Erlang halt model; also covers an init→spawn→deinit without a run). Safe
     // and single-threaded: the pool's workers have already joined inside `run`.
-    runtime_state.pool.shutdownAllProcesses();
-    runtime_state.pool.deinit();
+    runtime_state.backend.shutdownAndDeinit();
     runtime_state.envelope_pool.deinit();
     runtime_state.pid_table.deinit();
     runtime_state.ledger.sweep();
@@ -671,7 +819,7 @@ export fn zap_proc_runtime_deinit() callconv(.c) void {
 /// Returns `ZapProcStatus.ok` or `not_initialized`.
 export fn zap_proc_run_until_quiescent() callconv(.c) i32 {
     if (!runtime_initialized) return ZapProcStatus.not_initialized;
-    runtime_state.pool.runUntilQuiescent();
+    runtime_state.backend.runUntilQuiescent();
     return ZapProcStatus.ok;
 }
 
@@ -688,7 +836,7 @@ export fn zap_proc_run_until_quiescent() callconv(.c) i32 {
 export fn zap_proc_run_until_exit(target_pid_bits: u64) callconv(.c) i32 {
     if (!runtime_initialized) return ZapProcStatus.not_initialized;
     const target = concurrency.Pid.fromBits(target_pid_bits);
-    runtime_state.pool.runUntilRootExits(target);
+    runtime_state.backend.runUntilRootExits(target);
     return ZapProcStatus.ok;
 }
 
@@ -776,7 +924,7 @@ export fn zap_proc_spawn_at(entry: ZapProcEntry, argument: ?*anyopaque, manager_
     // (its stack pool + record cache are the driver thread's own — see
     // `SchedulerPool.primaryCore`). Either core's `spawn` touches only that
     // core's per-scheduler resources on its own thread.
-    const spawn_core = concurrency.Scheduler.currentThreadScheduler() orelse runtime_state.pool.primaryCore();
+    const spawn_core = concurrency.Scheduler.currentThreadScheduler() orelse runtime_state.backend.primaryCore();
     const pid = spawn_core.spawn(.{
         .entry = spawnTrampoline,
         .argument = closure_block,
@@ -1590,7 +1738,7 @@ test "abi: init → spawn → send → receive → exit round-trip through the C
 
     // Exactness: every payload and closure ledger block was consumed.
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
-    const stats = runtime_state.pool.statistics();
+    const stats = runtime_state.backend.production_pool.statistics();
     try testing.expectEqual(@as(i64, 0), stats.live_process_count);
     try testing.expectEqual(@as(u64, 2), stats.spawn_total);
     // Receiver returned (normal); sender used the exit intrinsic (the
@@ -1600,6 +1748,98 @@ test "abi: init → spawn → send → receive → exit round-trip through the C
     const envelope_stats = runtime_state.envelope_pool.statistics();
     try testing.expectEqual(@as(u32, 0), envelope_stats.live_page_count);
     try testing.expectEqual(@as(u32, 0), envelope_stats.abandoned_page_count);
+}
+
+// -- P4-J4: the seeded deterministic M:N backend drives the real intrinsics
+//    reproducibly (the plan-4.4 Zap-layer payoff, validated end-to-end) --------
+
+const seeded_producer_count = 3;
+const seeded_messages_per_producer = 4;
+const seeded_message_total = seeded_producer_count * seeded_messages_per_producer;
+
+/// A fan-in probe recording the ARRIVAL ORDER of producer tags at the consumer
+/// — the observable whose reproducibility proves the seeded backend replays an
+/// exact M:N interleaving THROUGH THE ABI (not just inside the kernel harness).
+const SeededReproProbe = struct {
+    consumer_pid_bits: u64 = 0,
+    arrival_order: [seeded_message_total]u8 = @splat(0),
+    received: usize = 0,
+    pairwise_fifo_violation: bool = false,
+    per_producer_next: [seeded_producer_count]u8 = @splat(0),
+};
+
+const SeededProducerArg = struct {
+    probe: *SeededReproProbe,
+    index: u8,
+};
+
+fn seededProducerEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const arg: *SeededProducerArg = @ptrCast(@alignCast(argument.?));
+    var sequence: u8 = 0;
+    while (sequence < seeded_messages_per_producer) : (sequence += 1) {
+        const payload = [2]u8{ arg.index, sequence }; // copied by the ABI (stack-safe)
+        const status = zap_proc_send(process, arg.probe.consumer_pid_bits, &payload, payload.len);
+        std.debug.assert(status == ZapProcStatus.ok);
+        // Safepoint so seeded per-quantum budgets interleave sibling producers.
+        zap_proc_yield_check(process);
+    }
+}
+
+fn seededConsumerEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *SeededReproProbe = @ptrCast(@alignCast(argument.?));
+    while (probe.received < seeded_message_total) {
+        var payload_pointer: ?[*]const u8 = null;
+        var payload_len: usize = 0;
+        const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+        const bytes = payload_pointer.?[0..payload_len];
+        const producer_index = bytes[0];
+        const sequence = bytes[1];
+        zap_proc_envelope_free(envelope);
+        probe.arrival_order[probe.received] = producer_index;
+        if (sequence != probe.per_producer_next[producer_index]) probe.pairwise_fifo_violation = true;
+        probe.per_producer_next[producer_index] += 1;
+        probe.received += 1;
+    }
+}
+
+fn runSeededFanIn(seed: u64, probe: *SeededReproProbe, arguments: *[seeded_producer_count]SeededProducerArg) !void {
+    try testing.expectEqual(ZapProcStatus.ok, runtimeInitSeededForTest(seed, 3));
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    const consumer_pid_bits = zap_proc_spawn(seededConsumerEntry, probe);
+    try testing.expect(consumer_pid_bits != concurrency.Pid.invalid.toBits());
+    probe.consumer_pid_bits = consumer_pid_bits;
+
+    for (arguments, 0..) |*argument, producer_index| {
+        argument.* = .{ .probe = probe, .index = @intCast(producer_index) };
+        const producer_pid_bits = zap_proc_spawn(seededProducerEntry, argument);
+        try testing.expect(producer_pid_bits != concurrency.Pid.invalid.toBits());
+    }
+
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+}
+
+test "abi: the seeded deterministic M:N backend replays an identical interleaving through the C-ABI intrinsics" {
+    // Two runs under the SAME seed must produce a byte-identical arrival
+    // interleaving at the consumer — the plan-4.4 payoff proved end-to-end
+    // through `zap_proc_runtime_init`(seeded) / `spawn` / `send` /
+    // `receive_park` / `run_until_quiescent`, not just inside the kernel harness.
+    var first_probe = SeededReproProbe{};
+    var first_arguments: [seeded_producer_count]SeededProducerArg = undefined;
+    try runSeededFanIn(0x5EED_D06, &first_probe, &first_arguments);
+    try testing.expectEqual(@as(usize, seeded_message_total), first_probe.received);
+    try testing.expect(!first_probe.pairwise_fifo_violation);
+    try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
+
+    var second_probe = SeededReproProbe{};
+    var second_arguments: [seeded_producer_count]SeededProducerArg = undefined;
+    try runSeededFanIn(0x5EED_D06, &second_probe, &second_arguments);
+    try testing.expectEqual(@as(usize, seeded_message_total), second_probe.received);
+    try testing.expect(!second_probe.pairwise_fifo_violation);
+
+    // Same seed ⇒ identical M:N arrival order through the ABI.
+    try testing.expectEqualSlices(u8, &first_probe.arrival_order, &second_probe.arrival_order);
 }
 
 /// Probe for the ambient-handle and root-join intrinsics: the "root"
@@ -1683,7 +1923,7 @@ test "abi: zap_proc_run_until_exit joins the target and leaves stragglers for de
 
     // The root is gone; the parked straggler is still live (reaped at deinit).
     try testing.expectEqual(@as(usize, 4), probe.received_payload_len);
-    try testing.expectEqual(@as(i64, 1), runtime_state.pool.liveProcessCount());
+    try testing.expectEqual(@as(i64, 1), runtime_state.backend.production_pool.liveProcessCount());
 
     // Joining a dead pid returns immediately.
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(root_pid_bits));
@@ -1909,7 +2149,7 @@ test "abi: an unexpected message dead-letters with telemetry and does not crash 
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
 
     try testing.expect(probe.received);
-    const stats = runtime_state.pool.statistics();
+    const stats = runtime_state.backend.production_pool.statistics();
     // Non-silent: exactly one unexpected-message dead letter recorded.
     try testing.expectEqual(@as(u64, 1), stats.unexpected_message_total);
     // Both processes are gone; the offending one via the kill path.

@@ -406,6 +406,38 @@ pub const Decisions = struct {
     }
 };
 
+/// The monotonic-time seam (plan 4.4, research.md §6.11): the scheduler
+/// reads "now" for `receive … after` deadline arithmetic and timing-wheel
+/// advancement ONLY through this seam, so a seeded run can substitute a
+/// VIRTUAL clock and make timer firing a pure function of the seed. This is
+/// the "timers" half of the seam inventory the module doc anticipated
+/// (`deterministic.zig` header): production reads the real monotonic clock;
+/// the multi-scheduler seeded simulator (`deterministic_mn.zig`) installs a
+/// shared virtual clock the discrete-event driver advances only when it fires
+/// the earliest armed timer. PINNED once handed to a scheduler.
+pub const Clock = struct {
+    /// Opaque state for the implementation (the virtual clock, in seeded mode).
+    clock_context: ?*anyopaque,
+    /// Read the current monotonic time in nanoseconds.
+    readNanoseconds: *const fn (clock_context: ?*anyopaque) u64,
+
+    /// Production policy: the real libc-free monotonic clock. Stateless.
+    pub const wall: Clock = .{
+        .clock_context = null,
+        .readNanoseconds = wallReadNanoseconds,
+    };
+
+    /// Read "now" in monotonic nanoseconds through the seam.
+    pub inline fn read(clock: Clock) u64 {
+        return clock.readNanoseconds(clock.clock_context);
+    }
+
+    fn wallReadNanoseconds(clock_context: ?*anyopaque) u64 {
+        _ = clock_context;
+        return monotonicNowNanoseconds();
+    }
+};
+
 /// What the scheduler does when no process is runnable but live processes
 /// exist.
 pub const IdleStrategy = enum {
@@ -797,7 +829,7 @@ pub const ProcessContext = struct {
             }
         }
 
-        const deadline_nanoseconds = monotonicNowNanoseconds() +| timeout_nanoseconds;
+        const deadline_nanoseconds = context.scheduler.options.clock.read() +| timeout_nanoseconds;
         while (true) {
             if (record.pending_kill) {
                 record.yield_reason = .reenqueue;
@@ -813,7 +845,7 @@ pub const ProcessContext = struct {
                     context.execution.yield();
                 },
                 .empty => {
-                    if (monotonicNowNanoseconds() >= deadline_nanoseconds) return .timed_out;
+                    if (context.scheduler.options.clock.read() >= deadline_nanoseconds) return .timed_out;
                     // Park with the deadline: the scheduler re-runs this
                     // process on a message wake OR when the deadline
                     // elapses (setting `receive_timed_out`).
@@ -1334,6 +1366,10 @@ pub const Scheduler = struct {
         /// Usable bytes per fiber stack (forwarded to this scheduler's
         /// stack pool).
         stack_usable_size: usize = stack_pool_module.default_usable_size,
+        /// The monotonic-time seam (see `Clock`). Production reads the real
+        /// clock; the seeded multi-scheduler simulator installs a virtual
+        /// clock so `receive … after` firing is a pure function of the seed.
+        clock: Clock = .wall,
     };
 
     /// Per-spawn options.
@@ -1655,7 +1691,7 @@ pub const Scheduler = struct {
             record,
             epoch,
             record.wake_deadline_nanoseconds,
-            monotonicNowNanoseconds(),
+            scheduler.options.clock.read(),
         ) catch {
             record.timer_entry = null;
             record.timer_wheel_owner = null;
@@ -1674,7 +1710,7 @@ pub const Scheduler = struct {
     fn advanceReceiveTimers(scheduler: *Scheduler) void {
         if (scheduler.receive_timer_wheel.isEmpty()) return;
         scheduler.receive_timer_wheel.advance(
-            monotonicNowNanoseconds(),
+            scheduler.options.clock.read(),
             *Scheduler,
             scheduler,
             fireReceiveTimeout,
@@ -1686,13 +1722,25 @@ pub const Scheduler = struct {
     /// straight to the earliest armed timer and fire it. Returns whether the
     /// wheel held any timer. This gives `receive … after` deterministic semantics
     /// under the seeded scheduler (a timeout fires precisely when the system
-    /// would otherwise deadlock). Scheduler-thread only.
-    fn fireEarliestReceiveTimeout(scheduler: *Scheduler) bool {
+    /// would otherwise deadlock). Also the per-core fire primitive the
+    /// multi-scheduler seeded simulator (`deterministic_mn.zig`) drives once it
+    /// has advanced the SHARED virtual clock to this core's due deadline.
+    /// Scheduler-thread only.
+    pub fn fireEarliestReceiveTimeout(scheduler: *Scheduler) bool {
         return scheduler.receive_timer_wheel.advanceToEarliestAndFire(
             *Scheduler,
             scheduler,
             fireReceiveTimeout,
         );
+    }
+
+    /// The exact absolute deadline (monotonic ns) of this core's earliest armed
+    /// `receive … after` timer, or null when none is armed. The seeded
+    /// multi-scheduler simulator takes the minimum across cores to advance the
+    /// shared virtual clock to the globally-next timer event (discrete-event
+    /// time order), then fires the due core(s). Scheduler-thread only.
+    pub fn earliestReceiveDeadlineNanoseconds(scheduler: *const Scheduler) ?u64 {
+        return scheduler.receive_timer_wheel.earliestEntryDeadlineNanoseconds();
     }
 
     // -------------------------------------------------------------------------
@@ -1828,6 +1876,21 @@ pub const Scheduler = struct {
         return current_scheduler;
     }
 
+    /// Set the current-thread scheduler and return the prior value — the
+    /// save/restore seam for a driver that multiplexes several schedulers on ONE
+    /// thread (the seeded multi-scheduler simulator, `deterministic_mn.zig`). It
+    /// swaps in the core it is about to step so the mailbox wake seam routes a
+    /// producer-side wake to that core (wake locality, exactly as a real pool
+    /// worker thread would) and `currentProcessContext`/`zap_proc_current`
+    /// resolve on it, then restores the prior value when the run ends. Production
+    /// pool workers use `beginRunThread`/`endRunThread` (one core per thread for
+    /// the whole loop) instead. Thread-local; caller-owned.
+    pub fn swapCurrentThreadScheduler(scheduler: ?*Scheduler) ?*Scheduler {
+        const previous = current_scheduler;
+        current_scheduler = scheduler;
+        return previous;
+    }
+
     /// Service this core's cross-thread events once: convert freshly-woken
     /// processes to runnable (drain the wake stack) and fire any elapsed
     /// `receive … after` deadlines. Run at the top of every worker iteration.
@@ -1887,6 +1950,28 @@ pub const Scheduler = struct {
     /// lands just before a park is not slept through.
     pub fn hasPendingReattach(scheduler: *Scheduler) bool {
         return scheduler.reattach_stack_head.load(.acquire) != null;
+    }
+
+    /// Whether a cross-thread message wake is pending on this core's wake stack
+    /// but not yet drained to runnable. The seeded multi-scheduler simulator
+    /// (`deterministic_mn.zig`) reads this — WITHOUT draining — to decide a core
+    /// is steppable: only the owning core can drain its own wake stack, so a
+    /// pending wake that no other core can service must keep the owner steppable
+    /// (else the discrete-event driver would wrongly declare deadlock). A stale
+    /// read is impossible in the single-threaded simulator (the only reader).
+    pub fn hasPendingWake(scheduler: *const Scheduler) bool {
+        return scheduler.wake_stack_head.load(.acquire) != null;
+    }
+
+    /// Whether this core's FIFO holds work a sibling could STEAL (the LIFO slot
+    /// is owner-only and never stealable, so it is excluded). The seeded
+    /// multi-scheduler simulator reads it to decide whether an otherwise-idle
+    /// core is steppable via a steal. Owner-biased approximate read under
+    /// concurrency; EXACT in the single-threaded simulator (its only caller).
+    pub fn hasStealableWork(scheduler: *Scheduler) bool {
+        scheduler.lockRunQueue();
+        defer scheduler.unlockRunQueue();
+        return scheduler.ready_count != 0;
     }
 
     /// Drain this core's cross-thread wake stack without running anything — the

@@ -509,6 +509,17 @@ pub const TimingWheel = struct {
         return true;
     }
 
+    /// The exact absolute deadline (ns) of the earliest armed entry, or null
+    /// when empty — the nanosecond view of `earliestEntryDeadlineTick`. The
+    /// seeded multi-scheduler simulator (`deterministic_mn.zig`) takes the
+    /// minimum across cores to advance the shared virtual clock to the
+    /// globally-next timer event before firing the due core(s). Deterministic
+    /// mode only (small N: it scans candidate buckets). Scheduler-thread only.
+    pub fn earliestEntryDeadlineNanoseconds(wheel: *const TimingWheel) ?u64 {
+        const tick = wheel.earliestEntryDeadlineTick() orelse return null;
+        return tickToNanoseconds(tick);
+    }
+
     /// The exact earliest entry `deadline_tick` across all levels and the
     /// overflow list, or null when empty. Used only by deterministic mode (small
     /// N); it scans the candidate buckets, unlike the O(level_count)

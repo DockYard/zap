@@ -167,6 +167,7 @@ pub const scheduler_pool = @import("scheduler_pool.zig");
 pub const blocking_pool = @import("blocking_pool.zig");
 pub const futex = @import("futex.zig");
 pub const deterministic = @import("deterministic.zig");
+pub const deterministic_mn = @import("deterministic_mn.zig");
 pub const introspection = @import("introspection.zig");
 pub const crash_report = @import("crash_report.zig");
 
@@ -207,6 +208,10 @@ pub const SendOutcome = scheduler.SendOutcome;
 pub const SeededDecisions = deterministic.SeededDecisions;
 pub const TraceRecorder = deterministic.TraceRecorder;
 pub const DeterministicHarness = deterministic.Harness;
+pub const Clock = scheduler.Clock;
+pub const MnSimulator = deterministic_mn.MnSimulator;
+pub const VirtualClock = deterministic_mn.VirtualClock;
+pub const MnTraceEvent = deterministic_mn.MnTraceEvent;
 pub const ProcessSnapshot = introspection.ProcessSnapshot;
 pub const ProcessListIterator = introspection.ProcessListIterator;
 pub const KernelCounters = introspection.KernelCounters;
@@ -233,6 +238,10 @@ test {
     _ = blocking_pool;
     _ = futex;
     _ = deterministic;
+    // P4-J4: the seeded MULTI-scheduler simulator — M:N interleaving under one
+    // seed, byte-identical replay, verona-rt-style seed sweeps, and the
+    // failing-seed contract (plan item 4.4).
+    _ = deterministic_mn;
     _ = introspection;
     _ = crash_report;
     _ = @import("teardown_stress.zig");

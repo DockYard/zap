@@ -54,6 +54,7 @@ const builtin = @import("builtin");
 const concurrency = @import("concurrency");
 
 const Scheduler = concurrency.Scheduler;
+const SchedulerPool = concurrency.SchedulerPool;
 const ProcessContext = concurrency.ProcessContext;
 const PidTable = concurrency.PidTable;
 const EnvelopePool = concurrency.EnvelopePool;
@@ -85,17 +86,24 @@ const Mode = enum {
     @"spawn-serial",
     @"spawn-lifecycle",
     pingpong,
+    @"pingpong-pool",
     wake,
 
     fn defaultOperationCount(mode: Mode) usize {
         return switch (mode) {
             .spawn, .@"spawn-lifecycle" => 102_400, // 400 batches of 256
             .@"spawn-serial" => 102_400,
-            .pingpong => 100_000,
+            .pingpong, .@"pingpong-pool" => 100_000,
             .wake => 100_000,
         };
     }
 };
+
+/// Cores for the `pingpong-pool` cross-scheduler mode: two — the minimal
+/// genuinely-M:N pool, so the cross-scheduler question ("does a communicating
+/// pair collocate on one core, or does the message cross a core boundary and
+/// pay a parked wake each round?") is isolated from many-idle-core noise.
+const pingpong_pool_core_count: usize = 2;
 
 // -- per-process manager (the Phase 1 test-manager shape; module doc) ---------------------
 
@@ -408,6 +416,103 @@ fn runPingPongMode(allocator: std.mem.Allocator, rounds: usize) !void {
     );
 }
 
+// -- pingpong-pool (cross-scheduler; the Phase-4 E1 re-measurement) ----------------------------
+
+/// One ping-pong repetition on the REAL M:N pool (P4-J1). Two processes are
+/// admitted to the primary core; the pool's worker threads then run them. The
+/// timed region includes the pool's per-run worker spawn/join (amortized over
+/// ≥100k rounds — negligible per RTT). Returns elapsed nanoseconds.
+fn runPingPongPoolRepetition(pool: *SchedulerPool, managers: *[2]BenchManager, rounds: usize) !u64 {
+    var pinger_plan = PingPongPlan{ .rounds = rounds };
+    var ponger_plan = PingPongPlan{ .rounds = rounds };
+
+    const start = nowNanoseconds();
+    const pinger_pid = try pool.primaryCore().spawn(.{
+        .entry = pingerEntry,
+        .argument = &pinger_plan,
+        .manager = managers[0].managerContext(),
+    });
+    const ponger_pid = try pool.primaryCore().spawn(.{
+        .entry = pongerEntry,
+        .argument = &ponger_plan,
+        .manager = managers[1].managerContext(),
+    });
+    pinger_plan.peer = ponger_pid;
+    ponger_plan.peer = pinger_pid;
+    pool.runUntilQuiescent();
+    const elapsed = nowNanoseconds() - start;
+
+    if (pinger_plan.completed_rounds != rounds or ponger_plan.completed_rounds != rounds) {
+        @panic("pingpong-pool: round accounting mismatch");
+    }
+    return elapsed;
+}
+
+/// The Phase-4 cross-scheduler E1 re-measurement (plan Phase-4 exit gate): a
+/// two-process ping-pong on a real 2-core M:N pool. Unlike the same-scheduler
+/// `pingpong` mode (one `Scheduler`, zero parks by construction), this pair can
+/// run on either core and the message can cross a core boundary. It reports the
+/// per-RTT time AND — the decomposition the gate wants — the total futex parks
+/// and the per-core quantum split, which reveal whether the wake-locality LIFO
+/// slot (research.md §6.1) COLLOCATES the communicating pair onto one core (the
+/// fast path, ≈ same-scheduler) or the message genuinely crosses cores each
+/// round (paying a parked wake ≈ the E9 cost). The `wake` mode measures that
+/// parked-wake component in isolation.
+fn runPingPongPoolMode(allocator: std.mem.Allocator, rounds: usize) !void {
+    var pid_table = try PidTable.init(allocator, .{ .capacity = 4096 });
+    defer pid_table.deinit();
+    var envelope_pool = EnvelopePool.init(allocator, .{});
+    defer envelope_pool.deinit();
+
+    var managers: [2]BenchManager = undefined;
+    for (&managers) |*manager| {
+        manager.* = .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    }
+    defer for (&managers) |*manager| manager.arena.deinit();
+
+    var pool: SchedulerPool = undefined;
+    try SchedulerPool.init(&pool, allocator, &pid_table, &envelope_pool, .{
+        .scheduler_count = pingpong_pool_core_count,
+    });
+    defer pool.deinit();
+
+    // Warmup (unrecorded): raises per-core stack pool / record caches.
+    _ = try runPingPongPoolRepetition(&pool, &managers, @max(rounds / 10, 1000));
+
+    var per_op_ns: [repetition_count]f64 = undefined;
+    for (&per_op_ns, 0..) |*result, repetition| {
+        const stats_before = pool.statistics();
+        const timed_ns = try runPingPongPoolRepetition(&pool, &managers, rounds);
+        const stats_after = pool.statistics();
+        result.* = @as(f64, @floatFromInt(timed_ns)) / @as(f64, @floatFromInt(rounds));
+        std.debug.print("rep {d}: total_ns={d} per_rtt_ns={d:.1} parks_this_rep={d}\n", .{
+            repetition,
+            timed_ns,
+            result.*,
+            stats_after.park_count - stats_before.park_count,
+        });
+    }
+    printResult("pingpong-pool", &per_op_ns);
+
+    // The decomposition: per-core quanta (collocation ⇒ one core carries ≈ all
+    // the RTT quanta; genuine crossing ⇒ the two cores split them) and total
+    // parks (collocation ⇒ the idle sibling parks; per-round crossing ⇒ parks
+    // scale with rounds).
+    const stats = pool.statistics();
+    std.debug.print("cores={d} total_parks={d} total_quanta={d}\n", .{
+        pool.coreCount(),
+        stats.park_count,
+        stats.quantum_total,
+    });
+    for (pool.cores, 0..) |*core, core_index| {
+        std.debug.print("  core {d}: quanta={d} parks={d}\n", .{
+            core_index,
+            core.statistics().quantum_total,
+            core.statistics().park_count,
+        });
+    }
+}
+
 // -- wake path ---------------------------------------------------------------------------------
 
 /// Shared producer↔receiver state for the wake benchmark. `sent_at_ns`
@@ -573,7 +678,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = arguments.next(); // program name
     const mode_text = arguments.next() orelse {
         std.debug.print(
-            "usage: bench <spawn|spawn-serial|spawn-lifecycle|pingpong|wake> [ops]\n",
+            "usage: bench <spawn|spawn-serial|spawn-lifecycle|pingpong|pingpong-pool|wake> [ops]\n",
             .{},
         );
         return error.MissingMode;
@@ -596,6 +701,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .@"spawn-serial" => try runSpawnMode(allocator, operation_count, 1, .full_lifecycle, "spawn-serial"),
         .@"spawn-lifecycle" => try runSpawnMode(allocator, operation_count, spawn_batch_size, .full_lifecycle, "spawn-lifecycle"),
         .pingpong => try runPingPongMode(allocator, operation_count),
+        .@"pingpong-pool" => try runPingPongPoolMode(allocator, operation_count),
         .wake => try runWakeMode(allocator, operation_count),
     }
 }
