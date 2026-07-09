@@ -288,6 +288,7 @@ const mailbox_module = @import("mailbox.zig");
 const envelope_pool_module = @import("envelope_pool.zig");
 const process_module = @import("process.zig");
 const crash_report_module = @import("crash_report.zig");
+const timing_wheel_module = @import("timing_wheel.zig");
 
 const Pid = pid_table_module.Pid;
 const PidTable = pid_table_module.PidTable;
@@ -490,19 +491,49 @@ const YieldReason = enum(u8) {
 ///     the scheduler self-revives immediately.
 /// Exactly one of {producer push, scheduler self-revive} fires per episode
 /// because the two RMWs are totally ordered on this variable.
-pub const ParkState = enum(u8) {
-    /// Running or runnable — not suspended. A wake seam `swap(.notified)`
-    /// displacing this is a no-op (the process observes the message itself).
-    running,
+pub const ParkState = enum(u2) {
+    /// Running or runnable — not suspended. A wake seam displacing this is a
+    /// no-op (the process observes the message itself).
+    running = 0,
     /// Suspended on an empty mailbox — a wake must revive it. A wake seam
-    /// `swap(.notified)` displacing this means the displacing producer owns the
-    /// revival.
-    parked,
+    /// displacing this means the displacing producer owns the revival.
+    parked = 1,
     /// A message arrived in the park window (the wake seam swapped this in over
     /// `.running`): the process's own park attempt sees it and self-revives
     /// instead of suspending, so the wake is never lost.
-    notified,
+    notified = 2,
 };
+
+/// The `park_control` word packs the `ParkState` (low 2 bits) with the process's
+/// **park epoch** (high 62 bits) into one seq_cst atomic. The epoch is bumped
+/// every time a `receive … after` park episode ends — on ANY core (a
+/// cross-scheduler message wake, a kill, or a timeout fire). Packing them
+/// together is what makes the timing wheel's cross-scheduler timeout-fire
+/// race-free (P4-J2): a stale timer in core A's wheel can only fire its process
+/// with a single `cmpxchg(pack(epoch, .parked) → pack(epoch+1, .running))`,
+/// which atomically proves the process is STILL parked for exactly THAT episode.
+/// A process revived cross-core and re-parked (a new episode, epoch+1) cannot be
+/// grabbed by the stale timer — the CAS's expected value no longer matches — so
+/// the after-branch never fires prematurely and the wheel entry is discarded
+/// lazily when its bucket expires. The epoch is monotonic for a record's whole
+/// life (it survives recycle, so a stale timer can never alias a reused record's
+/// new episode). One seq_cst variable still linearizes the entire handshake.
+const park_epoch_shift: u6 = 2;
+
+/// Pack an epoch and state into a `park_control` word.
+inline fn packParkControl(epoch: u64, state: ParkState) u64 {
+    return (epoch << park_epoch_shift) | @intFromEnum(state);
+}
+
+/// The epoch carried by a `park_control` word.
+inline fn parkControlEpoch(control: u64) u64 {
+    return control >> park_epoch_shift;
+}
+
+/// The `ParkState` carried by a `park_control` word.
+inline fn parkControlState(control: u64) ParkState {
+    return @enumFromInt(@as(u2, @truncate(control)));
+}
 
 /// Scheduler-side bookkeeping for one process: the PCB plus the fields
 /// that are the scheduler's business rather than the process's (queue
@@ -539,15 +570,32 @@ pub const ProcessRecord = struct {
     /// fiber, read by the scheduler after the switch — same thread.
     yield_reason: YieldReason,
     /// Absolute monotonic-nanosecond deadline for a
-    /// `.waiting_for_message_deadline` suspension (`receive … after`).
-    /// Meaningful only while the record is `.waiting` with that yield
-    /// reason; ignored otherwise. Scheduler-thread only.
+    /// `.waiting_for_message_deadline` suspension (`receive … after`). The
+    /// hand-off field from `receiveWaitTimeout` (which computes it) to
+    /// `runQuantum` (which arms the timing-wheel entry). Scheduler-thread only.
     wake_deadline_nanoseconds: u64,
-    /// Set by the scheduler when it wakes a timed waiter because its
-    /// deadline elapsed (rather than a message arriving); read and cleared
-    /// by `receiveWaitTimeout` on resume. Scheduler-thread + owning-fiber
-    /// (same thread) only.
+    /// Set by the timing wheel's fire callback when it wakes this waiter because
+    /// its deadline elapsed (rather than a message arriving); read and cleared by
+    /// `receiveWaitTimeout` on resume. Written by the owning wheel's scheduler
+    /// thread, read by the owning fiber after revival (queue-ordered).
     receive_timed_out: bool,
+    /// The live timing-wheel entry for the current `receive … after` episode, or
+    /// null. Written by the parking core at insert; consulted only on the SAME
+    /// core (the owner) for O(1) eager cancellation when a message beats the
+    /// deadline locally. Validated against `timer_epoch` so a freed node is never
+    /// dereferenced. Scheduler-thread (owner) only.
+    timer_entry: ?*timing_wheel_module.Entry,
+    /// Which scheduler's wheel holds `timer_entry`. A reviver/killer compares it
+    /// to itself to decide whether it may eagerly cancel (same core) or must let
+    /// the owner reap the entry lazily (cross core). Written at insert, read after
+    /// a seq_cst `park_control` acquire (which orders it).
+    timer_wheel_owner: ?*Scheduler,
+    /// The park epoch captured when `timer_entry` was armed (a plain copy of the
+    /// entry's epoch). Compared against the live `park_control` epoch to tell
+    /// whether the entry still belongs to the current episode — i.e. whether it
+    /// is live and safe to dereference — without touching the (possibly freed)
+    /// node. Scheduler-thread (owner) only.
+    timer_epoch: u64,
     /// Kill requested (untrappable). Scheduler-thread only: set by
     /// `kill`, observed at scheduling points and safepoints.
     pending_kill: bool,
@@ -558,8 +606,10 @@ pub const ProcessRecord = struct {
     /// revival and pushes the record onto a scheduler's wake stack exactly once.
     /// Replaces the Phase-1 `wake_pending` coalescing flag: the CAS both
     /// coalesces (one winner) and arbitrates the park/signal race, which a plain
-    /// flag could not do across two scheduler threads.
-    park_state: std.atomic.Value(ParkState),
+    /// flag could not do across two scheduler threads. Packs the park EPOCH
+    /// alongside the state (see `packParkControl`) so the wheel's cross-scheduler
+    /// timeout-fire is race-free.
+    park_control: std.atomic.Value(u64),
     /// Intrusive Treiber link in the target scheduler's wake stack. Written by
     /// the revival CAS winner before the head CAS publishes it.
     wake_next: ?*ProcessRecord,
@@ -998,19 +1048,13 @@ pub const Scheduler = struct {
     /// exposure hooks into (module doc).
     current_process: ?*ProcessControlBlock,
 
-    /// Count of `.waiting` processes suspended with a `receive … after`
-    /// deadline. Zero for any program that never uses `after`, so the
-    /// run loop's deadline scan (`fireExpiredReceiveTimeouts`) and the
-    /// deadline-bounded idle park are entirely skipped — the zero-`after`
-    /// fast path. Recomputed exactly by each `fireExpiredReceiveTimeouts`
-    /// scan (so a message-woken or killed timed waiter self-corrects the
-    /// count on the next scan). Scheduler-thread only.
-    timed_waiter_count: usize,
-    /// The earliest not-yet-expired timed-waiter deadline (absolute
-    /// monotonic ns), or 0 when there are none. Written by
-    /// `fireExpiredReceiveTimeouts`; read by the idle park to bound its
-    /// futex wait so a timeout fires on schedule. Scheduler-thread only.
-    earliest_deadline_nanoseconds: u64,
+    /// This scheduler's per-core hierarchical timing wheel (P4-J2): the O(1)
+    /// `receive … after` timer store, replacing the Phase-2 O(n)-per-core
+    /// deadline scan. Scheduler-thread only — the SACRED per-scheduler invariant
+    /// (`timing_wheel.zig` module doc). Empty for any program that never uses
+    /// `after`, so `advanceReceiveTimers` and the deadline-bounded idle park are
+    /// entirely skipped — the zero-`after` fast path.
+    receive_timer_wheel: timing_wheel_module.TimingWheel,
 
     // -- run queue (owner + work-stealing thieves) ---------------------------
     /// Whether this scheduler participates in M:N work stealing (P4-J1). When
@@ -1211,8 +1255,7 @@ pub const Scheduler = struct {
             .global_queue = options.global_queue,
             .fiber_scheduler_context = .{},
             .current_process = null,
-            .timed_waiter_count = 0,
-            .earliest_deadline_nanoseconds = 0,
+            .receive_timer_wheel = timing_wheel_module.TimingWheel.init(backing_allocator),
             .work_stealing = options.work_stealing,
             .runnext = null,
             .ready_head = null,
@@ -1250,6 +1293,11 @@ pub const Scheduler = struct {
             scheduler.backing_allocator.destroy(record);
         }
         scheduler.cached_record_count = 0;
+        // Free the timing wheel's node pool. Any entries still linked (a
+        // cross-scheduler message beat a not-yet-expired deadline, so the entry
+        // was invalidated by epoch but left for lazy reap) are freed here with
+        // the pool's arena — never leaked (`timing_wheel.zig` deinit doc).
+        scheduler.receive_timer_wheel.deinit();
         scheduler.stack_pool.deinit();
         scheduler.* = undefined;
     }
@@ -1282,11 +1330,17 @@ pub const Scheduler = struct {
         record.ready_next = null;
         record.yield_reason = .reenqueue;
         record.pending_kill = false;
-        record.park_state = .init(.running);
+        // Preserve the record's park epoch across recycle (it is monotonic for
+        // the record's whole life so a stale timer can never alias a reused
+        // record's new episode); only reset the state bits to `.running`.
+        record.park_control = .init(packParkControl(parkControlEpoch(record.park_control.raw), .running));
         record.wake_next = null;
         record.active_context = null;
         record.wake_deadline_nanoseconds = 0;
         record.receive_timed_out = false;
+        record.timer_entry = null;
+        record.timer_wheel_owner = null;
+        record.timer_epoch = 0;
         ProcessControlBlock.init(&record.pcb, kernel_fiber, options.manager);
         errdefer fiber_context.reclaimWithoutResume(&record.pcb.fiber);
 
@@ -1381,115 +1435,98 @@ pub const Scheduler = struct {
     }
 
     // -------------------------------------------------------------------------
-    // `receive … after` timeout firing (plan item 2.3, P2-J3)
+    // `receive … after` timeout firing — the per-scheduler timing wheel (P4-J2,
+    // `timing_wheel.zig`). Replaces the Phase-2 O(n)-per-core deadline scan with
+    // O(1) insert/cancel and an occupancy-accelerated clock advance.
     // -------------------------------------------------------------------------
 
-    /// Fire every `receive … after` waiter whose deadline has elapsed —
-    /// make it runnable and mark `receive_timed_out` — and recompute
-    /// `timed_waiter_count` + `earliest_deadline_nanoseconds` from the live
-    /// set (so a message-woken or killed timed waiter self-corrects the
-    /// count here rather than needing a decrement on every wake/kill path).
-    /// A no-op when no timed waiters exist — the zero-`after` fast path.
-    /// Scheduler-thread only; runs at the top of every run-loop iteration.
-    fn fireExpiredReceiveTimeouts(scheduler: *Scheduler) void {
-        if (scheduler.timed_waiter_count == 0) {
-            scheduler.earliest_deadline_nanoseconds = 0;
-            return;
+    /// Deliver an expired `receive … after` timer: the wheel's fire callback,
+    /// run on the owning wheel's scheduler thread when a bucket expires. It
+    /// atomically confirms — with one `cmpxchg` on the packed `park_control` —
+    /// that `record` is STILL parked for exactly the episode this timer was armed
+    /// for (`epoch`), transitions it to `.running` (bumping the epoch so the
+    /// episode ends), marks `receive_timed_out`, and makes it runnable. The CAS
+    /// failing means the timer is stale — a message beat the deadline, the
+    /// process was killed, revived cross-core, or the record recycled — so the
+    /// entry is discarded with no timeout delivered (the "harmlessly fires into
+    /// an already-satisfied receive" path). Because the epoch is packed INTO the
+    /// CAS's expected value, a process that was revived cross-core and re-parked
+    /// (a new episode) can never be grabbed by this stale timer.
+    fn fireReceiveTimeout(scheduler: *Scheduler, context: *anyopaque, epoch: u64) timing_wheel_module.FireOutcome {
+        const record: *ProcessRecord = @ptrCast(@alignCast(context));
+        const pcb = &record.pcb;
+        // One CAS validates {still parked} AND {still episode `epoch`} and ends
+        // the episode. On failure the timer lost the race — discard it.
+        if (record.park_control.cmpxchgStrong(
+            packParkControl(epoch, .parked),
+            packParkControl(epoch + 1, .running),
+            .seq_cst,
+            .seq_cst,
+        )) |_| {
+            return .discarded;
         }
-        const now = monotonicNowNanoseconds();
-        var remaining: usize = 0;
-        var earliest: u64 = 0;
-        var iterator = scheduler.pid_table.iterateLiveProcesses();
-        while (iterator.next()) |live| {
-            const pcb = live.pcb;
-            const record: *ProcessRecord = @fieldParentPtr("pcb", pcb);
-            // Handshake state (acquire) FIRST: only a genuinely `.parked`
-            // process has its deadline fields published (the parker released
-            // `.parked` after writing `yield_reason`/`wake_deadline`), so this
-            // acquire is what makes the non-atomic reads below race-free when a
-            // sibling scheduler scans the same shared pid table (P4-J1).
-            if (record.park_state.load(.acquire) != .parked) continue;
-            if (record.yield_reason != .waiting_for_message_deadline) continue;
-            if (now >= record.wake_deadline_nanoseconds) {
-                // Win the revival against a racing message wake: only the
-                // `.parked → .running` CAS winner fires the timeout. A loss
-                // means a producer notified this waiter (`.notified`) and its
-                // wake owns the enqueue — skip it here.
-                if (record.park_state.cmpxchgStrong(.parked, .running, .seq_cst, .seq_cst) == null) {
-                    // Read `pcb.pid` for the trace BEFORE `readyEnqueue` makes
-                    // the process stealable (P4-J1): once it is on the FIFO a
-                    // sibling core can steal, run, and TEAR IT DOWN — writing
-                    // `pcb.pid` — concurrently with a later read here. Capture it
-                    // while this scan still exclusively owns the revival.
-                    const timed_out_pid = pcb.pid;
-                    record.receive_timed_out = true;
-                    pcb.transitionTo(.runnable);
-                    scheduler.emitTrace(.wake, timed_out_pid);
-                    scheduler.readyEnqueue(record);
-                }
-            } else {
-                remaining += 1;
-                if (earliest == 0 or record.wake_deadline_nanoseconds < earliest) {
-                    earliest = record.wake_deadline_nanoseconds;
-                }
-            }
-        }
-        scheduler.timed_waiter_count = remaining;
-        scheduler.earliest_deadline_nanoseconds = earliest;
+        // Won the revival. Read `pcb.pid` for the trace BEFORE `readyEnqueue`
+        // makes the process stealable (P4-J1): once on the FIFO a sibling core
+        // can steal, run, and tear it down — writing `pcb.pid` — concurrently.
+        const timed_out_pid = pcb.pid;
+        record.receive_timed_out = true;
+        record.timer_entry = null; // the node is being freed by the wheel
+        pcb.transitionTo(.runnable);
+        scheduler.emitTrace(.wake, timed_out_pid);
+        scheduler.readyEnqueue(record);
+        return .fired;
     }
 
-    /// Deterministic-mode (`.forbid_parking`) timeout firing: with no wall
-    /// clock to sleep on, when nothing else can run, advance virtual time
-    /// to the EARLIEST timed-waiter deadline and fire exactly that waiter.
-    /// Returns whether one was fired. This is what gives `receive … after`
-    /// deterministic semantics under the seeded scheduler (a timeout fires
-    /// precisely when the system would otherwise deadlock). Scheduler-thread
-    /// only.
-    fn fireEarliestReceiveTimeout(scheduler: *Scheduler) bool {
-        if (scheduler.timed_waiter_count == 0) return false;
-        var earliest_record: ?*ProcessRecord = null;
-        var live_timed_waiters: usize = 0;
-        var iterator = scheduler.pid_table.iterateLiveProcesses();
-        while (iterator.next()) |live| {
-            const pcb = live.pcb;
-            const record: *ProcessRecord = @fieldParentPtr("pcb", pcb);
-            // Handshake acquire before the non-atomic deadline read (see
-            // `fireExpiredReceiveTimeouts`). Deterministic mode is single-
-            // threaded, so `.parked` always holds for a live timed waiter here.
-            if (record.park_state.load(.acquire) != .parked) continue;
-            if (record.yield_reason != .waiting_for_message_deadline) continue;
-            live_timed_waiters += 1;
-            const current = earliest_record orelse {
-                earliest_record = record;
-                continue;
-            };
-            if (record.wake_deadline_nanoseconds < current.wake_deadline_nanoseconds) {
-                earliest_record = record;
-            }
-        }
-        const fire = earliest_record orelse {
-            scheduler.timed_waiter_count = 0;
-            scheduler.earliest_deadline_nanoseconds = 0;
+    /// Arm a `receive … after` timer for `record` on THIS scheduler's wheel at
+    /// its `wake_deadline_nanoseconds`, tagged with the current park-episode
+    /// epoch, and record the entry / wheel owner / epoch on the record for O(1)
+    /// same-core cancellation. Returns false only if the wheel node could not be
+    /// allocated (system OOM) — the caller then re-runs the process rather than
+    /// parking it timerless. Scheduler-thread only.
+    fn armReceiveTimer(scheduler: *Scheduler, record: *ProcessRecord) bool {
+        const epoch = parkControlEpoch(record.park_control.load(.seq_cst));
+        const entry = scheduler.receive_timer_wheel.insert(
+            record,
+            epoch,
+            record.wake_deadline_nanoseconds,
+            monotonicNowNanoseconds(),
+        ) catch {
+            record.timer_entry = null;
+            record.timer_wheel_owner = null;
             return false;
         };
-        // Win the revival against a racing message wake (a no-op contention in
-        // single-threaded deterministic mode). If a producer notified it first,
-        // fall through and re-scan next call.
-        if (fire.park_state.cmpxchgStrong(.parked, .running, .seq_cst, .seq_cst) != null) {
-            scheduler.timed_waiter_count = live_timed_waiters;
-            return true;
-        }
-        // Capture the pid for the trace before `readyEnqueue` (deterministic
-        // mode is single-threaded, so this cannot race today, but it mirrors
-        // `fireExpiredReceiveTimeouts` — never read a shared PCB field after the
-        // process is enqueued and thus potentially owned by another core).
-        const fired_pid = fire.pcb.pid;
-        fire.receive_timed_out = true;
-        fire.pcb.transitionTo(.runnable);
-        scheduler.emitTrace(.wake, fired_pid);
-        scheduler.readyEnqueue(fire);
-        scheduler.timed_waiter_count = live_timed_waiters - 1;
+        record.timer_entry = entry;
+        record.timer_wheel_owner = scheduler;
+        record.timer_epoch = epoch;
         return true;
+    }
+
+    /// Advance this scheduler's timing wheel to now and fire every elapsed
+    /// `receive … after` timer. A no-op when the wheel is empty — the
+    /// zero-`after` fast path. Scheduler-thread only; runs at the top of every
+    /// run-loop / worker iteration (the deadline analogue of `drainWakeStack`).
+    fn advanceReceiveTimers(scheduler: *Scheduler) void {
+        if (scheduler.receive_timer_wheel.isEmpty()) return;
+        scheduler.receive_timer_wheel.advance(
+            monotonicNowNanoseconds(),
+            *Scheduler,
+            scheduler,
+            fireReceiveTimeout,
+        );
+    }
+
+    /// Deterministic-mode (`.forbid_parking`) timeout firing: with no wall clock
+    /// to sleep on, when nothing else can run, advance the wheel's virtual clock
+    /// straight to the earliest armed timer and fire it. Returns whether the
+    /// wheel held any timer. This gives `receive … after` deterministic semantics
+    /// under the seeded scheduler (a timeout fires precisely when the system
+    /// would otherwise deadlock). Scheduler-thread only.
+    fn fireEarliestReceiveTimeout(scheduler: *Scheduler) bool {
+        return scheduler.receive_timer_wheel.advanceToEarliestAndFire(
+            *Scheduler,
+            scheduler,
+            fireReceiveTimeout,
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1510,7 +1547,7 @@ pub const Scheduler = struct {
         defer current_scheduler = previous_scheduler;
         while (true) {
             scheduler.drainWakeStack();
-            scheduler.fireExpiredReceiveTimeouts();
+            scheduler.advanceReceiveTimers();
             if (scheduler.dequeueNextRunnable()) |record| {
                 if (record.pending_kill) {
                     // Killed while queued: torn down without ever running
@@ -1564,7 +1601,7 @@ pub const Scheduler = struct {
             // every join of an exited process).
             if (!scheduler.pid_table.isAlive(target)) return;
             scheduler.drainWakeStack();
-            scheduler.fireExpiredReceiveTimeouts();
+            scheduler.advanceReceiveTimers();
             if (scheduler.dequeueNextRunnable()) |record| {
                 if (record.pending_kill) {
                     // Killed while queued: torn down without ever running
@@ -1628,7 +1665,7 @@ pub const Scheduler = struct {
     /// `receive … after` deadlines. Run at the top of every worker iteration.
     pub fn serviceLocalEvents(scheduler: *Scheduler) void {
         scheduler.drainWakeStack();
-        scheduler.fireExpiredReceiveTimeouts();
+        scheduler.advanceReceiveTimers();
     }
 
     /// Take the next runnable process from this core (LIFO slot then FIFO), or
@@ -1846,18 +1883,41 @@ pub const Scheduler = struct {
                         _ = scheduler.commitPark(record);
                     },
                     .waiting_for_message_deadline => {
-                        scheduler.emitTrace(.wait, pcb.pid);
-                        pcb.transitionTo(.waiting);
-                        // A `receive … after` waiter: same handshake, and it is
-                        // countable so the run loop scans deadlines and bounds
-                        // its idle park — but ONLY while it actually stayed
-                        // parked. If the re-check revived it (a message beat the
-                        // park), it is runnable, not a timed waiter. The count
-                        // self-corrects on the next scan regardless (a woken or
-                        // killed waiter is no longer a `.waiting` deadline
-                        // waiter), so it is only ever incremented here.
-                        if (scheduler.commitPark(record)) {
-                            scheduler.timed_waiter_count += 1;
+                        // Arm the timing-wheel entry on THIS core's wheel BEFORE
+                        // committing the park, so the entry's writes
+                        // (`timer_entry`/`timer_wheel_owner`/`timer_epoch`) are
+                        // published by `commitPark`'s `.parked` release edge — a
+                        // cross-core reviver that later acquires `.parked` then
+                        // sees a coherent owner and correctly declines to touch
+                        // the entry (leaving it for lazy reap).
+                        if (scheduler.armReceiveTimer(record)) {
+                            scheduler.emitTrace(.wait, pcb.pid);
+                            pcb.transitionTo(.waiting);
+                            if (scheduler.commitPark(record)) {
+                                // Genuinely parked; the wheel entry fires or is
+                                // cancelled by a later message/kill.
+                            } else {
+                                // A message beat the park (`commitPark`
+                                // self-revived the process): cancel the just-armed
+                                // entry eagerly — same core, O(1) — since no
+                                // cross-core actor ever saw a `.parked` publish
+                                // for it, then end this aborted episode.
+                                scheduler.tryEagerCancelReceiveTimer(record, record.timer_epoch);
+                                const control = record.park_control.load(.seq_cst);
+                                record.park_control.store(
+                                    packParkControl(parkControlEpoch(control) + 1, .running),
+                                    .seq_cst,
+                                );
+                            }
+                        } else {
+                            // The wheel node could not be allocated (system OOM).
+                            // Do not park timerless (that would drop the `after`
+                            // deadline); re-run the process so `receiveWaitTimeout`
+                            // re-checks its deadline against the monotonic clock
+                            // and re-attempts the park — graceful degradation
+                            // under memory exhaustion, no `after` semantics lost.
+                            pcb.transitionTo(.runnable);
+                            scheduler.readyEnqueue(record);
                         }
                     },
                 }
@@ -1883,15 +1943,25 @@ pub const Scheduler = struct {
     /// own thread.
     fn commitPark(scheduler: *Scheduler, record: *ProcessRecord) bool {
         const pcb = &record.pcb;
-        if (record.park_state.cmpxchgStrong(.running, .parked, .seq_cst, .seq_cst)) |observed| {
+        // Park within the CURRENT episode's epoch: `.running → .parked`, epoch
+        // unchanged. The owner is the only writer of the epoch bits, so reading
+        // them here is race-free (a concurrent wake seam only flips the state to
+        // `.notified`, preserving the epoch).
+        const epoch = parkControlEpoch(record.park_control.load(.seq_cst));
+        if (record.park_control.cmpxchgStrong(
+            packParkControl(epoch, .running),
+            packParkControl(epoch, .parked),
+            .seq_cst,
+            .seq_cst,
+        )) |observed| {
             // Not `.running`: a message landed in the park window (`.notified`).
             // The suspension is resolved by that message — a genuine wakeup, so
             // emit `.wake` (the trace's "a waiting process became runnable"
             // event) exactly as the wake-stack drain does for a message that
             // arrives after the park commits. This keeps the wait/wake tallies
             // matched and the deterministic trace complete.
-            std.debug.assert(observed == .notified);
-            record.park_state.store(.running, .seq_cst);
+            std.debug.assert(parkControlState(observed) == .notified);
+            record.park_control.store(packParkControl(epoch, .running), .seq_cst);
             pcb.transitionTo(.runnable);
             scheduler.emitTrace(.wake, pcb.pid);
             scheduler.reviveEnqueue(record);
@@ -1907,6 +1977,16 @@ pub const Scheduler = struct {
     fn teardownProcess(scheduler: *Scheduler, record: *ProcessRecord, reason: ExitReason) void {
         const pcb = &record.pcb;
         const exit_pid = pcb.pid; // captured: unregister resets it
+
+        // (0) Cancel any live `receive … after` timer and END its park episode
+        // (bump the epoch) BEFORE the record can recycle. This is mandatory for
+        // correctness: without the epoch bump a stale wheel entry (epoch e)
+        // could later fire against this record reused for a new process that
+        // reaches episode e again — the recycle-aliasing hazard. Same-core
+        // (owning-wheel) entries are cancelled eagerly; a cross-core entry is
+        // reaped lazily by its owning wheel, whose fire callback now sees the
+        // bumped epoch and discards it.
+        scheduler.cancelProcessTimer(record);
 
         // (1) Crash report FIRST (plan 1.6, `crash_report.zig`): the
         // report snapshots the pid, state, mailbox depth, and — for a
@@ -2254,17 +2334,61 @@ pub const Scheduler = struct {
             record.wake_next = null;
             const pcb = &record.pcb;
             // The unique wake-seam winner swapped `.notified` in over `.parked`
-            // before pushing this record, so this core is its sole reviver.
-            // Reset the handshake to `.running` for the process's next life, and
-            // if it is still `.waiting` (not torn down between park and drain)
-            // make it runnable and enqueue it (LIFO slot under `work_stealing`).
-            record.park_state.store(.running, .seq_cst);
+            // before pushing this record, so this core is its sole reviver. END
+            // the park episode: bump the epoch (invalidating any stale
+            // `receive … after` timer for it — in this or another core's wheel)
+            // and reset the state to `.running` for the process's next life.
+            const ended_epoch = parkControlEpoch(record.park_control.load(.seq_cst));
+            record.park_control.store(packParkControl(ended_epoch + 1, .running), .seq_cst);
+            // A `receive … after` waiter whose timer lives in THIS core's wheel
+            // (a same-core message wake) gets its entry cancelled eagerly — O(1),
+            // same thread. A cross-core wake leaves the entry for the owning
+            // wheel to reap lazily (its epoch now mismatches, so the fire
+            // callback discards it). `ended_epoch` proves the entry is the
+            // current episode's live node before it is touched.
+            if (record.yield_reason == .waiting_for_message_deadline) {
+                scheduler.tryEagerCancelReceiveTimer(record, ended_epoch);
+            }
             if (pcb.currentState() == .waiting) {
                 pcb.transitionTo(.runnable);
                 scheduler.reviveEnqueue(record);
                 scheduler.emitTrace(.wake, pcb.pid);
             }
         }
+    }
+
+    /// If `record`'s live `receive … after` timer lives in THIS scheduler's
+    /// wheel and still belongs to episode `episode_epoch`, cancel it in O(1).
+    /// Same-core only: a cross-core caller (`timer_wheel_owner != scheduler`)
+    /// returns without touching the entry, leaving it for the owning wheel to
+    /// reap lazily. The `timer_epoch` check proves the entry is the current
+    /// episode's live node so a freed node is never dereferenced. Scheduler-thread
+    /// only.
+    fn tryEagerCancelReceiveTimer(scheduler: *Scheduler, record: *ProcessRecord, episode_epoch: u64) void {
+        if (record.timer_wheel_owner != scheduler) return;
+        if (record.timer_epoch != episode_epoch) return;
+        if (record.timer_entry) |entry| {
+            scheduler.receive_timer_wheel.cancel(entry);
+            record.timer_entry = null;
+        }
+    }
+
+    /// Cancel any live `receive … after` timer for a process being torn down and
+    /// END its park episode (bump the epoch). The epoch bump is what prevents a
+    /// stale wheel entry from ever firing against a recycled record's later
+    /// episode (the epoch is monotonic for a record's whole life). A same-core
+    /// entry is cancelled in O(1); a cross-core entry is left for its owning
+    /// wheel to reap lazily (its fire callback now sees the bumped epoch and
+    /// discards it). Scheduler-thread only.
+    fn cancelProcessTimer(scheduler: *Scheduler, record: *ProcessRecord) void {
+        const control = record.park_control.load(.seq_cst);
+        const epoch = parkControlEpoch(control);
+        // Only a `.waiting_for_message_deadline` waiter can hold a live entry;
+        // for any other teardown the timer (if it ever existed) already ended.
+        if (record.yield_reason == .waiting_for_message_deadline) {
+            scheduler.tryEagerCancelReceiveTimer(record, epoch);
+        }
+        record.park_control.store(packParkControl(epoch + 1, .running), .seq_cst);
     }
 
     /// Push a revived record onto `target`'s wake stack (lock-free Treiber) and
@@ -2304,8 +2428,23 @@ pub const Scheduler = struct {
         // `.running`/`.notified` means the process is active (it will observe
         // the message via its own receive, or self-revive at `commitPark`) — no
         // push. The message push in `mailbox.push` is sequenced-before this RMW,
-        // so the reviver sees it.
-        if (record.park_state.swap(.notified, .seq_cst) != .parked) return;
+        // so the reviver sees it. A seq_cst CAS loop sets the state to
+        // `.notified` while PRESERVING the epoch bits (the epoch belongs to the
+        // owner; the wake seam must not disturb it — see `packParkControl`).
+        // Only the owner's cold revival/teardown/fire paths ever change the
+        // epoch, so this loop retries essentially never.
+        var control = record.park_control.load(.seq_cst);
+        const displaced = while (true) {
+            const state = parkControlState(control);
+            if (state == .notified) return; // already notified — nothing to own
+            const desired = packParkControl(parkControlEpoch(control), .notified);
+            if (record.park_control.cmpxchgWeak(control, desired, .seq_cst, .seq_cst)) |actual| {
+                control = actual;
+                continue;
+            }
+            break state;
+        };
+        if (displaced != .parked) return; // displaced `.running` — process is active
         // We own the revival. Route onto the producer's core for wake locality;
         // a foreign producer falls back to the target's last-running scheduler.
         const target = current_scheduler orelse record.scheduler;
@@ -2342,13 +2481,12 @@ pub const Scheduler = struct {
 
     /// The bound for one idle futex park: the default defense-in-depth
     /// re-check period, shortened to the time remaining until the earliest
-    /// `receive … after` deadline so that timeout fires on schedule (the
-    /// wake then re-runs the loop, whose `fireExpiredReceiveTimeouts` makes
-    /// the expired waiter runnable). No timed waiters ⇒ the default bound.
+    /// timing-wheel deadline so that timeout fires on schedule (the wake then
+    /// re-runs the loop, whose `advanceReceiveTimers` makes the expired waiter
+    /// runnable). No armed timers ⇒ the default bound.
     fn idleParkTimeoutNanoseconds(scheduler: *Scheduler) u64 {
         const default_bound = scheduler.options.park_timeout_nanoseconds;
-        const deadline = scheduler.earliest_deadline_nanoseconds;
-        if (deadline == 0) return default_bound;
+        const deadline = scheduler.receive_timer_wheel.earliestDeadlineNanoseconds() orelse return default_bound;
         const now = monotonicNowNanoseconds();
         if (now >= deadline) return 1; // already due — wake promptly to fire it
         return @min(default_bound, deadline - now);
@@ -2364,7 +2502,11 @@ pub const Scheduler = struct {
             scheduler.cached_record_count -= 1;
             return record;
         }
-        return scheduler.backing_allocator.create(ProcessRecord);
+        const record = try scheduler.backing_allocator.create(ProcessRecord);
+        // A brand-new record starts at park epoch 0 (recycled records retain
+        // their monotonic epoch — see `spawn`); `spawn` sets every other field.
+        record.park_control = .init(packParkControl(0, .running));
+        return record;
     }
 
     fn recycleRecord(scheduler: *Scheduler, record: *ProcessRecord) void {

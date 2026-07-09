@@ -161,6 +161,7 @@ pub const process = @import("process.zig");
 pub const pid_table = @import("pid_table.zig");
 pub const mailbox = @import("mailbox.zig");
 pub const envelope_pool = @import("envelope_pool.zig");
+pub const timing_wheel = @import("timing_wheel.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const scheduler_pool = @import("scheduler_pool.zig");
 pub const deterministic = @import("deterministic.zig");
@@ -221,6 +222,7 @@ test {
     _ = pid_table;
     _ = mailbox;
     _ = envelope_pool;
+    _ = timing_wheel;
     _ = scheduler;
     _ = scheduler_pool;
     _ = deterministic;
