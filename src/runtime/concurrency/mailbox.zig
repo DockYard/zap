@@ -119,6 +119,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const envelope_pool = @import("envelope_pool.zig");
+const signal_module = @import("signal.zig");
 
 /// The opaque payload reference an envelope carries — the Phase 2 seam.
 /// Phase 1 treats these three words as opaque bytes: tests stamp them
@@ -152,6 +153,13 @@ pub const Fragment = struct {
     /// discriminator. Opaque to the mailbox and pool — the kernel never
     /// interprets the payload, only invokes this caller-supplied hook.
     moved_reclaim: ?MovedReclaimFn = null,
+    /// Signal discriminator (P5-J1, `signal.zig`): `.none` for an ordinary user
+    /// message, `.exit`/`.down` for a kernel-synthesized exit/`DOWN` signal
+    /// merged into the mailbox for a trapping/monitoring process. When non-`.none`
+    /// the payload is a `signal.SignalPayload` (a ledger block, freed by the
+    /// receiver's ordinary `zap_proc_envelope_free`); the receive lowering reads
+    /// this to tell a signal from a user message.
+    signal_kind: signal_module.SignalKind = .none,
 };
 
 /// Reclaim hook for an un-adopted moved payload (see `Fragment.moved_reclaim`).

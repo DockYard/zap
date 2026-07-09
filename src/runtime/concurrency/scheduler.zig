@@ -289,6 +289,7 @@ const envelope_pool_module = @import("envelope_pool.zig");
 const process_module = @import("process.zig");
 const crash_report_module = @import("crash_report.zig");
 const timing_wheel_module = @import("timing_wheel.zig");
+const signal_module = @import("signal.zig");
 
 const Pid = pid_table_module.Pid;
 const PidTable = pid_table_module.PidTable;
@@ -644,9 +645,25 @@ pub const ProcessRecord = struct {
     /// is live and safe to dereference — without touching the (possibly freed)
     /// node. Scheduler-thread (owner) only.
     timer_epoch: u64,
-    /// Kill requested (untrappable). Scheduler-thread only: set by
-    /// `kill`, observed at scheduling points and safepoints.
-    pending_kill: bool,
+    /// Kill/exit requested: the process must die at its next scheduling point
+    /// or safepoint. Set by same-core `kill` and by cross-core exit-signal
+    /// delivery (`killWithReason`, P5-J1), observed at scheduling points,
+    /// safepoints, and the receive loop. ATOMIC because under M:N an exit
+    /// signal from a process on another core dooms this one: the killer stores
+    /// `true` (release) then wakes the target (`reviveIfParked`), and the
+    /// target's core loads it (acquire) at its next observation point. The
+    /// paired reason lives in the PCB's `signal_state.pending_exit` (set under
+    /// that lock before this store); a plain same-core `kill`/self-exit leaves
+    /// `pending_exit` null and teardown defaults the reason to `killed`.
+    pending_kill: std.atomic.Value(bool),
+    /// Cache of the most recently `awaitSignal`-consumed exit/`DOWN` signal —
+    /// the raw J1 test/observation surface (`abi.zig`'s `zap_proc_last_signal_*`).
+    /// Owner-only (written and read by this process on its own core, in one
+    /// `awaitSignal` → read sequence). `last_signal_kind` is `.none` until the
+    /// first signal is consumed.
+    last_signal: signal_module.SignalPayload,
+    /// Kind of the cached `last_signal` (`.none` before the first consumed).
+    last_signal_kind: signal_module.SignalKind,
     /// The cross-thread wake handshake state (P4-J1; see `ParkState`). A
     /// spawned process is `.running`; the scheduler suspending it publishes
     /// `.parked`; the unique `.parked → .running` CAS winner (a producer that
@@ -784,7 +801,7 @@ pub const ProcessContext = struct {
         if (pcb.preemption_budget > 0) pcb.preemption_budget -= 1;
         const watchdog_requested =
             record.scheduler.watchdog_preempt_flag.load(.monotonic);
-        if (pcb.preemption_budget == 0 or watchdog_requested or record.pending_kill) {
+        if (pcb.preemption_budget == 0 or watchdog_requested or record.pending_kill.load(.acquire)) {
             record.yield_reason = .reenqueue;
             context.execution.yield();
         }
@@ -817,7 +834,7 @@ pub const ProcessContext = struct {
         const scheduler = record.scheduler;
         const watchdog_requested =
             scheduler.watchdog_preempt_flag.load(.monotonic);
-        if (record.pending_kill or watchdog_requested or scheduler.ready_count > 0) {
+        if (record.pending_kill.load(.acquire) or watchdog_requested or scheduler.ready_count > 0) {
             record.yield_reason = .reenqueue;
             context.execution.yield();
         }
@@ -835,7 +852,7 @@ pub const ProcessContext = struct {
     pub fn receive(context: *ProcessContext) *mailbox_module.Envelope {
         const record = context.record;
         while (true) {
-            if (record.pending_kill) {
+            if (record.pending_kill.load(.acquire)) {
                 // Die at this safepoint rather than consuming more input.
                 record.yield_reason = .reenqueue;
                 context.execution.yield();
@@ -870,7 +887,7 @@ pub const ProcessContext = struct {
         if (timeout_nanoseconds == 0) {
             var gap_spins: u32 = 0;
             while (true) {
-                if (record.pending_kill) {
+                if (record.pending_kill.load(.acquire)) {
                     record.yield_reason = .reenqueue;
                     context.execution.yield();
                     continue;
@@ -889,7 +906,7 @@ pub const ProcessContext = struct {
 
         const deadline_nanoseconds = context.scheduler.options.clock.read() +| timeout_nanoseconds;
         while (true) {
-            if (record.pending_kill) {
+            if (record.pending_kill.load(.acquire)) {
                 record.yield_reason = .reenqueue;
                 context.execution.yield();
                 continue;
@@ -973,6 +990,90 @@ pub const ProcessContext = struct {
     /// next safepoint). See `Scheduler.kill`.
     pub fn kill(context: *ProcessContext, target: Pid) KillOutcome {
         return context.scheduler.kill(target);
+    }
+
+    // -- Kernel signal primitives (P5-J1, `signal.zig`) -----------------------
+
+    /// `link(target)`: establish a bidirectional link (idempotent). See
+    /// `Scheduler.signalLink`.
+    pub fn link(context: *ProcessContext, target: Pid) bool {
+        return context.scheduler.signalLink(context.record, target);
+    }
+
+    /// `unlink(target)`: break a bidirectional link (idempotent).
+    pub fn unlink(context: *ProcessContext, target: Pid) bool {
+        return context.scheduler.signalUnlink(context.record, target);
+    }
+
+    /// `monitor(target) -> Ref`: install a stackable, unidirectional monitor.
+    pub fn monitor(context: *ProcessContext, target: Pid) signal_module.Ref {
+        return context.scheduler.signalMonitor(context.record, target);
+    }
+
+    /// `demonitor(ref)`: drop a monitor this process holds.
+    pub fn demonitor(context: *ProcessContext, ref: signal_module.Ref) bool {
+        return context.scheduler.signalDemonitor(context.record, ref);
+    }
+
+    /// `exit(target, reason)`: send a trappable exit signal (the Zap surface
+    /// classifies the reason atom into `normal`/`abnormal`).
+    pub fn exitSignal(
+        context: *ProcessContext,
+        target: Pid,
+        category: signal_module.ReasonCategory,
+        reason_term: u64,
+    ) SendOutcome {
+        return context.scheduler.signalExit(context.record, target, category, reason_term);
+    }
+
+    /// `exit(target, kill)`: the untrappable kill (target dies `killed`).
+    pub fn killUntrappable(context: *ProcessContext, target: Pid) SendOutcome {
+        return context.scheduler.signalKill(context.record, target);
+    }
+
+    /// Set this process's `trap_exit` flag, returning the previous value.
+    pub fn setTrapExit(context: *ProcessContext, value: bool) bool {
+        return context.record.pcb.signal_state.setTrapExit(value);
+    }
+
+    /// Self-terminate with an explicit reason (`Process.exit()` = `normal`;
+    /// `Process.exit(reason)` = the given category/term). Records the reason,
+    /// arms `pending_kill`, and yields; the scheduler observes the kill when the
+    /// quantum ends and tears the process down (the yield never returns for a
+    /// killed process — the caller follows with `unreachable`). Overrides any
+    /// signal-recorded reason (a self-exit is definitive).
+    pub fn exitSelf(context: *ProcessContext, category: signal_module.ReasonCategory, reason_term: u64) void {
+        context.record.pcb.signal_state.setPendingExit(.{ .category = category, .term = reason_term }, true);
+        context.record.pending_kill.store(true, .release);
+        context.yieldNow();
+    }
+
+    /// Whether this process traps exits.
+    pub fn trapsExits(context: *const ProcessContext) bool {
+        return context.record.pcb.signal_state.trapsExits();
+    }
+
+    /// Blocking receive of the next signal message; caches it and returns the
+    /// reason term (`lastSignal*` read the other fields). See
+    /// `Scheduler.awaitSignal`.
+    pub fn awaitSignal(context: *ProcessContext) u64 {
+        return context.scheduler.awaitSignal(context);
+    }
+
+    /// The `from` pid bits of the most recently `awaitSignal`-consumed signal.
+    pub fn lastSignalFrom(context: *const ProcessContext) u64 {
+        return context.record.last_signal.from_bits;
+    }
+
+    /// The monitor ref of the most recently consumed signal (`down` only).
+    pub fn lastSignalRef(context: *const ProcessContext) signal_module.Ref {
+        return context.record.last_signal.ref;
+    }
+
+    /// The kind of the most recently consumed signal (as its enum tag: 1=exit,
+    /// 2=down; 0=none if none consumed yet).
+    pub fn lastSignalKind(context: *const ProcessContext) u8 {
+        return @intFromEnum(context.record.last_signal_kind);
     }
 
     /// Run `operation` on the blocking / dirty-scheduler pool (P4-J3,
@@ -1476,6 +1577,14 @@ pub const Scheduler = struct {
         /// clock; the seeded multi-scheduler simulator installs a virtual
         /// clock so `receive … after` firing is a pure function of the seed.
         clock: Clock = .wall,
+        /// The kernel signal runtime (P5-J1, `signal.zig`): the shared node
+        /// pool, reason-atom registry, and payload seam that links/monitors/
+        /// exit signals stand on. A `SchedulerPool` creates ONE and shares it
+        /// across every core (like the pid table and envelope pool); a
+        /// standalone scheduler with no signal usage leaves it null (its
+        /// processes have empty signal sets, so teardown propagation is a
+        /// no-op). Signal intrinsics require it.
+        signal_runtime: ?*signal_module.SignalRuntime = null,
     };
 
     /// Per-spawn options.
@@ -1629,7 +1738,11 @@ pub const Scheduler = struct {
         record.entry_argument = options.argument;
         record.ready_next = null;
         record.yield_reason = .reenqueue;
-        record.pending_kill = false;
+        // Reset the kill flag for this incarnation (a recycled record inherits
+        // the previous incarnation's `true`, set when it was torn down).
+        record.pending_kill.store(false, .monotonic);
+        record.last_signal = .{};
+        record.last_signal_kind = .none;
         // Preserve the record's park epoch across recycle (it is monotonic for
         // the record's whole life so a stale timer can never alias a reused
         // record's new episode); only reset the state bits to `.running`.
@@ -1705,7 +1818,7 @@ pub const Scheduler = struct {
         const record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
         switch (target_pcb.currentState()) {
             .waiting => {
-                scheduler.teardownProcess(record, .killed);
+                scheduler.teardownProcess(record, scheduler.exitStatusForPending(record));
                 return .killed;
             },
             .runnable, .running, .blocking => {
@@ -1717,7 +1830,7 @@ pub const Scheduler = struct {
                 // interrupted — BEAM's dirty-NIF semantics), the process
                 // re-attaches, and `runNext` observes `pending_kill` and tears
                 // it down before its next quantum.
-                record.pending_kill = true;
+                record.pending_kill.store(true, .release);
                 return .kill_pending;
             },
             // `.embryo` is only observable inside `spawn` on this same
@@ -1741,7 +1854,7 @@ pub const Scheduler = struct {
             // trace ends, so exempting it keeps the seam's inventory to
             // decisions that can diverge replayed runs.
             if (scheduler.dequeueReadyAt(0)) |record| {
-                scheduler.teardownProcess(record, .killed);
+                scheduler.teardownProcess(record, scheduler.exitStatusForPending(record));
                 continue;
             }
             const waiting_record = find_waiting: {
@@ -1754,7 +1867,7 @@ pub const Scheduler = struct {
                 }
                 break :find_waiting null;
             } orelse break;
-            scheduler.teardownProcess(waiting_record, .killed);
+            scheduler.teardownProcess(waiting_record, scheduler.exitStatusForPending(waiting_record));
         }
         // Every live process is either runnable (queued) or waiting, so
         // the two sweeps above are exhaustive.
@@ -1900,10 +2013,10 @@ pub const Scheduler = struct {
             scheduler.drainReattachStack();
             scheduler.advanceReceiveTimers();
             if (scheduler.dequeueNextRunnable()) |record| {
-                if (record.pending_kill) {
+                if (record.pending_kill.load(.acquire)) {
                     // Killed while queued: torn down without ever running
                     // (legal `runnable → exiting`).
-                    scheduler.teardownProcess(record, .killed);
+                    scheduler.teardownProcess(record, scheduler.exitStatusForPending(record));
                     continue;
                 }
                 scheduler.runQuantum(record);
@@ -1955,10 +2068,10 @@ pub const Scheduler = struct {
             scheduler.drainReattachStack();
             scheduler.advanceReceiveTimers();
             if (scheduler.dequeueNextRunnable()) |record| {
-                if (record.pending_kill) {
+                if (record.pending_kill.load(.acquire)) {
                     // Killed while queued: torn down without ever running
                     // (legal `runnable → exiting`).
-                    scheduler.teardownProcess(record, .killed);
+                    scheduler.teardownProcess(record, scheduler.exitStatusForPending(record));
                     continue;
                 }
                 scheduler.runQuantum(record);
@@ -2047,8 +2160,8 @@ pub const Scheduler = struct {
     /// dequeued from this core, pulled from the global queue, or just stolen;
     /// `runQuantum` claims ownership for the quantum (migration). Owner-thread.
     pub fn runNext(scheduler: *Scheduler, record: *ProcessRecord) void {
-        if (record.pending_kill) {
-            scheduler.teardownProcess(record, .killed);
+        if (record.pending_kill.load(.acquire)) {
+            scheduler.teardownProcess(record, scheduler.exitStatusForPending(record));
             return;
         }
         scheduler.runQuantum(record);
@@ -2121,7 +2234,7 @@ pub const Scheduler = struct {
     /// (pool shutdown, single-threaded) has already removed it from every run
     /// queue, or it is a `.waiting` process that sits on none.
     pub fn teardownAsStraggler(scheduler: *Scheduler, record: *ProcessRecord) void {
-        scheduler.teardownProcess(record, .killed);
+        scheduler.teardownProcess(record, scheduler.exitStatusForPending(record));
     }
 
     /// The `ProcessContext` of the process the scheduler is currently
@@ -2257,12 +2370,23 @@ pub const Scheduler = struct {
         scheduler.watchdog_preempt_flag.store(false, .monotonic);
 
         switch (outcome) {
-            .finished => scheduler.teardownProcess(record, .normal),
+            .finished => {
+                // A process that finished its entry exits `normal` — UNLESS a
+                // signal doomed it first (a self `exit_signal`/kill whose
+                // `pending_kill` the finishing fiber never hit a safepoint to
+                // observe): honor the pending reason so a self-signalled abnormal
+                // exit still propagates abnormally (P5-J1).
+                if (record.pending_kill.load(.acquire)) {
+                    scheduler.teardownProcess(record, scheduler.exitStatusForPending(record));
+                } else {
+                    scheduler.teardownProcess(record, scheduler.normalStatus());
+                }
+            },
             .yielded => {
-                if (record.pending_kill) {
+                if (record.pending_kill.load(.acquire)) {
                     // Killed at a safepoint (or while it happened to
                     // yield): `running → exiting`.
-                    scheduler.teardownProcess(record, .killed);
+                    scheduler.teardownProcess(record, scheduler.exitStatusForPending(record));
                     return;
                 }
                 switch (record.yield_reason) {
@@ -2525,12 +2649,415 @@ pub const Scheduler = struct {
     }
 
     // -------------------------------------------------------------------------
+    // Kernel signal mechanism (P5-J1, `signal.zig`): links, monitors, exit
+    // signals, trap_exit. The genuine intrinsics over which J2/J3 write
+    // spawn_link/spawn_monitor/supervisors in PURE ZAP. Every cross-core touch
+    // of a target (deliver a signal, mutate its sets) rides the SAME pin
+    // (`beginSend`/`endSend`) + `isAlive` re-check the copy send uses, so it is
+    // race-free against the target's concurrent teardown; teardown propagation
+    // runs after `closeAndQuiesce`, which drains those pins, so no set-mutation
+    // is ever missed or double-fired (P4-R1 grace period).
+    // -------------------------------------------------------------------------
+
+    /// The kernel signal runtime, or null when this scheduler has none wired (a
+    /// standalone non-signal scheduler). Teardown propagation treats null as
+    /// "no links/monitors possible" (a no-op); the signal intrinsics require it.
+    inline fn signalRuntimePtr(scheduler: *Scheduler) ?*signal_module.SignalRuntime {
+        return scheduler.options.signal_runtime;
+    }
+
+    /// The registered `normal` reason term (0 with no signal runtime — only
+    /// reachable when no process has links/monitors, so the term is unused).
+    fn normalReasonTerm(scheduler: *Scheduler) u64 {
+        return if (scheduler.options.signal_runtime) |sr| sr.reason_atoms.normalTerm() else 0;
+    }
+
+    /// The registered `killed` reason term.
+    fn killedReasonTerm(scheduler: *Scheduler) u64 {
+        return if (scheduler.options.signal_runtime) |sr| sr.reason_atoms.killedTerm() else 0;
+    }
+
+    /// The exit status of a normally-finishing process.
+    fn normalStatus(scheduler: *Scheduler) signal_module.ExitStatus {
+        return signal_module.ExitStatus.normalStatus(scheduler.normalReasonTerm());
+    }
+
+    /// The exit status of a process torn down because `pending_kill` was set:
+    /// the reason a signal recorded (`pending_exit`), or `killed` for a plain
+    /// same-core kill / self-exit that recorded none.
+    fn exitStatusForPending(scheduler: *Scheduler, record: *ProcessRecord) signal_module.ExitStatus {
+        return record.pcb.signal_state.getPendingExit() orelse
+            signal_module.ExitStatus.abnormalStatus(scheduler.killedReasonTerm());
+    }
+
+    /// Push one exit/`DOWN` signal MESSAGE onto `target_pcb`'s mailbox from
+    /// `sender_record`'s envelope handle. The payload (`signal.SignalPayload`)
+    /// is a runtime ledger block (via the payload seam) so the receiver's
+    /// ordinary `zap_proc_envelope_free` reclaims it exactly like a copied user
+    /// payload; the `Fragment.signal_kind` discriminator marks it a signal. The
+    /// caller holds a `beginSend` pin on the target (mailbox-race-free). A
+    /// payload/envelope OOM drops the signal (best-effort, Erlang-faithful — a
+    /// signal is not guaranteed under memory pressure).
+    fn pushSignalMessage(
+        scheduler: *Scheduler,
+        sender_record: *ProcessRecord,
+        target_pcb: *ProcessControlBlock,
+        kind: signal_module.SignalKind,
+        payload: signal_module.SignalPayload,
+    ) void {
+        const sr = scheduler.signalRuntimePtr() orelse return;
+        const seam = sr.payload_seam;
+        const allocate = seam.allocate orelse return;
+        const body = allocate(seam.context, @sizeOf(signal_module.SignalPayload)) orelse return;
+        const payload_slot: *signal_module.SignalPayload = @ptrCast(@alignCast(body));
+        payload_slot.* = payload;
+        const envelope = sender_record.envelope_handle.allocate() catch {
+            if (seam.free) |free_payload| free_payload(seam.context, body, @sizeOf(signal_module.SignalPayload));
+            return;
+        };
+        envelope.fragment = .{
+            .payload_pointer = body,
+            .payload_byte_length = @sizeOf(signal_module.SignalPayload),
+            .payload_origin_page = null,
+            .signal_kind = kind,
+        };
+        _ = target_pcb.mailbox.push(envelope);
+    }
+
+    /// Doom `target_record` with `status`: record the reason (`pending_exit`,
+    /// first-wins unless `override` — an untrappable `kill` overriding to
+    /// `killed`), set `pending_kill` (release), and revive the target if parked
+    /// so it observes the kill at its next scheduling point / receive. Race-free
+    /// cross-core: the target's own core performs the teardown (its fiber stack
+    /// is core-local); the release store + the revive handshake publish the kill
+    /// to it. The caller holds a `beginSend` pin, so the record is not recycled.
+    fn killWithReason(
+        scheduler: *Scheduler,
+        target_record: *ProcessRecord,
+        status: signal_module.ExitStatus,
+        override: bool,
+    ) void {
+        _ = scheduler;
+        target_record.pcb.signal_state.setPendingExit(status, override);
+        target_record.pending_kill.store(true, .release);
+        reviveIfParked(target_record);
+    }
+
+    /// Deliver an exit signal from `from_bits` to `target_pid` per the
+    /// Erlang-fidelity reason rules (research.md §6.7): `normal` never kills a
+    /// non-trapping process (a trapping one still gets the message); an abnormal
+    /// reason kills a non-trapping process (via `killWithReason`) or is
+    /// delivered as an `{'EXIT', From, Reason}` message to a trapping one.
+    /// `break_link` (teardown propagation) also removes `from_bits` from the
+    /// target's link set (a dying process breaks its links). A dead/stale target
+    /// silently drops (Erlang: a signal to a dead process is a no-op).
+    fn deliverExitSignalTo(
+        scheduler: *Scheduler,
+        sender_record: *ProcessRecord,
+        target_pid: Pid,
+        from_bits: u64,
+        status: signal_module.ExitStatus,
+        break_link: bool,
+    ) SendOutcome {
+        const target_pcb = scheduler.pid_table.lookupSilent(target_pid) orelse return .dead_lettered;
+        const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
+        if (!target_record.beginSend()) return .dead_lettered;
+        defer target_record.endSend();
+        if (!scheduler.pid_table.isAlive(target_pid)) return .dead_lettered;
+
+        if (break_link) {
+            if (scheduler.signalRuntimePtr()) |sr| {
+                _ = target_pcb.signal_state.unlinkPeer(&sr.node_pool, from_bits);
+            }
+        }
+
+        const traps = target_pcb.signal_state.trapsExits();
+        if (status.category == .normal) {
+            // A normal exit does not kill a non-trapping process; a trapping one
+            // still receives it as a message.
+            if (traps) scheduler.pushSignalMessage(sender_record, target_pcb, .exit, .{
+                .from_bits = from_bits,
+                .reason_term = status.term,
+            });
+        } else if (traps) {
+            scheduler.pushSignalMessage(sender_record, target_pcb, .exit, .{
+                .from_bits = from_bits,
+                .reason_term = status.term,
+            });
+        } else {
+            scheduler.killWithReason(target_record, status, false);
+        }
+        return .delivered;
+    }
+
+    /// Fire a monitor `DOWN` from `monitored_bits` to `monitor_pid` under `ref`
+    /// with `reason_term`. Always a message (monitors are NOT affected by
+    /// `trap_exit`). A dead monitor silently drops.
+    fn deliverDownTo(
+        scheduler: *Scheduler,
+        sender_record: *ProcessRecord,
+        monitor_pid: Pid,
+        ref: signal_module.Ref,
+        monitored_bits: u64,
+        reason_term: u64,
+    ) SendOutcome {
+        const target_pcb = scheduler.pid_table.lookupSilent(monitor_pid) orelse return .dead_lettered;
+        const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
+        if (!target_record.beginSend()) return .dead_lettered;
+        defer target_record.endSend();
+        if (!scheduler.pid_table.isAlive(monitor_pid)) return .dead_lettered;
+        scheduler.pushSignalMessage(sender_record, target_pcb, .down, .{
+            .from_bits = monitored_bits,
+            .ref = ref,
+            .reason_term = reason_term,
+        });
+        return .delivered;
+    }
+
+    /// Remove the incoming-monitor entry `ref` from `target_pid` (a monitoring
+    /// process cleaning a target's `monitored_by` at its own teardown, or a
+    /// `demonitor`). Silent no-op if the target is gone (its set was freed with
+    /// it). Race-free via the `beginSend` pin.
+    fn cleanRemoteMonitor(scheduler: *Scheduler, target_pid: Pid, ref: signal_module.Ref) void {
+        const sr = scheduler.signalRuntimePtr() orelse return;
+        const target_pcb = scheduler.pid_table.lookupSilent(target_pid) orelse return;
+        const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
+        if (!target_record.beginSend()) return;
+        defer target_record.endSend();
+        if (!scheduler.pid_table.isAlive(target_pid)) return;
+        _ = target_pcb.signal_state.removeMonitoredByRef(&sr.node_pool, ref);
+    }
+
+    /// Propagate `record`'s exit at teardown: send exit signals to every linked
+    /// peer (breaking each link), fire `DOWN` to every monitor watching it, and
+    /// clean each monitored target's `monitored_by` of this process's outgoing
+    /// monitors — then free every set node. Runs after `closeAndQuiesce` and
+    /// before `abandon` (see `teardownProcess`). A no-op with no signal runtime.
+    fn propagateExitSignals(
+        scheduler: *Scheduler,
+        record: *ProcessRecord,
+        exit_pid: Pid,
+        status: signal_module.ExitStatus,
+    ) void {
+        const sr = scheduler.signalRuntimePtr() orelse return;
+        const state = &record.pcb.signal_state;
+        const from_bits = exit_pid.toBits();
+
+        var link_node = state.takeLinks();
+        while (link_node) |node| {
+            link_node = node.next;
+            _ = scheduler.deliverExitSignalTo(record, Pid.fromBits(node.pid_bits), from_bits, status, true);
+            sr.node_pool.free(node);
+        }
+
+        var monitored_node = state.takeMonitoredBy();
+        while (monitored_node) |node| {
+            monitored_node = node.next;
+            _ = scheduler.deliverDownTo(record, Pid.fromBits(node.pid_bits), node.ref, from_bits, status.term);
+            sr.node_pool.free(node);
+        }
+
+        var outgoing_node = state.takeMonitors();
+        while (outgoing_node) |node| {
+            outgoing_node = node.next;
+            scheduler.cleanRemoteMonitor(Pid.fromBits(node.pid_bits), node.ref);
+            sr.node_pool.free(node);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Signal operations (invoked from a running process through `ProcessContext`)
+    // -------------------------------------------------------------------------
+
+    /// `link(target)`: establish a bidirectional link (idempotent, one-per-pair;
+    /// research.md §6.7). Returns true if the link was established (or already
+    /// existed). Linking a DEAD process delivers an exit signal with `noproc` to
+    /// the caller instead (Erlang `link/1` semantics) and returns false.
+    fn signalLink(scheduler: *Scheduler, self_record: *ProcessRecord, target_pid: Pid) bool {
+        const sr = scheduler.signalRuntimePtr() orelse return false;
+        const self_bits = self_record.pcb.pid.toBits();
+        const target_pcb = scheduler.pid_table.lookupSilent(target_pid) orelse {
+            scheduler.linkNoproc(self_record, target_pid);
+            return false;
+        };
+        const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
+        if (!target_record.beginSend()) {
+            scheduler.linkNoproc(self_record, target_pid);
+            return false;
+        }
+        defer target_record.endSend();
+        if (!scheduler.pid_table.isAlive(target_pid)) {
+            scheduler.linkNoproc(self_record, target_pid);
+            return false;
+        }
+        // Add on the target side (pinned) then the self side; the pin gates the
+        // target's teardown so its propagation sees this link (or, if it already
+        // closed, `beginSend` failed above and we took the noproc path).
+        _ = target_pcb.signal_state.linkPeer(&sr.node_pool, self_bits) catch return false;
+        _ = self_record.pcb.signal_state.linkPeer(&sr.node_pool, target_pid.toBits()) catch {
+            _ = target_pcb.signal_state.unlinkPeer(&sr.node_pool, self_bits);
+            return false;
+        };
+        return true;
+    }
+
+    /// A `link` to an already-dead process: deliver a `noproc` exit signal to
+    /// the caller (which dies if not trapping, or receives `{'EXIT', Dead,
+    /// noproc}` if trapping). The signal is delivered to SELF, so it uses the
+    /// same delivery path (self is always alive/pinned trivially here).
+    fn linkNoproc(scheduler: *Scheduler, self_record: *ProcessRecord, dead_pid: Pid) void {
+        const status = signal_module.ExitStatus.abnormalStatus(scheduler.reasonNoproc());
+        const self_pcb = &self_record.pcb;
+        if (self_pcb.signal_state.trapsExits()) {
+            scheduler.pushSignalMessage(self_record, self_pcb, .exit, .{
+                .from_bits = dead_pid.toBits(),
+                .reason_term = status.term,
+            });
+        } else {
+            scheduler.killWithReason(self_record, status, false);
+        }
+    }
+
+    fn reasonNoproc(scheduler: *Scheduler) u64 {
+        return if (scheduler.options.signal_runtime) |sr| sr.reason_atoms.noprocTerm() else 0;
+    }
+
+    /// `unlink(target)`: break the bidirectional link (idempotent). Returns
+    /// whether a link existed on the self side.
+    fn signalUnlink(scheduler: *Scheduler, self_record: *ProcessRecord, target_pid: Pid) bool {
+        const sr = scheduler.signalRuntimePtr() orelse return false;
+        const removed = self_record.pcb.signal_state.unlinkPeer(&sr.node_pool, target_pid.toBits());
+        // Break the peer side too (best-effort; a dead peer already freed its set).
+        if (scheduler.pid_table.lookupSilent(target_pid)) |target_pcb| {
+            const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
+            if (target_record.beginSend()) {
+                defer target_record.endSend();
+                if (scheduler.pid_table.isAlive(target_pid)) {
+                    _ = target_pcb.signal_state.unlinkPeer(&sr.node_pool, self_record.pcb.pid.toBits());
+                }
+            }
+        }
+        return removed;
+    }
+
+    /// `monitor(target) -> Ref`: install a unidirectional, stackable monitor and
+    /// return its fresh reference. Monitoring a DEAD process fires `DOWN` with
+    /// `noproc` to the caller immediately (research.md §6.7) and still returns a
+    /// (now spent) ref.
+    fn signalMonitor(scheduler: *Scheduler, self_record: *ProcessRecord, target_pid: Pid) signal_module.Ref {
+        const sr = scheduler.signalRuntimePtr() orelse return 0;
+        const ref = sr.mintRef();
+        const self_bits = self_record.pcb.pid.toBits();
+        const target_pcb = scheduler.pid_table.lookupSilent(target_pid) orelse {
+            scheduler.fireNoprocDown(self_record, ref, target_pid);
+            return ref;
+        };
+        const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
+        if (!target_record.beginSend()) {
+            scheduler.fireNoprocDown(self_record, ref, target_pid);
+            return ref;
+        }
+        defer target_record.endSend();
+        if (!scheduler.pid_table.isAlive(target_pid)) {
+            scheduler.fireNoprocDown(self_record, ref, target_pid);
+            return ref;
+        }
+        target_pcb.signal_state.addMonitoredBy(&sr.node_pool, ref, self_bits) catch return ref;
+        self_record.pcb.signal_state.addMonitor(&sr.node_pool, ref, target_pid.toBits()) catch {
+            _ = target_pcb.signal_state.removeMonitoredByRef(&sr.node_pool, ref);
+            return ref;
+        };
+        return ref;
+    }
+
+    /// Fire a `noproc` `DOWN` to `self_record` immediately (monitoring a dead
+    /// process). Delivered to self (always alive), so it goes straight into the
+    /// caller's own mailbox.
+    fn fireNoprocDown(scheduler: *Scheduler, self_record: *ProcessRecord, ref: signal_module.Ref, dead_pid: Pid) void {
+        scheduler.pushSignalMessage(self_record, &self_record.pcb, .down, .{
+            .from_bits = dead_pid.toBits(),
+            .ref = ref,
+            .reason_term = scheduler.reasonNoproc(),
+        });
+    }
+
+    /// `demonitor(ref)`: drop a monitor this process holds. Removes it from the
+    /// caller's outgoing set and from the target's `monitored_by`. Returns
+    /// whether the ref was a live outgoing monitor. A pending `DOWN` already in
+    /// the mailbox is NOT flushed (plain `demonitor`, not `demonitor(_, flush)`).
+    fn signalDemonitor(scheduler: *Scheduler, self_record: *ProcessRecord, ref: signal_module.Ref) bool {
+        const sr = scheduler.signalRuntimePtr() orelse return false;
+        const target_bits = self_record.pcb.signal_state.takeMonitorRef(&sr.node_pool, ref) orelse return false;
+        scheduler.cleanRemoteMonitor(Pid.fromBits(target_bits), ref);
+        return true;
+    }
+
+    /// `exit(target, reason)`: send a trappable exit signal (`kind` selects the
+    /// `normal`/`abnormal` category — the Zap surface classifies the atom).
+    /// Returns whether the target resolved.
+    fn signalExit(
+        scheduler: *Scheduler,
+        self_record: *ProcessRecord,
+        target_pid: Pid,
+        category: signal_module.ReasonCategory,
+        reason_term: u64,
+    ) SendOutcome {
+        const status: signal_module.ExitStatus = .{ .category = category, .term = reason_term };
+        return scheduler.deliverExitSignalTo(self_record, target_pid, self_record.pcb.pid.toBits(), status, false);
+    }
+
+    /// `exit(target, kill)`: the UNTRAPPABLE kill. The target dies with reason
+    /// `killed` REGARDLESS of `trap_exit` (research.md §6.7), so its own links
+    /// then receive the trappable `killed`, never `kill`. Returns whether the
+    /// target resolved.
+    fn signalKill(scheduler: *Scheduler, self_record: *ProcessRecord, target_pid: Pid) SendOutcome {
+        _ = self_record;
+        const target_pcb = scheduler.pid_table.lookupSilent(target_pid) orelse return .dead_lettered;
+        const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
+        if (!target_record.beginSend()) return .dead_lettered;
+        defer target_record.endSend();
+        if (!scheduler.pid_table.isAlive(target_pid)) return .dead_lettered;
+        // Untrappable: override any trappable pending reason to `killed`.
+        scheduler.killWithReason(target_record, signal_module.ExitStatus.abnormalStatus(scheduler.killedReasonTerm()), true);
+        return .delivered;
+    }
+
+    /// Blocking receive of the next SIGNAL message (an exit/`DOWN`) — the raw J1
+    /// observation surface a trapping/monitoring process uses to inspect a
+    /// signal. Pops the mailbox head, caches its fields in `record.last_signal`,
+    /// frees the payload + envelope, and returns the reason term. Aborts if the
+    /// head is an ordinary user message (the raw contract, mirroring
+    /// `receive_raw`); J2/J3's `receive` construct decodes signals through the
+    /// per-envelope `signal_kind` accessors instead.
+    fn awaitSignal(scheduler: *Scheduler, context: *ProcessContext) u64 {
+        const sr = scheduler.signalRuntimePtr().?;
+        const envelope = context.receive();
+        if (envelope.fragment.signal_kind == .none) {
+            @panic("awaitSignal: mailbox head is an ordinary message, not a signal");
+        }
+        const payload: *const signal_module.SignalPayload = @ptrCast(@alignCast(envelope.fragment.payload_pointer.?));
+        context.record.last_signal = payload.*;
+        context.record.last_signal_kind = envelope.fragment.signal_kind;
+        const reason_term = payload.reason_term;
+        if (sr.payload_seam.free) |free_payload| {
+            free_payload(sr.payload_seam.context, envelope.fragment.payload_pointer.?, envelope.fragment.payload_byte_length);
+        }
+        envelope.fragment = .{};
+        envelope_pool_module.free(envelope);
+        return reason_term;
+    }
+
+    // -------------------------------------------------------------------------
     // Teardown (module doc, "Exit and crash teardown" — the ONE path)
     // -------------------------------------------------------------------------
 
-    fn teardownProcess(scheduler: *Scheduler, record: *ProcessRecord, reason: ExitReason) void {
+    fn teardownProcess(scheduler: *Scheduler, record: *ProcessRecord, status: signal_module.ExitStatus) void {
         const pcb = &record.pcb;
         const exit_pid = pcb.pid; // captured: unregister resets it
+        // The crash-report label and exit-counter classification (the legacy
+        // `ExitReason` enum): a `normal` category is a clean exit, everything
+        // else a kill/crash. The reason TERM lives in `status` for propagation.
+        const reason: ExitReason = if (status.category == .normal) .normal else .killed;
 
         // (0) Cancel any live `receive … after` timer and END its park episode
         // (bump the epoch) BEFORE the record can recycle. This is mandatory for
@@ -2577,8 +3104,20 @@ pub const Scheduler = struct {
         // page — the message-vs-timer envelope-page leak.
         record.closeAndQuiesce();
 
+        // (5b) Propagate exit signals to links and fire `DOWN` to monitors
+        // (P5-J1, `signal.zig`). Placed AFTER `closeAndQuiesce`: that gate
+        // (send_closed + in-flight-send drain) waits out every `link`/`monitor`/
+        // exit-signal that pinned this process before the close, so their
+        // set-mutations have landed and this snapshot sees them; a `link`/
+        // `monitor` that pins AFTER the close is rejected (dead-letters, fires
+        // `noproc`), so no entry is ever missed or double-fired — the same
+        // grace-period discipline that makes cross-core sends race-free (P4-R1).
+        // Placed BEFORE `abandon` (7): signal messages are pushed from THIS
+        // process's still-live envelope handle to the peers' mailboxes.
+        scheduler.propagateExitSignals(record, exit_pid, status);
+
         // (6) Drain the mailbox: every envelope back to its origin page.
-        drainMailboxForTeardown(&pcb.mailbox);
+        scheduler.drainMailboxForTeardown(&pcb.mailbox);
 
         // (7) Abandon the sender side: empty pages return now; in-flight
         // pages flip to `.abandoned` for their receivers to reclaim.
@@ -2635,7 +3174,7 @@ pub const Scheduler = struct {
     /// doc) and a kernel bug to surface loudly, never to leak past.
     const teardown_drain_gap_spin_limit: u32 = 100_000;
 
-    fn drainMailboxForTeardown(mailbox: *mailbox_module.Mailbox) void {
+    fn drainMailboxForTeardown(scheduler: *Scheduler, mailbox: *mailbox_module.Mailbox) void {
         var consecutive_gap_spins: u32 = 0;
         while (true) {
             switch (mailbox.pop()) {
@@ -2647,6 +3186,20 @@ pub const Scheduler = struct {
                     // reclaimed at runtime-ledger teardown, as before.
                     if (envelope.fragment.moved_reclaim) |reclaim| {
                         if (envelope.fragment.payload_pointer) |payload| reclaim(payload);
+                        envelope.fragment = .{};
+                    } else if (envelope.fragment.signal_kind != .none) {
+                        // Leak-exactness for an undelivered SIGNAL payload (P5-J1):
+                        // a trapping/monitoring process died with a queued exit/
+                        // `DOWN` it never consumed — free its payload block through
+                        // the seam (the same free the receiver's `envelope_free`
+                        // would have run) before the header returns to the pool.
+                        if (scheduler.signalRuntimePtr()) |sr| {
+                            if (sr.payload_seam.free) |free_payload| {
+                                if (envelope.fragment.payload_pointer) |payload| {
+                                    free_payload(sr.payload_seam.context, payload, envelope.fragment.payload_byte_length);
+                                }
+                            }
+                        }
                         envelope.fragment = .{};
                     }
                     envelope_pool_module.free(envelope);
@@ -3017,17 +3570,23 @@ pub const Scheduler = struct {
     /// (the message is already visible to the target's next receive).
     fn mailboxWakeCallback(wake_context: ?*anyopaque) void {
         const record: *ProcessRecord = @ptrCast(@alignCast(wake_context.?));
-        // Mark the process notified (single seq_cst RMW — the whole handshake
-        // linearizes here). Only if this displaced `.parked` was the process
-        // actually suspended and does THIS producer own its revival; displacing
-        // `.running`/`.notified` means the process is active (it will observe
-        // the message via its own receive, or self-revive at `commitPark`) — no
-        // push. The message push in `mailbox.push` is sequenced-before this RMW,
-        // so the reviver sees it. A seq_cst CAS loop sets the state to
-        // `.notified` while PRESERVING the epoch bits (the epoch belongs to the
-        // owner; the wake seam must not disturb it — see `packParkControl`).
-        // Only the owner's cold revival/teardown/fire paths ever change the
-        // epoch, so this loop retries essentially never.
+        reviveIfParked(record);
+    }
+
+    /// The cross-thread wake handshake core (P4-J1), shared by the mailbox wake
+    /// seam and the exit-signal kill path (P5-J1). Mark `record` notified (a
+    /// single seq_cst RMW — the whole handshake linearizes here) and, iff this
+    /// displaced `.parked` (the process was genuinely suspended), own its
+    /// revival and push it to a core's wake stack. Displacing `.running`/
+    /// `.notified` means the process is active — it observes the message (or the
+    /// pending kill) via its own receive/safepoint, or self-revives at
+    /// `commitPark` (whose `.running → .parked` CAS now fails against the
+    /// `.notified` we set) — so no push. The whatever-woke-it write (a mailbox
+    /// push, or a `pending_kill` store) is sequenced-before this RMW, so the
+    /// revived process sees it. The seq_cst CAS loop preserves the epoch bits
+    /// (owned by the process; the waker must not disturb them — `packParkControl`),
+    /// and retries essentially never (only the owner's cold paths change epoch).
+    fn reviveIfParked(record: *ProcessRecord) void {
         var control = record.park_control.load(.seq_cst);
         const displaced = while (true) {
             const state = parkControlState(control);
@@ -3040,8 +3599,8 @@ pub const Scheduler = struct {
             break state;
         };
         if (displaced != .parked) return; // displaced `.running` — process is active
-        // We own the revival. Route onto the producer's core for wake locality;
-        // a foreign producer falls back to the target's last-running scheduler.
+        // We own the revival. Route onto the waker's core for wake locality;
+        // a foreign waker falls back to the target's last-running scheduler.
         const target = current_scheduler orelse record.scheduler;
         pushWake(target, record);
     }
@@ -3118,6 +3677,7 @@ pub const Scheduler = struct {
         record.park_control = .init(packParkControl(0, .running));
         record.in_flight_send_count = .init(0);
         record.send_closed = .init(false);
+        record.pending_kill = .init(false);
         return record;
     }
 

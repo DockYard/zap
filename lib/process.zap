@@ -287,11 +287,12 @@ pub struct Process {
   }
 
   @doc = """
-    Terminates the calling process immediately (the kernel's teardown
-    path; exit reasons and links/monitors are Phase 5 work). Never
-    returns. From the root process this ends the program with exit
-    status 0. A process that simply returns from its entry function
-    exits normally without calling this.
+    Terminates the calling process NORMALLY (reason `:normal`) — the same clean
+    exit as returning from its entry function. A linked NON-trapping process is
+    NOT killed by a normal exit; a trapping linked/monitoring process receives
+    `{'EXIT', Self, :normal}` / a `:normal` `DOWN`. Never returns. From the root
+    process this ends the program with exit status 0. To exit abnormally (so a
+    linked process dies or a supervisor restarts), use `Process.exit_with`.
     """
 
   pub fn exit() -> Never {
@@ -397,5 +398,166 @@ pub struct Process {
 
   pub fn receive_raw_atom() -> Atom {
     :zig.ProcessRuntime.receive_atom()
+  }
+
+  # Register the well-known reason atoms the kernel synthesizes (`:normal` for a
+  # clean exit, `:killed` for a kill, `:noproc` for a dead-process address) so
+  # the atom IDENTITIES live in Zap, never hardcoded in the compiler. Idempotent;
+  # the signal ops below call it before first use.
+  fn ensure_reason_atoms_registered() -> Bool {
+    :zig.ProcessRuntime.register_reason_atoms(:normal, :killed, :noproc)
+  }
+
+  @doc = """
+    Links the calling process to the process behind `target_pid` (raw pid
+    bits) — a BIDIRECTIONAL, one-per-pair link (linking twice is idempotent).
+    When either linked process exits abnormally, the exit signal propagates to
+    the other: a non-trapping peer dies with the same reason (cascading); a
+    trapping peer receives an `{'EXIT', From, Reason}` message instead. A
+    `normal` exit does NOT kill a linked peer. Linking an already-dead process
+    delivers a `:noproc` exit signal to the caller. Returns `true` when the link
+    was established. The raw-bits surface; `spawn_link` (J2) wraps it.
+    """
+
+  pub fn link(target_pid :: u64) -> Bool {
+    _registered = ensure_reason_atoms_registered()
+    :zig.ProcessRuntime.link_process(target_pid)
+  }
+
+  @doc = """
+    Removes the bidirectional link between the calling process and
+    `target_pid` (idempotent — unlinking a non-link is a no-op). Returns
+    whether a link existed on the caller's side.
+    """
+
+  pub fn unlink(target_pid :: u64) -> Bool {
+    :zig.ProcessRuntime.unlink_process(target_pid)
+  }
+
+  @doc = """
+    Monitors `target_pid` and returns a unique reference. UNIDIRECTIONAL and
+    STACKABLE: N monitors of the same process deliver N independent
+    `{'DOWN', Ref, :process, Pid, Reason}` messages when it exits. Unlike a
+    link, a monitor never propagates an exit to the monitoring process — it only
+    delivers a message. Monitoring an already-dead process fires a `:noproc`
+    `DOWN` immediately. Drop a monitor with `demonitor(ref)`. The raw-bits
+    surface; `spawn_monitor` (J2) wraps it.
+    """
+
+  pub fn monitor(target_pid :: u64) -> u64 {
+    _registered = ensure_reason_atoms_registered()
+    :zig.ProcessRuntime.monitor_process(target_pid)
+  }
+
+  @doc = """
+    Drops the monitor identified by `ref` (from a prior `monitor`). Returns
+    whether `ref` named a live monitor this process holds. A `DOWN` message
+    already delivered to the mailbox is not removed (plain demonitor).
+    """
+
+  pub fn demonitor(ref :: u64) -> Bool {
+    :zig.ProcessRuntime.demonitor_process(ref)
+  }
+
+  @doc = """
+    Sets the calling process's `trap_exit` flag, returning the PREVIOUS value.
+    With `trap_exit` set, a trappable exit signal that would otherwise kill this
+    process is converted into an `{'EXIT', From, Reason}` message in its mailbox
+    (read via `await_signal`) — the foundation supervisors stand on. An
+    untrappable `kill` (`Process.kill`) still terminates a trapping process.
+    """
+
+  pub fn trap_exit(value :: Bool) -> Bool {
+    :zig.ProcessRuntime.set_trap_exit(value)
+  }
+
+  @doc = """
+    Whether the calling process currently traps exits.
+    """
+
+  pub fn traps_exits() -> Bool {
+    :zig.ProcessRuntime.get_trap_exit()
+  }
+
+  @doc = """
+    Sends a TRAPPABLE exit signal carrying `reason` (an atom) to `target_pid`.
+    `:normal` is special — it does NOT kill a non-trapping target (a trapping
+    one still receives `{'EXIT', From, :normal}`); any other reason kills a
+    non-trapping target (which then propagates the reason to ITS links) or is
+    delivered as a message to a trapping one. Returns `true` when the target
+    resolved (a signal to a dead process is a silent no-op, not an error). For
+    the untrappable kill, use `Process.kill`.
+    """
+
+  pub fn exit_signal(target_pid :: u64, reason :: Atom) -> Bool {
+    _registered = ensure_reason_atoms_registered()
+    :zig.ProcessRuntime.send_exit_signal(target_pid, reason != :normal, reason)
+  }
+
+  @doc = """
+    Sends the UNTRAPPABLE kill signal to `target_pid`: it terminates with reason
+    `:killed` regardless of `trap_exit` (a trapping process cannot survive a
+    kill). Because the target dies as `:killed` (not `:kill`), its own linked
+    processes receive the ordinary trappable `:killed` reason. Returns `true`
+    when the target resolved.
+    """
+
+  pub fn kill(target_pid :: u64) -> Bool {
+    _registered = ensure_reason_atoms_registered()
+    :zig.ProcessRuntime.kill_process(target_pid)
+  }
+
+  @doc = """
+    Terminates the calling process ABNORMALLY with `reason` (an atom) — Erlang
+    `exit(Reason)`. Linked non-trapping processes die with `reason`; trapping
+    linked/monitoring processes receive it as a message. Never returns. For a
+    clean exit use `Process.exit()`.
+    """
+
+  pub fn exit_with(reason :: Atom) -> Never {
+    _registered = ensure_reason_atoms_registered()
+    :zig.ProcessRuntime.exit_with_reason(reason)
+  }
+
+  @doc = """
+    Blocks until the next SIGNAL message (a trapped `{'EXIT', …}` or a
+    `{'DOWN', …}`) is at the mailbox head, consumes it, and returns its reason
+    as an `Atom`. The other fields of the just-consumed signal are read with
+    `last_signal_from`, `last_signal_ref`, and `last_signal_kind`. This is the
+    raw primitive a trapping/monitoring process uses to observe a signal; the
+    typed `receive` construct (J2/J3) decodes signals into tuples. Aborts if the
+    mailbox head is an ordinary user message.
+    """
+
+  pub fn await_signal() -> Atom {
+    :zig.ProcessRuntime.await_signal()
+  }
+
+  @doc = """
+    The raw pid bits the most recently `await_signal`-consumed signal came FROM
+    (the exiting process for an `{'EXIT', …}`, the monitored process for a
+    `{'DOWN', …}`).
+    """
+
+  pub fn last_signal_from() -> u64 {
+    :zig.ProcessRuntime.last_signal_from()
+  }
+
+  @doc = """
+    The monitor reference of the most recently consumed signal (meaningful only
+    for a `{'DOWN', …}`; zero for an `{'EXIT', …}`).
+    """
+
+  pub fn last_signal_ref() -> u64 {
+    :zig.ProcessRuntime.last_signal_ref()
+  }
+
+  @doc = """
+    The kind of the most recently consumed signal: `1` for a trapped exit
+    (`{'EXIT', …}`), `2` for a monitor `DOWN` (`{'DOWN', …}`).
+    """
+
+  pub fn last_signal_kind() -> i64 {
+    :zig.ProcessRuntime.last_signal_kind()
   }
 }

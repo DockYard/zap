@@ -91,6 +91,7 @@ const std = @import("std");
 const fiber_context = @import("fiber_context.zig");
 const pid_table = @import("pid_table.zig");
 const mailbox_module = @import("mailbox.zig");
+const signal_module = @import("signal.zig");
 
 /// Process identifier — the generational pid of `pid_table.zig` (plan
 /// Phase 1 item 1.2, locked design decision 4): `{slot, generation,
@@ -339,6 +340,13 @@ pub const ProcessControlBlock = struct {
     mailbox: mailbox_module.Mailbox,
     /// Head of the external-resource drop-list (see `DropListNode`).
     drop_list_head: ?*DropListNode,
+    /// Per-process signal state (P5-J1, `signal.zig`): the link set, the
+    /// incoming/outgoing monitor sets, the `trap_exit` flag, and the pending
+    /// exit reason. Unlike the owner-only fields above, its cross-core-mutated
+    /// sets are guarded by its own embedded lock (a peer links/monitors this
+    /// process from another core). Empty at `init`; the scheduler drains it at
+    /// teardown (propagating exit signals and `DOWN`s, then freeing its nodes).
+    signal_state: signal_module.SignalState,
 
     /// Assemble a PCB IN PLACE — at its final address, which the mailbox
     /// pins from this call on (its empty state references its embedded
@@ -360,6 +368,7 @@ pub const ProcessControlBlock = struct {
         process.manager = manager;
         process.mailbox.init();
         process.drop_list_head = null;
+        process.signal_state = .{};
     }
 
     /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot

@@ -116,8 +116,16 @@
 //!   this file (it is the object root above the kernel), and only its
 //!   test block participates in the kernel test suite below.
 //!
-//! NOT here yet: timers, links/monitors,
-//! and the `std.Io` vtable. Since P2-J1 this tree IS wired into Zap
+//! * `signal.zig` — the kernel signal primitives (P5-J1, plan §5.1): the
+//!   per-process link set / monitor sets / `trap_exit` flag / pending-exit
+//!   reason (`SignalState`), the shared link/monitor node pool + reason-atom
+//!   registry + exit/`DOWN` payload seam (`SignalRuntime`), and the exit-status
+//!   / reason-category / signal-kind value types. The MECHANISM only; supervision
+//!   POLICY is pure-Zap stdlib (J3). `scheduler.zig` drives propagation at
+//!   teardown; `abi.zig` exposes the `zap_proc_link/monitor/exit_signal/…`
+//!   intrinsics; `signal_stress.zig` is its cross-core TSan race proof.
+//!
+//! NOT here yet: the `std.Io` vtable. Since P2-J1 this tree IS wired into Zap
 //! compilation behind the comptime `runtime_concurrency` gate (default
 //! OFF): when the gate is ON, `src/concurrency_driver.zig` compiles
 //! `abi.zig` (the object root above this file) per target through
@@ -160,6 +168,7 @@ pub const fiber_context = @import("fiber_context.zig");
 pub const process = @import("process.zig");
 pub const pid_table = @import("pid_table.zig");
 pub const mailbox = @import("mailbox.zig");
+pub const signal = @import("signal.zig");
 pub const envelope_pool = @import("envelope_pool.zig");
 pub const timing_wheel = @import("timing_wheel.zig");
 pub const scheduler = @import("scheduler.zig");
@@ -185,6 +194,12 @@ pub const LiveProcessIterator = pid_table.LiveProcessIterator;
 pub const Mailbox = mailbox.Mailbox;
 pub const Envelope = mailbox.Envelope;
 pub const Fragment = mailbox.Fragment;
+pub const SignalRuntime = signal.SignalRuntime;
+pub const SignalKind = signal.SignalKind;
+pub const SignalPayload = signal.SignalPayload;
+pub const ExitStatus = signal.ExitStatus;
+pub const ReasonCategory = signal.ReasonCategory;
+pub const SignalRef = signal.Ref;
 pub const PopOutcome = mailbox.PopOutcome;
 pub const PeekOutcome = mailbox.PeekOutcome;
 pub const WakeCallback = mailbox.WakeCallback;
@@ -231,6 +246,7 @@ test {
     _ = process;
     _ = pid_table;
     _ = mailbox;
+    _ = signal;
     _ = envelope_pool;
     _ = timing_wheel;
     _ = scheduler;
@@ -253,6 +269,10 @@ test {
     // (co-scheduled progress during a block, re-attach, pool sizing, and the
     // detach/re-attach scheduler-local-invariant handoff under TSan).
     _ = @import("blocking_stress.zig");
+    // P5-J1: the cross-core signal-vs-teardown race (links/monitors/exit signals
+    // delivered to a concurrently-exiting process on another core) under the real
+    // M:N pool — leak-exact and TSan-clean.
+    _ = @import("signal_stress.zig");
     _ = @import("abi.zig");
     // E8: conservative fiber-stack scan cost + false-retention (plan §7 /
     // risk #1) — decides whether conservative mark-sweep ships as a TRACED

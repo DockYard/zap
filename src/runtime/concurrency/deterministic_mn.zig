@@ -364,6 +364,10 @@ pub const MnSimulator = struct {
         /// FIFO length past which a core spills half its backlog to the global
         /// queue (small default so scenarios exercise the overflow path).
         spill_threshold: usize = 8,
+        /// The kernel signal runtime (P5-J1) shared across the simulated cores,
+        /// or null (signal-free scenarios). The ABI's seeded backend passes the
+        /// runtime's shared instance so seeded signal runs work.
+        signal_runtime: ?*@import("signal.zig").SignalRuntime = null,
     };
 
     /// Build a seeded M:N simulator for `seed` over a BORROWED pid table and
@@ -437,6 +441,7 @@ pub const MnSimulator = struct {
                 .trace_hook = CoreTraceTap.hookThunk,
                 .trace_context = &simulator.core_taps[core_index],
                 .stack_usable_size = options.stack_usable_size,
+                .signal_runtime = options.signal_runtime,
             });
         }
         return simulator;

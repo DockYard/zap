@@ -536,6 +536,11 @@ const RuntimeState = struct {
     /// seed-reproducible interleaving). See `SchedulerBackend`.
     backend: SchedulerBackend,
     ledger: Ledger,
+    /// The kernel signal runtime (P5-J1, `signal.zig`): the shared link/monitor
+    /// node pool, the reason-atom registry, and the exit/`DOWN` payload seam
+    /// (wired to `ledger` below). Shared across every scheduler core via
+    /// `Scheduler.Options.signal_runtime`.
+    signal_runtime: concurrency.SignalRuntime,
     /// The per-spawn manager registry (plan item 3.1/3.3, P3-J3): core
     /// vtables indexed by manager id. Slot 0 is the manifest default (bound by
     /// `zap_proc_bind_manager`); slots 1.. are the distinct `spawn(f, .{
@@ -662,6 +667,37 @@ fn contextFromHandle(process: *anyopaque) *concurrency.ProcessContext {
 }
 
 // ---------------------------------------------------------------------------
+// Signal payload seam (P5-J1): an exit/`DOWN` message payload lives in a ledger
+// block so the receiver's ordinary `zap_proc_envelope_free` reclaims it exactly
+// like a copied user payload. The scheduler allocates/frees through these hooks
+// (it cannot reach the ledger directly); `installSignalRuntime` wires them.
+// ---------------------------------------------------------------------------
+
+fn signalPayloadAllocate(context: ?*anyopaque, byte_length: usize) callconv(.c) ?[*]u8 {
+    _ = context;
+    const block = runtime_state.ledger.allocate(byte_length) catch return null;
+    return block.bodyPointer();
+}
+
+fn signalPayloadFree(context: ?*anyopaque, body: [*]const u8, byte_length: usize) callconv(.c) void {
+    _ = context;
+    _ = byte_length;
+    runtime_state.ledger.free(LedgerBlock.fromBodyPointer(body));
+}
+
+/// Install the shared signal runtime (node pool + reason registry + payload
+/// seam) BEFORE the scheduler backend is created, so `&runtime_state.signal_
+/// runtime` is a wired, stable pointer to hand every core.
+fn installSignalRuntime() void {
+    runtime_state.signal_runtime = concurrency.SignalRuntime.init(backing_allocator);
+    runtime_state.signal_runtime.payload_seam = .{
+        .context = null,
+        .allocate = signalPayloadAllocate,
+        .free = signalPayloadFree,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Intrinsics — runtime lifecycle (driver thread)
 // ---------------------------------------------------------------------------
 
@@ -679,6 +715,7 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
     runtime_state.pid_table = concurrency.PidTable.init(backing_allocator, .{}) catch
         return ZapProcStatus.out_of_memory;
     runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
+    installSignalRuntime();
 
     if (readSeededSchedulerSeed()) |seed| {
         // Seeded deterministic M:N backend (P4-J4): a single-threaded,
@@ -690,7 +727,7 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
             &runtime_state.pid_table,
             &runtime_state.envelope_pool,
             seed,
-            .{ .core_count = core_count },
+            .{ .core_count = core_count, .signal_runtime = &runtime_state.signal_runtime },
         ) catch {
             runtime_state.envelope_pool.deinit();
             runtime_state.pid_table.deinit();
@@ -712,7 +749,7 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
             backing_allocator,
             &runtime_state.pid_table,
             &runtime_state.envelope_pool,
-            .{},
+            .{ .core_options = .{ .signal_runtime = &runtime_state.signal_runtime } },
         ) catch {
             runtime_state.envelope_pool.deinit();
             runtime_state.pid_table.deinit();
@@ -734,12 +771,13 @@ fn runtimeInitSeededForTest(seed: u64, core_count: usize) i32 {
     runtime_state.pid_table = concurrency.PidTable.init(backing_allocator, .{}) catch
         return ZapProcStatus.out_of_memory;
     runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
+    installSignalRuntime();
     const simulator = concurrency.MnSimulator.create(
         backing_allocator,
         &runtime_state.pid_table,
         &runtime_state.envelope_pool,
         seed,
-        .{ .core_count = core_count },
+        .{ .core_count = core_count, .signal_runtime = &runtime_state.signal_runtime },
     ) catch {
         runtime_state.envelope_pool.deinit();
         runtime_state.pid_table.deinit();
@@ -808,6 +846,9 @@ export fn zap_proc_runtime_deinit() callconv(.c) void {
     runtime_state.envelope_pool.deinit();
     runtime_state.pid_table.deinit();
     runtime_state.ledger.sweep();
+    // Every process's signal sets were drained at its teardown (above), so no
+    // signal node is live — `deinit` asserts that and returns the pool's blocks.
+    runtime_state.signal_runtime.deinit();
     runtime_initialized = false;
 }
 
@@ -1095,16 +1136,17 @@ export fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void 
     envelope_pool_module.free(envelope);
 }
 
-/// Terminate the calling process at this point: teardown through the
-/// kernel's kill path (see the module doc's exit-semantics seam). Never
-/// returns.
+/// Terminate the calling process NORMALLY (reason `normal`, P5-J1): the same
+/// clean exit as returning from its entry. A linked non-trapping process is NOT
+/// killed; a trapping linked/monitoring process receives `{'EXIT', Self, normal}`
+/// / a `DOWN`. Never returns. (For an abnormal self-exit, see
+/// `zap_proc_exit_reason`.)
 export fn zap_proc_exit(process: *anyopaque) callconv(.c) noreturn {
     const context = contextFromHandle(process);
-    // Self-kill: mark, then yield at a safepoint. The scheduler observes
-    // `pending_kill` when the quantum ends and tears the process down
-    // instead of resuming it — the yield cannot return.
-    _ = context.kill(context.selfPid());
-    context.yieldNow();
+    // Record the `normal` reason, mark, then yield at a safepoint: the scheduler
+    // observes `pending_kill` when the quantum ends and tears the process down
+    // with the recorded reason instead of resuming it — the yield cannot return.
+    context.exitSelf(.normal, runtime_state.signal_runtime.reason_atoms.normalTerm());
     unreachable;
 }
 
@@ -1192,6 +1234,152 @@ export fn zap_proc_receive_wait_timeout(
 /// scheduler). Never returns. The keep-alive dead-letter sink is Phase 5.
 export fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) noreturn {
     contextFromHandle(process).deadLetterUnexpected();
+}
+
+// ---------------------------------------------------------------------------
+// Kernel signal primitives (P5-J1, `signal.zig`): the minimal intrinsic surface
+// J2 (`spawn_link`/`spawn_monitor`) and J3 (supervisors) lower onto. Links,
+// monitors, exit signals, and `trap_exit` — the MECHANISM only; all supervision
+// POLICY is pure Zap stdlib. Reason atoms (`normal`/`killed`/`noproc`) are
+// registered by the Zap surface (`zap_proc_set_reason_atoms`), so no Zap atom
+// name is ever hardcoded here.
+// ---------------------------------------------------------------------------
+
+/// Register the three well-known reason atom ids the kernel must synthesize
+/// (`normal` for a clean exit, `killed` for a kill, `noproc` for addressing a
+/// dead process). Idempotent; the Zap signal wrappers call it before first use.
+export fn zap_proc_set_reason_atoms(normal_term: u64, killed_term: u64, noproc_term: u64) callconv(.c) void {
+    if (!runtime_initialized) return;
+    runtime_state.signal_runtime.reason_atoms.set(normal_term, killed_term, noproc_term);
+}
+
+/// `link(pid)`: establish a bidirectional link (idempotent, one-per-pair). A
+/// link to an already-dead process delivers a `noproc` exit to the caller.
+/// Returns whether the link was established (false ⇒ the target was dead).
+export fn zap_proc_link(process: *anyopaque, target_pid_bits: u64) callconv(.c) bool {
+    return contextFromHandle(process).link(concurrency.Pid.fromBits(target_pid_bits));
+}
+
+/// `unlink(pid)`: break a bidirectional link (idempotent). Returns whether a
+/// link existed.
+export fn zap_proc_unlink(process: *anyopaque, target_pid_bits: u64) callconv(.c) bool {
+    return contextFromHandle(process).unlink(concurrency.Pid.fromBits(target_pid_bits));
+}
+
+/// `monitor(pid) -> Ref`: install a unidirectional, stackable monitor and
+/// return its fresh unique reference. Monitoring an already-dead process fires
+/// a `noproc` `DOWN` to the caller immediately and still returns a ref.
+export fn zap_proc_monitor(process: *anyopaque, target_pid_bits: u64) callconv(.c) u64 {
+    return contextFromHandle(process).monitor(concurrency.Pid.fromBits(target_pid_bits));
+}
+
+/// `demonitor(Ref)`: drop a monitor this process holds. Returns whether the ref
+/// named a live outgoing monitor.
+export fn zap_proc_demonitor(process: *anyopaque, ref: u64) callconv(.c) bool {
+    return contextFromHandle(process).demonitor(ref);
+}
+
+/// `exit(pid, reason)`: send a TRAPPABLE exit signal. `reason_kind` is the
+/// Zap-classified category: 0 = `normal` (never kills a non-trapping target),
+/// non-zero = `abnormal`. `reason_term` is the reason atom carried to a trapping
+/// target / delivered as `{'EXIT', From, Reason}`. Returns `ZapProcStatus.ok`
+/// (delivered) or `dead_lettered` (target dead — a silent no-op, Erlang).
+export fn zap_proc_exit_signal(
+    process: *anyopaque,
+    target_pid_bits: u64,
+    reason_kind: u8,
+    reason_term: u64,
+) callconv(.c) i32 {
+    const category: concurrency.ReasonCategory = if (reason_kind == 0) .normal else .abnormal;
+    return switch (contextFromHandle(process).exitSignal(concurrency.Pid.fromBits(target_pid_bits), category, reason_term)) {
+        .delivered => ZapProcStatus.ok,
+        .dead_lettered => ZapProcStatus.dead_lettered,
+    };
+}
+
+/// `exit(pid, kill)`: the UNTRAPPABLE kill. The target dies with reason `killed`
+/// regardless of `trap_exit`. Returns `ok` (delivered) or `dead_lettered`.
+export fn zap_proc_kill(process: *anyopaque, target_pid_bits: u64) callconv(.c) i32 {
+    return switch (contextFromHandle(process).killUntrappable(concurrency.Pid.fromBits(target_pid_bits))) {
+        .delivered => ZapProcStatus.ok,
+        .dead_lettered => ZapProcStatus.dead_lettered,
+    };
+}
+
+/// Set this process's `trap_exit` flag (Erlang `process_flag(trap_exit, _)`),
+/// returning the previous value.
+export fn zap_proc_set_trap_exit(process: *anyopaque, value: bool) callconv(.c) bool {
+    return contextFromHandle(process).setTrapExit(value);
+}
+
+/// Whether this process traps exits.
+export fn zap_proc_trap_exit(process: *anyopaque) callconv(.c) bool {
+    return contextFromHandle(process).trapsExits();
+}
+
+/// Self-terminate with an explicit reason. `reason_kind`: 0 = `normal`,
+/// non-zero = `abnormal`. Never returns.
+export fn zap_proc_exit_reason(process: *anyopaque, reason_kind: u8, reason_term: u64) callconv(.c) noreturn {
+    const context = contextFromHandle(process);
+    const category: concurrency.ReasonCategory = if (reason_kind == 0) .normal else .abnormal;
+    context.exitSelf(category, reason_term);
+    unreachable;
+}
+
+/// Blocking receive of the next SIGNAL message (raw J1 surface): pops the
+/// mailbox head (which MUST be an exit/`DOWN` signal), caches its fields, frees
+/// it, and returns the reason term. `zap_proc_last_signal_*` read the other
+/// fields. Aborts if the head is an ordinary user message.
+export fn zap_proc_await_signal(process: *anyopaque) callconv(.c) u64 {
+    return contextFromHandle(process).awaitSignal();
+}
+
+/// The `from` pid bits of the most recently `zap_proc_await_signal`-consumed
+/// signal (the exiting process for an exit, the monitored process for a `DOWN`).
+export fn zap_proc_last_signal_from(process: *anyopaque) callconv(.c) u64 {
+    return contextFromHandle(process).lastSignalFrom();
+}
+
+/// The monitor ref of the most recently consumed signal (`DOWN` only; 0 else).
+export fn zap_proc_last_signal_ref(process: *anyopaque) callconv(.c) u64 {
+    return contextFromHandle(process).lastSignalRef();
+}
+
+/// The kind of the most recently consumed signal (1 = exit, 2 = down).
+export fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64 {
+    return contextFromHandle(process).lastSignalKind();
+}
+
+// Per-envelope signal accessors (the J2/J3 receive-lowering surface): given an
+// envelope from `zap_proc_receive_park`, tell a signal from a user message and
+// read its fields, so `receive` can build `{'EXIT', …}` / `{'DOWN', …}` tuples.
+
+/// The signal kind of a parked envelope (0 = ordinary user message, 1 = exit,
+/// 2 = down).
+export fn zap_proc_envelope_signal_kind(envelope_handle: *anyopaque) callconv(.c) u8 {
+    const envelope: *mailbox_module.Envelope = @ptrCast(@alignCast(envelope_handle));
+    return @intFromEnum(envelope.fragment.signal_kind);
+}
+
+/// The `from` pid bits of a signal envelope.
+export fn zap_proc_envelope_signal_from(envelope_handle: *anyopaque) callconv(.c) u64 {
+    const envelope: *mailbox_module.Envelope = @ptrCast(@alignCast(envelope_handle));
+    const payload: *const concurrency.SignalPayload = @ptrCast(@alignCast(envelope.fragment.payload_pointer.?));
+    return payload.from_bits;
+}
+
+/// The monitor ref of a signal envelope (`down` only).
+export fn zap_proc_envelope_signal_ref(envelope_handle: *anyopaque) callconv(.c) u64 {
+    const envelope: *mailbox_module.Envelope = @ptrCast(@alignCast(envelope_handle));
+    const payload: *const concurrency.SignalPayload = @ptrCast(@alignCast(envelope.fragment.payload_pointer.?));
+    return payload.ref;
+}
+
+/// The reason term of a signal envelope.
+export fn zap_proc_envelope_signal_reason(envelope_handle: *anyopaque) callconv(.c) u64 {
+    const envelope: *mailbox_module.Envelope = @ptrCast(@alignCast(envelope_handle));
+    const payload: *const concurrency.SignalPayload = @ptrCast(@alignCast(envelope.fragment.payload_pointer.?));
+    return payload.reason_term;
 }
 
 // ---------------------------------------------------------------------------
@@ -1741,10 +1929,12 @@ test "abi: init → spawn → send → receive → exit round-trip through the C
     const stats = runtime_state.backend.production_pool.statistics();
     try testing.expectEqual(@as(i64, 0), stats.live_process_count);
     try testing.expectEqual(@as(u64, 2), stats.spawn_total);
-    // Receiver returned (normal); sender used the exit intrinsic (the
-    // Phase 2 kill-path exit — module doc).
-    try testing.expectEqual(@as(u64, 1), stats.normal_exit_total);
-    try testing.expectEqual(@as(u64, 1), stats.kill_total);
+    // Both exit normally: the receiver returned from its entry, and the sender
+    // called `zap_proc_exit` — which since P5-J1 is a NORMAL self-exit (reason
+    // `normal`), NOT the old Phase-2 kill-path exit. So `normal_exit_total` is 2
+    // and no teardown is classified as a kill.
+    try testing.expectEqual(@as(u64, 2), stats.normal_exit_total);
+    try testing.expectEqual(@as(u64, 0), stats.kill_total);
     const envelope_stats = runtime_state.envelope_pool.statistics();
     try testing.expectEqual(@as(u32, 0), envelope_stats.live_page_count);
     try testing.expectEqual(@as(u32, 0), envelope_stats.abandoned_page_count);

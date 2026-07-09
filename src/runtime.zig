@@ -3806,6 +3806,25 @@ const ZapConcurrencyKernel = struct {
     ) callconv(.c) i32;
     extern fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) noreturn;
 
+    // Kernel signal primitives (P5-J1, `src/runtime/concurrency/abi.zig`): links,
+    // monitors, exit signals, trap_exit — the mechanism J2/J3 build supervision
+    // on in pure Zap. Reason terms are atom ids (binary-global `u32`, widened to
+    // `u64` at this boundary); refs are `u64`.
+    extern fn zap_proc_set_reason_atoms(normal_term: u64, killed_term: u64, noproc_term: u64) callconv(.c) void;
+    extern fn zap_proc_link(process: *anyopaque, target_pid_bits: u64) callconv(.c) bool;
+    extern fn zap_proc_unlink(process: *anyopaque, target_pid_bits: u64) callconv(.c) bool;
+    extern fn zap_proc_monitor(process: *anyopaque, target_pid_bits: u64) callconv(.c) u64;
+    extern fn zap_proc_demonitor(process: *anyopaque, ref: u64) callconv(.c) bool;
+    extern fn zap_proc_exit_signal(process: *anyopaque, target_pid_bits: u64, reason_kind: u8, reason_term: u64) callconv(.c) i32;
+    extern fn zap_proc_kill(process: *anyopaque, target_pid_bits: u64) callconv(.c) i32;
+    extern fn zap_proc_set_trap_exit(process: *anyopaque, value: bool) callconv(.c) bool;
+    extern fn zap_proc_trap_exit(process: *anyopaque) callconv(.c) bool;
+    extern fn zap_proc_exit_reason(process: *anyopaque, reason_kind: u8, reason_term: u64) callconv(.c) noreturn;
+    extern fn zap_proc_await_signal(process: *anyopaque) callconv(.c) u64;
+    extern fn zap_proc_last_signal_from(process: *anyopaque) callconv(.c) u64;
+    extern fn zap_proc_last_signal_ref(process: *anyopaque) callconv(.c) u64;
+    extern fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64;
+
     // P2-J6 three-layer cooperative safepoints (plan item 2.5). The
     // per-quantum reduction budget the scheduler publishes (`_budget`,
     // read-only here — the layer-2 loop-local counter's seed) and the
@@ -5313,6 +5332,114 @@ pub const ProcessRuntime = struct {
     pub fn exit_process() noreturn {
         requireConcurrencyRuntimeGate();
         ZapConcurrencyKernel.zap_proc_exit(requireCurrentProcessHandle());
+    }
+
+    // -- Kernel signal primitives (P5-J1) -------------------------------------
+
+    /// Register the well-known reason atoms the kernel synthesizes (`normal` for
+    /// a clean exit, `killed` for a kill, `noproc` for a dead-process address).
+    /// The Zap signal wrappers call this before first use, so the atom
+    /// IDENTITIES stay in Zap (`lib/process.zap`), never hardcoded in Zig.
+    /// Atoms are binary-global `u32` ids, widened to `u64` at the kernel ABI.
+    pub fn register_reason_atoms(normal_atom: anytype, killed_atom: anytype, noproc_atom: anytype) bool {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_proc_set_reason_atoms(
+            @as(u64, normal_atom),
+            @as(u64, killed_atom),
+            @as(u64, noproc_atom),
+        );
+        return true;
+    }
+
+    /// `link(pid)`: establish a bidirectional link (idempotent). See
+    /// `zap_proc_link`.
+    pub fn link_process(target_pid_bits: u64) bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_link(requireCurrentProcessHandle(), target_pid_bits);
+    }
+
+    /// `unlink(pid)`: break a bidirectional link (idempotent).
+    pub fn unlink_process(target_pid_bits: u64) bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_unlink(requireCurrentProcessHandle(), target_pid_bits);
+    }
+
+    /// `monitor(pid) -> Ref`: install a stackable monitor, returning its ref.
+    pub fn monitor_process(target_pid_bits: u64) u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_monitor(requireCurrentProcessHandle(), target_pid_bits);
+    }
+
+    /// `demonitor(Ref)`: drop a monitor this process holds.
+    pub fn demonitor_process(ref: u64) bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_demonitor(requireCurrentProcessHandle(), ref);
+    }
+
+    /// `exit(pid, reason)`: send a TRAPPABLE exit signal. `abnormal` is the
+    /// Zap-classified category (`false` = `normal`, which never kills a
+    /// non-trapping target). Returns whether the target resolved.
+    pub fn send_exit_signal(target_pid_bits: u64, abnormal: bool, reason_atom: anytype) bool {
+        requireConcurrencyRuntimeGate();
+        const reason_kind: u8 = if (abnormal) 1 else 0;
+        return ZapConcurrencyKernel.zap_proc_exit_signal(
+            requireCurrentProcessHandle(),
+            target_pid_bits,
+            reason_kind,
+            @as(u64, reason_atom),
+        ) == 0;
+    }
+
+    /// `exit(pid, kill)`: the UNTRAPPABLE kill (target dies `killed`). Returns
+    /// whether the target resolved.
+    pub fn kill_process(target_pid_bits: u64) bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_kill(requireCurrentProcessHandle(), target_pid_bits) == 0;
+    }
+
+    /// Set this process's `trap_exit` flag, returning the previous value.
+    pub fn set_trap_exit(value: bool) bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_set_trap_exit(requireCurrentProcessHandle(), value);
+    }
+
+    /// Whether this process traps exits.
+    pub fn get_trap_exit() bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_trap_exit(requireCurrentProcessHandle());
+    }
+
+    /// Self-terminate abnormally with `reason_atom` (Erlang `exit(Reason)`).
+    /// Never returns.
+    pub fn exit_with_reason(reason_atom: anytype) noreturn {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_proc_exit_reason(requireCurrentProcessHandle(), 1, @as(u64, reason_atom));
+    }
+
+    /// Blocking receive of the next signal message (raw J1 surface): consume the
+    /// mailbox head (an exit/`DOWN`), cache its fields, and return the reason as
+    /// its binary-global `u32` atom id. `last_signal_*` read the other fields.
+    pub fn await_signal() u32 {
+        requireConcurrencyRuntimeGate();
+        return @truncate(ZapConcurrencyKernel.zap_proc_await_signal(requireCurrentProcessHandle()));
+    }
+
+    /// The `from` pid bits of the most recently `await_signal`-consumed signal.
+    pub fn last_signal_from() u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_last_signal_from(requireCurrentProcessHandle());
+    }
+
+    /// The monitor ref of the most recently consumed signal (`DOWN` only).
+    pub fn last_signal_ref() u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_last_signal_ref(requireCurrentProcessHandle());
+    }
+
+    /// The kind of the most recently consumed signal (1 = exit, 2 = down).
+    pub fn last_signal_kind() i64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_last_signal_kind(requireCurrentProcessHandle());
     }
 
     /// Park the calling process until a message is at the mailbox head or

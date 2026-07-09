@@ -707,6 +707,22 @@ pub const PidTable = struct {
         return observation.pcb.?;
     }
 
+    /// Resolve a pid to its live PCB with the SAME validation as `lookup` but
+    /// WITHOUT the dead-letter accounting, hook, or log — for the signal
+    /// mechanism (P5-J1), where addressing an already-dead process is an
+    /// EXPECTED silent no-op (Erlang: an exit signal / `DOWN` to a dead process
+    /// is dropped, not a mis-addressed user message). Returns null on any
+    /// mismatch, exactly like `lookup`, but never touches `dead_letter_count`.
+    pub fn lookupSilent(table: *PidTable, pid: Pid) ?*process.ProcessControlBlock {
+        if (!pid.isLocal()) return null;
+        if (pid.slot >= table.slots.len) return null;
+        const observation = readSlotConsistent(&table.slots[pid.slot]);
+        if (observation.metadata.generation != pid.generation) return null;
+        if (observation.metadata.state != .occupied) return null;
+        if (observation.metadata.model != pid.model) return null;
+        return observation.pcb.?;
+    }
+
     /// Silent aliveness probe: the same validation as `lookup` without
     /// the dead-letter accounting, hook, or log — for control-flow
     /// checks where a dead pid is the EXPECTED terminal condition
