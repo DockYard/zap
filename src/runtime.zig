@@ -3830,7 +3830,31 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_last_signal_from(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_last_signal_ref(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64;
+    extern fn zap_proc_last_signal_reason(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_monotonic_nanos(process: *anyopaque) callconv(.c) u64;
+
+    // The correlated receive (P5-J4, `src/runtime/concurrency/abi.zig`): the
+    // INTERNAL `call`/`Task.await` machinery — the ref-trick receive-mark and
+    // the correlation-token receive (research §6.2, decision 7). Never surface
+    // syntax; only `lib/task.zap`/`lib/process.zap`'s call/await internals
+    // reach these.
+    extern fn zap_proc_recv_mark_prepare(process: *anyopaque) callconv(.c) void;
+    extern fn zap_proc_recv_mark_bind(process: *anyopaque, ref: u64) callconv(.c) void;
+    extern fn zap_proc_send_correlated(
+        process: *anyopaque,
+        target_pid_bits: u64,
+        ref: u64,
+        payload_pointer: ?[*]const u8,
+        payload_len: usize,
+    ) callconv(.c) i32;
+    extern fn zap_proc_receive_correlated(process: *anyopaque, ref: u64, timeout_nanoseconds: u64) callconv(.c) i32;
+    extern fn zap_proc_take_correlated(
+        process: *anyopaque,
+        out_payload_pointer: *?[*]const u8,
+        out_payload_len: *usize,
+    ) callconv(.c) *anyopaque;
+    extern fn zap_proc_demonitor_flush(process: *anyopaque, ref: u64) callconv(.c) bool;
+    extern fn zap_proc_correlated_scan_visits(process: *anyopaque) callconv(.c) u64;
 
     // Local process registry (P5-J2, `src/runtime/concurrency/registry.zig`):
     // the atomic name→pid table `Process.register`/`whereis`/`unregister` and
@@ -5344,14 +5368,28 @@ pub const ProcessRuntime = struct {
         var payload_len: usize = 0;
         const envelope = ZapConcurrencyKernel.zap_proc_receive_park(process, &payload_pointer, &payload_len);
         defer ZapConcurrencyKernel.zap_proc_envelope_free(envelope);
+        return decodeReceivedEnvelope(MessageType, envelope, payload_pointer, payload_len);
+    }
 
-        // Same-model O(1) region-move receive (P3-J5): if the envelope carries a
-        // MOVED value graph (not a copied byte blob), take ownership of it,
-        // ADOPT its backing into THIS process's heap, and return it IN PLACE —
-        // no reconstruction, no copy. The sender only ever moves a flat
-        // `List(scalar)` cell (see `send_message_moved`), so the moved root IS a
-        // `MessageType` value; a moved payload for any other receive type is a
-        // protocol violation.
+    /// Decode one received envelope as `MessageType` — the shared core of
+    /// `receiveMessage` (the steady-state receive) and
+    /// `takeCorrelatedMessage` (the correlated reply decode, P5-J4). The
+    /// caller owns the envelope and frees it after this returns (the
+    /// payload view borrows from it until then).
+    ///
+    /// Same-model O(1) region-move receive (P3-J5): if the envelope carries a
+    /// MOVED value graph (not a copied byte blob), take ownership of it,
+    /// ADOPT its backing into THIS process's heap, and return it IN PLACE —
+    /// no reconstruction, no copy. The sender only ever moves a flat
+    /// `List(scalar)` cell (see `send_message_moved`), so the moved root IS a
+    /// `MessageType` value; a moved payload for any other receive type is a
+    /// protocol violation.
+    fn decodeReceivedEnvelope(
+        comptime MessageType: type,
+        envelope: *anyopaque,
+        payload_pointer: ?[*]const u8,
+        payload_len: usize,
+    ) MessageType {
         if (ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope)) |moved_root| {
             if (comptime movableFlatListCell(MessageType)) |Cell| {
                 const alignment = comptime Cell.bufferAlign();
@@ -5548,6 +5586,142 @@ pub const ProcessRuntime = struct {
     pub fn dead_letter_unexpected() noreturn {
         requireConcurrencyRuntimeGate();
         ZapConcurrencyKernel.zap_proc_dead_letter_unexpected(requireCurrentProcessHandle());
+    }
+
+    // -- The correlated receive (P5-J4) ---------------------------------------
+    //
+    // The INTERNAL `call`/`Task.await` machinery: the ref-trick receive-mark
+    // (research §6.2) plus the correlation-token receive resolved as
+    // internal-only in zap-concurrency-research §5.2 / decision 7. Reached
+    // exclusively from `lib/task.zap` and `lib/process.zap`'s call/await
+    // bodies — never from surface syntax; the steady-state exhaustive
+    // `receive` construct is untouched.
+
+    /// Capture the receive-mark at the calling process's current mailbox
+    /// position. MUST run BEFORE the correlation ref is minted (monitoring a
+    /// dead target fires its `noproc` `DOWN` during minting, and that `DOWN`
+    /// has to land after the mark to be scannable); pair with
+    /// `receive_mark_bind`. Returns `true` (a bindable Zap expression).
+    pub fn receive_mark_prepare() bool {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_proc_recv_mark_prepare(requireCurrentProcessHandle());
+        return true;
+    }
+
+    /// Bind the prepared receive-mark to the freshly-minted `ref` it
+    /// serves. Returns `true` (a bindable Zap expression).
+    pub fn receive_mark_bind(ref: u64) bool {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_proc_recv_mark_bind(requireCurrentProcessHandle(), ref);
+        return true;
+    }
+
+    /// Send `message` to `target_pid_bits` stamped with the correlation
+    /// `ref` — the reply half of the `call`/`Task` protocol. The stamp
+    /// rides the envelope header, so the payload is exactly the reply
+    /// VALUE (the receiver decodes it as its awaited type directly).
+    /// Everything else mirrors `send_message`: walker-sendable types,
+    /// deep-copy transport, `true` on delivery / `false` on dead-letter.
+    pub fn send_correlated(target_pid_bits: u64, ref: u64, message: anytype) bool {
+        requireConcurrencyRuntimeGate();
+        const MessageType = switch (@TypeOf(message)) {
+            comptime_int => i64,
+            comptime_float => f64,
+            else => @TypeOf(message),
+        };
+        if (comptime !isWalkerSendable(MessageType)) unsendableMessageTypeError(MessageType);
+
+        // Scalar fast-path — bit-copy, wire-compatible with the rich decode
+        // (mirrors `send_message`).
+        if (comptime isWalkerScalar(MessageType)) {
+            var message_storage: MessageType = message;
+            const payload_bytes = std.mem.asBytes(&message_storage);
+            return interpretSendStatus(ZapConcurrencyKernel.zap_proc_send_correlated(
+                requireCurrentProcessHandle(),
+                target_pid_bits,
+                ref,
+                payload_bytes.ptr,
+                payload_bytes.len,
+            ));
+        }
+
+        const typed_message: MessageType = message;
+        const blob = serializeMessage(MessageType, typed_message, std.heap.c_allocator) catch
+            @panic("zap: Process.reply failed inside the concurrency runtime (out of memory serializing the reply)");
+        defer std.heap.c_allocator.free(blob);
+        return interpretSendStatus(ZapConcurrencyKernel.zap_proc_send_correlated(
+            requireCurrentProcessHandle(),
+            target_pid_bits,
+            ref,
+            blob.ptr,
+            blob.len,
+        ));
+    }
+
+    /// Block until the message correlated with `ref` arrives — a reply
+    /// stamped by `send_correlated`, or the monitor `DOWN` carrying `ref` —
+    /// or `timeout_milliseconds` elapses (`<= 0` polls one scan without
+    /// parking). Returns the `zap_proc_receive_correlated` outcome code:
+    /// `0` = reply stashed (decode it with `take_correlated_message`),
+    /// `1` = `DOWN` consumed (fields via `last_signal_from`/
+    /// `last_signal_reason`), `2` = timed out. Messages skipped by the
+    /// correlated scan remain queued, in order, for the steady-state
+    /// `receive`.
+    pub fn await_correlated(ref: u64, timeout_milliseconds: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        const timeout_nanoseconds: u64 = if (timeout_milliseconds <= 0)
+            0
+        else
+            @as(u64, @intCast(timeout_milliseconds)) *| std.time.ns_per_ms;
+        return ZapConcurrencyKernel.zap_proc_receive_correlated(
+            requireCurrentProcessHandle(),
+            ref,
+            timeout_nanoseconds,
+        );
+    }
+
+    /// Decode the correlated reply stashed by the last `await_correlated`
+    /// that returned `0`, as `MessageType` — the correlated twin of
+    /// `receiveMessage` (same walker decode, same moved-payload adoption).
+    /// The ZIR backend monomorphizes this on the annotated result type of
+    /// the `:zig.ProcessRuntime.take_correlated_message()` intrinsic
+    /// (`zir_builder.zig`), exactly like `receive_message`.
+    pub fn takeCorrelatedMessage(comptime MessageType: type) MessageType {
+        comptime std.debug.assert(isWalkerSendable(MessageType));
+        requireConcurrencyRuntimeGate();
+        const process = requireCurrentProcessHandle();
+        var payload_pointer: ?[*]const u8 = null;
+        var payload_len: usize = 0;
+        const envelope = ZapConcurrencyKernel.zap_proc_take_correlated(process, &payload_pointer, &payload_len);
+        defer ZapConcurrencyKernel.zap_proc_envelope_free(envelope);
+        return decodeReceivedEnvelope(MessageType, envelope, payload_pointer, payload_len);
+    }
+
+    /// `demonitor(ref)` + FLUSH (Elixir `Process.demonitor(ref, [:flush])`):
+    /// drop the monitor and guarantee no `DOWN` for `ref` is ever observed
+    /// afterwards — the call/await cleanup that keeps a late `DOWN` from
+    /// poisoning a later steady-state `receive`. Returns whether `ref`
+    /// named a live outgoing monitor.
+    pub fn demonitor_flush(ref: u64) bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_demonitor_flush(requireCurrentProcessHandle(), ref);
+    }
+
+    /// The reason term of the most recently consumed signal (an
+    /// `await_signal`, or an `await_correlated` that returned `1`), as its
+    /// binary-global `u32` atom id.
+    pub fn last_signal_reason() u32 {
+        requireConcurrencyRuntimeGate();
+        return @truncate(ZapConcurrencyKernel.zap_proc_last_signal_reason(requireCurrentProcessHandle()));
+    }
+
+    /// Cumulative count of envelopes examined by this process's correlated
+    /// receives — the R8 operation-count telemetry proving the
+    /// O(1)-from-mark skip (`lib/process.zap`'s
+    /// `Process.correlated_receive_visits`).
+    pub fn correlated_scan_visits() u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_proc_correlated_scan_visits(requireCurrentProcessHandle());
     }
 };
 

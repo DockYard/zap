@@ -1454,6 +1454,142 @@ export fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64 {
     return contextFromHandle(process).lastSignalKind();
 }
 
+/// The reason term of the most recently consumed signal (`zap_proc_await_signal`
+/// or a down-consumed `zap_proc_receive_correlated`) — the field
+/// `await_signal` returns directly, exposed for the correlated path where the
+/// outcome code and the reason must both be readable.
+export fn zap_proc_last_signal_reason(process: *anyopaque) callconv(.c) u64 {
+    return contextFromHandle(process).lastSignalReason();
+}
+
+// ---------------------------------------------------------------------------
+// The correlated receive (P5-J4): the INTERNAL `call`/`Task.await` machinery —
+// research §6.2's ref-trick receive-mark, zap-concurrency-research §5.2's
+// resolved "internal correlation-token skip" (decision 7). Never surface
+// syntax; the steady-state exhaustive `receive` above is untouched. See
+// `mailbox.zig` ("The correlated receive + receive-mark") for the mark/skip
+// semantics and `scheduler.zig` (`receiveCorrelated`) for the wait.
+// ---------------------------------------------------------------------------
+
+/// Capture the receive-mark at the calling process's current mailbox
+/// position. MUST be called BEFORE the correlation ref is minted (a monitor
+/// on a dead target fires its `noproc` `DOWN` during minting, and that
+/// `DOWN` has to land after the mark); pair with `zap_proc_recv_mark_bind`.
+export fn zap_proc_recv_mark_prepare(process: *anyopaque) callconv(.c) void {
+    contextFromHandle(process).prepareReceiveMark();
+}
+
+/// Bind the prepared receive-mark to the freshly-minted `ref` it serves.
+export fn zap_proc_recv_mark_bind(process: *anyopaque, ref: u64) callconv(.c) void {
+    contextFromHandle(process).bindReceiveMark(ref);
+}
+
+/// Send `payload_len` opaque bytes to `target_pid_bits` stamped with the
+/// correlation `ref` — the reply half of the `call`/`Task` protocol. The
+/// stamp lives in the envelope HEADER (`Fragment.correlation_ref`), so the
+/// receiver's correlated receive matches it without interpreting payload
+/// bytes. Everything else is `zap_proc_send` exactly (copy transport,
+/// dead-letter semantics, status codes).
+export fn zap_proc_send_correlated(
+    process: *anyopaque,
+    target_pid_bits: u64,
+    ref: u64,
+    payload_pointer: ?[*]const u8,
+    payload_len: usize,
+) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    const target = concurrency.Pid.fromBits(target_pid_bits);
+
+    var fragment = mailbox_module.Fragment{ .correlation_ref = ref };
+    var payload_block: ?*LedgerBlock = null;
+    if (payload_len > 0) {
+        const block = runtime_state.ledger.allocate(payload_len) catch
+            return ZapProcStatus.out_of_memory;
+        @memcpy(block.bodyPointer()[0..payload_len], payload_pointer.?[0..payload_len]);
+        fragment.payload_pointer = block.bodyPointer();
+        fragment.payload_byte_length = payload_len;
+        payload_block = block;
+    }
+
+    const outcome = context.send(target, fragment) catch {
+        if (payload_block) |block| runtime_state.ledger.free(block);
+        return ZapProcStatus.out_of_memory;
+    };
+    return switch (outcome) {
+        .delivered => ZapProcStatus.ok,
+        .dead_lettered => blk: {
+            if (payload_block) |block| runtime_state.ledger.free(block);
+            break :blk ZapProcStatus.dead_lettered;
+        },
+    };
+}
+
+/// C-ABI outcomes of `zap_proc_receive_correlated` (the tag values of
+/// `scheduler.AwaitCorrelatedOutcome`).
+pub const ZapProcCorrelatedOutcome = struct {
+    /// A correlated user REPLY arrived and is stashed; decode it with
+    /// `zap_proc_take_correlated`.
+    pub const reply_ready: i32 = 0;
+    /// The monitor `DOWN` carrying the ref arrived instead; its fields are
+    /// cached (`zap_proc_last_signal_from`/`_reason`), the envelope freed.
+    pub const down_consumed: i32 = 1;
+    /// The timeout elapsed with no correlated message.
+    pub const timed_out: i32 = 2;
+};
+
+/// Block until the message correlated with `ref` arrives — a user reply
+/// stamped by `zap_proc_send_correlated`, or the monitor `DOWN` carrying
+/// `ref` — or until `timeout_nanoseconds` elapses. Skipped messages remain
+/// queued, in order, for the steady-state receive. Scanning starts at the
+/// receive-mark when it is armed for `ref` (the O(1) skip past any older
+/// backlog); a reply outcome is stashed for the immediately-following
+/// `zap_proc_take_correlated`. If the process is killed while waiting, the
+/// call never returns.
+export fn zap_proc_receive_correlated(
+    process: *anyopaque,
+    ref: u64,
+    timeout_nanoseconds: u64,
+) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    return @intFromEnum(context.awaitCorrelated(ref, timeout_nanoseconds));
+}
+
+/// Take the reply envelope stashed by the last `reply_ready`
+/// `zap_proc_receive_correlated`, returning it as the same opaque
+/// borrowed-payload reference `zap_proc_receive_park` yields (release it
+/// with `zap_proc_envelope_free`; a moved payload is claimed with
+/// `zap_proc_envelope_take_moved`). Aborts if nothing is stashed — the
+/// call/await machinery always pairs the two calls.
+export fn zap_proc_take_correlated(
+    process: *anyopaque,
+    out_payload_pointer: *?[*]const u8,
+    out_payload_len: *usize,
+) callconv(.c) *anyopaque {
+    const context = contextFromHandle(process);
+    const envelope = context.takeCorrelatedStash();
+    out_payload_pointer.* = envelope.fragment.payload_pointer;
+    out_payload_len.* = envelope.fragment.payload_byte_length;
+    return @ptrCast(envelope);
+}
+
+/// `demonitor(ref)` + FLUSH (Elixir `Process.demonitor(ref, [:flush])`):
+/// drop the monitor and guarantee no `DOWN` for `ref` is ever observed by
+/// the calling process afterwards — the cleanup the call/await reply and
+/// timeout paths run so a late `DOWN` can never poison a later steady-state
+/// receive. Returns whether `ref` named a live outgoing monitor. See
+/// `Scheduler.signalDemonitorFlush` for the three-case race analysis.
+export fn zap_proc_demonitor_flush(process: *anyopaque, ref: u64) callconv(.c) bool {
+    return contextFromHandle(process).demonitorFlush(ref);
+}
+
+/// Cumulative count of envelopes examined by the calling process's
+/// correlated receives — the R8 operation-count telemetry that PROVES the
+/// O(1)-from-mark skip (a correlated receive over a 10k-message backlog
+/// examines a handful of envelopes when the mark is armed, 10k+ when not).
+export fn zap_proc_correlated_scan_visits(process: *anyopaque) callconv(.c) u64 {
+    return contextFromHandle(process).correlatedScanVisits();
+}
+
 /// The current MONOTONIC time in nanoseconds, read through the scheduler's clock
 /// seam (the same clock as `receive … after`). The `lib/process.zap`
 /// `Process.monotonic_millis` surface divides to milliseconds; supervisors

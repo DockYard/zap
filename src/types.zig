@@ -5781,6 +5781,44 @@ pub const TypeChecker = struct {
                 }
                 return true;
             },
+            // An INSTANTIATED parametric struct — `.applied { base: struct,
+            // args }`, e.g. `Call(i64)` (the typed-call request envelope,
+            // `lib/process.zap`) — is sendable iff every field's SUBSTITUTED
+            // type is sendable. Build the declaration's type_params→args
+            // substitution and check each field through it, mirroring the
+            // applied-struct arm of the pattern-binding walk
+            // (`recordCasePatternBindingTypesWithOwnership`). The runtime
+            // mirror needs no twin arm: after monomorphization the
+            // instantiation IS a plain by-value Zig struct, which
+            // `runtime.zig`'s `isWalkerSendable` already admits field-by-field.
+            // Applied UNIONS deliberately stay unsendable (payload-bearing
+            // variants need per-variant walker glue — the `.tagged_union` arm
+            // below rejects the parametric case for the same reason).
+            .applied => |applied_type| {
+                const base_type = self.store.getType(applied_type.base);
+                if (base_type != .struct_type) return false;
+                const declaration_struct = base_type.struct_type;
+                var substitution = SubstitutionMap.init(self.allocator);
+                defer substitution.deinit();
+                const pair_count = @min(declaration_struct.type_params.len, applied_type.args.len);
+                for (
+                    declaration_struct.type_params[0..pair_count],
+                    applied_type.args[0..pair_count],
+                ) |formal_id, argument_id| {
+                    const formal_type = self.store.getType(formal_id);
+                    if (formal_type != .type_var) continue;
+                    try substitution.bind(formal_type.type_var, argument_id);
+                }
+                for (declaration_struct.fields) |field| {
+                    const substituted_field_type = try substitution.applyToType(self.store, field.type_id);
+                    if (!try self.typeIsWalkerSendableBudgeted(
+                        substituted_field_type,
+                        try budget.childDepth(depth),
+                        budget,
+                    )) return false;
+                }
+                return true;
+            },
             .tagged_union => |tagged_union_type| tagged_union_type.type_params.len == 0 and
                 taggedUnionIsPayloadFree(tagged_union_type),
             else => false,

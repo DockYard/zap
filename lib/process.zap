@@ -677,4 +677,138 @@ pub struct Process {
   pub fn last_signal_kind() -> i64 {
     :zig.ProcessRuntime.last_signal_kind()
   }
+
+  @doc = """
+    The reason atom of the most recently consumed signal — the value
+    `await_signal` returned, re-readable without consuming another
+    signal. Also carries the reason of the `DOWN` a failed `Process.call`
+    or `Task.await` consumed internally (which those surfaces re-exit
+    with).
+    """
+
+  pub fn last_signal_reason() -> Atom {
+    :zig.ProcessRuntime.last_signal_reason()
+  }
+
+  @doc = """
+    Synchronous typed request/response against a server process — the
+    GenServer-call shape (concurrency plan item 5.3, P5-J4), with the
+    default 5000 ms timeout (Elixir's `GenServer.call/2`).
+
+    `Process.call(server, request)` monitors the server, sends it a
+    `Call(request_type)` envelope carrying the request plus the reply
+    address, and blocks until the correlated reply arrives. The wait is
+    the INTERNAL correlated receive (research §6.2's ref-trick): it finds
+    the reply in O(1) from the receive-mark captured when the monitor
+    reference was minted — an arbitrarily deep mailbox backlog is skipped,
+    stays queued, and keeps its order for the ordinary `receive`.
+
+    The server receives the envelope as an ordinary message of type
+    `Call(request_type)` and answers with `Process.reply(call, value)`:
+
+        # server loop
+        call = receive Call(i64) { c -> c }
+        _sent = Process.reply(call, call.request + 1)
+
+    The reply type is the call expression's annotated type — bind or
+    ascribe it at the call site: `sum = (Process.call(server, 41) :: i64)`.
+
+    Failure surface (Elixir-aligned — `GenServer.call` semantics): the
+    caller EXITS rather than receiving an error value. A DEAD server —
+    or one that dies mid-call — is detected through the monitor
+    IMMEDIATELY (a `:noproc` `DOWN` for an already-dead server, the real
+    exit reason for a mid-call death), and the caller exits with that
+    reason instead of hanging until the timeout; a silent-but-alive
+    server exits the caller with `:timeout` when the deadline elapses.
+    On every return path the monitor is dropped with FLUSH semantics, so
+    no stale `DOWN` can ever poison a later `receive`.
+    """
+
+  pub fn call(server :: Pid(Call(request_type)), request :: request_type) -> reply_type {
+    Process.call(server, request, 5000)
+  }
+
+  @doc = """
+    `Process.call` with an explicit timeout in milliseconds. See
+    `call/2` for the protocol, typing, and the Elixir-aligned failure
+    surface (exit on dead server / `:timeout` on deadline).
+    """
+
+  pub fn call(server :: Pid(Call(request_type)), request :: request_type, timeout_milliseconds :: i64) -> reply_type {
+    # Mark BEFORE the ref exists so even the immediately-fired :noproc
+    # DOWN of a dead server lands after the mark (O(1) to find).
+    _mark_prepared = :zig.ProcessRuntime.receive_mark_prepare()
+    ref = Process.monitor(server.raw)
+    _mark_bound = :zig.ProcessRuntime.receive_mark_bind(ref)
+    envelope = %Call(request_type){request: request, reply_ref: ref, reply_to: Process.self()}
+    # A dead server dead-letters the send; the monitor's :noproc DOWN
+    # (not the send) is what reports it — Erlang semantics.
+    _request_sent = Process.send(server, envelope)
+    outcome = :zig.ProcessRuntime.await_correlated(ref, timeout_milliseconds)
+    case outcome {
+      0 ->
+        {
+          value = (:zig.ProcessRuntime.take_correlated_message() :: reply_type)
+          # demonitor + flush: a server that dies right after replying
+          # must not leave a late DOWN in our mailbox.
+          _flushed = :zig.ProcessRuntime.demonitor_flush(ref)
+          value
+        }
+      1 ->
+        {
+          # The server died before replying (or was already dead —
+          # :noproc): the DOWN was consumed; exit with its reason,
+          # immediately, never waiting out the timeout.
+          _demonitored = Process.demonitor(ref)
+          Process.exit_with(Process.last_signal_reason())
+        }
+      _ ->
+        {
+          _flushed = :zig.ProcessRuntime.demonitor_flush(ref)
+          Process.exit_with(:timeout)
+        }
+    }
+  }
+
+  @doc = """
+    Answers a `Process.call`: sends `value` back to the caller identified
+    by the received `Call` envelope, correlated with its reply reference
+    (the correlation stamp rides the message envelope's header, so the
+    caller's typed await decodes exactly `value`). Returns `true` when
+    the reply was enqueued on a live mailbox, `false` when the caller is
+    gone (it crashed or timed out and exited — a late reply dead-letters
+    harmlessly, Erlang semantics).
+    """
+
+  pub fn reply(call_envelope :: Call(request_type), value :: reply_type) -> Bool {
+    :zig.ProcessRuntime.send_correlated(call_envelope.reply_to, call_envelope.reply_ref, value)
+  }
+
+  @doc = """
+    Cumulative count of mailbox envelopes examined by this process's
+    internal correlated receives (`Process.call`/`Task.await`) — the
+    observability counter for the O(1)-from-mark skip (research §6.2
+    R8): a call made over a deep mailbox backlog examines a handful of
+    envelopes, not the backlog. Deltas between two reads measure one
+    call's scan work.
+    """
+
+  pub fn correlated_receive_visits() -> u64 {
+    :zig.ProcessRuntime.correlated_scan_visits()
+  }
+}
+
+@doc = """
+  The request envelope a `Process.call` delivers to the server: the typed
+  `request` plus the reply address (`reply_to`, the caller's raw pid bits)
+  and the correlation reference (`reply_ref`) that `Process.reply` stamps
+  on the answer. A server receives it as an ordinary typed message —
+  `receive Call(i64) { c -> ... }` — and never touches the correlation
+  fields except through `Process.reply(call, value)`.
+  """
+
+pub struct Call(request_type) {
+  request :: request_type
+  reply_ref :: u64
+  reply_to :: u64
 }

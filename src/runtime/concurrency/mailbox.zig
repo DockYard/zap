@@ -80,6 +80,56 @@
 //! causal order is promised**; the XCHG interleaving across senders is
 //! arbitrary.
 //!
+//! ## The correlated receive + receive-mark (P5-J4 — the ONE sanctioned
+//! ## deviation from pop-head-and-dispatch)
+//!
+//! Research §6.2's ref-trick (`recv_mark`/`recv_opt_info`) and
+//! zap-concurrency-research.md §5.2/decision 7: the `call`/`Task.await`
+//! machinery — and ONLY it, never surface syntax — needs to receive the
+//! one message correlated with a freshly-minted unique reference,
+//! skipping an arbitrarily deep backlog in O(1). Three consumer-side
+//! pieces implement it:
+//!
+//! * **The mark** (`prepareReceiveMark`/`bindReceiveMark`): captured at
+//!   ref-creation time as the NEWEST queued envelope (`producer_tail`).
+//!   No message at-or-before the mark can carry a reference minted after
+//!   the capture (the reply's push XCHG is totally ordered after the
+//!   capture on `producer_tail`), so a correlated scan starts AT THE
+//!   MARK's successor — O(1) from the mark instead of O(backlog) from
+//!   the head. `prepare` runs BEFORE the ref is minted (so an
+//!   immediately-fired `noproc` `DOWN` still lands after the mark);
+//!   `bind` then names the ref the mark serves. One mark slot (Erlang's
+//!   own limitation): a correlated receive whose ref does not match the
+//!   bound ref falls back to a head scan — always sound, just O(N).
+//!   INVARIANT: a `.after` mark references a STILL-QUEUED envelope;
+//!   `pop` and the correlated extraction repair the mark before that
+//!   envelope leaves the queue.
+//!
+//! * **The scan + extraction** (`takeCorrelated`): walks from the mark
+//!   (or head), EXAMINES each envelope against the correlation ref (the
+//!   envelope-header `correlation_ref` stamp, or a `DOWN` signal's
+//!   monitor ref — the kernel never interprets payload bytes), and
+//!   EXTRACTS only the match. Skipped envelopes are never unlinked:
+//!   they remain queued, in order, for the steady-state receive — no
+//!   loss, no reorder of the skipped prefix. Extraction unlinks an
+//!   interior node with a consumer-only predecessor relink; extracting
+//!   the current TAIL closes the queue back to the predecessor with the
+//!   same reset-then-CAS discipline as the drain closure below (the
+//!   predecessor plays the stub's role).
+//!
+//! * **The any-push wake flag** (`armCorrelatedWake`): the wake seam
+//!   fires only on empty→nonempty transitions, but a correlated waiter
+//!   parks with a NONEMPTY (skipped-backlog) mailbox, so `push` also
+//!   fires the seam whenever `correlated_wake_armed` is set. Arming is
+//!   race-free without any new fence in `push`: the consumer stores the
+//!   flag, then CASes `producer_tail` against the last envelope its scan
+//!   examined (a no-op value write). If the CAS succeeds, the flag store
+//!   is release-published into `producer_tail`'s release sequence — every
+//!   later push's acq_rel XCHG synchronizes-with it and reads the flag as
+//!   set; if it fails, the tail already moved and the consumer rescans
+//!   instead of parking. Cost on the non-correlated hot path: one
+//!   monotonic load per push of a cache line the XCHG already owns.
+//!
 //! ## Memory ordering (the complete atomics inventory)
 //!
 //! | atomic | op / ordering | why |
@@ -160,6 +210,13 @@ pub const Fragment = struct {
     /// receiver's ordinary `zap_proc_envelope_free`); the receive lowering reads
     /// this to tell a signal from a user message.
     signal_kind: signal_module.SignalKind = .none,
+    /// Correlation token (P5-J4, research §6.2's ref-trick): the unique
+    /// reference stamped by the INTERNAL correlated send
+    /// (`zap_proc_send_correlated` — the `call`/`Task` reply path) so the
+    /// receiver's correlated receive matches this envelope by a header
+    /// compare, never by interpreting payload bytes. Zero for every
+    /// ordinary (uncorrelated) send.
+    correlation_ref: u64 = 0,
 };
 
 /// Reclaim hook for an un-adopted moved payload (see `Fragment.moved_reclaim`).
@@ -210,6 +267,60 @@ pub const PopOutcome = union(enum) {
     /// the pending store belongs to a RUNNING producer and lands within
     /// two instructions unless that producer was preempted.
     transient_gap,
+};
+
+/// Where a correlated receive starts scanning (P5-J4 receive-mark; module
+/// doc, "The correlated receive + receive-mark"). Consumer-only state.
+pub const ReceiveMark = union(enum) {
+    /// No mark armed: a correlated scan starts at the head.
+    none,
+    /// The queue was EMPTY at prepare time (or the marked envelope has
+    /// since been delivered): every queued envelope is at-or-after the
+    /// mark position, so scan from the head — same skip guarantee, the
+    /// backlog to skip is simply gone.
+    from_head,
+    /// Scan from this envelope's SUCCESSOR: it was the newest queued
+    /// envelope at prepare time, so nothing at-or-before it can carry a
+    /// ref minted after the capture. INVARIANT: still queued (`pop` and
+    /// the correlated extraction repair the mark before delivering it).
+    after: *Envelope,
+};
+
+/// Which envelopes a correlated scan matches (P5-J4).
+pub const CorrelatedMatchKind = enum {
+    /// A correlated USER reply (`Fragment.correlation_ref == ref`) OR the
+    /// monitor `DOWN` carrying `ref` — the `call`/`Task.await` wait.
+    user_or_down,
+    /// ONLY the monitor `DOWN` carrying `ref` — the demonitor-flush path
+    /// (a late user reply must stay queued and surface through the
+    /// steady-state receive's dead-letter accounting, never be silently
+    /// eaten by a flush).
+    down_only,
+};
+
+/// One `takeCorrelated` attempt (consumer-only).
+pub const CorrelatedScanOutcome = union(enum) {
+    /// The matching envelope, EXTRACTED from the queue — the caller owns
+    /// it (and must eventually free it). Every skipped envelope remains
+    /// queued, in order.
+    matched: *Envelope,
+    /// No match anywhere in the reachable queue; the payload is the LAST
+    /// queued envelope the scan examined (the queue tail at scan end), or
+    /// the embedded stub when the queue is empty. Hand it to
+    /// `armCorrelatedWake`, and back to the next `takeCorrelated` as
+    /// `resume_after` so the rescan only walks NEW arrivals.
+    exhausted: *Envelope,
+    /// A producer is mid-publish past the last reachable envelope (the
+    /// tail moved but the link is not visible after the bounded spin):
+    /// more input is arriving, so do not park — yield and rescan from the
+    /// payload envelope. Mirrors `PopOutcome.transient_gap`.
+    publish_pending: *Envelope,
+    /// The queue-extraction step itself hit a mid-publish window (the
+    /// matched envelope is the last node, the close-CAS failed, and the
+    /// appending producer's link did not land within the spin bound). The
+    /// matched envelope REMAINS QUEUED; yield and rescan (the same
+    /// deterministic match is found again). Mirrors `PopOutcome.transient_gap`.
+    extraction_pending,
 };
 
 /// Result of a non-consuming `Mailbox.peek` (the `receive … after`
@@ -275,6 +386,26 @@ pub const Mailbox = struct {
     wake_callback: WakeCallback,
     /// Opaque context handed to `wake_callback`.
     wake_context: ?*anyopaque,
+    /// The correlated receive's any-push wake request (module doc, "The
+    /// correlated receive + receive-mark"). Written ONLY by the consumer
+    /// (armed via `armCorrelatedWake`'s release-sequence protocol, cleared
+    /// on resume); read by every producer after its push XCHG. While set,
+    /// `push` fires the wake seam on EVERY push, not only the
+    /// empty→nonempty transition.
+    correlated_wake_armed: std.atomic.Value(bool),
+    /// The receive-mark (P5-J4). Consumer-only.
+    receive_mark: ReceiveMark,
+    /// The unique ref the mark serves, bound by `bindReceiveMark` after
+    /// the ref is minted; zero = unbound. A correlated scan uses the mark
+    /// only when its ref matches — a mismatch falls back to a head scan
+    /// (sound, just unskipped). Consumer-only.
+    receive_mark_ref: u64,
+    /// Cumulative count of envelopes EXAMINED by correlated scans — the
+    /// R8 operation-count telemetry proving the O(1)-from-mark claim (a
+    /// 10k-backlog correlated receive that starts at the mark examines a
+    /// handful of envelopes, not 10k). Consumer-only observability; never
+    /// control flow.
+    correlated_scan_visit_total: u64,
     /// Test-only producer instrumentation (zero-sized outside tests).
     push_instrumentation: PushInstrumentation,
     /// The embedded stub envelope marking the empty queue. Never pushed
@@ -295,6 +426,10 @@ pub const Mailbox = struct {
         mailbox.drain_closure_count = 0;
         mailbox.wake_callback = noopWakeCallback;
         mailbox.wake_context = null;
+        mailbox.correlated_wake_armed = .init(false);
+        mailbox.receive_mark = .none;
+        mailbox.receive_mark_ref = 0;
+        mailbox.correlated_scan_visit_total = 0;
         mailbox.push_instrumentation = .{};
     }
 
@@ -315,7 +450,17 @@ pub const Mailbox = struct {
         previous_tail.next.store(envelope, .release);
 
         const transitioned_from_empty = previous_tail == &mailbox.stub;
-        if (transitioned_from_empty) mailbox.wake_callback(mailbox.wake_context);
+        // The correlated-waiter wake (module doc): while the flag is set,
+        // EVERY push wakes — a correlated waiter parks with a nonempty
+        // (skipped-backlog) mailbox, so the empty→nonempty transition
+        // cannot be its wake source. Visibility of a `true` flag is
+        // guaranteed by the arm protocol's release sequence on
+        // `producer_tail` (the swap above acquires it); the load itself
+        // is a monotonic read of a line the XCHG already owns.
+        const correlated_wake_requested = mailbox.correlated_wake_armed.load(.monotonic);
+        if (transitioned_from_empty or correlated_wake_requested) {
+            mailbox.wake_callback(mailbox.wake_context);
+        }
         return transitioned_from_empty;
     }
 
@@ -394,8 +539,264 @@ pub const Mailbox = struct {
     }
 
     fn deliver(mailbox: *Mailbox, envelope: *Envelope) PopOutcome {
+        mailbox.repairMarkBeforeDelivery(envelope, null);
         _ = mailbox.approximate_depth.fetchSub(1, .monotonic);
         return .{ .envelope = envelope };
+    }
+
+    /// Maintain the `.after`-mark invariant (module doc): the marked
+    /// envelope must never leave the queue while the mark references it.
+    /// `pop` delivers the HEAD, so when the marked envelope is delivered
+    /// every remaining envelope is younger than the mark — `from_head`
+    /// preserves the skip guarantee exactly. A correlated EXTRACTION can
+    /// remove the marked envelope from mid-queue (a head-scan fallback
+    /// matching it); repairing to its still-queued `predecessor` is the
+    /// conservative-older repair (a too-old mark only widens the scan,
+    /// never skips a matchable message).
+    fn repairMarkBeforeDelivery(mailbox: *Mailbox, envelope: *Envelope, predecessor: ?*Envelope) void {
+        if (mailbox.receive_mark != .after) return;
+        if (mailbox.receive_mark.after != envelope) return;
+        if (predecessor) |previous| {
+            if (previous != &mailbox.stub) {
+                mailbox.receive_mark = .{ .after = previous };
+                return;
+            }
+        }
+        mailbox.receive_mark = .from_head;
+    }
+
+    // -------------------------------------------------------------------------
+    // The correlated receive (P5-J4 — module doc, "The correlated receive +
+    // receive-mark"). Consumer-only, like every consumer-side entry point.
+    // -------------------------------------------------------------------------
+
+    /// Capture the receive-mark position: the newest queued envelope at
+    /// this instant (or `from_head` when empty). MUST run BEFORE the
+    /// correlation ref is minted — a monitor on an already-dead target
+    /// fires its `noproc` `DOWN` during minting, and that `DOWN` must land
+    /// AFTER the mark to be scannable. Overwrites any previous mark (one
+    /// slot — the Erlang `recv_mark` limitation; a mismatched correlated
+    /// receive falls back to a head scan).
+    pub fn prepareReceiveMark(mailbox: *Mailbox) void {
+        const tail = mailbox.producer_tail.load(.monotonic);
+        mailbox.receive_mark = if (tail == &mailbox.stub) .from_head else .{ .after = tail };
+        mailbox.receive_mark_ref = 0;
+    }
+
+    /// Bind the prepared mark to the freshly-minted `ref` it serves.
+    /// Pushes that land between `prepareReceiveMark` and this bind sit
+    /// AFTER the mark position, so they stay scannable — the two-step
+    /// protocol has no gap.
+    pub fn bindReceiveMark(mailbox: *Mailbox, ref: u64) void {
+        if (mailbox.receive_mark == .none) return;
+        mailbox.receive_mark_ref = ref;
+    }
+
+    /// Whether `envelope` is correlated with `ref` under `match_kind`:
+    /// a user reply stamped `correlation_ref == ref`, or the monitor
+    /// `DOWN` whose signal payload carries `ref`. Header/payload-struct
+    /// compares only — the kernel never interprets user payload bytes.
+    fn envelopeMatchesCorrelation(envelope: *const Envelope, ref: u64, match_kind: CorrelatedMatchKind) bool {
+        switch (envelope.fragment.signal_kind) {
+            .none => {
+                if (match_kind == .down_only) return false;
+                return envelope.fragment.correlation_ref == ref;
+            },
+            .down => {
+                const payload: *const signal_module.SignalPayload =
+                    @ptrCast(@alignCast(envelope.fragment.payload_pointer.?));
+                return payload.ref == ref;
+            },
+            .exit => return false,
+        }
+    }
+
+    /// One correlated scan-and-extract attempt for `ref` (consumer-only;
+    /// blocking/parking policy lives in the scheduler). Scans from
+    /// `resume_after` when non-null (a previous attempt's `exhausted`/
+    /// `publish_pending` position — every envelope at-or-before it was
+    /// already examined and stays queued), else from the mark when it is
+    /// armed for `ref`, else from the head. Skipped envelopes are never
+    /// unlinked; only the match is extracted. See `CorrelatedScanOutcome`.
+    pub fn takeCorrelated(
+        mailbox: *Mailbox,
+        ref: u64,
+        match_kind: CorrelatedMatchKind,
+        resume_after: ?*Envelope,
+    ) CorrelatedScanOutcome {
+        // Ref 0 is the "uncorrelated" stamp every ordinary send carries; a
+        // scan for it would match arbitrary user messages.
+        std.debug.assert(ref != 0);
+        const stub_envelope = &mailbox.stub;
+
+        // The anchor: the queued envelope whose successor opens the
+        // unscanned region — or null, meaning the region starts AT
+        // `consumer_head` itself (a head scan with a real head).
+        var anchor: ?*Envelope = null;
+        var start_at_head = false;
+        if (resume_after) |resumed| {
+            anchor = resumed;
+        } else if (mailbox.receive_mark == .after and mailbox.receive_mark_ref == ref) {
+            anchor = mailbox.receive_mark.after;
+        } else {
+            start_at_head = true;
+        }
+        if (start_at_head) {
+            if (mailbox.consumer_head == stub_envelope) {
+                anchor = stub_envelope;
+            } else {
+                anchor = null;
+            }
+        }
+
+        // Establish (previous, current) for the walk.
+        var previous: ?*Envelope = undefined;
+        var current: *Envelope = undefined;
+        if (anchor) |anchored| {
+            const first = anchored.next.load(.acquire) orelse first: {
+                if (mailbox.producer_tail.load(.acquire) == anchored) {
+                    return .{ .exhausted = anchored };
+                }
+                // The tail moved past the anchor but the link is not
+                // visible: a producer is mid-publish right at the scan
+                // boundary. Grant it the pop-path spin grace.
+                break :first spinForNextLink(anchored) orelse
+                    return .{ .publish_pending = anchored };
+            };
+            previous = anchored;
+            current = first;
+        } else {
+            previous = null;
+            current = mailbox.consumer_head;
+        }
+
+        while (true) {
+            mailbox.correlated_scan_visit_total += 1;
+            if (envelopeMatchesCorrelation(current, ref, match_kind)) {
+                const extracted = mailbox.extractCorrelated(previous, current) orelse
+                    return .extraction_pending;
+                return .{ .matched = extracted };
+            }
+            const successor = current.next.load(.acquire) orelse {
+                if (mailbox.producer_tail.load(.acquire) == current) {
+                    return .{ .exhausted = current };
+                }
+                const linked = spinForNextLink(current) orelse
+                    return .{ .publish_pending = current };
+                previous = current;
+                current = linked;
+                continue;
+            };
+            previous = current;
+            current = successor;
+        }
+    }
+
+    /// Extract `matched` from the queue, leaving every other envelope in
+    /// place and in order. `previous` is the queued envelope linking to
+    /// `matched` (the embedded stub at the head boundary), or null when
+    /// `matched` IS `consumer_head` — that case is exactly `pop`'s head
+    /// delivery. Returns null when the matched envelope is the current
+    /// tail, the close-CAS lost to an appending producer, AND that
+    /// producer's link did not land within the spin bound — the matched
+    /// envelope then REMAINS QUEUED (nothing is torn down) and the caller
+    /// retries after a yield.
+    fn extractCorrelated(mailbox: *Mailbox, previous: ?*Envelope, matched: *Envelope) ?*Envelope {
+        const stub_envelope = &mailbox.stub;
+
+        if (previous) |predecessor| {
+            if (matched.next.load(.acquire)) |successor| {
+                // Interior unlink: `predecessor.next` is dead to every
+                // producer (only the CURRENT tail's `next` is ever
+                // producer-written, and `matched` sits after
+                // `predecessor`), so a consumer-only monotonic store
+                // suffices.
+                predecessor.next.store(successor, .monotonic);
+                return mailbox.finishExtraction(matched, predecessor);
+            }
+            // `matched` is the last reachable node: close the queue back
+            // to `predecessor` with the drain-closure discipline (reset
+            // the new tail's link BEFORE the CAS so the CAS's release
+            // publishes it to the next producer that XCHGs it out).
+            predecessor.next.store(null, .monotonic);
+            if (mailbox.producer_tail.cmpxchgStrong(matched, predecessor, .acq_rel, .acquire) == null) {
+                if (predecessor == stub_envelope) {
+                    // The queue closed to EMPTY (the head-boundary shape
+                    // `stub → matched`): this is exactly `pop`'s drain
+                    // closure, so keep the wake-exactness ledger honest.
+                    mailbox.consumer_head = stub_envelope;
+                    mailbox.drain_closure_count += 1;
+                }
+                return mailbox.finishExtraction(matched, predecessor);
+            }
+            // Close lost: a producer appended behind `matched`. Its link
+            // lands within two producer instructions unless preempted.
+            const successor = matched.next.load(.acquire) orelse
+                spinForNextLink(matched) orelse {
+                // Restore the chain (consumer-only field, no racing
+                // writer) and let the caller retry after a yield.
+                predecessor.next.store(matched, .monotonic);
+                return null;
+            };
+            predecessor.next.store(successor, .monotonic);
+            return mailbox.finishExtraction(matched, predecessor);
+        }
+
+        // Head extraction: `matched == consumer_head` — mirror `pop`'s
+        // delivery of the head exactly.
+        std.debug.assert(matched == mailbox.consumer_head);
+        if (matched.next.load(.acquire)) |successor| {
+            mailbox.consumer_head = successor;
+            return mailbox.finishExtraction(matched, null);
+        }
+        stub_envelope.next.store(null, .monotonic);
+        if (mailbox.producer_tail.cmpxchgStrong(matched, stub_envelope, .acq_rel, .acquire) == null) {
+            mailbox.consumer_head = stub_envelope;
+            mailbox.drain_closure_count += 1;
+            return mailbox.finishExtraction(matched, null);
+        }
+        const successor = matched.next.load(.acquire) orelse
+            spinForNextLink(matched) orelse return null;
+        mailbox.consumer_head = successor;
+        return mailbox.finishExtraction(matched, null);
+    }
+
+    fn finishExtraction(mailbox: *Mailbox, matched: *Envelope, predecessor: ?*Envelope) *Envelope {
+        mailbox.repairMarkBeforeDelivery(matched, predecessor);
+        _ = mailbox.approximate_depth.fetchSub(1, .monotonic);
+        return matched;
+    }
+
+    /// Arm the any-push wake for a correlated waiter about to park
+    /// (module doc). `last_examined` is the scan's `exhausted` payload —
+    /// the queue tail as the scan saw it (the embedded stub when empty).
+    /// Returns true when armed: the flag store is release-published into
+    /// `producer_tail`'s release sequence by a successful no-op CAS, so
+    /// every LATER push's acq_rel XCHG synchronizes-with it and observes
+    /// the flag — no fence added to the push hot path, no lost wake.
+    /// Returns false (flag cleared) when the tail already moved past
+    /// `last_examined`: a message arrived after the scan — rescan instead
+    /// of parking.
+    pub fn armCorrelatedWake(mailbox: *Mailbox, last_examined: *Envelope) bool {
+        mailbox.correlated_wake_armed.store(true, .monotonic);
+        if (mailbox.producer_tail.cmpxchgStrong(last_examined, last_examined, .acq_rel, .acquire) == null) {
+            return true;
+        }
+        mailbox.correlated_wake_armed.store(false, .monotonic);
+        return false;
+    }
+
+    /// Clear the any-push wake request (the correlated waiter resumed).
+    /// Consumer-only; producers that already read `true` fire at most one
+    /// redundant wake, which the park handshake absorbs.
+    pub fn disarmCorrelatedWake(mailbox: *Mailbox) void {
+        mailbox.correlated_wake_armed.store(false, .monotonic);
+    }
+
+    /// Cumulative correlated-scan visit count (R8 telemetry; see the
+    /// field doc).
+    pub fn correlatedScanVisits(mailbox: *const Mailbox) u64 {
+        return mailbox.correlated_scan_visit_total;
     }
 
     /// Bounded wait for a mid-publish producer's link store (module doc,
@@ -557,6 +958,357 @@ test "Mailbox: wake signal fires exactly once per empty→nonempty transition (s
 fn countingWakeCallbackSingleThreaded(wake_context: ?*anyopaque) void {
     const counter: *usize = @ptrCast(@alignCast(wake_context.?));
     counter.* += 1;
+}
+
+// -- correlated receive + receive-mark (P5-J4) --------------------------------
+
+fn correlatedEnvelope(ref: u64) Envelope {
+    return .{
+        .next = .init(null),
+        .origin_page = null,
+        .fragment = .{ .correlation_ref = ref },
+    };
+}
+
+fn downSignalEnvelope(payload: *const signal_module.SignalPayload) Envelope {
+    return .{
+        .next = .init(null),
+        .origin_page = null,
+        .fragment = .{
+            .payload_pointer = @ptrCast(payload),
+            .payload_byte_length = @sizeOf(signal_module.SignalPayload),
+            .signal_kind = .down,
+        },
+    };
+}
+
+fn expectTakeMatched(mailbox: *Mailbox, ref: u64, expected: *Envelope) !void {
+    switch (mailbox.takeCorrelated(ref, .user_or_down, null)) {
+        .matched => |envelope| try testing.expectEqual(expected, envelope),
+        else => return error.TestExpectedMatch,
+    }
+}
+
+test "Mailbox: correlated take extracts the interior match and preserves skipped order" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var first = standaloneEnvelope(1);
+    var second = standaloneEnvelope(2);
+    var reply = correlatedEnvelope(77);
+    var third = standaloneEnvelope(3);
+    _ = mailbox.push(&first);
+    _ = mailbox.push(&second);
+    _ = mailbox.push(&reply);
+    _ = mailbox.push(&third);
+    try testing.expectEqual(@as(usize, 4), mailbox.depth());
+
+    // No mark armed: head scan finds the match, extracts ONLY it.
+    try expectTakeMatched(&mailbox, 77, &reply);
+    try testing.expectEqual(@as(usize, 3), mailbox.depth());
+
+    // The skipped prefix and suffix remain queued, in order — no loss,
+    // no reorder.
+    try expectPopped(&mailbox, &first);
+    try expectPopped(&mailbox, &second);
+    try expectPopped(&mailbox, &third);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: correlated take at the head and at the tail mirrors pop's boundary discipline" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    // Head + sole envelope: extraction closes the queue (a drain closure).
+    var sole = correlatedEnvelope(5);
+    try testing.expect(mailbox.push(&sole));
+    try expectTakeMatched(&mailbox, 5, &sole);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+    try testing.expectEqual(@as(usize, 1), mailbox.drain_closure_count);
+    // The next push is an exact empty→nonempty transition again.
+    var after_close = standaloneEnvelope(9);
+    try testing.expect(mailbox.push(&after_close));
+    try expectPopped(&mailbox, &after_close);
+
+    // Tail extraction with a real predecessor: the queue closes back to
+    // the predecessor (NOT to empty — no drain closure), and a later push
+    // links behind the predecessor correctly.
+    var kept = standaloneEnvelope(10);
+    var tail_reply = correlatedEnvelope(6);
+    _ = mailbox.push(&kept);
+    _ = mailbox.push(&tail_reply);
+    try expectTakeMatched(&mailbox, 6, &tail_reply);
+    var appended = standaloneEnvelope(11);
+    _ = mailbox.push(&appended);
+    try expectPopped(&mailbox, &kept);
+    try expectPopped(&mailbox, &appended);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: correlated take reports exhausted (with the scan tail) when nothing matches" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    // Empty queue: exhausted at the stub.
+    switch (mailbox.takeCorrelated(3, .user_or_down, null)) {
+        .exhausted => |last| try testing.expectEqual(&mailbox.stub, last),
+        else => return error.TestExpectedExhausted,
+    }
+
+    var first = standaloneEnvelope(1);
+    var second = standaloneEnvelope(2);
+    _ = mailbox.push(&first);
+    _ = mailbox.push(&second);
+    switch (mailbox.takeCorrelated(3, .user_or_down, null)) {
+        .exhausted => |last| try testing.expectEqual(&second, last),
+        else => return error.TestExpectedExhausted,
+    }
+    // Resuming from the reported position rescans only new arrivals.
+    var reply = correlatedEnvelope(3);
+    _ = mailbox.push(&reply);
+    const visits_before_resume = mailbox.correlatedScanVisits();
+    switch (mailbox.takeCorrelated(3, .user_or_down, &second)) {
+        .matched => |envelope| try testing.expectEqual(&reply, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    try testing.expectEqual(@as(u64, 1), mailbox.correlatedScanVisits() - visits_before_resume);
+    try expectPopped(&mailbox, &first);
+    try expectPopped(&mailbox, &second);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: the receive-mark makes a correlated take O(1) past a deep backlog (R8)" {
+    const backlog_count = 10_000;
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    const backlog = try testing.allocator.alloc(Envelope, backlog_count);
+    defer testing.allocator.free(backlog);
+    for (backlog, 0..) |*envelope, index| {
+        envelope.* = standaloneEnvelope(index);
+        _ = mailbox.push(envelope);
+    }
+
+    // The call protocol: mark BEFORE the ref exists, then bind.
+    mailbox.prepareReceiveMark();
+    mailbox.bindReceiveMark(42);
+
+    // Post-mark traffic: one unrelated message, then the correlated reply.
+    var unrelated = standaloneEnvelope(999_999);
+    var reply = correlatedEnvelope(42);
+    _ = mailbox.push(&unrelated);
+    _ = mailbox.push(&reply);
+
+    const visits_before = mailbox.correlatedScanVisits();
+    try expectTakeMatched(&mailbox, 42, &reply);
+    const visited = mailbox.correlatedScanVisits() - visits_before;
+
+    // THE R8 proof: the scan started at the mark and examined only the
+    // post-mark messages (2), not the 10k backlog. A head scan would have
+    // visited backlog_count + 2.
+    try testing.expectEqual(@as(u64, 2), visited);
+
+    // No loss, no reorder: the full backlog (and the skipped post-mark
+    // message) drain in order through the steady-state pop.
+    for (backlog) |*envelope| try expectPopped(&mailbox, envelope);
+    try expectPopped(&mailbox, &unrelated);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: a mismatched ref ignores the mark and falls back to a (sound) head scan" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    // An older correlated reply for ref A sits BEFORE the mark armed for
+    // ref B; awaiting A must still find it (head fallback), not skip it.
+    var reply_a = correlatedEnvelope(101);
+    _ = mailbox.push(&reply_a);
+    mailbox.prepareReceiveMark();
+    mailbox.bindReceiveMark(202);
+
+    try expectTakeMatched(&mailbox, 101, &reply_a);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: pop of the marked envelope repairs the mark to from_head" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var first = standaloneEnvelope(1);
+    var second = standaloneEnvelope(2);
+    _ = mailbox.push(&first);
+    _ = mailbox.push(&second);
+    mailbox.prepareReceiveMark();
+    mailbox.bindReceiveMark(7);
+    try testing.expect(mailbox.receive_mark == .after);
+    try testing.expectEqual(&second, mailbox.receive_mark.after);
+
+    // Steady-state pops deliver up to and including the marked envelope.
+    try expectPopped(&mailbox, &first);
+    try testing.expect(mailbox.receive_mark == .after);
+    try expectPopped(&mailbox, &second);
+    try testing.expect(mailbox.receive_mark == .from_head);
+
+    // The mark stays honest: a reply pushed after the repair is found.
+    var reply = correlatedEnvelope(7);
+    _ = mailbox.push(&reply);
+    try expectTakeMatched(&mailbox, 7, &reply);
+}
+
+test "Mailbox: correlated extraction of the marked envelope repairs the mark to its predecessor" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var older = standaloneEnvelope(1);
+    var marked_reply = correlatedEnvelope(11);
+    _ = mailbox.push(&older);
+    _ = mailbox.push(&marked_reply);
+    // Mark lands ON the correlated envelope (newest at prepare time),
+    // bound to a DIFFERENT ref, so awaiting 11 head-scans and extracts
+    // the marked envelope itself.
+    mailbox.prepareReceiveMark();
+    mailbox.bindReceiveMark(999);
+    try testing.expectEqual(&marked_reply, mailbox.receive_mark.after);
+
+    try expectTakeMatched(&mailbox, 11, &marked_reply);
+    // Repaired to the still-queued predecessor (conservative-older).
+    try testing.expect(mailbox.receive_mark == .after);
+    try testing.expectEqual(&older, mailbox.receive_mark.after);
+    try expectPopped(&mailbox, &older);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: down_only matches the DOWN and never a correlated user reply" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var payload = signal_module.SignalPayload{ .from_bits = 5, .ref = 33, .reason_term = 1 };
+    var user_reply = correlatedEnvelope(33);
+    var down = downSignalEnvelope(&payload);
+    _ = mailbox.push(&user_reply);
+    _ = mailbox.push(&down);
+
+    // down_only skips the (same-ref) user reply and takes the DOWN.
+    switch (mailbox.takeCorrelated(33, .down_only, null)) {
+        .matched => |envelope| try testing.expectEqual(&down, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    // user_or_down then takes the reply; an exit signal never matches.
+    try expectTakeMatched(&mailbox, 33, &user_reply);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: user_or_down takes the earlier of reply and DOWN in queue order" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var payload = signal_module.SignalPayload{ .from_bits = 5, .ref = 44, .reason_term = 1 };
+    var reply = correlatedEnvelope(44);
+    var down = downSignalEnvelope(&payload);
+    _ = mailbox.push(&reply);
+    _ = mailbox.push(&down);
+
+    // The reply precedes its DOWN (the worker replies, then exits): the
+    // wait must take the reply.
+    try expectTakeMatched(&mailbox, 44, &reply);
+    switch (mailbox.takeCorrelated(44, .down_only, null)) {
+        .matched => |envelope| try testing.expectEqual(&down, envelope),
+        else => return error.TestExpectedMatch,
+    }
+}
+
+test "Mailbox: armCorrelatedWake makes every push fire the wake seam until disarmed" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+    var wake_count: usize = 0;
+    mailbox.wake_callback = countingWakeCallbackSingleThreaded;
+    mailbox.wake_context = &wake_count;
+
+    // Nonempty mailbox (the correlated-waiter shape): a push while
+    // UNARMED does not wake (no empty→nonempty transition)…
+    var backlog_envelope = standaloneEnvelope(1);
+    try testing.expect(mailbox.push(&backlog_envelope)); // transition wake
+    try testing.expectEqual(@as(usize, 1), wake_count);
+    var silent = standaloneEnvelope(2);
+    try testing.expect(!mailbox.push(&silent));
+    try testing.expectEqual(@as(usize, 1), wake_count);
+
+    // …but after arming at the scan's exhausted tail, every push wakes.
+    const exhausted_tail = switch (mailbox.takeCorrelated(9, .user_or_down, null)) {
+        .exhausted => |last| last,
+        else => return error.TestExpectedExhausted,
+    };
+    try testing.expectEqual(&silent, exhausted_tail);
+    try testing.expect(mailbox.armCorrelatedWake(exhausted_tail));
+    var woken_one = standaloneEnvelope(3);
+    var woken_two = standaloneEnvelope(4);
+    _ = mailbox.push(&woken_one);
+    _ = mailbox.push(&woken_two);
+    try testing.expectEqual(@as(usize, 3), wake_count);
+
+    // Disarm restores transition-only waking.
+    mailbox.disarmCorrelatedWake();
+    var silent_again = standaloneEnvelope(5);
+    _ = mailbox.push(&silent_again);
+    try testing.expectEqual(@as(usize, 3), wake_count);
+}
+
+test "Mailbox: armCorrelatedWake refuses when a message landed after the scan" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var first = standaloneEnvelope(1);
+    _ = mailbox.push(&first);
+    const exhausted_tail = switch (mailbox.takeCorrelated(9, .user_or_down, null)) {
+        .exhausted => |last| last,
+        else => return error.TestExpectedExhausted,
+    };
+
+    // A message lands between the scan and the arm: the arm must fail
+    // (and leave the flag clear) so the caller rescans instead of parking.
+    var raced = correlatedEnvelope(9);
+    _ = mailbox.push(&raced);
+    try testing.expect(!mailbox.armCorrelatedWake(exhausted_tail));
+    try testing.expect(!mailbox.correlated_wake_armed.load(.monotonic));
+
+    // The rescan from the stale position finds the racer.
+    switch (mailbox.takeCorrelated(9, .user_or_down, exhausted_tail)) {
+        .matched => |envelope| try testing.expectEqual(&raced, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    try expectPopped(&mailbox, &first);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: correlated take reports publish_pending on a parked mid-publish producer" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var parked_envelope = correlatedEnvelope(21);
+    var producer = ParkedProducer{
+        .target_mailbox = &mailbox,
+        .park_on_envelope = &parked_envelope,
+    };
+    producer.arm();
+
+    const producer_thread = try std.Thread.spawn(.{}, ParkedProducer.run, .{&producer});
+    try producer.reached_gap_window.timedWait(test_wait_nanoseconds);
+
+    // The tail moved (the reply is arriving) but the link has not landed:
+    // the scan must report publish_pending — never exhausted (which would
+    // let the caller park and miss the wake) and never a bogus match.
+    switch (mailbox.takeCorrelated(21, .user_or_down, null)) {
+        .publish_pending => |last| try testing.expectEqual(&mailbox.stub, last),
+        else => return error.TestExpectedPublishPending,
+    }
+
+    producer.release_from_gap_window.set();
+    producer_thread.join();
+
+    try expectTakeMatched(&mailbox, 21, &parked_envelope);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
 }
 
 // -- deterministic transient-gap tests ---------------------------------------

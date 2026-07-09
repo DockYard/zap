@@ -665,6 +665,15 @@ pub const ProcessRecord = struct {
     last_signal: signal_module.SignalPayload,
     /// Kind of the cached `last_signal` (`.none` before the first consumed).
     last_signal_kind: signal_module.SignalKind,
+    /// The correlated user REPLY stashed by a `.reply_ready`
+    /// `awaitCorrelated`, held for the immediately-following typed decode
+    /// (`takeCorrelatedStash` — the two-call `zap_proc_receive_correlated`
+    /// → `zap_proc_take_correlated` ABI protocol, P5-J4). Owner-only.
+    /// Per-PROCESS (never thread-local): a safepoint yield between the two
+    /// ABI calls may interleave another process on this OS thread, and its
+    /// own correlated receive must not clobber this one's stash. Freed at
+    /// teardown if the process dies between the two calls.
+    pending_correlated_envelope: ?*mailbox_module.Envelope,
     /// The cross-thread wake handshake state (P4-J1; see `ParkState`). A
     /// spawned process is `.running`; the scheduler suspending it publishes
     /// `.parked`; the unique `.parked → .running` CAS winner (a producer that
@@ -940,6 +949,166 @@ pub const ProcessContext = struct {
                 },
             }
         }
+    }
+
+    // -- The correlated receive (P5-J4 — `mailbox.zig`, "The correlated
+    // -- receive + receive-mark"). INTERNAL to the `call`/`Task.await`
+    // -- machinery (decision 7): never surface syntax, and the steady-state
+    // -- exhaustive `receive` above is untouched.
+
+    /// Capture the receive-mark at the current mailbox position. MUST run
+    /// BEFORE the correlation ref is minted (`Mailbox.prepareReceiveMark`).
+    pub fn prepareReceiveMark(context: *ProcessContext) void {
+        context.record.pcb.mailbox.prepareReceiveMark();
+    }
+
+    /// Bind the prepared mark to its freshly-minted `ref`.
+    pub fn bindReceiveMark(context: *ProcessContext, ref: u64) void {
+        context.record.pcb.mailbox.bindReceiveMark(ref);
+    }
+
+    /// Block until a message correlated with `ref` arrives (a stamped user
+    /// reply, or the monitor `DOWN` carrying `ref`) or the timeout elapses;
+    /// `timeout_nanoseconds == null` waits indefinitely (the internal
+    /// demonitor-flush wait for a DOWN that is provably in flight). The
+    /// match is EXTRACTED and owned by the caller; skipped messages remain
+    /// queued in order for the steady-state receive. Scanning starts at the
+    /// receive-mark when it is armed for `ref` (O(1) past any older
+    /// backlog), else at the head (sound, unskipped). Parks between scans
+    /// with the mailbox's any-push wake armed, so a reply pushed into a
+    /// nonempty mailbox still wakes this process. If the process is killed
+    /// while waiting, the suspension never returns.
+    pub fn receiveCorrelated(
+        context: *ProcessContext,
+        ref: u64,
+        match_kind: mailbox_module.CorrelatedMatchKind,
+        timeout_nanoseconds: ?u64,
+    ) CorrelatedWaitOutcome {
+        const record = context.record;
+        const mailbox = &record.pcb.mailbox;
+        const deadline_nanoseconds: ?u64 = if (timeout_nanoseconds) |timeout|
+            context.scheduler.options.clock.read() +| timeout
+        else
+            null;
+        var resume_after: ?*mailbox_module.Envelope = null;
+        while (true) {
+            if (record.pending_kill.load(.acquire)) {
+                record.yield_reason = .reenqueue;
+                context.execution.yield();
+                continue;
+            }
+            switch (mailbox.takeCorrelated(ref, match_kind, resume_after)) {
+                .matched => |envelope| return .{ .matched = envelope },
+                .publish_pending => |last_examined| {
+                    // A producer is mid-publish: input is arriving. Retry
+                    // next quantum (pop's transient-gap discipline) from
+                    // where the scan stopped.
+                    resume_after = last_examined;
+                    record.yield_reason = .reenqueue;
+                    context.execution.yield();
+                },
+                .extraction_pending => {
+                    // The match is found but its extraction lost a
+                    // close-CAS to a mid-publish producer; it remains
+                    // queued — rescan from the top (the deterministic
+                    // match is found again, with the link landed).
+                    record.yield_reason = .reenqueue;
+                    context.execution.yield();
+                },
+                .exhausted => |last_examined| {
+                    if (deadline_nanoseconds) |deadline| {
+                        if (context.scheduler.options.clock.read() >= deadline) return .timed_out;
+                    }
+                    // Arm the any-push wake against the exact tail the scan
+                    // saw; failure means a message landed after the scan —
+                    // rescan instead of parking (no lost wake).
+                    if (!mailbox.armCorrelatedWake(last_examined)) {
+                        resume_after = last_examined;
+                        continue;
+                    }
+                    if (deadline_nanoseconds) |deadline| {
+                        record.receive_timed_out = false;
+                        record.wake_deadline_nanoseconds = deadline;
+                        record.yield_reason = .waiting_for_message_deadline;
+                    } else {
+                        record.yield_reason = .waiting_for_message;
+                    }
+                    context.execution.yield();
+                    mailbox.disarmCorrelatedWake();
+                    resume_after = last_examined;
+                    if (deadline_nanoseconds != null and record.receive_timed_out) {
+                        record.receive_timed_out = false;
+                        // A message that raced the deadline wins: one final
+                        // scan before conceding the timeout.
+                        switch (mailbox.takeCorrelated(ref, match_kind, resume_after)) {
+                            .matched => |envelope| return .{ .matched = envelope },
+                            else => return .timed_out,
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// The `call`/`Task.await` wait (the ABI surface behind
+    /// `zap_proc_receive_correlated`): block for the message correlated
+    /// with `ref`, then classify it. A user REPLY is stashed on the record
+    /// for the immediately-following typed decode
+    /// (`takeCorrelatedStash` ← `zap_proc_take_correlated`); the monitor
+    /// `DOWN` is consumed here — its fields cached exactly like
+    /// `awaitSignal` (read via `lastSignal*`/`lastSignalReason`), its
+    /// payload and envelope freed.
+    pub fn awaitCorrelated(
+        context: *ProcessContext,
+        ref: u64,
+        timeout_nanoseconds: ?u64,
+    ) AwaitCorrelatedOutcome {
+        switch (context.receiveCorrelated(ref, .user_or_down, timeout_nanoseconds)) {
+            .timed_out => return .timed_out,
+            .matched => |envelope| {
+                if (envelope.fragment.signal_kind == .down) {
+                    const payload: *const signal_module.SignalPayload =
+                        @ptrCast(@alignCast(envelope.fragment.payload_pointer.?));
+                    context.record.last_signal = payload.*;
+                    context.record.last_signal_kind = .down;
+                    context.scheduler.freeSignalEnvelope(envelope);
+                    return .down_consumed;
+                }
+                std.debug.assert(context.record.pending_correlated_envelope == null);
+                context.record.pending_correlated_envelope = envelope;
+                return .reply_ready;
+            },
+        }
+    }
+
+    /// Take the reply envelope stashed by the last `.reply_ready`
+    /// `awaitCorrelated`. Aborts on a protocol violation (no stash) —
+    /// the internal call/await machinery always pairs the two.
+    pub fn takeCorrelatedStash(context: *ProcessContext) *mailbox_module.Envelope {
+        const envelope = context.record.pending_correlated_envelope orelse
+            @panic("takeCorrelatedStash: no correlated reply is pending (kernel protocol violation)");
+        context.record.pending_correlated_envelope = null;
+        return envelope;
+    }
+
+    /// The reason term of the most recently cached signal (`awaitSignal`
+    /// or a `.down_consumed` `awaitCorrelated`).
+    pub fn lastSignalReason(context: *const ProcessContext) u64 {
+        return context.record.last_signal.reason_term;
+    }
+
+    /// `demonitor(ref)` + FLUSH (Elixir `Process.demonitor(ref, [:flush])`
+    /// semantics): drop the monitor AND guarantee no `DOWN` for `ref` is
+    /// ever observed by this process afterwards. See
+    /// `Scheduler.signalDemonitorFlush`.
+    pub fn demonitorFlush(context: *ProcessContext, ref: u64) bool {
+        return context.scheduler.signalDemonitorFlush(context, ref);
+    }
+
+    /// Cumulative correlated-scan visit count for THIS process's mailbox —
+    /// the R8 O(1)-from-mark telemetry (`mailbox.zig`).
+    pub fn correlatedScanVisits(context: *const ProcessContext) u64 {
+        return context.record.pcb.mailbox.correlatedScanVisits();
     }
 
     /// Send one envelope to `target`: allocate from THIS process's
@@ -1228,6 +1397,30 @@ pub const ReceiveWaitOutcome = enum {
     message_available,
     /// The `after` duration elapsed with no message.
     timed_out,
+};
+
+/// The outcome of `ProcessContext.receiveCorrelated` (P5-J4).
+pub const CorrelatedWaitOutcome = union(enum) {
+    /// The correlated envelope, EXTRACTED from the mailbox (caller owns
+    /// it). Skipped messages remain queued, in order.
+    matched: *mailbox_module.Envelope,
+    /// The timeout elapsed with no correlated message.
+    timed_out,
+};
+
+/// The outcome of `ProcessContext.awaitCorrelated` — the classified
+/// `call`/`Task.await` wait. Tag values are the C-ABI contract of
+/// `zap_proc_receive_correlated` (`abi.zig`).
+pub const AwaitCorrelatedOutcome = enum(i32) {
+    /// A correlated user REPLY arrived; it is stashed on the record for
+    /// the immediately-following `takeCorrelatedStash` typed decode.
+    reply_ready = 0,
+    /// The monitor `DOWN` carrying the ref arrived instead (the callee
+    /// died before replying); consumed and cached like `awaitSignal` —
+    /// read the fields via `lastSignalFrom`/`lastSignalReason`.
+    down_consumed = 1,
+    /// The timeout elapsed.
+    timed_out = 2,
 };
 
 /// Bound on the in-`receiveWaitTimeout` spin that resolves a producer
@@ -1803,6 +1996,7 @@ pub const Scheduler = struct {
         record.pending_kill.store(false, .monotonic);
         record.last_signal = .{};
         record.last_signal_kind = .none;
+        record.pending_correlated_envelope = null;
         // Preserve the record's park epoch across recycle (it is monotonic for
         // the record's whole life so a stale timer can never alias a reused
         // record's new episode); only reset the state bits to `.running`.
@@ -2925,14 +3119,29 @@ pub const Scheduler = struct {
     /// process cleaning a target's `monitored_by` at its own teardown, or a
     /// `demonitor`). Silent no-op if the target is gone (its set was freed with
     /// it). Race-free via the `beginSend` pin.
-    fn cleanRemoteMonitor(scheduler: *Scheduler, target_pid: Pid, ref: signal_module.Ref) void {
-        const sr = scheduler.signalRuntimePtr() orelse return;
-        const target_pcb = scheduler.pid_table.lookupSilent(target_pid) orelse return;
+    ///
+    /// Returns whether it is now GUARANTEED that no `DOWN` for `ref` is
+    /// queued or can ever be delivered: `true` iff the target was pinned
+    /// alive. The pin gates the target's teardown BEFORE
+    /// `propagateExitSignals` runs (`closeAndQuiesce` waits for it), so a
+    /// successful pin means the target has not fired — and after this
+    /// removal never will fire — a `DOWN` for `ref`. Every bail-out path
+    /// (`false`) means the target is dead or tearing down, so its
+    /// propagation may already have delivered the `DOWN` or still has it
+    /// in flight — the `signalDemonitorFlush` caller must flush/await it.
+    fn cleanRemoteMonitor(scheduler: *Scheduler, target_pid: Pid, ref: signal_module.Ref) bool {
+        const sr = scheduler.signalRuntimePtr() orelse return false;
+        const target_pcb = scheduler.pid_table.lookupSilent(target_pid) orelse return false;
         const target_record: *ProcessRecord = @fieldParentPtr("pcb", target_pcb);
-        if (!target_record.beginSend()) return;
+        if (!target_record.beginSend()) return false;
         defer target_record.endSend();
-        if (!scheduler.pid_table.isAlive(target_pid)) return;
+        if (!scheduler.pid_table.isAlive(target_pid)) return false;
+        // Pinned alive ⇒ propagation has not run ⇒ no DOWN was ever fired
+        // for this monitor; removing the entry (idempotently — it can only
+        // be absent if this monitor was never fully installed) prevents any
+        // future one.
         _ = target_pcb.signal_state.removeMonitoredByRef(&sr.node_pool, ref);
+        return true;
     }
 
     /// Propagate `record`'s exit at teardown: send exit signals to every linked
@@ -2967,7 +3176,7 @@ pub const Scheduler = struct {
         var outgoing_node = state.takeMonitors();
         while (outgoing_node) |node| {
             outgoing_node = node.next;
-            scheduler.cleanRemoteMonitor(Pid.fromBits(node.pid_bits), node.ref);
+            _ = scheduler.cleanRemoteMonitor(Pid.fromBits(node.pid_bits), node.ref);
             sr.node_pool.free(node);
         }
     }
@@ -3095,8 +3304,82 @@ pub const Scheduler = struct {
     fn signalDemonitor(scheduler: *Scheduler, self_record: *ProcessRecord, ref: signal_module.Ref) bool {
         const sr = scheduler.signalRuntimePtr() orelse return false;
         const target_bits = self_record.pcb.signal_state.takeMonitorRef(&sr.node_pool, ref) orelse return false;
-        scheduler.cleanRemoteMonitor(Pid.fromBits(target_bits), ref);
+        _ = scheduler.cleanRemoteMonitor(Pid.fromBits(target_bits), ref);
         return true;
+    }
+
+    /// `demonitor(ref)` + FLUSH — Elixir `Process.demonitor(ref, [:flush])`
+    /// semantics, the cleanup the `call`/`Task.await` reply and timeout
+    /// paths require (P5-J4): after this returns, NO `DOWN` for `ref` will
+    /// ever be observed by the calling process. Three cases, decided by
+    /// where the monitored target is in its lifecycle:
+    ///
+    /// 1. Target pinned ALIVE (`cleanRemoteMonitor` true): its
+    ///    `monitored_by` entry is removed before its teardown can run, so
+    ///    no `DOWN` was or will be fired. Nothing to flush — O(1), the
+    ///    common live-server case (the R8 O(1) budget depends on this: no
+    ///    queue scan happens here).
+    /// 2. Target dead or tearing down: exactly one `DOWN` for `ref` is
+    ///    queued or in flight (its propagation fires every `monitored_by`
+    ///    entry exactly once, and ours could not be removed). Await it
+    ///    with the correlated receive — `down_only`, so a late user reply
+    ///    is never eaten — and discard it. The wait starts at the
+    ///    receive-mark when still armed for `ref` (the `DOWN` was pushed
+    ///    after the mark, so this stays O(1)-from-mark) and is bounded by
+    ///    the target's in-progress teardown, which cannot block on this
+    ///    process.
+    /// 3. No outgoing entry for `ref` (an immediately-fired `noproc`
+    ///    monitor, whose `DOWN` was delivered at monitor() time and never
+    ///    had a remote entry): flush a queued `DOWN` non-blockingly (one
+    ///    scan; nothing can still be in flight).
+    ///
+    /// Returns whether `ref` named a live outgoing monitor (mirroring
+    /// `signalDemonitor`).
+    ///
+    /// PRECONDITION (internal machinery, decision 7): the `DOWN` for `ref`
+    /// has not already been consumed — the call/await paths use this only
+    /// after taking a correlated REPLY or timing out, never after a
+    /// `.down_consumed` outcome (which uses the plain `signalDemonitor`).
+    fn signalDemonitorFlush(scheduler: *Scheduler, context: *ProcessContext, ref: signal_module.Ref) bool {
+        const sr = scheduler.signalRuntimePtr() orelse return false;
+        const self_record = context.record;
+        const removed_target_bits = self_record.pcb.signal_state.takeMonitorRef(&sr.node_pool, ref);
+        if (removed_target_bits) |target_bits| {
+            if (scheduler.cleanRemoteMonitor(Pid.fromBits(target_bits), ref)) {
+                // Case 1: provably no DOWN anywhere. O(1).
+                return true;
+            }
+            // Case 2: exactly one DOWN queued or in flight — consume it.
+            switch (context.receiveCorrelated(ref, .down_only, null)) {
+                .matched => |envelope| scheduler.freeSignalEnvelope(envelope),
+                .timed_out => unreachable, // no deadline was armed
+            }
+            return true;
+        }
+        // Case 3: no outgoing entry — flush a queued noproc DOWN, if any
+        // (single non-blocking scan: timeout 0 concedes after one pass).
+        switch (context.receiveCorrelated(ref, .down_only, 0)) {
+            .matched => |envelope| scheduler.freeSignalEnvelope(envelope),
+            .timed_out => {},
+        }
+        return false;
+    }
+
+    /// Free a consumed signal envelope (an exit/`DOWN` popped or extracted
+    /// by this process): release its `SignalPayload` block through the
+    /// payload seam, then return the header to the pool — exactly
+    /// `awaitSignal`'s reclaim, factored for the correlated paths.
+    fn freeSignalEnvelope(scheduler: *Scheduler, envelope: *mailbox_module.Envelope) void {
+        std.debug.assert(envelope.fragment.signal_kind != .none);
+        if (scheduler.signalRuntimePtr()) |sr| {
+            if (sr.payload_seam.free) |free_payload| {
+                if (envelope.fragment.payload_pointer) |payload| {
+                    free_payload(sr.payload_seam.context, payload, envelope.fragment.payload_byte_length);
+                }
+            }
+        }
+        envelope.fragment = .{};
+        envelope_pool_module.free(envelope);
     }
 
     /// `exit(target, reason)`: send a trappable exit signal (`kind` selects the
@@ -3307,6 +3590,17 @@ pub const Scheduler = struct {
         // process's still-live envelope handle to the peers' mailboxes.
         scheduler.propagateExitSignals(record, exit_pid, status);
 
+        // (5c) Free a correlated reply stashed between the two calls of the
+        // await protocol (P5-J4, `pending_correlated_envelope`): the process
+        // died after `awaitCorrelated` extracted the reply but before the
+        // typed decode took it. Same reclaim discipline as the drain below —
+        // the envelope was already popped from the mailbox, so the drain
+        // cannot see it.
+        if (record.pending_correlated_envelope) |stashed| {
+            record.pending_correlated_envelope = null;
+            scheduler.reclaimUndeliveredEnvelope(stashed);
+        }
+
         // (6) Drain the mailbox: every envelope back to its origin page.
         scheduler.drainMailboxForTeardown(&pcb.mailbox);
 
@@ -3365,35 +3659,39 @@ pub const Scheduler = struct {
     /// doc) and a kernel bug to surface loudly, never to leak past.
     const teardown_drain_gap_spin_limit: u32 = 100_000;
 
+    /// Reclaim one envelope this process owned but never delivered to Zap
+    /// code — the teardown-drain discipline, factored so the correlated-
+    /// reply stash (P5-J4) reclaims identically. Leak-exactness for an
+    /// undelivered MOVED payload: the graph was detached from a sender but
+    /// this receiver dies before adopting it, so reclaim it (munmap) before
+    /// the header goes back to the pool. Leak-exactness for an undelivered
+    /// SIGNAL payload (P5-J1): free its payload block through the seam (the
+    /// same free the receiver's `envelope_free` would have run). A copied
+    /// payload's ledger block is reclaimed at runtime-ledger teardown, as
+    /// before.
+    fn reclaimUndeliveredEnvelope(scheduler: *Scheduler, envelope: *mailbox_module.Envelope) void {
+        if (envelope.fragment.moved_reclaim) |reclaim| {
+            if (envelope.fragment.payload_pointer) |payload| reclaim(payload);
+            envelope.fragment = .{};
+        } else if (envelope.fragment.signal_kind != .none) {
+            if (scheduler.signalRuntimePtr()) |sr| {
+                if (sr.payload_seam.free) |free_payload| {
+                    if (envelope.fragment.payload_pointer) |payload| {
+                        free_payload(sr.payload_seam.context, payload, envelope.fragment.payload_byte_length);
+                    }
+                }
+            }
+            envelope.fragment = .{};
+        }
+        envelope_pool_module.free(envelope);
+    }
+
     fn drainMailboxForTeardown(scheduler: *Scheduler, mailbox: *mailbox_module.Mailbox) void {
         var consecutive_gap_spins: u32 = 0;
         while (true) {
             switch (mailbox.pop()) {
                 .envelope => |envelope| {
-                    // Leak-exactness for an undelivered MOVED payload: the graph
-                    // was detached from a sender but this receiver dies before
-                    // adopting it, so reclaim it (munmap) before the header goes
-                    // back to the pool. A copied payload's ledger block is
-                    // reclaimed at runtime-ledger teardown, as before.
-                    if (envelope.fragment.moved_reclaim) |reclaim| {
-                        if (envelope.fragment.payload_pointer) |payload| reclaim(payload);
-                        envelope.fragment = .{};
-                    } else if (envelope.fragment.signal_kind != .none) {
-                        // Leak-exactness for an undelivered SIGNAL payload (P5-J1):
-                        // a trapping/monitoring process died with a queued exit/
-                        // `DOWN` it never consumed — free its payload block through
-                        // the seam (the same free the receiver's `envelope_free`
-                        // would have run) before the header returns to the pool.
-                        if (scheduler.signalRuntimePtr()) |sr| {
-                            if (sr.payload_seam.free) |free_payload| {
-                                if (envelope.fragment.payload_pointer) |payload| {
-                                    free_payload(sr.payload_seam.context, payload, envelope.fragment.payload_byte_length);
-                                }
-                            }
-                        }
-                        envelope.fragment = .{};
-                    }
-                    envelope_pool_module.free(envelope);
+                    scheduler.reclaimUndeliveredEnvelope(envelope);
                     consecutive_gap_spins = 0;
                 },
                 .empty => return,

@@ -1481,6 +1481,29 @@ const MonomorphContext = struct {
                     }
                 }
             },
+            .block => |block_value| {
+                // A macro expansion in binding position — e.g.
+                // `task = Task.async(...)` (P5-J4), whose expansion is a
+                // statement block ending in the `Task.async_start(...)`
+                // call — lowers the binding's VALUE to a `.block` whose own
+                // `type_id` carries no useful type. Adopt the last
+                // expression's effective type (the block's runtime value),
+                // so local-type tracking sees through the wrapper and a
+                // later generic call on the local (`Task.await(task)`)
+                // still specializes. Without this arm the local stays
+                // untracked, the call keeps its unspecialized generic
+                // target, and the ZIR backend binds every instantiation to
+                // one arbitrary concrete parameter type.
+                if (block_value.stmts.len > 0) {
+                    const last_stmt = block_value.stmts[block_value.stmts.len - 1];
+                    if (last_stmt == .expr) {
+                        const inner_type = try self.effectiveExprType(last_stmt.expr);
+                        if (inner_type != types_mod.TypeStore.UNKNOWN) {
+                            type_id = inner_type;
+                        }
+                    }
+                }
+            },
             else => {},
         }
 

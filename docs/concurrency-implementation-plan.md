@@ -641,9 +641,40 @@ cross-scheduler budget explicitly re-derived from the loaded numbers.
   dead-letter sink + telemetry.
 - **5.4** `spawn_link`/`spawn_monitor`; `Process` module completed; `@doc` everywhere.
 
+  **P5-J4 (2026-07-09):** `Task.async`/`Task.await` (`lib/task.zap`) + the typed synchronous
+  `Process.call`/`Process.reply` over a parametric `Call(request_type)` envelope
+  (`lib/process.zap`) landed PURE ZAP over the new internal correlated receive — research
+  §6.2's ref-trick receive-mark, resolved internal-only per rev-2 §5.2 / decision 7 (never
+  surface syntax; the steady-state exhaustive `receive` is untouched). Elixir-aligned failure
+  surface: `await`/`call` EXIT the caller on worker/server crash (with the dead process's
+  reason — a dead server errors immediately via the monitor's `noproc` `DOWN`, never the
+  timeout), on `:timeout`, and (await) on `:not_owner`; every return path demonitors WITH
+  FLUSH (`Process.demonitor(ref, [:flush])` semantics) so a late `DOWN` can never poison a
+  later receive. Kernel (the ONE sanctioned deviation from pop-head-and-dispatch,
+  `mailbox.zig` module doc): mark prepare-before-mint/bind-after, correlated scan+extract
+  that leaves every skipped message queued in order, and an any-push wake flag armed
+  race-free by a release-sequence no-op CAS on `producer_tail` (zero new fences on the push
+  hot path); `scheduler.zig` adds `receiveCorrelated`/`awaitCorrelated` (reply stashed
+  per-process for the two-call typed decode), `signalDemonitorFlush` (three-case
+  teardown-race analysis; the in-flight-`DOWN` case awaits it via the mark — still O(1)),
+  and teardown reclaim of a stashed reply. Compiler: applied parametric structs are
+  walker-sendable (`types.zig`), `take_correlated_message` type-directed decode intercept
+  (`zir_builder.zig`), the monomorphizer sees through macro-expansion blocks
+  (`monomorphize.zig` `effectiveExprType`), and macro-cloned anonymous functions get
+  desugar-unique names (`desugar.zig` — a macro quote's `__anon_fn_N` was cloned into every
+  expansion and the ZIR name-keyed dedup silently fused all Task workers into one).
+  **R8 MEASURED**: a correlated call over a 10k-message backlog examines **2 envelopes**
+  (kernel unit proof asserts exactly 2 vs 10_002 for a head scan; the gate-ON test asserts
+  `Process.correlated_receive_visits()` delta < 10 and drains the backlog in order — no
+  loss, no reorder). Gate-ON `:test_concurrency` **112/0** (251 assertions; 99 baseline + 7
+  Task + 6 call); kernel tests 209/209 both modes; `-fsanitize-thread` clean (204 pass / 5
+  skip / 0 fail).
+
 Exit gate: supervision-tree Zest suite (restart intensity, rest_for_one ordering, brutal_kill
 timing) under seeded determinism; R8 selective-receive benchmark (10⁶-deep mailbox, O(1)
-correlated replies).
+correlated replies). *[R8 discharged at 10⁴ depth by the P5-J4 operation-count proof above —
+visits are independent of backlog depth by construction (the scan starts at the mark), so the
+10⁶ variant is a constant-factor rerun if ever wanted.]*
 
 ### Phase 6 — Performance tier (L)
 

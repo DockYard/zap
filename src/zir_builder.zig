@@ -7594,7 +7594,30 @@ pub const ZirDriver = struct {
                         // `@TypeOf`, so the actual runtime type — including
                         // `Map(u32, Term)` — is preserved.
                         const is_generic_container = std.mem.eql(u8, mod_name, "List") or std.mem.eql(u8, mod_name, "Map");
-                        if (std.mem.eql(u8, mod_name, "ProcessRuntime") and std.mem.eql(u8, func_name, "receive_message")) {
+                        if (std.mem.eql(u8, mod_name, "ProcessRuntime") and std.mem.eql(u8, func_name, "take_correlated_message")) {
+                            // The correlated-reply decode (P5-J4): the typed
+                            // twin of the `receive_message` intercept below.
+                            // `lib/task.zap`/`lib/process.zap` write
+                            // `(:zig.ProcessRuntime.take_correlated_message()
+                            // :: T)`; monomorphize the walker decode
+                            // `ProcessRuntime.takeCorrelatedMessage(T)` on the
+                            // message type reconstructed from the annotated
+                            // result type. There is no Zig
+                            // `take_correlated_message`; this intercept is the
+                            // ONLY lowering of that intrinsic name.
+                            const message_type_ref = (try self.emitContainerElementTypeRef(cb.result_type)) orelse
+                                return error.EmitFailed;
+                            const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                            if (rt_import == error_ref) return error.EmitFailed;
+                            const proc_runtime = zir_builder_emit_field_val(self.handle, rt_import, "ProcessRuntime", 14);
+                            if (proc_runtime == error_ref) return error.EmitFailed;
+                            const take_fn = zir_builder_emit_field_val(self.handle, proc_runtime, "takeCorrelatedMessage", 21);
+                            if (take_fn == error_ref) return error.EmitFailed;
+                            const type_args = [_]u32{message_type_ref};
+                            const ref = zir_builder_emit_call_ref(self.handle, take_fn, &type_args, 1);
+                            if (ref == error_ref) return error.EmitFailed;
+                            try self.setLocal(cb.dest, ref);
+                        } else if (std.mem.eql(u8, mod_name, "ProcessRuntime") and std.mem.eql(u8, func_name, "receive_message")) {
                             // The GENERIC deep-copy receive. `macro.zig` routes
                             // every non-fixed-scalar `receive`/`receive_raw`
                             // here as `(:zig.ProcessRuntime.receive_message() ::
