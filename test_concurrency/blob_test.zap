@@ -248,6 +248,35 @@ pub struct TestConcurrency.BlobTest {
       assert(Blob.live_count() == base)
     }
 
+    test("fetch_global distinguishes absence and presence in the type") {
+      base = Blob.live_count()
+
+      # Absent key: None, and no reference was granted.
+      never = Blob.fetch_global(:blob_test_fetch_never_put_key)
+      assert(Option.is_none?(never))
+      assert(Blob.live_count() == base)
+
+      # Present key: Some carries a counted grant of the stored blob.
+      value = Blob.new("fetched v1")
+      _put = Blob.put_global(:blob_test_fetch_key, value)
+      _drop = Blob.release(value)   # the registry is now the sole owner
+      assert(Blob.live_count() == base + 1)
+
+      fetched = Blob.fetch_global(:blob_test_fetch_key)
+      content = case fetched {
+        Option.Some(blob) -> {
+          text = Blob.to_string(blob)
+          # Counted grant: the registry's reference + the Some payload's.
+          assert(Blob.ref_count(blob) == 2)
+          _released = Blob.release(blob)
+          text
+        }
+        Option.None -> "absent"
+      }
+      assert(content == "fetched v1")
+      assert(Blob.live_count() == base + 1)   # the registry entry remains, by design
+    }
+
     test("put/get round-trips; the value survives the publisher's death") {
       base = Blob.live_count()
       publisher = Process.spawn(&TestConcurrency.BlobTest.registry_publisher_entry/0)

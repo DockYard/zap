@@ -6545,7 +6545,12 @@ pub const IrBuilder = struct {
                     for (tu.variants, 0..) |variant, i| {
                         const type_str = if (spec.variant_payload_type_ids[i]) |tid| blk: {
                             if (tid == types_mod.TypeStore.ATOM) break :blk @as([]const u8, "u32");
-                            break :blk try typeIdToZigTypeStrWithStore(tid, type_store);
+                            // Nominal payloads must resolve inside the
+                            // specialization's own synthetic module —
+                            // render them as `@import` expressions
+                            // (see `zigTypeToImportableStr`).
+                            const payload_zig_type = try typeIdToZigTypeWithStore(tid, type_store);
+                            break :blk try zigTypeToImportableStr(self.allocator, payload_zig_type);
                         } else "void";
                         try variants.append(self.allocator, .{
                             .name = self.interner.get(variant.name),
@@ -6596,7 +6601,13 @@ pub const IrBuilder = struct {
             for (variants_in) |v| {
                 const type_str = if (v.type_id) |tid| blk: {
                     if (tid == types_mod.TypeStore.ATOM) break :blk @as([]const u8, "u32");
-                    break :blk try typeIdToZigTypeStrWithStore(tid, self.type_store);
+                    // Nominal payloads must resolve inside the union's
+                    // synthetic module when this def is a dotless
+                    // top-level union rendered by Step 3.6 — render
+                    // them as `@import` expressions (see
+                    // `zigTypeToImportableStr`).
+                    const payload_zig_type = try typeIdToZigTypeWithStore(tid, self.type_store);
+                    break :blk try zigTypeToImportableStr(self.allocator, payload_zig_type);
                 } else "void";
                 try union_variants.append(self.allocator, .{
                     .name = self.interner.get(v.name),
@@ -9147,12 +9158,17 @@ pub const IrBuilder = struct {
             raw_name;
         const union_name = try std.fmt.allocPrint(self.allocator, "{s}_Union", .{func_name});
 
-        // Synthesize the union type definition
+        // Synthesize the union type definition. The variant NAME stays
+        // the bare struct name (it doubles as the dispatch tag), but
+        // the payload TYPE must be an `@import` expression so it
+        // resolves inside the union's own synthetic module (see
+        // `zigTypeToImportableStr` — every payload here is a struct,
+        // guarded by the `.struct_type` checks above).
         var variants: std.ArrayList(UnionVariant) = .empty;
         for (type_names.items) |tn| {
             try variants.append(self.allocator, .{
                 .name = tn,
-                .type_name = tn,
+                .type_name = try nominalNameToImportExpr(self.allocator, tn, false),
             });
         }
 
@@ -18858,6 +18874,69 @@ fn typeIdToZigTypeStrWithStore(type_id: types_mod.TypeId, type_store: ?*const ty
     return zigTypeToStr(zig_type);
 }
 
+/// Render a nominal type name as the `@import` expression that
+/// resolves it from a FOREIGN Zig module. Mirrors
+/// `emitStructTypeRef`'s foreign cases in the ZIR backend and
+/// `appendZigTypeForVTable`'s nominal arms:
+///
+///   * dotless + `decl_lives_inside_file == false` → `@import("Name")`
+///     (the file-IS-struct convention — the import itself is the type)
+///   * dotless + `decl_lives_inside_file == true` → `@import("Name").Name`
+///     (Step 3.6 layout: the union/enum is a `pub const` INSIDE the file)
+///   * dotted `Owner.Leaf` → `@import("Owner").Leaf`, with dots in the
+///     owner prefix converted to underscores (`A.B.C` → `@import("A_B").C`,
+///     matching the ZIR backend's `dottedPrefixToImportName`)
+///
+/// The returned string is allocated on `allocator` (same ownership
+/// convention as the specialization table's `mangled_name`).
+fn nominalNameToImportExpr(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    decl_lives_inside_file: bool,
+) std.mem.Allocator.Error![]const u8 {
+    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot_idx| {
+        const owner_prefix = name[0..dot_idx];
+        const leaf_name = name[dot_idx + 1 ..];
+        var rendered: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer rendered.deinit(allocator);
+        try rendered.appendSlice(allocator, "@import(\"");
+        for (owner_prefix) |prefix_char| {
+            try rendered.append(allocator, if (prefix_char == '.') '_' else prefix_char);
+        }
+        try rendered.appendSlice(allocator, "\").");
+        try rendered.appendSlice(allocator, leaf_name);
+        return rendered.toOwnedSlice(allocator);
+    }
+    if (decl_lives_inside_file) {
+        return std.fmt.allocPrint(allocator, "@import(\"{s}\").{s}", .{ name, name });
+    }
+    return std.fmt.allocPrint(allocator, "@import(\"{s}\")", .{name});
+}
+
+/// Render a Zig type string for a `union_def`/`enum_def` variant
+/// payload. Unlike `zigTypeToStr`, nominal type references (user
+/// structs, tagged unions, other parametric specializations) are
+/// rendered as `@import` expressions: the union_def's synthetic
+/// source file (`renderSpecializationSourceFileBody` in the ZIR
+/// backend) is its own Zig module with NO lexical access to any
+/// other Zap emission, so a bare identifier like `Marker` fails
+/// AstGen with "use of undeclared identifier". The `@import` form
+/// resolves in any synthetic module because the fork's
+/// `addStructImpl` wires every Zap struct module as a bidirectional
+/// dep of every other. Non-nominal types pass through `zigTypeToStr`
+/// unchanged (root-cause fix for the `Option(<user struct>)`
+/// miscompile/ICE — concurrency plan item 6.2 follow-on).
+fn zigTypeToImportableStr(
+    allocator: std.mem.Allocator,
+    zig_type: ZigType,
+) std.mem.Allocator.Error![]const u8 {
+    return switch (zig_type) {
+        .struct_ref => |name| nominalNameToImportExpr(allocator, name, false),
+        .tagged_union => |name| nominalNameToImportExpr(allocator, name, true),
+        else => zigTypeToStr(zig_type),
+    };
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -23380,6 +23459,108 @@ test "IR emits per-instantiation TypeDef for Option(Error)-shaped applied form" 
     const some_type_name = option_foo_def.variants[some_idx].type_name orelse
         return error.MissingSomePayloadType;
     try std.testing.expectEqualStrings("zap_runtime.ProtocolBox", some_type_name);
+}
+
+test "IR renders importable payload type for Option over a plain user struct" {
+    // Root-cause pin for the `Option(<user struct>)` miscompile/ICE
+    // (concurrency plan item 6.2 follow-on). A parametric union
+    // specialization like `Option_Marker` lives in its own synthetic
+    // Zig module (Step 3.6), which has NO lexical access to any other
+    // Zap emission — a bare `Marker` payload identifier fails AstGen
+    // with "use of undeclared identifier". The ZIR-injection pipeline
+    // used to swallow that failure (the injected root published an
+    // empty ZIR imports table, so the failed file never became alive)
+    // and the compile continued to LLVM emission, where the
+    // unanalyzed decl's placeholder global panicked `Builder.toBitcode`
+    // with "attempt to use null value". The payload type string must
+    // therefore be an `@import` expression, which resolves in ANY
+    // synthetic module because the fork's `addStructImpl` wires every
+    // Zap struct module as a bidirectional dep of every other.
+    const source =
+        \\pub union Option(t) {
+        \\  Some :: t
+        \\  None
+        \\}
+        \\pub struct Marker {
+        \\  value :: i64 = 0
+        \\}
+        \\pub struct UseSite {
+        \\  pub fn make_none() -> Option(Marker) { %Option(Marker).None }
+        \\  pub fn dummy() -> i64 { 0 }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner: *ast.StringInterner = undefined;
+    var graph: *const scope_mod.ScopeGraph = undefined;
+    const program = try buildIrProgramForProtocolTest(alloc, source, &interner, &graph);
+
+    const option_marker = findTypeDefByName(program, "Option_Marker") orelse
+        return error.MissingOptionMarker;
+    try std.testing.expect(option_marker.kind == .union_def);
+    const option_marker_def = option_marker.kind.union_def;
+
+    var some_index: ?usize = null;
+    for (option_marker_def.variants, 0..) |variant, idx| {
+        if (std.mem.eql(u8, variant.name, "Some")) some_index = idx;
+    }
+    const some_idx = some_index orelse return error.MissingSomeVariant;
+    const some_type_name = option_marker_def.variants[some_idx].type_name orelse
+        return error.MissingSomePayloadType;
+    // The payload MUST be the module-import expression, not the bare
+    // identifier: the synthetic `Option_Marker.zig` file cannot
+    // resolve `Marker` lexically (file-IS-struct convention — the
+    // import itself is the struct type).
+    try std.testing.expectEqualStrings("@import(\"Marker\")", some_type_name);
+}
+
+test "zigTypeToImportableStr renders nominal payloads as import expressions" {
+    // Direct unit coverage for the specialization-payload renderer.
+    // The import shapes mirror `emitStructTypeRef`'s foreign cases —
+    // a synthetic specialization file is always a foreign module
+    // relative to the payload's defining emission:
+    //
+    //   * plain struct `Bar`      → `@import("Bar")`   (file IS the type)
+    //   * dotted struct `IO.Mode` → `@import("IO").Mode`
+    //   * union/enum `Color`      → `@import("Color").Color`
+    //     (Step 3.6 declares the type INSIDE the file)
+    //   * dotted union `A.B.C`    → `@import("A_B").C`
+    //   * primitives pass through `zigTypeToStr` unchanged
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try std.testing.expectEqualStrings(
+        "@import(\"Bar\")",
+        try zigTypeToImportableStr(alloc, .{ .struct_ref = "Bar" }),
+    );
+    try std.testing.expectEqualStrings(
+        "@import(\"IO\").Mode",
+        try zigTypeToImportableStr(alloc, .{ .struct_ref = "IO.Mode" }),
+    );
+    try std.testing.expectEqualStrings(
+        "@import(\"Color\").Color",
+        try zigTypeToImportableStr(alloc, .{ .tagged_union = "Color" }),
+    );
+    try std.testing.expectEqualStrings(
+        "@import(\"Option_i64\").Option_i64",
+        try zigTypeToImportableStr(alloc, .{ .tagged_union = "Option_i64" }),
+    );
+    try std.testing.expectEqualStrings(
+        "@import(\"A_B\").C",
+        try zigTypeToImportableStr(alloc, .{ .tagged_union = "A.B.C" }),
+    );
+    try std.testing.expectEqualStrings(
+        "i64",
+        try zigTypeToImportableStr(alloc, .i64),
+    );
+    try std.testing.expectEqualStrings(
+        "zap_runtime.ProtocolBox",
+        try zigTypeToImportableStr(alloc, .{ .protocol_box = "Error" }),
+    );
 }
 
 test "IR emits per-instantiation vtables for parametric impls" {

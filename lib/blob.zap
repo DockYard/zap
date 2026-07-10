@@ -332,12 +332,8 @@ pub struct Blob {
     The hit path is lock-free: a read plus an atomic retain, safe
     against concurrent `Blob.put_global` replacement from any process.
 
-    NOTE: an `Option(Blob)`-returning variant is the intended eventual
-    surface; it is blocked by a pre-existing compiler defect where
-    instantiating `Option(<struct>)` in a `runtime_concurrency: true`
-    binary mis-lowers (tracked in `docs/concurrency-implementation-
-    plan.md` item 6.2's follow-ons; the defect predates and is
-    unrelated to `Blob`).
+    See `Blob.fetch_global/1` for the `Option(Blob)`-returning
+    companion when the caller has no natural fallback blob.
 
     ## Examples
 
@@ -351,6 +347,36 @@ pub struct Blob {
     case :zig.BlobRuntime.registry_get(key) {
       0 -> default
       bits -> %Blob{zap_blob_handle: bits}
+    }
+  }
+
+  @doc = """
+    Looks up a blob in the global immutable registry, distinguishing
+    presence from absence in the type: returns `Option.Some(blob)`
+    when the atom key holds a value and `Option.None` when it does
+    not. The `Option(Blob)` companion to `Blob.get_global/2` for
+    callers that have no natural fallback blob.
+
+    Present-vs-absent is decided ATOMICALLY by the same lock-free
+    registry read `get_global` uses — there is no separate existence
+    probe, so a concurrent `Blob.put_global` cannot slip between the
+    check and the fetch. On a hit the caller receives a NEW reference
+    (released by `Blob.release` or automatically at exit), exactly as
+    with `get_global`.
+
+    ## Examples
+
+        case Blob.fetch_global(:app_config) {
+          Option.Some(config) -> Blob.to_string(config)
+          Option.None -> "unset"
+        }
+
+    """
+
+  pub fn fetch_global(key :: Atom) -> Option(Blob) {
+    case :zig.BlobRuntime.registry_get(key) {
+      0 -> Option(Blob).None
+      bits -> Option(Blob).Some(%Blob{zap_blob_handle: bits})
     }
   }
 
