@@ -431,6 +431,66 @@ pub struct Process {
   }
 
   @doc = """
+    Hibernates the calling process until the next message arrives — the
+    idle-footprint shrink for long-lived, rarely-messaged processes
+    (connection handlers waiting on rare events), Zap's analogue of
+    Erlang's `:erlang.hibernate/3`.
+
+    Parks WITHOUT consuming the message that eventually arrives: when
+    `hibernate` returns, the message is still queued and the next `receive`
+    consumes it. While parked, the scheduler releases the process's
+    committed stack pages below the parked frame back to the operating
+    system (they recommit transparently on wake), so an idle process's
+    resident footprint shrinks to a few pages regardless of how deep its
+    earlier call chains ran. Heap reclamation is governed by the process's
+    memory manager: an ARC process has already reclaimed everything
+    unreachable through deterministic drops, and a `Memory.Arena` process
+    reclaims per-iteration garbage at its receive loop's compiler-proven
+    back-edge reset — hibernating between messages composes with that reset
+    to give the full BEAM-hibernation effect. Returns `true` once a message
+    is waiting; if one is already queued, returns immediately.
+
+    ## Example
+
+        pub fn rare_event_handler() -> Nil {
+          _waiting = Process.hibernate()
+          event = receive i64 {
+            n -> n
+          }
+          handle(event)
+          MyApp.Handler.rare_event_handler()
+        }
+    """
+
+  pub fn hibernate() -> Bool {
+    :zig.ProcessRuntime.hibernate()
+  }
+
+  @doc = """
+    Bytes currently reserved by the calling process's OWN heap, at its
+    memory manager's accounting granularity — the per-process heap
+    observability surface (the BEAM `process_info(self(), :memory)`
+    analogue, restricted to self-inspection).
+
+    A `Memory.Arena` process reports the bytes reserved from the operating
+    system for its bulk set (chunk bytes, headers included) — the number
+    that stays BOUNDED across a long-lived server's life when the receive
+    loop's compiler-proven back-edge reset reclaims each iteration's
+    garbage, and that grows without bound when state genuinely accumulates.
+    Managers without byte accounting (`Memory.ARC` today) report `0`.
+
+    ## Example
+
+        before = Process.heap_bytes()
+        _work = handle_many_messages()
+        growth = Process.heap_bytes() - before
+    """
+
+  pub fn heap_bytes() -> u64 {
+    :zig.ProcessRuntime.heap_byte_count()
+  }
+
+  @doc = """
     Types raw pid bits as `Pid(i64)`. Prefer the `Process.pid(i64,
     bits)` token form; this named constructor is its expansion
     target.

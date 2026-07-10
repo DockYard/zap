@@ -264,7 +264,28 @@ pub const ManagerVTable = struct {
     /// internal accounting granularity instead. Advisory, never
     /// load-bearing; `teardown` returns it to zero.
     heapByteCount: *const fn (manager_state: ?*anyopaque) usize,
+    /// Reset this process's ITERATION heap region to the receive-back-edge
+    /// watermark (plan item 6.4, P6-J4 — the arena auto-reset). Called by
+    /// `zap_proc_receive_iteration_reset`, which the compiler emits ONLY at
+    /// receive sites whose iteration closure it PROVED (`src/receive_reset.zig`
+    /// — no allocation made after the watermark is reachable at the receive
+    /// point), so the reclamation here is sound by construction. Semantics are
+    /// manager-governed: a BULK_OR_NEVER manager exposing the `ARSR`
+    /// capability (Arena) captures a watermark on the first call and bulk-
+    /// frees back to it on every later call; every other model keeps the
+    /// default NO-OP (ARC/ORC already reclaimed deterministically via drops,
+    /// Tracking frees at last use, Leak/NoOp never reclaim by design). The
+    /// default keeps every existing vtable literal valid — only bindings that
+    /// discover `ARSR` override it.
+    iterationHeapReset: *const fn (manager_state: ?*anyopaque) void = defaultIterationHeapReset,
 };
+
+/// The `ManagerVTable.iterationHeapReset` default: no bulk-reset capability,
+/// nothing to reclaim — the sound conservative behavior for every manager
+/// that does not expose `ARSR` (see the field doc).
+pub fn defaultIterationHeapReset(manager_state: ?*anyopaque) void {
+    _ = manager_state;
+}
 
 /// A process's manager binding: opaque per-process manager state plus the
 /// dispatch vtable (the plan §3 "manager context" PCB field; the plan
@@ -296,6 +317,14 @@ pub const ManagerContext = struct {
     /// for the exactness contract).
     pub fn heapByteCount(manager: ManagerContext) usize {
         return manager.vtable.heapByteCount(manager.manager_state);
+    }
+
+    /// Reset the iteration heap region to the receive-back-edge watermark,
+    /// through the vtable (plan item 6.4 — see
+    /// `ManagerVTable.iterationHeapReset` for the per-model semantics and
+    /// the compiler-proof precondition).
+    pub fn iterationHeapReset(manager: ManagerContext) void {
+        manager.vtable.iterationHeapReset(manager.manager_state);
     }
 };
 

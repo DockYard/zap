@@ -319,13 +319,16 @@ const Ledger = struct {
 /// Phase-3 per-process-instance factory (`ManifestManagerBinding` calls
 /// `init` once per spawn to mint a fresh private heap and `deinit` once at
 /// teardown for the real wholesale free), so they are now real typed
-/// pointers rather than the Phase-2 opaque placeholders. `get_capability_desc`
-/// stays opaque because the kernel never invokes it (the runtime discovers
-/// the refcount capability). Redeclared per the self-contained-manager
-/// convention (spec §11.1.1); the `comptime` layout asserts below catch
-/// drift from the canonical definition. A newer-minor manager advertises a
-/// larger `size` and appends trailing fields (spec §2.3); the kernel reads
-/// only this v1.0 prefix, so it stays forward-compatible.
+/// pointers rather than the Phase-2 opaque placeholders.
+/// `get_capability_desc` is typed as of P6-J4: `createProcessBinding` probes
+/// it once per spawn for the descriptor-only `ARSR` (watermark/reset — the
+/// receive-back-edge arena auto-reset) and `STAT` (heap-bytes observability)
+/// capabilities (spec §7.2/§9/§10). Redeclared per the
+/// self-contained-manager convention (spec §11.1.1); the `comptime` layout
+/// asserts below catch drift from the canonical definition. A newer-minor
+/// manager advertises a larger `size` and appends trailing fields (spec
+/// §2.3); the kernel reads only this v1.0 prefix, so it stays
+/// forward-compatible.
 const ZapMemoryManagerCoreV1 = extern struct {
     abi_major: u16,
     abi_minor: u16,
@@ -335,8 +338,50 @@ const ZapMemoryManagerCoreV1 = extern struct {
     deinit: *const fn (context: *anyopaque) callconv(.c) void,
     allocate: *const fn (context: *anyopaque, byte_length: usize, alignment: u32) callconv(.c) ?[*]u8,
     deallocate: *const fn (context: *anyopaque, memory: [*]u8, byte_length: usize, alignment: u32) callconv(.c) void,
-    get_capability_desc: *const anyopaque,
+    get_capability_desc: *const fn (context: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1,
 };
+
+/// Locally-redeclared `ZapCapabilityDescV1` (spec §5; canonical definition in
+/// `src/memory/abi.zig`) — the record `get_capability_desc` answers with.
+const ZapCapabilityDescV1 = extern struct {
+    id: u32,
+    version: u16,
+    size: u16,
+    flags: u32,
+    vtable: *const anyopaque,
+};
+
+/// Locally-redeclared `ZapArenaWatermarkV1` (spec §9): a BULK_OR_NEVER
+/// manager's opaque bulk-set position. The kernel stores one per process
+/// binding (captured at the first proven receive-back-edge reset) and only
+/// round-trips it — the four words are manager-private.
+const ZapArenaWatermarkV1 = extern struct {
+    chunk: ?*anyopaque,
+    bump_cursor: usize,
+    chunk_end: usize,
+    next_chunk_size: usize,
+};
+
+/// Locally-redeclared `ZapArenaResetCapabilityV1` (spec §9) — the
+/// descriptor-only `ARSR` watermark/reset capability.
+const ZapArenaResetCapabilityV1 = extern struct {
+    watermark: *const fn (context: *anyopaque, out_watermark: *ZapArenaWatermarkV1) callconv(.c) void,
+    reset_to_watermark: *const fn (context: *anyopaque, watermark: *const ZapArenaWatermarkV1) callconv(.c) void,
+};
+
+/// Locally-redeclared `ZapStatsCapabilityV1` (spec §10) — the
+/// descriptor-only `STAT` heap-bytes observability capability.
+const ZapStatsCapabilityV1 = extern struct {
+    heap_byte_count: *const fn (context: *anyopaque) callconv(.c) usize,
+};
+
+/// `ARSR` capability tag at the target's native endianness (spec §7.1/§9;
+/// mirrors `src/memory/abi.zig`'s `ARSR_TAG` — the correspondence is locked
+/// by the layout-assert discipline plus the round-trip test below).
+const ARSR_TAG: u32 = std.mem.readInt(u32, "ARSR", builtin.target.cpu.arch.endian());
+
+/// `STAT` capability tag at the target's native endianness (spec §7.1/§10).
+const STAT_TAG: u32 = std.mem.readInt(u32, "STAT", builtin.target.cpu.arch.endian());
 
 comptime {
     const ptr = @sizeOf(*const anyopaque);
@@ -348,6 +393,18 @@ comptime {
         @compileError("abi: ZapMemoryManagerCoreV1.allocate offset drift");
     if (@offsetOf(ZapMemoryManagerCoreV1, "deallocate") != 16 + 3 * ptr)
         @compileError("abi: ZapMemoryManagerCoreV1.deallocate offset drift");
+    if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 16 + 4 * ptr)
+        @compileError("abi: ZapMemoryManagerCoreV1.get_capability_desc offset drift");
+    // Descriptor + P6-J4 capability mirrors (spec §5/§9/§10 layouts, matching
+    // the canonical asserts in src/memory/abi.zig).
+    if (@sizeOf(ZapCapabilityDescV1) != std.mem.alignForward(usize, 12, ptr) + ptr)
+        @compileError("abi: ZapCapabilityDescV1 must be its integer prefix plus one pointer");
+    if (@sizeOf(ZapArenaWatermarkV1) != 4 * ptr)
+        @compileError("abi: ZapArenaWatermarkV1 must be exactly four pointer-width words");
+    if (@sizeOf(ZapArenaResetCapabilityV1) != 2 * ptr)
+        @compileError("abi: ZapArenaResetCapabilityV1 must be exactly two pointer slots wide");
+    if (@sizeOf(ZapStatsCapabilityV1) != 1 * ptr)
+        @compileError("abi: ZapStatsCapabilityV1 must be exactly one pointer slot wide");
 }
 
 /// Number of manager slots the per-spawn manager registry holds (plan item
@@ -373,12 +430,34 @@ const MAX_MANAGER_SLOTS: u32 = 16;
 /// manager per-process dispatch that lets an ARC process and an Arena process
 /// coexist in one binary.
 ///
-/// The layout is FROZEN and mirrored on the runtime side (`src/runtime.zig`,
-/// `ProcessManagerBinding`): `core` first, `context` second, both non-optional
-/// (a bound process always has both). `extern struct` pins the field order.
+/// The layout is FROZEN in its two-field PREFIX and mirrored on the runtime
+/// side (`src/runtime.zig`, `ProcessManagerBinding`): `core` first, `context`
+/// second, both non-optional (a bound process always has both). `extern
+/// struct` pins the field order. The runtime mirror reads ONLY that prefix
+/// from the published pointer, so the P6-J4 fields appended after it are
+/// kernel-private and prefix-compatible by construction (the §2.3 trailing-
+/// extension discipline applied to an internal struct).
 const ProcessManagerBinding = extern struct {
     core: *const ZapMemoryManagerCoreV1,
     context: *anyopaque,
+    // -- P6-J4 kernel-private extension (never read by the runtime mirror) --
+    /// The manager's `ARSR` watermark/reset capability, discovered once at
+    /// spawn (`createProcessBinding`), or null when the manager does not
+    /// expose it (every non-Arena first-party manager). Null keeps the
+    /// receive-back-edge reset a no-op — the sound conservative default.
+    arena_reset: ?*const ZapArenaResetCapabilityV1,
+    /// The manager's `STAT` heap-bytes capability, discovered once at spawn,
+    /// or null (heap-byte queries then report 0, the pre-P6-J4 behavior).
+    stats: ?*const ZapStatsCapabilityV1,
+    /// The iteration watermark for the receive-back-edge auto-reset: captured
+    /// by the FIRST `iterationHeapReset` call (the process's first proven
+    /// receive), then bulk-reset back to by every later call. Owner-only,
+    /// like the allocation path (the reset thunk runs on the thread driving
+    /// the process's quantum). Meaningful only when
+    /// `iteration_watermark_captured` is true.
+    iteration_watermark: ZapArenaWatermarkV1,
+    /// Whether `iteration_watermark` has been captured (see above).
+    iteration_watermark_captured: bool,
 };
 
 /// The per-process `ManagerVTable` every production (non-test) process
@@ -393,6 +472,7 @@ const process_manager_vtable = process_module.ManagerVTable{
     .deallocate = processDeallocateThunk,
     .teardown = processTeardownThunk,
     .heapByteCount = processHeapByteCountThunk,
+    .iterationHeapReset = processIterationHeapResetThunk,
 };
 
 fn processBinding(manager_state: ?*anyopaque) *ProcessManagerBinding {
@@ -413,8 +493,38 @@ fn createProcessBinding(core: *const ZapMemoryManagerCoreV1) ?process_module.Man
         core.deinit(context);
         return null;
     };
-    binding.* = .{ .core = core, .context = context };
+    binding.* = .{
+        .core = core,
+        .context = context,
+        // Descriptor-only capability discovery (spec §7.2): one probe per
+        // capability per SPAWN, never on a hot path. A manager without the
+        // descriptor keeps the sound defaults (no-op reset, 0 heap bytes).
+        .arena_reset = discoverCapabilityVtable(ZapArenaResetCapabilityV1, core, context, ARSR_TAG),
+        .stats = discoverCapabilityVtable(ZapStatsCapabilityV1, core, context, STAT_TAG),
+        .iteration_watermark = .{ .chunk = null, .bump_cursor = 0, .chunk_end = 0, .next_chunk_size = 0 },
+        .iteration_watermark_captured = false,
+    };
     return .{ .manager_state = binding, .vtable = &process_manager_vtable };
+}
+
+/// Probe `core.get_capability_desc(tag)` and validate the answer against the
+/// expected v1 vtable shape (spec §5.1 selection rules, restricted to the one
+/// version the kernel understands): matching id, version 1, and a `size`
+/// covering at least the slots the kernel reads. Any mismatch — including a
+/// manager that answers with a FUTURE version only — resolves to null, i.e.
+/// "capability absent", the conservative degradation the spec prescribes for
+/// an older consumer.
+fn discoverCapabilityVtable(
+    comptime CapabilityVtable: type,
+    core: *const ZapMemoryManagerCoreV1,
+    context: *anyopaque,
+    tag: u32,
+) ?*const CapabilityVtable {
+    const desc = core.get_capability_desc(context, tag) orelse return null;
+    if (desc.id != tag) return null;
+    if (desc.version != 1) return null;
+    if (desc.size < @sizeOf(CapabilityVtable)) return null;
+    return @ptrCast(@alignCast(desc.vtable));
 }
 
 fn processAllocateThunk(manager_state: ?*anyopaque, byte_length: usize, alignment: std.mem.Alignment) ?[*]u8 {
@@ -438,12 +548,49 @@ fn processTeardownThunk(manager_state: ?*anyopaque) void {
     backing_allocator.destroy(binding);
 }
 
-/// Advisory only (plan item 1.6): the v1.0 core ABI exposes no per-context
-/// live-byte query, so report 0. Per-process byte accounting is a manager
-/// capability follow-on; teardown returns the whole heap regardless.
+/// Per-process heap bytes (plan item 1.6), resolved through the manager's
+/// descriptor-only `STAT` capability when it provides one (spec §10; the
+/// first-party Arena reports reserved chunk bytes through an atomic counter,
+/// so this is safe to call from any thread — introspection snapshots read
+/// other processes' managers). A manager without `STAT` reports 0, the
+/// pre-P6-J4 advisory behavior; teardown returns the whole heap regardless.
 fn processHeapByteCountThunk(manager_state: ?*anyopaque) usize {
-    _ = manager_state;
-    return 0;
+    const binding = processBinding(manager_state);
+    const stats = binding.stats orelse return 0;
+    return stats.heap_byte_count(binding.context);
+}
+
+/// The receive-back-edge arena auto-reset (plan item 6.4, P6-J4). Reached
+/// ONLY through `zap_proc_receive_iteration_reset`, which the compiler emits
+/// solely at receive sites whose iteration closure it PROVED
+/// (`src/receive_reset.zig`) — the soundness precondition for the bulk free
+/// below. Per-model semantics (documented on `ManagerVTable.iterationHeapReset`):
+///
+///   * Manager WITHOUT `ARSR` (ARC/ORC/Tracking/GC/Leak/NoOp): no-op.
+///     REFCOUNTED models already reclaimed each iteration's garbage
+///     deterministically through drops; Tracking frees at last use;
+///     Leak/NoOp never reclaim by design. Nothing to bulk-free.
+///   * Manager WITH `ARSR` (Arena — BULK_OR_NEVER): the FIRST call captures
+///     the iteration watermark (the boundary between spawn-era state and
+///     iteration-era garbage — everything the process allocated before its
+///     first proven receive stays untouched forever); every LATER call
+///     bulk-frees back to it in O(chunks-allocated-since). This is what
+///     bounds a long-lived Arena server's heap (the §2.4 growth warning):
+///     message adoptions, handler temporaries, and reply staging from
+///     iteration i are wholesale-reclaimed when iteration i+1 reaches the
+///     receive point.
+///
+/// Owner-only: runs on the thread driving the process's quantum, exactly
+/// like the allocate path.
+fn processIterationHeapResetThunk(manager_state: ?*anyopaque) void {
+    const binding = processBinding(manager_state);
+    const reset = binding.arena_reset orelse return;
+    if (!binding.iteration_watermark_captured) {
+        reset.watermark(binding.context, &binding.iteration_watermark);
+        binding.iteration_watermark_captured = true;
+        return;
+    }
+    reset.reset_to_watermark(binding.context, &binding.iteration_watermark);
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +1434,47 @@ export fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void 
         envelope.fragment = .{};
     }
     envelope_pool_module.free(envelope);
+}
+
+/// The receive-back-edge arena auto-reset (plan item 6.4, P6-J4). The
+/// compiler emits a call to this intrinsic IMMEDIATELY BEFORE a receive
+/// primitive ONLY at receive sites whose iteration closure it proved
+/// (`src/receive_reset.zig`: no allocation made after the process's first
+/// proven receive is reachable at this program point) — that proof is the
+/// soundness precondition for the bulk free. Dispatches through the calling
+/// process's OWN manager binding: a BULK_OR_NEVER manager exposing `ARSR`
+/// (Arena) captures the iteration watermark on the first call and bulk-frees
+/// back to it on every later call; every other model is a no-op (see
+/// `processIterationHeapResetThunk` for the per-model table). Never parks,
+/// never fails; O(chunks-allocated-since-the-watermark).
+export fn zap_proc_receive_iteration_reset(process: *anyopaque) callconv(.c) void {
+    const context = contextFromHandle(process);
+    context.record.pcb.manager.iterationHeapReset();
+}
+
+/// Bytes currently held by the CALLING process's own heap, per its manager's
+/// accounting granularity (the descriptor-only `STAT` capability, spec §10 —
+/// the first-party Arena reports reserved chunk bytes; a manager without
+/// `STAT` reports 0). Self-inspection only — the introspection surface
+/// (`introspection.zig`) covers cross-process snapshots — so there is no
+/// liveness race to defend against: a process reading its own live binding.
+export fn zap_proc_heap_byte_count(process: *anyopaque) callconv(.c) usize {
+    return contextFromHandle(process).record.pcb.manager.heapByteCount();
+}
+
+/// Park the calling process until a USER message is queued, WITHOUT
+/// consuming it, shrinking the process's idle footprint at the park — the
+/// BEAM `hibernate` analogue (plan item 6.4; research.md §6.5 note 4).
+/// While the fiber is suspended the scheduler releases the committed stack
+/// pages below its saved stack pointer back to the OS
+/// (`Scheduler.shrinkHibernatedStack`) — they recommit by fault on wake —
+/// and heap-side reclamation is model-governed (see `ProcessContext.hibernate`
+/// for the per-model table). Returns when the mailbox holds a user message
+/// (a following `receive` consumes it); returns immediately — without
+/// shrinking — if one is already queued. If the process is killed while
+/// hibernated, the call never returns.
+export fn zap_proc_hibernate(process: *anyopaque) callconv(.c) void {
+    contextFromHandle(process).hibernate();
 }
 
 // ---------------------------------------------------------------------------
@@ -2148,10 +2336,19 @@ const TestManagerCore = struct {
         .deinit = deinitThunk,
         .allocate = allocateThunk,
         .deallocate = deallocateThunk,
-        .get_capability_desc = @ptrCast(&unusedThunk),
+        .get_capability_desc = nullCapabilityLookup,
     };
 
-    fn unusedThunk() callconv(.c) void {}
+    /// Typed null capability lookup: `createProcessBinding` probes every
+    /// spawned process's core for the descriptor-only `ARSR`/`STAT`
+    /// capabilities (P6-J4), so a test core's slot must be CALLABLE with the
+    /// real signature — an opaque placeholder would be undefined behavior at
+    /// the first spawn. Answering null means "no capabilities" (spec §5.5).
+    fn nullCapabilityLookup(context: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1 {
+        _ = context;
+        _ = id;
+        return null;
+    }
 
     fn initThunk(options: ?*const anyopaque) callconv(.c) ?*anyopaque {
         _ = options;
@@ -2266,7 +2463,7 @@ test "abi: zap_proc_bind_manager validates the core ABI and gates spawn (no fall
         .deinit = TestManagerCore.deinitThunk,
         .allocate = TestManagerCore.allocateThunk,
         .deallocate = TestManagerCore.deallocateThunk,
-        .get_capability_desc = @ptrCast(&TestManagerCore.unusedThunk),
+        .get_capability_desc = TestManagerCore.nullCapabilityLookup,
     };
     try testing.expectEqual(
         ZapProcStatus.manager_abi_unsupported,
@@ -2297,7 +2494,7 @@ const test_refcounted_core = ZapMemoryManagerCoreV1{
     .deinit = TestManagerCore.deinitThunk,
     .allocate = TestManagerCore.allocateThunk,
     .deallocate = TestManagerCore.deallocateThunk,
-    .get_capability_desc = @ptrCast(&TestManagerCore.unusedThunk),
+    .get_capability_desc = TestManagerCore.nullCapabilityLookup,
 };
 
 test "abi: reclamationModelForCaps decodes the declared_caps axis encoding (pid model bits)" {
@@ -2336,7 +2533,7 @@ test "abi: zap_proc_register_manager validates index range and core ABI" {
         .deinit = TestManagerCore.deinitThunk,
         .allocate = TestManagerCore.allocateThunk,
         .deallocate = TestManagerCore.deallocateThunk,
-        .get_capability_desc = @ptrCast(&TestManagerCore.unusedThunk),
+        .get_capability_desc = TestManagerCore.nullCapabilityLookup,
     };
     try testing.expectEqual(
         ZapProcStatus.manager_abi_unsupported,
@@ -3781,4 +3978,380 @@ test "abi: string tier — a promoted string send survives its sender at the sam
     try testing.expect(probe.receiver_appended_bytes_match);
     // Both processes are dead; the teardown drains freed the blob.
     try testing.expectEqual(@as(u64, 0), zap_blob_live_count());
+}
+
+// -- P6-J4: `ARSR`/`STAT` discovery, the receive-back-edge iteration reset,
+// -- heap-bytes observability, and `hibernate` ---------------------------------
+
+/// A test manager exposing the descriptor-only `ARSR` + `STAT` capabilities
+/// over a single-buffer bump heap — the kernel-level double of the
+/// first-party Arena manager's capability surface (the real Arena is
+/// exercised end-to-end by the gate-ON Zap suite,
+/// `test_concurrency/arena_server_test.zap`; the kernel tree is
+/// self-contained and cannot import `src/memory/arena/manager.zig`).
+const ArsrTestManager = struct {
+    const buffer_capacity: usize = 256 * 1024;
+
+    const Context = struct {
+        buffer: [*]u8,
+        cursor: usize,
+        /// Mirrors `cursor` for the `STAT` read (atomic, like the real
+        /// Arena's reserved-byte counter — introspection may read it
+        /// cross-thread).
+        used_bytes: std.atomic.Value(usize),
+    };
+
+    fn initThunk(options: ?*const anyopaque) callconv(.c) ?*anyopaque {
+        _ = options;
+        const context = backing_allocator.create(Context) catch return null;
+        const buffer = backing_allocator.alloc(u8, buffer_capacity) catch {
+            backing_allocator.destroy(context);
+            return null;
+        };
+        context.* = .{ .buffer = buffer.ptr, .cursor = 0, .used_bytes = .init(0) };
+        return @ptrCast(context);
+    }
+
+    fn deinitThunk(raw_context: *anyopaque) callconv(.c) void {
+        const context: *Context = @ptrCast(@alignCast(raw_context));
+        // Comptime-length slicing of a many-item pointer yields `*[N]u8`;
+        // coerce to a runtime slice for `free`.
+        const whole_buffer: []u8 = context.buffer[0..buffer_capacity];
+        backing_allocator.free(whole_buffer);
+        backing_allocator.destroy(context);
+    }
+
+    fn allocateThunk(raw_context: *anyopaque, byte_length: usize, alignment: u32) callconv(.c) ?[*]u8 {
+        const context: *Context = @ptrCast(@alignCast(raw_context));
+        const base = @intFromPtr(context.buffer);
+        const aligned = std.mem.alignForward(usize, base + context.cursor, alignment) - base;
+        if (aligned + byte_length > buffer_capacity) return null;
+        context.cursor = aligned + byte_length;
+        context.used_bytes.store(context.cursor, .monotonic);
+        return context.buffer + aligned;
+    }
+
+    fn deallocateThunk(raw_context: *anyopaque, memory: [*]u8, byte_length: usize, alignment: u32) callconv(.c) void {
+        _ = raw_context;
+        _ = memory;
+        _ = byte_length;
+        _ = alignment;
+    }
+
+    fn watermarkThunk(raw_context: *anyopaque, out_watermark: *ZapArenaWatermarkV1) callconv(.c) void {
+        const context: *Context = @ptrCast(@alignCast(raw_context));
+        out_watermark.* = .{
+            .chunk = null,
+            .bump_cursor = context.cursor,
+            .chunk_end = 0,
+            .next_chunk_size = 0,
+        };
+    }
+
+    fn resetToWatermarkThunk(raw_context: *anyopaque, watermark: *const ZapArenaWatermarkV1) callconv(.c) void {
+        const context: *Context = @ptrCast(@alignCast(raw_context));
+        std.debug.assert(watermark.bump_cursor <= context.cursor);
+        context.cursor = watermark.bump_cursor;
+        context.used_bytes.store(context.cursor, .monotonic);
+    }
+
+    fn heapByteCountThunk(raw_context: *anyopaque) callconv(.c) usize {
+        const context: *Context = @ptrCast(@alignCast(raw_context));
+        return context.used_bytes.load(.monotonic);
+    }
+
+    const reset_capability = ZapArenaResetCapabilityV1{
+        .watermark = watermarkThunk,
+        .reset_to_watermark = resetToWatermarkThunk,
+    };
+
+    const reset_descriptor = ZapCapabilityDescV1{
+        .id = ARSR_TAG,
+        .version = 1,
+        .size = @sizeOf(ZapArenaResetCapabilityV1),
+        .flags = 0,
+        .vtable = @ptrCast(&reset_capability),
+    };
+
+    const stats_capability = ZapStatsCapabilityV1{
+        .heap_byte_count = heapByteCountThunk,
+    };
+
+    const stats_descriptor = ZapCapabilityDescV1{
+        .id = STAT_TAG,
+        .version = 1,
+        .size = @sizeOf(ZapStatsCapabilityV1),
+        .flags = 0,
+        .vtable = @ptrCast(&stats_capability),
+    };
+
+    fn capabilityLookup(raw_context: *anyopaque, id: u32) callconv(.c) ?*const ZapCapabilityDescV1 {
+        _ = raw_context;
+        if (id == ARSR_TAG) return &reset_descriptor;
+        if (id == STAT_TAG) return &stats_descriptor;
+        return null;
+    }
+
+    const core = ZapMemoryManagerCoreV1{
+        .abi_major = 1,
+        .abi_minor = 0,
+        .size = @sizeOf(ZapMemoryManagerCoreV1),
+        .declared_caps = 0, // BULK_OR_NEVER, like the real Arena.
+        .init = initThunk,
+        .deinit = deinitThunk,
+        .allocate = allocateThunk,
+        .deallocate = deallocateThunk,
+        .get_capability_desc = capabilityLookup,
+    };
+};
+
+/// Probe for the iteration-reset semantics test: the entry samples its own
+/// heap bytes around allocations and `zap_proc_receive_iteration_reset`
+/// calls, exercising the watermark capture/reset protocol exactly as a
+/// proven receive loop would.
+const IterationResetProbe = struct {
+    heap_after_spawn_era_alloc: usize = 0,
+    heap_after_watermark_capture: usize = 0,
+    heap_after_iteration_allocs: usize = 0,
+    heap_after_first_reset: usize = 0,
+    steady_state_held: bool = false,
+    completed: bool = false,
+};
+
+fn iterationResetEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *IterationResetProbe = @ptrCast(@alignCast(argument.?));
+    const manager = contextFromHandle(process).record.pcb.manager;
+
+    // Spawn-era allocation: lives BELOW the watermark, never reclaimed by
+    // iteration resets.
+    _ = manager.allocate(1024, .of(u64)) orelse return;
+    probe.heap_after_spawn_era_alloc = zap_proc_heap_byte_count(process);
+
+    // The FIRST reset call captures the watermark and frees nothing.
+    zap_proc_receive_iteration_reset(process);
+    probe.heap_after_watermark_capture = zap_proc_heap_byte_count(process);
+
+    // Iteration-era garbage.
+    for (0..16) |_| _ = manager.allocate(512, .of(u64)) orelse return;
+    probe.heap_after_iteration_allocs = zap_proc_heap_byte_count(process);
+
+    // The SECOND call bulk-frees back to the watermark.
+    zap_proc_receive_iteration_reset(process);
+    probe.heap_after_first_reset = zap_proc_heap_byte_count(process);
+
+    // Steady state across many iterations: allocate, reset, always back to
+    // the watermark level — the bounded-server invariant in miniature.
+    var held = true;
+    for (0..32) |_| {
+        for (0..16) |_| _ = manager.allocate(512, .of(u64)) orelse return;
+        zap_proc_receive_iteration_reset(process);
+        if (zap_proc_heap_byte_count(process) != probe.heap_after_first_reset) held = false;
+    }
+    probe.steady_state_held = held;
+    probe.completed = true;
+}
+
+test "abi: iteration reset — ARSR watermark capture, bulk free, and steady state through the process binding" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_register_manager(1, @ptrCast(&ArsrTestManager.core)));
+
+    var probe = IterationResetProbe{};
+    const pid_bits = zap_proc_spawn_at(iterationResetEntry, &probe, 1);
+    try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+    // BULK_OR_NEVER model bits, like the real Arena.
+    try testing.expectEqual(pid_table.ReclamationModel.bulk_or_never, concurrency.Pid.fromBits(pid_bits).model);
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expect(probe.completed);
+    // STAT observability is live: spawn-era allocation is visible…
+    try testing.expect(probe.heap_after_spawn_era_alloc >= 1024);
+    // …the first reset call captured the watermark WITHOUT freeing…
+    try testing.expectEqual(probe.heap_after_spawn_era_alloc, probe.heap_after_watermark_capture);
+    // …iteration garbage grew the heap…
+    try testing.expect(probe.heap_after_iteration_allocs > probe.heap_after_watermark_capture);
+    // …and the reset bulk-freed EXACTLY back to the watermark.
+    try testing.expectEqual(probe.heap_after_watermark_capture, probe.heap_after_first_reset);
+    try testing.expect(probe.steady_state_held);
+}
+
+/// Probe for the no-`ARSR` conservative path: the same call shape under a
+/// manager without the capability must no-op (never crash, never free).
+const NoArsrResetProbe = struct {
+    heap_byte_count_answer: usize = std.math.maxInt(usize),
+    completed: bool = false,
+};
+
+fn noArsrResetEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *NoArsrResetProbe = @ptrCast(@alignCast(argument.?));
+    const manager = contextFromHandle(process).record.pcb.manager;
+    _ = manager.allocate(2048, .of(u64)) orelse return;
+    zap_proc_receive_iteration_reset(process);
+    _ = manager.allocate(2048, .of(u64)) orelse return;
+    zap_proc_receive_iteration_reset(process);
+    // No STAT capability → the heap-bytes query answers 0.
+    probe.heap_byte_count_answer = zap_proc_heap_byte_count(process);
+    probe.completed = true;
+}
+
+test "abi: iteration reset and heap-bytes are conservative no-ops under a manager without ARSR/STAT" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    TestManagerCore.resetAccounting();
+    bindTestManager();
+
+    var probe = NoArsrResetProbe{};
+    const pid_bits = zap_proc_spawn(noArsrResetEntry, &probe);
+    try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expect(probe.completed);
+    try testing.expectEqual(@as(usize, 0), probe.heap_byte_count_answer);
+    // The no-op reset freed nothing: both allocations were still live at
+    // teardown and the wholesale free reclaimed them (exact accounting).
+    try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total.load(.monotonic));
+}
+
+/// Deep stack excursion for the hibernate tests: `depth` frames, each
+/// touching a 2 KiB buffer, checksummed so the compiler cannot elide the
+/// stack traffic. Marked never-inline so every level is a real frame.
+fn hibernateDeepTouch(depth: usize, seed: usize) usize {
+    var frame_buffer: [2048]u8 = undefined;
+    for (&frame_buffer, 0..) |*byte, index| byte.* = @truncate(seed +% index);
+    var checksum: usize = 0;
+    for (frame_buffer) |byte| checksum +%= byte;
+    if (depth == 0) return checksum;
+    return checksum +% @call(.never_inline, hibernateDeepTouch, .{ depth - 1, seed +% 1 });
+}
+
+/// Probe for the hibernate round trip. Phasing: `run_until_quiescent`
+/// returns only at live-count ZERO, so a parked hibernator would hang it —
+/// the parked phase is driven in ROOT mode instead (`zap_proc_run_until_exit`
+/// on a marker process the hibernator handshakes with just before parking).
+const HibernateProbe = struct {
+    receiver_pid_bits: u64 = 0,
+    marker_pid_bits: u64 = 0,
+    first_deep_checksum: usize = 0,
+    woke: std.atomic.Value(bool) = .init(false),
+    payload_matches: bool = false,
+    resumed_deep_matches: bool = false,
+    completed: bool = false,
+
+    const payload = "hibernate-wake";
+    const handshake = "about-to-hibernate";
+};
+
+/// Phase marker: waits for the hibernator's "about to hibernate" handshake,
+/// then yields the scheduler a bounded number of times so the hibernator's
+/// park commits, then exits — ending the root-mode drive with the hibernator
+/// PARKED but alive.
+fn hibernateMarkerEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    _ = argument;
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    zap_proc_envelope_free(envelope);
+    for (0..64) |_| zap_proc_yield_check(process);
+}
+
+fn hibernateWakerEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *HibernateProbe = @ptrCast(@alignCast(argument.?));
+    std.debug.assert(zap_proc_send(
+        process,
+        probe.receiver_pid_bits,
+        HibernateProbe.payload.ptr,
+        HibernateProbe.payload.len,
+    ) == ZapProcStatus.ok);
+}
+
+fn hibernateEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *HibernateProbe = @ptrCast(@alignCast(argument.?));
+
+    // Commit a deep stack region (≈32 × 2 KiB ≈ 64 KiB touched; Debug frames
+    // are fatter, still well inside the 256 KiB usable stack) BEFORE
+    // hibernating — the committed pages the shrink must release.
+    probe.first_deep_checksum = @call(.never_inline, hibernateDeepTouch, .{ 32, 7 });
+
+    // Handshake: tell the phase marker the park is imminent.
+    std.debug.assert(zap_proc_send(
+        process,
+        probe.marker_pid_bits,
+        HibernateProbe.handshake.ptr,
+        HibernateProbe.handshake.len,
+    ) == ZapProcStatus.ok);
+
+    zap_proc_hibernate(process);
+    probe.woke.store(true, .release);
+
+    // The message that woke us is queued, NOT consumed — consume it now.
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    if (payload_pointer) |pointer| {
+        probe.payload_matches = std.mem.eql(u8, pointer[0..payload_len], HibernateProbe.payload);
+    }
+    zap_proc_envelope_free(envelope);
+
+    // Recommit-by-fault integrity: the same deep excursion after the shrink
+    // must work and compute the same checksum.
+    const second = @call(.never_inline, hibernateDeepTouch, .{ 32, 7 });
+    probe.resumed_deep_matches = second == probe.first_deep_checksum;
+    probe.completed = true;
+}
+
+test "abi: hibernate parks non-consuming, shrinks the committed stack, and wakes on the next message" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    var probe = HibernateProbe{};
+    const marker_bits = zap_proc_spawn(hibernateMarkerEntry, &probe);
+    try testing.expect(marker_bits != concurrency.Pid.invalid.toBits());
+    probe.marker_pid_bits = marker_bits;
+    const pid_bits = zap_proc_spawn(hibernateEntry, &probe);
+    try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+
+    // Phase 1 (root mode on the marker): the hibernator deep-touches,
+    // handshakes, and PARKS; the marker's exit ends the drive with the
+    // hibernator still alive and hibernated.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(marker_bits));
+    try testing.expect(!probe.woke.load(.acquire));
+    const stats_parked = runtime_state.backend.production_pool.statistics();
+    try testing.expect(stats_parked.hibernate_park_total >= 1);
+    // The deep excursion committed ≥64 KiB; the shrink released the pages
+    // below the parked frame (at least half that, conservatively — the
+    // parked frame chain sits near the stack top).
+    try testing.expect(stats_parked.hibernate_stack_bytes_released >= 32 * 1024);
+
+    // Phase 2: a user message wakes it (sent from a waker process — sends
+    // are process-scoped intrinsics); hibernate returns WITHOUT consuming,
+    // the following receive consumes, and the recommitted stack works.
+    probe.receiver_pid_bits = pid_bits;
+    const waker_bits = zap_proc_spawn(hibernateWakerEntry, &probe);
+    try testing.expect(waker_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+    try testing.expect(probe.woke.load(.acquire));
+    try testing.expect(probe.payload_matches);
+    try testing.expect(probe.resumed_deep_matches);
+    try testing.expect(probe.completed);
+}
+
+test "abi: a hibernated process is torn down cleanly at runtime deinit (no wake ever arrives)" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    bindTestManager();
+
+    var probe = HibernateProbe{};
+    const marker_bits = zap_proc_spawn(hibernateMarkerEntry, &probe);
+    try testing.expect(marker_bits != concurrency.Pid.invalid.toBits());
+    probe.marker_pid_bits = marker_bits;
+    const pid_bits = zap_proc_spawn(hibernateEntry, &probe);
+    try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(marker_bits));
+    try testing.expect(!probe.woke.load(.acquire));
+
+    // Deinit with the process still hibernated: the parked-kill teardown
+    // path reclaims it leak-exactly (the deinit-side ledgers assert).
+    zap_proc_runtime_deinit();
+    try testing.expect(!probe.completed);
 }

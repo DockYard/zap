@@ -3943,6 +3943,15 @@ const ZapConcurrencyKernel = struct {
         timeout_nanoseconds: u64,
     ) callconv(.c) i32;
     extern fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) noreturn;
+    // P6-J4 (plan item 6.4): the receive-back-edge arena auto-reset — emitted
+    // by the compiler ONLY at receive sites whose iteration closure it proved
+    // (`src/receive_reset.zig`); `hibernate` — the BEAM-analogue idle park
+    // (arena semantics documented at the kernel export; committed-stack
+    // shrink; wake on the next user message); and the self heap-bytes
+    // observability read (the manager's `STAT` capability, 0 without one).
+    extern fn zap_proc_receive_iteration_reset(process: *anyopaque) callconv(.c) void;
+    extern fn zap_proc_hibernate(process: *anyopaque) callconv(.c) void;
+    extern fn zap_proc_heap_byte_count(process: *anyopaque) callconv(.c) usize;
 
     // Kernel signal primitives (P5-J1, `src/runtime/concurrency/abi.zig`): links,
     // monitors, exit signals, trap_exit — the mechanism J2/J3 build supervision
@@ -6103,6 +6112,42 @@ pub const ProcessRuntime = struct {
     pub fn dead_letter_unexpected() noreturn {
         requireConcurrencyRuntimeGate();
         ZapConcurrencyKernel.zap_proc_dead_letter_unexpected(requireCurrentProcessHandle());
+    }
+
+    /// The receive-back-edge arena auto-reset intrinsic (P6-J4, plan item
+    /// 6.4). NEVER written by user code and never lowered from a Zap
+    /// library function: the compiler inserts a call to this primitive
+    /// immediately before a receive decode ONLY at sites whose iteration
+    /// closure it PROVED (`src/receive_reset.zig` — no heap allocation made
+    /// after the process's first proven receive is reachable there). The
+    /// kernel dispatches through the calling process's own manager binding:
+    /// an `ARSR`-capable manager (Arena) watermark-resets its bulk set;
+    /// every other model no-ops. Returns `true` always (the IR insertion
+    /// needs a value-producing call shape; the result is dead).
+    pub fn receive_iteration_reset() bool {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_proc_receive_iteration_reset(requireCurrentProcessHandle());
+        return true;
+    }
+
+    /// `Process.hibernate` (P6-J4, plan item 6.4 — BEAM's `hibernate`
+    /// analogue): park until a USER message is queued WITHOUT consuming it,
+    /// shrinking the process's idle footprint at the park (committed stack
+    /// pages below the parked frame are released to the OS and recommit by
+    /// fault on wake; heap semantics are model-governed — see the kernel
+    /// export's per-model table). Returns `true` when a message is waiting.
+    pub fn hibernate() bool {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_proc_hibernate(requireCurrentProcessHandle());
+        return true;
+    }
+
+    /// Bytes currently held by the CALLING process's own heap, at its
+    /// manager's accounting granularity (the `STAT` capability: Arena
+    /// reports reserved chunk bytes; managers without `STAT` report 0).
+    pub fn heap_byte_count() u64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_proc_heap_byte_count(requireCurrentProcessHandle()));
     }
 
     // -- The correlated receive (P5-J4) ---------------------------------------

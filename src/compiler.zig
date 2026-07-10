@@ -10932,6 +10932,28 @@ fn materializeAnalysisArcOps(
     }
     try runArcVerifier(alloc, program, type_store, options);
     try runConcurrencyVerifier(alloc, program, analysis_context, options);
+    try runReceiveResetInstrumentation(alloc, program, options);
+}
+
+/// P6-J4 (plan item 6.4): the receive-back-edge arena auto-reset. Runs LAST
+/// in the pre-ZIR pipeline — after drop materialization and both verifiers —
+/// so the iteration-closure proof (`src/receive_reset.zig`) observes the
+/// final IR shape, including every materialized retain/release (each counts
+/// as a use in the conservative liveness intervals). The pass inserts a
+/// `ProcessRuntime.receive_iteration_reset` builtin before each PROVEN
+/// receive site; its inserted instruction is a plain scalar-result builtin
+/// call with no ARC obligations (dest ownership `.trivial`), so no verifier
+/// re-run is required. Zero-cost for any program without receive primitives
+/// (the entire gate-OFF world): the pre-scan returns without touching the IR.
+fn runReceiveResetInstrumentation(
+    alloc: std.mem.Allocator,
+    program: *ir.Program,
+    options: CompileOptions,
+) CompileError!void {
+    progressStage(options, "Concurrency: proving receive-back-edge iteration closures", .{});
+    _ = zap.receive_reset.instrumentProvenReceiveSites(alloc, program) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
 }
 
 /// P2-J7 (plan item 2.6): the send-boundary concurrency verifier. Runs

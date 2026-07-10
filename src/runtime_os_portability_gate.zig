@@ -521,13 +521,16 @@ const kernel_seam_allowlist = [_]KernelSeam{
     },
     .{
         .file = "stack_pool.zig",
-        .needles = &.{"std.c.mprotect"},
+        .needles = &.{ "std.c.mprotect", "std.c.madvise", "std.c.MADV", "std.os.linux" },
         .reason =
         \\Guard-page protection (`mprotect`) for lazy-commit fiber stacks —
         \\the memory primitive that makes a stack overflow trap instead of
-        \\corrupting the neighbor. (The Mach/Linux region-protection PROBES
-        \\live in the test section and are excluded by the `const testing`
-        \\boundary.)
+        \\corrupting the neighbor — plus the P6-J4 hibernate stack shrink
+        \\(`decommitRange`): Darwin `madvise(MADV_FREE_REUSABLE)` and the
+        \\raw Linux `madvise(MADV_DONTNEED)` syscall, per-OS decommit
+        \\primitives by nature (same posture as the futex layer). (The
+        \\Mach/Linux region-protection PROBES live in the test section and
+        \\are excluded by the `const testing` boundary.)
         ,
     },
     .{

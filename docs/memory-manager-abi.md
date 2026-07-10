@@ -1131,6 +1131,54 @@ pub const ZapCycleCollectCapabilityV1 = extern struct {
 
 Status. ORC-as-a-per-spawn-manager is complete and correct: the collector is proven leak-exact in the manager's own unit tests (self-referential, two-node, three-node, and join-node cycles built through the ABI, dropped, and reclaimed; a negative control confirms that without collection the cycle leaks; an externally-reachable cycle is NOT wrongly collected), and the per-process dispatch is wired (an ORC process's release reaches ORC's machinery). The **surface-level** value of cycle collection — a Zap program building a reference cycle and observing it reclaimed — is currently DORMANT: Zap is immutable, so no `A → B → A` back-edge is expressible at the language surface, and `CYCL`'s per-type `register_cell_type` auto-registration is not yet wired to the runtime container types. Both are future work (mutable-closure / opportunistic-mutation primitives, and the `register_cell_type` wiring). See `docs/concurrency-implementation-plan.md` item 3.4.
 
+### 8.8 `ZapArenaResetCapabilityV1` (`ARSR`) and `ZapStatsCapabilityV1` (`STAT`) — descriptor-only bulk reset + heap statistics
+
+P6-J4 (concurrency plan item 6.4, the receive-back-edge arena auto-reset) defines two further descriptor-only capabilities, exposed by the first-party `Memory.Arena` manager. Like `CYCL` (8.7), **neither has a `declared_caps` bit**: the section 7.1 `ARSR`/`STAT` bit positions remain RESERVED and must stay clear (the compiler continues to reject managers declaring reserved bits). Both are discovered dynamically through `core.get_capability_desc(tag)`; a manager without them returns `null` for the tag and every consumer degrades safely (no reset — the sound conservative behavior; heap-byte queries report 0). Arena's `declared_caps` stays `0x0` (Axis-A `BULK_OR_NEVER`), byte-identical to its pre-P6-J4 value, so no codegen keying changes — the reset call site is emitted by the compiler's iteration-closure proof (`src/receive_reset.zig`) independently of which manager the process ends up running under, and DISPATCHES per process at runtime through the kernel's manager binding (`src/runtime/concurrency/abi.zig`, `createProcessBinding` probes both tags once per spawn).
+
+`ARSR` (`desc.version = 1`, `desc.size = 2 * PTR` — canonical Zig definition `ZapArenaResetCapabilityV1` in `src/memory/abi.zig`):
+
+```zig
+/// A point-in-time position of a BULK_OR_NEVER manager's bulk set. OPAQUE
+/// to consumers: the four words are manager-private cursor state; only
+/// round-trip values captured from the SAME context.
+pub const ZapArenaWatermarkV1 = extern struct {
+    chunk: ?*anyopaque,
+    bump_cursor: usize,
+    chunk_end: usize,
+    next_chunk_size: usize,
+};
+
+pub const ZapArenaResetCapabilityV1 = extern struct {
+    /// Capture the context's current bulk-set position (single-owner,
+    /// like `core.allocate`).
+    watermark: *const fn (ctx: *anyopaque, out_watermark: *ZapArenaWatermarkV1) callconv(.c) void,
+    /// Free every allocation made after `watermark` was captured —
+    /// O(chunks-allocated-since) — and restore the allocation POSITION to
+    /// it (the first-party arena deliberately keeps the learned geometric
+    /// growth schedule: sizing POLICY is not position). The CALLER owns
+    /// the proof that nothing allocated after the capture is still
+    /// reachable; a reset without that proof is a use-after-free. For the
+    /// receive-back-edge auto-reset that proof is the compiler's
+    /// iteration-closure check.
+    reset_to_watermark: *const fn (ctx: *anyopaque, watermark: *const ZapArenaWatermarkV1) callconv(.c) void,
+};
+```
+
+`STAT` (`desc.version = 1`, `desc.size = 1 * PTR` — canonical Zig definition `ZapStatsCapabilityV1` in `src/memory/abi.zig`):
+
+```zig
+pub const ZapStatsCapabilityV1 = extern struct {
+    /// Bytes currently held by this context's heap, at manager-defined
+    /// granularity (the first-party arena reports RESERVED chunk bytes).
+    /// Unlike the single-owner slots, MUST be callable from any thread
+    /// while the owner allocates (introspection snapshots read other
+    /// processes' managers): back it with a monotonic atomic counter.
+    heap_byte_count: *const fn (ctx: *anyopaque) callconv(.c) usize,
+};
+```
+
+Consumers today: the concurrency kernel's per-process manager binding routes `ManagerVTable.iterationHeapReset` through `ARSR` (watermark captured at the process's first proven receive, bulk-reset back to it on every later one — what bounds a long-lived Arena server's heap) and `ManagerVTable.heapByteCount` through `STAT` (the `Process.heap_bytes` self-inspection surface and `introspection.zig`'s per-process snapshots). Every other first-party manager answers `null` for both tags: REFCOUNTED models reclaim per-iteration garbage deterministically through drops (nothing to bulk-free), Tracking frees at last use, and Leak/NoOp never reclaim by design.
+
 ---
 
 ## 9. Reserved capability shapes
@@ -1206,7 +1254,9 @@ pub const ZapTracingGCCapabilityV1_RESERVED = extern struct {
 
 ### 9.2 Other reserved capabilities
 
-The remaining reserved capabilities (`REGN`, `STAT`, `FNLZ`, `WKRF`, `ARSR`, `ARTS`, `SHHP`, `TRAC`) have only their tag and bit position reserved. Their struct shapes will be defined in future ABI minor or major versions. A v1.0 manager must not declare any of these bits.
+The remaining reserved capabilities (`REGN`, `FNLZ`, `WKRF`, `ARTS`, `SHHP`, `TRAC`) have only their tag and bit position reserved. Their struct shapes will be defined in future ABI minor or major versions. A v1.0 manager must not declare any of these bits.
+
+`STAT` and `ARSR` have DEFINED v1 struct shapes as **descriptor-only** capabilities (section 8.8) — their section 7.1 *bits* remain RESERVED (never declared in `declared_caps`); discovery is exclusively through `core.get_capability_desc(tag)`, the `CYCL` pattern.
 
 ---
 

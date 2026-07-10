@@ -162,6 +162,11 @@ pub const KernelCounters = struct {
     normal_exit_total: u64,
     /// Kill teardowns.
     kill_total: u64,
+    /// `Process.hibernate` parks committed (plan item 6.4, P6-J4).
+    hibernate_park_total: u64,
+    /// Committed stack bytes released to the OS at hibernate parks — the
+    /// plan item 6.4 idle-footprint shrink, observable per scheduler.
+    hibernate_stack_bytes_released: u64,
 };
 
 /// Snapshot the counter roster for `scheduler` (and its shared pid
@@ -180,6 +185,8 @@ pub fn kernelCounters(scheduler: *const Scheduler) KernelCounters {
         .spawn_total = scheduler_statistics.spawn_total,
         .normal_exit_total = scheduler_statistics.normal_exit_total,
         .kill_total = scheduler_statistics.kill_total,
+        .hibernate_park_total = scheduler_statistics.hibernate_park_total,
+        .hibernate_stack_bytes_released = scheduler_statistics.hibernate_stack_bytes_released,
     };
 }
 

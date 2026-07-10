@@ -49,15 +49,30 @@
 //! the cache is empty) and a release either moves a stack from live to
 //! cached (total unchanged) or unmaps it (total shrinks).
 //!
-//! Final sizing/watermark policy is deliberately deferred (plan Appendix
-//! A.4 item 3) and will be decided empirically by Phase 1.7's Darwin
-//! spawn/die-cycle teardown test; the constants below are the initial
-//! mirror of the ARC slab policy. One consequence to keep in view for
-//! that decision: a cached stack's RESIDENT pages do not decay — the
-//! free list retains whatever pages the stack's deepest tenant faulted
-//! in — so long-idle caches hold peak-depth resident memory until
-//! `trim`; whether releases should `madvise` the usable range back to
-//! the OS is part of the same Phase 1.7 / A.4 item 3 sizing decision.
+//! The A.4 item 3 stack-RSS-decay question — whether and where committed
+//! stack pages `madvise` back to the OS — is DECIDED as of P6-J4 (plan
+//! item 6.4), split by call shape:
+//!
+//!   * **Hibernate (`Process.hibernate`) DOES decommit.** An explicitly
+//!     idle process's committed pages below its parked frame are released
+//!     via `decommitBelowStackPointer` (Darwin `MADV_FREE_REUSABLE`,
+//!     Linux `MADV_DONTNEED` — see `decommitRange` for the exact
+//!     semantics) and recommit by fault on wake. The process itself
+//!     signals long idleness, so the refault cost is off any hot path.
+//!   * **Release-to-cache does NOT decommit.** A cached stack's resident
+//!     pages still do not decay — the free list retains whatever pages
+//!     the deepest tenant faulted in until `trim`. Rationale: the pool's
+//!     design invariant is ZERO syscalls on the acquire/release fast
+//!     path (the E9 9 ns pooled-spawn floor above), and spawn/die-storm
+//!     workloads — exactly the shape that populates the cache — reuse
+//!     the pages immediately, so an unconditional release-madvise would
+//!     buy nothing there and cost a syscall plus refaults per cycle.
+//!     Idle-cache decay therefore rides hibernate (per-process, demand-
+//!     signaled) rather than the pool (global, workload-blind); if a
+//!     future workload shows long-idle caches dominating RSS, the
+//!     decommit primitive below is the ready-made mechanism to apply at
+//!     `release` behind a policy knob, measured with the 1.7 teardown
+//!     harness.
 //!
 //! ## The fiber-stack-lifetime invariant (release-side enforcement)
 //!
@@ -166,6 +181,88 @@ pub const Stack = struct {
         return @intFromPtr(stack.mapping.ptr) + stack.mapping.len;
     }
 };
+
+/// Release the committed pages of `stack` STRICTLY BELOW `stack_pointer`
+/// back to the OS — the `Process.hibernate` stack shrink (plan item 6.4,
+/// P6-J4; the A.4 item 3 decision recorded in the module doc). The released
+/// range is dead stack (a downward-growing stack never holds live data below
+/// its SP), and the pages recommit by fault on the next deep call — the
+/// pool's lazy-commit design working in reverse.
+///
+/// The caller must guarantee NO execution can be on `stack` for the duration
+/// of the call (the kernel's one call site runs on the scheduler's stack
+/// against a `.suspended` fiber it still exclusively owns —
+/// `scheduler.zig`'s `.hibernating` dispatch, strictly before the park is
+/// published to potential revivers).
+///
+/// One whole page below the page containing `stack_pointer` is preserved in
+/// addition to the SP page itself: the tier-1 ABIs' 128-byte red zone lives
+/// below SP (AAPCS64 / SysV x86-64), and the cushion also covers any spill
+/// slots the saved frame's resume path touches before pushing a new frame.
+/// Returns the byte length released (0 when the range is empty, when
+/// `stack_pointer` lies outside the usable range — a contract violation
+/// answered conservatively — or when the platform has no decommit
+/// primitive).
+pub fn decommitBelowStackPointer(stack: Stack, stack_pointer: usize) usize {
+    const usable_bytes = stack.usable();
+    const usable_start = @intFromPtr(usable_bytes.ptr);
+    const usable_end = usable_start + usable_bytes.len;
+    if (stack_pointer < usable_start or stack_pointer > usable_end) return 0;
+    const page = std.heap.pageSize();
+    const sp_page_floor = std.mem.alignBackward(usize, stack_pointer, page);
+    if (sp_page_floor < usable_start + page) return 0;
+    const keep_boundary = sp_page_floor - page;
+    if (keep_boundary <= usable_start) return 0;
+    const length = keep_boundary - usable_start;
+    decommitRange(usable_start, length);
+    return length;
+}
+
+/// Per-OS decommit of a page-aligned anonymous-mapping range (both `address`
+/// and `length` are page multiples by construction in
+/// `decommitBelowStackPointer`: the usable range starts one page above the
+/// page-aligned mapping base and the keep boundary is page-floored).
+///
+/// * **Darwin — `MADV_FREE_REUSABLE`, falling back to `MADV_FREE`.** Plain
+///   `MADV_FREE` on xnu only marks pages clean-and-reclaimable: physical
+///   pages leave the task lazily under memory pressure, so RSS and
+///   `phys_footprint` do not visibly drop — useless for an observable
+///   hibernate. `MADV_FREE_REUSABLE` (Darwin-specific; the primitive
+///   WebKit's bmalloc and jemalloc's Darwin `pages_purge` use for exactly
+///   this decommit-without-unmap purpose) additionally marks the range
+///   "reusable", removing the pages from the task's `phys_footprint` ledger
+///   IMMEDIATELY and making them reclaimable at any time. Data correctness
+///   on re-touch does not require the paired `MADV_FREE_REUSE`: a write
+///   fault re-dirties the page and xnu's fault path takes it back out of
+///   the reusable set (the `FREE_REUSE` pairing exists for exact footprint
+///   RE-accounting, which a fault-recommitted dead-stack page can
+///   harmlessly under-report — jemalloc ships the same asymmetry). The
+///   fallback covers kernels/ranges where `FREE_REUSABLE` returns an error
+///   (it is stricter about range shape than `MADV_FREE`).
+/// * **Linux — `MADV_DONTNEED`** (direct syscall, no libc dependency):
+///   immediate decommit semantics for private anonymous mappings — RSS
+///   drops at once and the next touch faults in a fresh zero page.
+///   Deliberately not Linux `MADV_FREE`, whose RSS effect is deferred to
+///   memory pressure and thus unobservable/undeterministic for tests.
+/// * **Other targets — no-op** (returning the stack to the OS wholesale at
+///   `munmap` remains the only decay). Windows would use
+///   `VirtualFree(MEM_DECOMMIT)` over a `MEM_RESERVE`d region and wasm has
+///   no virtual-memory decommit; both are follow-ons recorded at plan item
+///   6.4's deferral list.
+fn decommitRange(address: usize, length: usize) void {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            const range_pointer: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(address);
+            if (std.c.madvise(range_pointer, length, std.c.MADV.FREE_REUSABLE) != 0) {
+                _ = std.c.madvise(range_pointer, length, std.c.MADV.FREE);
+            }
+        },
+        .linux => {
+            _ = std.os.linux.madvise(@ptrFromInt(address), length, std.os.linux.MADV.DONTNEED);
+        },
+        else => {},
+    }
+}
 
 /// Intrusive free-list node stored in the first bytes of a cached stack's
 /// usable range (the lowest, coldest usable page — the bytes a fiber only
@@ -722,4 +819,124 @@ fn readLinuxRegionProtection(address: usize) ?RegionProtection {
         return .{ .readable = perms[0] == 'r', .writable = perms[1] == 'w' };
     }
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// P6-J4 — `decommitBelowStackPointer` (the hibernate stack shrink)
+// ---------------------------------------------------------------------------
+
+test "decommitBelowStackPointer: geometry — keep boundary, empty ranges, out-of-range SP" {
+    var pool = StackPool.init(.{});
+    defer pool.deinit();
+    const stack = try pool.acquire();
+    defer pool.release(stack);
+
+    const page_length = std.heap.pageSize();
+    const usable_bytes = stack.usable();
+    const usable_start = @intFromPtr(usable_bytes.ptr);
+
+    // An SP outside the usable range is a contract violation answered with 0.
+    try testing.expectEqual(@as(usize, 0), decommitBelowStackPointer(stack, usable_start - 1));
+    try testing.expectEqual(@as(usize, 0), decommitBelowStackPointer(stack, stack.top() + 1));
+
+    // An SP within the two lowest usable pages leaves nothing to release
+    // (the SP page and one cushion page below it are always preserved).
+    try testing.expectEqual(@as(usize, 0), decommitBelowStackPointer(stack, usable_start));
+    try testing.expectEqual(@as(usize, 0), decommitBelowStackPointer(stack, usable_start + 2 * page_length - 1));
+
+    // An SP at the very top (page-aligned: its page floor is itself, so only
+    // the one cushion page below it is preserved) releases everything except
+    // that cushion page.
+    const released = decommitBelowStackPointer(stack, stack.top());
+    if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
+        try testing.expectEqual(usable_bytes.len - 1 * page_length, released);
+    }
+}
+
+test "decommitBelowStackPointer: bytes at and above the keep boundary survive; released range recommits by fault" {
+    var pool = StackPool.init(.{});
+    defer pool.deinit();
+    const stack = try pool.acquire();
+    defer pool.release(stack);
+
+    const page_length = std.heap.pageSize();
+    const usable_bytes = stack.usable();
+    const usable_start = @intFromPtr(usable_bytes.ptr);
+
+    // Commit the whole usable range with a position-derived pattern.
+    for (usable_bytes, 0..) |*byte, index| byte.* = @truncate(index);
+
+    // A mid-stack SP: everything below (sp_page - 1 page) is released.
+    const synthetic_sp = usable_start + usable_bytes.len / 2;
+    const sp_page_floor = std.mem.alignBackward(usize, synthetic_sp, page_length);
+    const keep_boundary = sp_page_floor - page_length;
+    const released = decommitBelowStackPointer(stack, synthetic_sp);
+    if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
+        try testing.expectEqual(keep_boundary - usable_start, released);
+    }
+
+    // Everything from the keep boundary up must be byte-identical — the
+    // preserved cushion page, the SP page, and all live frames above.
+    var offset = keep_boundary - usable_start;
+    while (offset < usable_bytes.len) : (offset += 1) {
+        try testing.expectEqual(@as(u8, @truncate(offset)), usable_bytes[offset]);
+    }
+
+    // The released range recommits by fault: writes land and read back —
+    // the wake-after-hibernate path in miniature. (Its PRIOR contents are
+    // legitimately gone or stale — either is allowed; only re-use must work.)
+    var probe_offset: usize = 0;
+    while (probe_offset < keep_boundary - usable_start) : (probe_offset += page_length) {
+        usable_bytes[probe_offset] = 0x5C;
+        try testing.expectEqual(@as(u8, 0x5C), usable_bytes[probe_offset]);
+    }
+}
+
+/// Current `phys_footprint` of this task (Darwin) — the ledger the hibernate
+/// shrink must visibly reduce (`MADV_FREE_REUSABLE` removes reusable pages
+/// from it immediately, unlike `MADV_FREE`'s lazy reclaim). 0 elsewhere.
+fn testCurrentPhysFootprint() usize {
+    if (builtin.os.tag != .macos) return 0;
+    var info: std.c.task_vm_info_data_t = undefined;
+    var count: std.c.mach_msg_type_number_t = std.c.TASK.VM.INFO_COUNT;
+    const kr = std.c.task_info(
+        std.c.mach_task_self(),
+        std.c.TASK.VM.INFO,
+        @ptrCast(&info),
+        &count,
+    );
+    if (kr != 0) return 0;
+    return @intCast(info.phys_footprint);
+}
+
+test "decommitBelowStackPointer: the released pages leave the task's physical footprint (Darwin)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    // A deliberately large stack so the measured delta dwarfs allocator /
+    // runtime footprint noise during the test.
+    const touched_length: usize = 32 * 1024 * 1024;
+    var pool = StackPool.init(.{ .usable_size = touched_length });
+    defer pool.deinit();
+    const stack = try pool.acquire();
+    defer pool.release(stack);
+
+    const usable_bytes = stack.usable();
+    // Commit every page.
+    var offset: usize = 0;
+    while (offset < usable_bytes.len) : (offset += std.heap.pageSize()) {
+        usable_bytes[offset] = 0xA5;
+    }
+    const footprint_committed = testCurrentPhysFootprint();
+
+    // Hibernate-shape shrink: SP parked near the top, everything below
+    // released.
+    const released = decommitBelowStackPointer(stack, stack.top());
+    try testing.expect(released >= touched_length - 1 * std.heap.pageSize());
+    const footprint_shrunk = testCurrentPhysFootprint();
+
+    // The footprint must drop by at least half the released range (generous
+    // slack for unrelated allocations racing the two samples; the real delta
+    // is ~the full 32 MiB).
+    try testing.expect(footprint_committed > footprint_shrunk);
+    try testing.expect(footprint_committed - footprint_shrunk >= released / 2);
 }

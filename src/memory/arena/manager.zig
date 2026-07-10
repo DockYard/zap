@@ -220,6 +220,31 @@ const ZapMemoryManagerCoreV1 = extern struct {
     get_capability_desc: *const fn (*anyopaque, u32) callconv(.c) ?*const ZapCapabilityDescV1,
 };
 
+/// Locally-redeclared `ZapArenaWatermarkV1` (canonical definition in
+/// `src/memory/abi.zig`, spec §9). The four words are THIS manager's private
+/// cursor state; consumers treat them as opaque and only round-trip values
+/// captured from the same context.
+const ZapArenaWatermarkV1 = extern struct {
+    chunk: ?*anyopaque,
+    bump_cursor: usize,
+    chunk_end: usize,
+    next_chunk_size: usize,
+};
+
+/// Locally-redeclared `ZapArenaResetCapabilityV1` (spec §9) — the
+/// descriptor-only `ARSR` watermark/reset capability this manager exposes
+/// through `get_capability_desc(ARSR_TAG)`.
+const ZapArenaResetCapabilityV1 = extern struct {
+    watermark: *const fn (*anyopaque, *ZapArenaWatermarkV1) callconv(.c) void,
+    reset_to_watermark: *const fn (*anyopaque, *const ZapArenaWatermarkV1) callconv(.c) void,
+};
+
+/// Locally-redeclared `ZapStatsCapabilityV1` (spec §10) — the descriptor-only
+/// `STAT` heap-bytes observability capability.
+const ZapStatsCapabilityV1 = extern struct {
+    heap_byte_count: *const fn (*anyopaque) callconv(.c) usize,
+};
+
 comptime {
     if (@sizeOf(ZapMemoryManagerMetaV1) != 32) @compileError(
         "arena: ZapMemoryManagerMetaV1 v1.0 must be exactly 32 bytes",
@@ -254,7 +279,24 @@ comptime {
     if (@offsetOf(ZapMemoryManagerCoreV1, "get_capability_desc") != 16 + 4 * PTR) @compileError(
         "arena: ZapMemoryManagerCoreV1.get_capability_desc must be the fifth pointer slot",
     );
+    if (@sizeOf(ZapArenaWatermarkV1) != 4 * PTR) @compileError(
+        "arena: ZapArenaWatermarkV1 must be exactly four pointer-width words",
+    );
+    if (@sizeOf(ZapArenaResetCapabilityV1) != 2 * PTR) @compileError(
+        "arena: ZapArenaResetCapabilityV1 must be exactly two pointer slots wide",
+    );
+    if (@sizeOf(ZapStatsCapabilityV1) != 1 * PTR) @compileError(
+        "arena: ZapStatsCapabilityV1 must be exactly one pointer slot wide",
+    );
 }
+
+/// `ARSR` capability tag (spec §7.1/§9) at the target's native endianness —
+/// redeclared per the self-contained manager convention, matching
+/// `src/memory/abi.zig`'s `ARSR_TAG`.
+const ARSR_TAG: u32 = std.mem.readInt(u32, "ARSR", builtin.target.cpu.arch.endian());
+
+/// `STAT` capability tag (spec §7.1/§10) at the target's native endianness.
+const STAT_TAG: u32 = std.mem.readInt(u32, "STAT", builtin.target.cpu.arch.endian());
 
 // ---------------------------------------------------------------------------
 // Manager constants
@@ -374,6 +416,16 @@ const ArenaContext = struct {
     /// only on the refill, init, and teardown paths — never on the
     /// bump fast path.
     backing: std.mem.Allocator,
+    /// Total bytes currently reserved from the backing allocator (the sum of
+    /// every live chunk's `size`, headers included) — the `STAT` capability's
+    /// `heap_byte_count` (spec §10). ATOMIC, unlike every other field: the
+    /// single-owner invariant covers all WRITES (only the owning thread
+    /// allocates chunks or resets), but cross-thread introspection snapshots
+    /// (`heap_byte_count`) READ it while the owner runs, so the counter uses
+    /// monotonic atomic ops to keep those reads formally race-free. Touched
+    /// only on the cold refill/reset/teardown paths — never on the bump fast
+    /// path.
+    reserved_byte_count: std.atomic.Value(usize),
 };
 
 /// Create a fresh context on `backing`. Shared by the production
@@ -388,6 +440,7 @@ fn arenaContextCreate(backing: std.mem.Allocator) ?*ArenaContext {
         .chunk_list = null,
         .next_chunk_size = ARENA_FIRST_CHUNK_SIZE,
         .backing = backing,
+        .reserved_byte_count = std.atomic.Value(usize).init(0),
     };
     return arena_ctx;
 }
@@ -410,6 +463,7 @@ fn arenaChunkAllocate(arena_ctx: *ArenaContext, chunk_size: usize) ?*ChunkHeader
         .size = chunk_size,
     };
     arena_ctx.chunk_list = chunk;
+    _ = arena_ctx.reserved_byte_count.fetchAdd(chunk_size, .monotonic);
     return chunk;
 }
 
@@ -580,14 +634,112 @@ fn arenaDeallocate(
     _ = alignment;
 }
 
-/// Capability descriptor lookup. The Arena manager declares zero
-/// capabilities, so every query returns null (spec §5.5).
+// ---------------------------------------------------------------------------
+// `ARSR` watermark/reset capability (spec §9) — the P6-J4 receive-back-edge
+// arena auto-reset mechanism. Descriptor-only: `declared_caps` stays 0x0
+// (the §7.1 `ARSR` bit remains RESERVED; the `CYCL` precedent), and consumers
+// discover the vtable through `get_capability_desc(ARSR_TAG)`.
+// ---------------------------------------------------------------------------
+
+/// `ARSR.watermark` — capture the context's current bulk-set position.
+/// Single-owner like `core.allocate`.
+fn arenaWatermark(ctx: *anyopaque, out_watermark: *ZapArenaWatermarkV1) callconv(.c) void {
+    const arena_ctx: *ArenaContext = @ptrCast(@alignCast(ctx));
+    out_watermark.* = .{
+        .chunk = if (arena_ctx.chunk_list) |chunk| @ptrCast(chunk) else null,
+        .bump_cursor = arena_ctx.bump_cursor,
+        .chunk_end = arena_ctx.chunk_end,
+        .next_chunk_size = arena_ctx.next_chunk_size,
+    };
+}
+
+/// `ARSR.reset_to_watermark` — free every chunk allocated after `watermark`
+/// was captured (the newest-first `chunk_list` walk stops at the captured
+/// head) and restore the bump POSITION to the captured cursor. The geometric
+/// growth schedule (`next_chunk_size`) is deliberately NOT restored: it is
+/// sizing POLICY, not position, and keeping the learned value means a server
+/// loop whose iterations overflow the retained chunk converges onto one
+/// right-sized refill per iteration instead of re-climbing the schedule from
+/// 64 KiB every time. Single-owner; the CALLER owns the proof that nothing
+/// allocated after the capture is still live (see spec §9 — an unproven
+/// reset is a use-after-free).
+fn arenaResetToWatermark(ctx: *anyopaque, watermark: *const ZapArenaWatermarkV1) callconv(.c) void {
+    const arena_ctx: *ArenaContext = @ptrCast(@alignCast(ctx));
+    const backing = arena_ctx.backing;
+    const watermark_chunk: ?*ChunkHeader = if (watermark.chunk) |raw| @ptrCast(@alignCast(raw)) else null;
+    var freed_bytes: usize = 0;
+    while (arena_ctx.chunk_list != watermark_chunk) {
+        // A watermark from a foreign context (contract violation) would walk
+        // past the list end; surface it as the kernel-bug panic it is rather
+        // than dereferencing null.
+        const chunk = arena_ctx.chunk_list orelse @panic(
+            "arena: reset_to_watermark watermark does not belong to this context",
+        );
+        arena_ctx.chunk_list = chunk.next;
+        freed_bytes += chunk.size;
+        const chunk_bytes: [*]u8 = @ptrCast(chunk);
+        backing.rawFree(
+            chunk_bytes[0..chunk.size],
+            comptime std.mem.Alignment.of(ChunkHeader),
+            @returnAddress(),
+        );
+    }
+    arena_ctx.bump_cursor = watermark.bump_cursor;
+    arena_ctx.chunk_end = watermark.chunk_end;
+    if (freed_bytes != 0) {
+        _ = arena_ctx.reserved_byte_count.fetchSub(freed_bytes, .monotonic);
+    }
+}
+
+/// `STAT.heap_byte_count` — bytes currently reserved from the backing
+/// allocator (live chunk bytes, headers included). Safe from ANY thread
+/// while the owner allocates: a single monotonic atomic load (spec §10).
+fn arenaHeapByteCount(ctx: *anyopaque) callconv(.c) usize {
+    const arena_ctx: *ArenaContext = @ptrCast(@alignCast(ctx));
+    return arena_ctx.reserved_byte_count.load(.monotonic);
+}
+
+/// The `ARSR` capability vtable instance the descriptor points at.
+const arena_reset_capability = ZapArenaResetCapabilityV1{
+    .watermark = arenaWatermark,
+    .reset_to_watermark = arenaResetToWatermark,
+};
+
+/// The `ARSR` capability descriptor returned by `get_capability_desc`.
+const arena_reset_descriptor = ZapCapabilityDescV1{
+    .id = ARSR_TAG,
+    .version = 1,
+    .size = @sizeOf(ZapArenaResetCapabilityV1),
+    .flags = 0,
+    .vtable = @ptrCast(&arena_reset_capability),
+};
+
+/// The `STAT` capability vtable instance the descriptor points at.
+const arena_stats_capability = ZapStatsCapabilityV1{
+    .heap_byte_count = arenaHeapByteCount,
+};
+
+/// The `STAT` capability descriptor returned by `get_capability_desc`.
+const arena_stats_descriptor = ZapCapabilityDescV1{
+    .id = STAT_TAG,
+    .version = 1,
+    .size = @sizeOf(ZapStatsCapabilityV1),
+    .flags = 0,
+    .vtable = @ptrCast(&arena_stats_capability),
+};
+
+/// Capability descriptor lookup. Arena declares zero `declared_caps` bits but
+/// exposes two DESCRIPTOR-ONLY capabilities (spec §7.2, the `CYCL` precedent):
+/// `ARSR` (watermark/reset — the receive-back-edge auto-reset mechanism) and
+/// `STAT` (heap-bytes observability). Every other query returns null
+/// (spec §5.5).
 fn arenaGetCapabilityDesc(
     ctx: *anyopaque,
     id: u32,
 ) callconv(.c) ?*const ZapCapabilityDescV1 {
     _ = ctx;
-    _ = id;
+    if (id == ARSR_TAG) return &arena_reset_descriptor;
+    if (id == STAT_TAG) return &arena_stats_descriptor;
     return null;
 }
 
@@ -1055,4 +1207,162 @@ test "arenaAllocate reports pathological size overflow as null" {
         @as(?[*]u8, null),
         arenaAllocate(ctx, std.math.maxInt(usize) - 4, 8),
     );
+}
+
+// ---------------------------------------------------------------------------
+// In-file behavioural tests — `ARSR` watermark/reset + `STAT` heap bytes
+// (P6-J4, plan item 6.4). Same discipline as the bump tests above: every
+// test drives the real vtable functions against a `std.testing.allocator`
+// backing, so the testing allocator's leak detection proves reset returns
+// exactly the post-watermark chunks and deinit still reclaims the rest.
+// ---------------------------------------------------------------------------
+
+test "ARSR/STAT descriptors are discoverable and correctly shaped" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    const reset_desc = arenaGetCapabilityDesc(ctx, ARSR_TAG) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ARSR_TAG, reset_desc.id);
+    try std.testing.expectEqual(@as(u16, 1), reset_desc.version);
+    try std.testing.expectEqual(@as(u16, @sizeOf(ZapArenaResetCapabilityV1)), reset_desc.size);
+
+    const stats_desc = arenaGetCapabilityDesc(ctx, STAT_TAG) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(STAT_TAG, stats_desc.id);
+    try std.testing.expectEqual(@as(u16, 1), stats_desc.version);
+    try std.testing.expectEqual(@as(u16, @sizeOf(ZapStatsCapabilityV1)), stats_desc.size);
+
+    // Unknown ids still answer null (spec §5.5).
+    const refc_tag: u32 = std.mem.readInt(u32, "REFC", builtin.target.cpu.arch.endian());
+    try std.testing.expectEqual(@as(?*const ZapCapabilityDescV1, null), arenaGetCapabilityDesc(ctx, refc_tag));
+}
+
+test "reset_to_watermark frees post-watermark chunks and preserves earlier allocations" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    // Pre-watermark allocation: must survive every later reset untouched.
+    const pre_block = arenaAllocate(ctx, 512, 8) orelse return error.OutOfMemory;
+    @memset(pre_block[0..512], 0xC3);
+    const chunks_at_capture = testCountChunks(arena_ctx);
+    const reserved_at_capture = arenaHeapByteCount(ctx);
+
+    var mark: ZapArenaWatermarkV1 = undefined;
+    arenaWatermark(ctx, &mark);
+
+    // Record where the first post-watermark allocation lands so the reset's
+    // cursor restore can be proven by address reuse.
+    const first_post = arenaAllocate(ctx, 64, 8) orelse return error.OutOfMemory;
+    // Force BOTH refill shapes past the watermark: a standard refill (fill
+    // the current chunk) and a dedicated oversize chunk.
+    var filled: usize = 0;
+    while (testCountChunks(arena_ctx) == chunks_at_capture) : (filled += 1) {
+        try std.testing.expect(filled < 4096);
+        _ = arenaAllocate(ctx, 4096, 8) orelse return error.OutOfMemory;
+    }
+    _ = arenaAllocate(ctx, ARENA_MAX_CHUNK_SIZE + 4096, 8) orelse return error.OutOfMemory;
+    try std.testing.expect(testCountChunks(arena_ctx) >= chunks_at_capture + 2);
+    try std.testing.expect(arenaHeapByteCount(ctx) > reserved_at_capture);
+
+    arenaResetToWatermark(ctx, &mark);
+
+    // Position, chunk set, and accounting are back at the capture point…
+    try std.testing.expectEqual(chunks_at_capture, testCountChunks(arena_ctx));
+    try std.testing.expectEqual(reserved_at_capture, arenaHeapByteCount(ctx));
+    try std.testing.expectEqual(mark.bump_cursor, arena_ctx.bump_cursor);
+    try std.testing.expectEqual(mark.chunk_end, arena_ctx.chunk_end);
+    // …the pre-watermark block is untouched…
+    for (pre_block[0..512]) |byte| try std.testing.expectEqual(@as(u8, 0xC3), byte);
+    // …and the next allocation reuses the reclaimed cursor position.
+    const first_after_reset = arenaAllocate(ctx, 64, 8) orelse return error.OutOfMemory;
+    try std.testing.expectEqual(@intFromPtr(first_post), @intFromPtr(first_after_reset));
+}
+
+test "reset_to_watermark with a pre-first-chunk watermark empties the arena" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    var mark: ZapArenaWatermarkV1 = undefined;
+    arenaWatermark(ctx, &mark);
+    try std.testing.expectEqual(@as(?*anyopaque, null), mark.chunk);
+
+    _ = arenaAllocate(ctx, 4096, 8) orelse return error.OutOfMemory;
+    try std.testing.expect(testCountChunks(arena_ctx) >= 1);
+
+    arenaResetToWatermark(ctx, &mark);
+    try std.testing.expectEqual(@as(usize, 0), testCountChunks(arena_ctx));
+    try std.testing.expectEqual(@as(usize, 0), arenaHeapByteCount(ctx));
+    try std.testing.expectEqual(@as(usize, 0), arena_ctx.bump_cursor);
+    try std.testing.expectEqual(@as(usize, 0), arena_ctx.chunk_end);
+
+    // The arena is fully usable after an empty-state reset.
+    const revived = arenaAllocate(ctx, 128, 8) orelse return error.OutOfMemory;
+    @memset(revived[0..128], 0x7E);
+}
+
+test "reset_to_watermark at the current position is an idempotent no-op" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    _ = arenaAllocate(ctx, 256, 8) orelse return error.OutOfMemory;
+    var mark: ZapArenaWatermarkV1 = undefined;
+    arenaWatermark(ctx, &mark);
+    const chunks_before = testCountChunks(arena_ctx);
+    const reserved_before = arenaHeapByteCount(ctx);
+
+    arenaResetToWatermark(ctx, &mark);
+    arenaResetToWatermark(ctx, &mark);
+
+    try std.testing.expectEqual(chunks_before, testCountChunks(arena_ctx));
+    try std.testing.expectEqual(reserved_before, arenaHeapByteCount(ctx));
+    try std.testing.expectEqual(mark.bump_cursor, arena_ctx.bump_cursor);
+}
+
+test "reset_to_watermark keeps the learned growth schedule (policy, not position)" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    var mark: ZapArenaWatermarkV1 = undefined;
+    arenaWatermark(ctx, &mark);
+    try std.testing.expectEqual(ARENA_FIRST_CHUNK_SIZE, mark.next_chunk_size);
+
+    // Drive several standard refills so the schedule doubles past its
+    // starting value.
+    var filled: usize = 0;
+    while (arena_ctx.next_chunk_size < 4 * ARENA_FIRST_CHUNK_SIZE) : (filled += 1) {
+        try std.testing.expect(filled < 4096);
+        _ = arenaAllocate(ctx, 4096, 8) orelse return error.OutOfMemory;
+    }
+    const learned_schedule = arena_ctx.next_chunk_size;
+
+    arenaResetToWatermark(ctx, &mark);
+    try std.testing.expectEqual(learned_schedule, arena_ctx.next_chunk_size);
+}
+
+test "heap_byte_count tracks reserved chunk bytes across allocation, reset, and steady state" {
+    const arena_ctx = arenaContextCreate(std.testing.allocator) orelse return error.OutOfMemory;
+    defer arenaDeinit(@ptrCast(arena_ctx));
+    const ctx: *anyopaque = @ptrCast(arena_ctx);
+
+    try std.testing.expectEqual(@as(usize, 0), arenaHeapByteCount(ctx));
+    _ = arenaAllocate(ctx, 64, 8) orelse return error.OutOfMemory;
+    const one_chunk = arenaHeapByteCount(ctx);
+    try std.testing.expect(one_chunk >= ARENA_FIRST_CHUNK_SIZE);
+
+    var mark: ZapArenaWatermarkV1 = undefined;
+    arenaWatermark(ctx, &mark);
+
+    // The bounded-server steady state in miniature: many iterations, each
+    // allocating and then resetting to the watermark — reserved bytes must
+    // return to the capture value every iteration (the §2.4 unbounded-growth
+    // warning, closed).
+    for (0..64) |_| {
+        for (0..32) |_| _ = arenaAllocate(ctx, 4096, 8) orelse return error.OutOfMemory;
+        arenaResetToWatermark(ctx, &mark);
+        try std.testing.expectEqual(one_chunk, arenaHeapByteCount(ctx));
+    }
 }

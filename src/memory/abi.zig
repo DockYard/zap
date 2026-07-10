@@ -526,6 +526,127 @@ comptime {
     );
 }
 
+// ===========================================================================
+// `ARSR` — arena watermark/reset capability (descriptor-only, spec §9).
+//
+// The bulk-reclamation entry points for BULK_OR_NEVER managers (plan item
+// 6.4, P6-J4): the receive-back-edge arena auto-reset and any future scoped
+// arena lifetime discover these through `core.get_capability_desc(ARSR_TAG)`.
+// Descriptor-only per spec §7.2 (the `CYCL` precedent): the §7.1 bit stays
+// RESERVED and `declared_caps` is untouched — no compiler codegen keys on the
+// capability's presence (the emitted reset call dispatches at runtime through
+// the process's manager binding, and a manager without the descriptor makes
+// the call a no-op).
+// ===========================================================================
+
+/// `ARSR` capability tag (spec §9), read at the target's native endianness —
+/// same discipline as `REFC_TAG` (never hand-compute the hex literal).
+pub const ARSR_TAG: u32 = std.mem.readInt(u32, "ARSR", builtin.target.cpu.arch.endian());
+
+/// A point-in-time position of a BULK_OR_NEVER manager's bulk set, captured
+/// by `ZapArenaResetCapabilityV1.watermark` and consumed by
+/// `reset_to_watermark`. OPAQUE to every consumer: the four fields are the
+/// manager's private cursor state (for the first-party chunked bump arena:
+/// the chunk-list head, the bump cursor, the chunk end, and the geometric
+/// schedule cursor), and a consumer must never interpret or fabricate them —
+/// only round-trip a value obtained from the SAME manager context. The struct
+/// is `extern` so it can be embedded in kernel-side per-process state and
+/// cross the C ABI by pointer.
+pub const ZapArenaWatermarkV1 = extern struct {
+    /// Manager-private position word 0 (chunked bump arena: the chunk-list
+    /// head at capture; null when no chunk was mapped yet).
+    chunk: ?*anyopaque,
+    /// Manager-private position word 1 (bump cursor at capture).
+    bump_cursor: usize,
+    /// Manager-private position word 2 (current chunk end at capture).
+    chunk_end: usize,
+    /// Manager-private position word 3 (geometric schedule cursor at
+    /// capture). Captured for completeness; the first-party arena's reset
+    /// deliberately does NOT restore it — the growth schedule is sizing
+    /// POLICY, not position (see `arenaResetToWatermark`).
+    next_chunk_size: usize,
+};
+
+/// `ARSR` capability vtable (spec §9). Pointed at by a `ZapCapabilityDescV1`
+/// whose `id == ARSR_TAG` and `version == 1`.
+///
+/// Contract (single-owner, like `core.allocate`): both entry points may only
+/// be called by the context's one owning thread. `reset_to_watermark` frees —
+/// in O(chunks-allocated-since) — EVERY allocation made through
+/// `core.allocate` after the watermark was captured, and restores the
+/// allocation cursor so subsequent allocations reuse the reclaimed address
+/// space. Allocations made BEFORE the capture are untouched. The CALLER owns
+/// the soundness proof that nothing allocated after the watermark is still
+/// reachable — for the receive-back-edge auto-reset that proof is the
+/// compiler's iteration-closure check (`src/receive_reset.zig`); a reset
+/// without such a proof is a use-after-free.
+pub const ZapArenaResetCapabilityV1 = extern struct {
+    /// Capture the context's current bulk-set position into `out_watermark`.
+    watermark: *const fn (ctx: *anyopaque, out_watermark: *ZapArenaWatermarkV1) callconv(.c) void,
+    /// Free every allocation made after `watermark` was captured and restore
+    /// the cursor to it. `watermark` MUST have been produced by `watermark`
+    /// on this same `ctx`, and no allocation made after the capture may be
+    /// live (caller-owned proof).
+    reset_to_watermark: *const fn (ctx: *anyopaque, watermark: *const ZapArenaWatermarkV1) callconv(.c) void,
+};
+
+/// Byte length of the v1.0 `ZapArenaResetCapabilityV1` vtable — the value a
+/// conforming descriptor advertises in `desc.size`.
+pub const ARENA_RESET_V1_SIZE: u16 = @intCast(2 * PTR);
+
+// ===========================================================================
+// `STAT` — manager-side allocation statistics (descriptor-only, spec §10).
+//
+// The per-process heap-bytes observability seam (plan item 1.6 / P1-J5): the
+// kernel's `ManagerVTable.heapByteCount` thunk resolves through this
+// descriptor when the bound manager provides it, and reports 0 otherwise
+// (the pre-P6-J4 behavior). Descriptor-only for the same §7.2 reasons as
+// `ARSR`; the §7.1 `STAT` bit stays RESERVED.
+// ===========================================================================
+
+/// `STAT` capability tag (spec §10), read at the target's native endianness.
+pub const STAT_TAG: u32 = std.mem.readInt(u32, "STAT", builtin.target.cpu.arch.endian());
+
+/// `STAT` capability vtable (spec §10). Pointed at by a `ZapCapabilityDescV1`
+/// whose `id == STAT_TAG` and `version == 1`.
+pub const ZapStatsCapabilityV1 = extern struct {
+    /// Bytes currently held by this context's heap, at manager-defined
+    /// granularity (the first-party arena reports RESERVED chunk bytes —
+    /// growth, which is what boundedness assertions need — not the bump
+    /// cursor's consumed bytes). Unlike the single-owner allocation slots,
+    /// this entry MUST be safe to call from any thread while the owner
+    /// allocates (introspection snapshots read other processes' managers):
+    /// implementations back it with a monotonic atomic counter.
+    heap_byte_count: *const fn (ctx: *anyopaque) callconv(.c) usize,
+};
+
+/// Byte length of the v1.0 `ZapStatsCapabilityV1` vtable.
+pub const STATS_V1_SIZE: u16 = @intCast(1 * PTR);
+
+comptime {
+    if (@sizeOf(ZapArenaResetCapabilityV1) != 2 * PTR) @compileError(
+        "abi: ZapArenaResetCapabilityV1 must be exactly two pointer slots wide",
+    );
+    if (@offsetOf(ZapArenaResetCapabilityV1, "watermark") != 0 * PTR) @compileError(
+        "abi: ZapArenaResetCapabilityV1.watermark must be the first pointer slot",
+    );
+    if (@offsetOf(ZapArenaResetCapabilityV1, "reset_to_watermark") != 1 * PTR) @compileError(
+        "abi: ZapArenaResetCapabilityV1.reset_to_watermark must be the second pointer slot",
+    );
+    if (@sizeOf(ZapStatsCapabilityV1) != 1 * PTR) @compileError(
+        "abi: ZapStatsCapabilityV1 must be exactly one pointer slot wide",
+    );
+    if (@sizeOf(ZapArenaWatermarkV1) != 4 * PTR) @compileError(
+        "abi: ZapArenaWatermarkV1 must be exactly four pointer-width words",
+    );
+    if (ARENA_RESET_V1_SIZE != @sizeOf(ZapArenaResetCapabilityV1)) @compileError(
+        "abi: ARENA_RESET_V1_SIZE must match the current ZapArenaResetCapabilityV1 size",
+    );
+    if (STATS_V1_SIZE != @sizeOf(ZapStatsCapabilityV1)) @compileError(
+        "abi: STATS_V1_SIZE must match the current ZapStatsCapabilityV1 size",
+    );
+}
+
 test "ZapMemoryManagerMetaV1 layout is exactly 32 bytes" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(ZapMemoryManagerMetaV1));
 }
@@ -585,6 +706,22 @@ test "REFC_TAG round-trips through native endian" {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, REFC_TAG, builtin.target.cpu.arch.endian());
     try std.testing.expectEqualStrings("REFC", &buf);
+}
+
+test "ARSR_TAG and STAT_TAG round-trip through native endian" {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, ARSR_TAG, builtin.target.cpu.arch.endian());
+    try std.testing.expectEqualStrings("ARSR", &buf);
+    std.mem.writeInt(u32, &buf, STAT_TAG, builtin.target.cpu.arch.endian());
+    try std.testing.expectEqualStrings("STAT", &buf);
+}
+
+test "ARSR/STAT capability vtables lock their 64-bit layouts" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(ZapArenaResetCapabilityV1));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(ZapStatsCapabilityV1));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(ZapArenaWatermarkV1));
+    try std.testing.expectEqual(@as(u16, 16), ARENA_RESET_V1_SIZE);
+    try std.testing.expectEqual(@as(u16, 8), STATS_V1_SIZE);
 }
 
 test "REFCOUNT_V1_BIT is bit 0" {

@@ -1028,6 +1028,109 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
     (the view can then hold a counted reference), documented as pinning.
 - **6.4** Arena auto-reset at the receive back-edge for solver-proven loop-closed processes;
   `hibernate` intrinsic (arena reset + stack shrink).
+  **DONE (P6-J4, 2026-07-10)** — research.md §6.5's "single most promising Zap-specific
+  optimization" landed end to end; the §2.4 arena-server growth warning is CLOSED.
+  - **The mechanism (manager ABI, additive per spec §2.3/§7.2):** two new DESCRIPTOR-ONLY
+    capabilities on the `CYCL` pattern (spec §8.8; `declared_caps` untouched — the reserved
+    §7.1 bits stay clear): `ARSR` (`ZapArenaResetCapabilityV1`: `watermark` +
+    `reset_to_watermark` — O(chunks-since) bulk free back to a captured position; the
+    geometric growth schedule is deliberately kept, policy not position) and `STAT`
+    (`ZapStatsCapabilityV1.heap_byte_count` — atomic reserved-bytes accounting, closing the
+    P1-J5 `heapByteCount == 0` gap). `Memory.Arena` implements both; the kernel's
+    per-process binding probes both tags once per spawn (`createProcessBinding`) and routes
+    `ManagerVTable.iterationHeapReset`/`heapByteCount` through them. Per-model semantics:
+    Arena captures the iteration watermark at the process's FIRST proven receive and
+    bulk-frees back to it at every later one; ARC/ORC no-op (drops already reclaimed each
+    iteration deterministically); Tracking frees at last use; Leak/NoOp never reclaim by
+    design. Zap surface: `Process.heap_bytes()` (self-inspection, BEAM
+    `process_info(self(), :memory)` analogue).
+  - **The soundness proof gate (`src/receive_reset.zig`, run after drop materialization +
+    both verifiers):** the compiler emits `ProcessRuntime.receive_iteration_reset`
+    immediately before a receive primitive ONLY at sites passing the conservative
+    iteration-closure proof — (1) the containing function is a RESET CONTEXT (whole-program
+    monotone fixpoint over the reference graph: sanctioned spawn-entry `make_closure`
+    references reached through alias chains ending at a spawn primitive's entry argument,
+    self tail-call back-edges, and calls from established reset contexts at heap-clean call
+    sites; dispatch-table/`__try`/escaping-closure references disqualify; name-based
+    references match under a SUPERSET predicate so a reference can be over-attributed but
+    never missed), (2) shape-eligible (non-closure, capture-free, scalar params, forward-only
+    control flow), and (3) NO heap-possible local's [first-def, last-use] linearized interval
+    strictly contains the receive (def-site classification: constants/arithmetic/checks/
+    static string literals safe, alias moves propagate, calls safe only on provably-scalar
+    returns, everything unknown heap-possible and — with no attributable def — live from
+    entry). Where any condition fails the site is left alone (no reset — a wrong reset is a
+    use-after-free; conservative always). The decision is PER RECEIVE SITE, never per
+    process. WHAT IT REJECTS TODAY (the numbered deferrals): (i) the plain
+    `Process.spawn(&f/0)` library-function path (entry closure escapes into a call argument;
+    the managed `spawn(f, Memory.X)` macro path — the one that matters for Arena — is
+    covered), (ii) name-resolution precision (dispatch groups, `__try` variants, mutual
+    recursion between loop functions), (iii) accumulating-state precision (a loop retaining
+    state is rejected wholesale; a region-solver split of per-iteration vs retained regions
+    over the back-edge could reset the per-iteration region only).
+  - **`hibernate`:** `Process.hibernate()` → `zap_proc_hibernate` →
+    `ProcessContext.hibernate` (the deadline-less sibling of `receiveWaitTimeout`'s
+    non-consuming `.user_any` park; signals never satisfy it) with the new `.hibernating`
+    yield reason, whose dispatch releases the fiber's committed stack pages below the saved
+    SP (`stack_pool.decommitBelowStackPointer`; one cushion page below the SP page preserved
+    for the red zone) STRICTLY BEFORE `commitPark` publishes the park — after the publish a
+    reviver may run the fiber concurrently. Pages recommit by fault on wake. Arena heap is
+    NOT bulk-reset at hibernate (unlike BEAM's M:F(A) restart, Zap's hibernate RETURNS — live
+    locals must survive; no proof covers an arbitrary call site): an Arena server that
+    hibernates between messages composes the proven receive-site reset with the stack shrink,
+    which together are BEAM hibernation. ARC empty-slab-cache release-to-OS at hibernate is
+    deferral (iv). Observability: `hibernate_park_total` + `hibernate_stack_bytes_released`
+    per scheduler, aggregated by the pool and `introspection.kernelCounters`.
+  - **The A.4.3 decision (stack RSS decay), recorded:** hibernate DOES decommit (Darwin
+    `MADV_FREE_REUSABLE` with `MADV_FREE` fallback — plain `MADV_FREE`'s reclaim is
+    pressure-lazy and invisible in `phys_footprint`; `FREE_REUSABLE` drops the ledger
+    immediately and a re-dirtying fault takes the page back out of the reusable set, the
+    bmalloc/jemalloc purge protocol, with the `FREE_REUSE` re-accounting pairing consciously
+    omitted since a fault-recommitted dead-stack page may harmlessly under-report; Linux
+    `MADV_DONTNEED` — immediate, deterministic zero-fill recommit; other targets no-op,
+    Windows `VirtualFree(MEM_DECOMMIT)` is deferral (v)). Pool release-to-cache does NOT
+    decommit — the acquire/release fast path stays syscall-free (the E9 9 ns floor) and
+    spawn/die storms reuse pages immediately; idle-cache decay rides hibernate (per-process,
+    demand-signaled). Measured (kernel test, 32 MiB touched stack): decommit drops
+    `phys_footprint` by ≥ released/2 with the real delta ≈ the full range.
+  - **Proofs:** arena unit tests (watermark/reset/steady-state accounting, descriptor
+    discovery); `receive_reset.zig` unit fixtures (proven flat loop instruments BEFORE the
+    receive; heap-live-across rejects; heap param rejects; no-spawn-ref rejects; unknown
+    caller rejects; entry→loop chain proves; per-SITE split in one function; share_value
+    alias chain sanctioned; escaping closure rejected; no-receive program untouched);
+    kernel abi tests (ARSR/STAT discovery + watermark semantics through the binding,
+    no-capability no-op, hibernate park/shrink/wake + deep-stack recommit integrity +
+    teardown-while-hibernated); stack-pool decommit geometry/integrity + Darwin
+    footprint measurement; gate-ON Zap suite `test_concurrency/arena_server_test.zap`
+    (the HEADLINE: a flat `Memory.Arena` server holds Process.heap_bytes EXACTLY equal
+    across a 10,000-message storm; the accumulating server's retained 1,000-element state
+    survives intact — the gate held; the mixed process proves per-site decisions) and
+    `test_concurrency/hibernate_test.zap` (wake semantics, 50-round hibernate loop,
+    deep-stack recommit checksum, pre-queued immediate return, 16-hibernator M:N fleet).
+  - **Numbers (2026-07-10, aarch64-macos):** WITHOUT the reset the headline flat Arena
+    server's reserved bytes grew 196,608 → 16,711,680 across the 10,000-message storm
+    (85×, linear — the §2.4 pathology reproduced live); WITH it the two samples are
+    EXACTLY EQUAL (the watermark reset restores the chunk set every iteration — the
+    test asserts equality, not a fuzzy bound). Hibernate stack shrink: the kernel
+    measurement over a 32 MiB fully-touched stack shows `phys_footprint` dropping by
+    ≥ released/2 immediately (`MADV_FREE_REUSABLE`'s ledger removal), with the abi-level
+    round trip recommitting a 64-frame excursion to an identical checksum after wake.
+    Gates: gate-ON `:test_concurrency` **168/0 (434 assertions)** from a clean build
+    (the +8 over P6-J3's 160 are this item's 3 arena-server + 5 hibernate tests);
+    `zig build test` 0; `zig build test-kernel` 0 under the fork compiler (Debug 244/3
+    skip + ReleaseFast 247, per-binary suites); kernel TSan-clean `halt_on_error=1`
+    Debug 242/0 + ReleaseFast 239/0; gate-OFF **byte-identity**: a script-mode gate-OFF
+    binary's `__TEXT,__text` SHA-256 (`c0bec391…4e1426`) is IDENTICAL under the HEAD
+    compiler and the P6-J4 compiler, and carries zero
+    `zap_proc_*`/`receive_iteration`/`hibernate` symbols (the E2 durable proof; the
+    only deliberate gate-OFF byte change is confined to `Memory.Arena`-manifest
+    binaries, whose manager gained the STAT counter on its cold chunk-refill path).
+  - **Observed during validation (pre-existing, not this item's):** the manifest
+    incremental DAEMON intermittently fails an incremental relink with a spurious
+    `duplicate symbol _zap_runtime_atomic_add_u32_acq_rel` (kernel object vs zcu
+    object) even though `nm` shows the on-disk kernel object contains no such global —
+    stale incremental link state in the fork's zir_api, the P6-J2 daemon-state bug
+    class. Fresh (non-incremental) builds are deterministic and green; root-causing
+    the incremental linker is a fork-hygiene follow-on.
 - **6.5** Full observability: send/receive trace points (compile-time-optional), scheduler
   utilization, run-queue depth, deadlock ("all waiting, none runnable") and starvation
   detection.

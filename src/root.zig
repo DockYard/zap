@@ -39,6 +39,7 @@ pub const arc_ownership = @import("arc_ownership.zig");
 pub const arc_param_convention = @import("arc_param_convention.zig");
 pub const arc_verifier = @import("arc_verifier.zig");
 pub const concurrency_verifier = @import("concurrency_verifier.zig");
+pub const receive_reset = @import("receive_reset.zig");
 pub const arc_drop_insertion = @import("arc_drop_insertion.zig");
 pub const arc_materialize = @import("arc_materialize.zig");
 pub const uniqueness = @import("uniqueness.zig");
@@ -158,6 +159,7 @@ test {
     _ = @import("arc_param_convention.zig");
     _ = @import("arc_verifier.zig");
     _ = @import("concurrency_verifier.zig");
+    _ = @import("receive_reset.zig");
     _ = @import("arc_drop_insertion.zig");
     _ = @import("arc_materialize.zig");
     _ = @import("uniqueness.zig");

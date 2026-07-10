@@ -277,6 +277,12 @@ pub const SchedulerPool = struct {
         /// Blocking-pool re-attaches drained back to runnable (P4-J3), summed
         /// across cores (whichever core the process re-attached onto counts it).
         blocking_reattach_total: u64,
+        /// `Process.hibernate` parks committed (plan item 6.4), summed across
+        /// cores (the core that dispatched the hibernating quantum counts it).
+        hibernate_park_total: u64,
+        /// Committed stack bytes released to the OS at hibernate parks, summed
+        /// across cores.
+        hibernate_stack_bytes_released: u64,
     };
 
     pub fn statistics(pool: *const SchedulerPool) Statistics {
@@ -291,6 +297,8 @@ pub const SchedulerPool = struct {
             .wake_signal_count = 0,
             .blocking_offload_total = 0,
             .blocking_reattach_total = 0,
+            .hibernate_park_total = 0,
+            .hibernate_stack_bytes_released = 0,
         };
         for (pool.cores) |*core| {
             const core_stats = core.statistics();
@@ -303,6 +311,8 @@ pub const SchedulerPool = struct {
             totals.wake_signal_count += core_stats.wake_signal_count;
             totals.blocking_offload_total += core_stats.blocking_offload_total;
             totals.blocking_reattach_total += core_stats.blocking_reattach_total;
+            totals.hibernate_park_total += core_stats.hibernate_park_total;
+            totals.hibernate_stack_bytes_released += core_stats.hibernate_stack_bytes_released;
         }
         return totals;
     }

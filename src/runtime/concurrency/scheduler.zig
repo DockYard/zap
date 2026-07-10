@@ -503,6 +503,12 @@ const YieldReason = enum(u8) {
     /// made runnable by a wake signal, a kill, OR the scheduler observing
     /// `wake_deadline_nanoseconds` elapse (which sets `receive_timed_out`).
     waiting_for_message_deadline,
+    /// Hibernating (`Process.hibernate`, plan item 6.4): suspended awaiting
+    /// a user message exactly like `.waiting_for_message`, but the scheduler
+    /// additionally releases the fiber's committed stack pages below the
+    /// saved SP (`shrinkHibernatedStack`) before committing the park — the
+    /// idle-footprint shrink that makes long-lived idle processes cheap.
+    hibernating,
     /// Evacuating to the blocking / dirty-scheduler pool (P4-J3): a
     /// `Process.blocking` call yielded to hand its fiber to a blocking-pool
     /// OS thread. The scheduler does NOT re-enqueue it (it goes to `.blocking`)
@@ -514,6 +520,20 @@ const YieldReason = enum(u8) {
     /// worker's `runBlockingPhase`, never by a core's `runQuantum`.
     blocking_complete,
 };
+
+/// Release a hibernating process's committed stack pages below its saved
+/// stack pointer back to the OS (plan item 6.4 — the `hibernate` stack
+/// shrink; the A.4.3 stack-RSS-decay decision point). Called ONLY from the
+/// `.hibernating` quantum-dispatch arm, where the fiber is `.suspended` and
+/// still exclusively owned by this core (strictly before `commitPark`
+/// publishes it to potential revivers), so no execution can be on the
+/// released range. The pages recommit by fault on wake — the stack pool's
+/// lazy-commit design (`stack_pool.zig` module doc) working in reverse.
+/// A fiber not in `.suspended` (impossible here; defensive) shrinks nothing.
+fn shrinkHibernatedStack(record: *ProcessRecord) u64 {
+    const saved = fiber_context.savedRegisters(&record.pcb.fiber) orelse return 0;
+    return stack_pool_module.decommitBelowStackPointer(record.pcb.fiber.stack, saved.stack_pointer);
+}
 
 /// The cross-thread wake handshake state of a process (P4-J1). Under M:N a
 /// producer on any thread may deliver a message to a process that a
@@ -998,6 +1018,83 @@ pub const ProcessContext = struct {
                     }
                     // Push wake or spurious resume: loop re-probes the new
                     // arrivals and re-checks the deadline.
+                },
+            }
+        }
+    }
+
+    /// Hibernate (plan item 6.4, P6-J4 — BEAM's `erlang:hibernate` analogue
+    /// for an explicit-continuation language): park (non-consuming) until a
+    /// USER message is queued, signaling the scheduler to SHRINK this
+    /// process's idle footprint at the park. Structurally the deadline-less
+    /// sibling of `receiveWaitTimeout`'s parking loop — the same
+    /// signal-skipping `.user_any` probe (a queued trapped exit must not
+    /// satisfy the hibernation wait; it stays queued for `await_signal`) and
+    /// the same `armCorrelatedWake` protocol (the mailbox may be nonempty
+    /// with probed-past signals, so the empty→nonempty wake alone would miss
+    /// a new push) — but yielding with reason `.hibernating`, which the
+    /// quantum dispatch handles as `.waiting_for_message` PLUS the committed-
+    /// stack release (`shrinkHibernatedStack`) before the park is published.
+    ///
+    /// Memory semantics per model (the research.md §6.5 note-4 contract,
+    /// resolved for a language whose hibernate RETURNS to its caller rather
+    /// than discarding the stack for a fresh continuation like BEAM's
+    /// M:F(A) restart):
+    ///
+    ///   * STACK (every model): committed pages below the suspended fiber's
+    ///     saved SP are released to the OS and recommit by fault on wake —
+    ///     the dominant idle-footprint term (`stack_pool.default_usable_size`
+    ///     dwarfs a parked process's live frames).
+    ///   * HEAP, Arena (BULK_OR_NEVER): NO bulk reset here — unlike BEAM,
+    ///     live locals in the hibernating frame chain must survive the call,
+    ///     and no compiler proof covers an arbitrary intrinsic call site.
+    ///     Arena reclamation is the receive-back-edge auto-reset's job
+    ///     (`zap_proc_receive_iteration_reset`, proof-gated): an Arena server
+    ///     that hibernates between messages composes both — reset at the
+    ///     proven receive, stack shrink here — which together are exactly
+    ///     BEAM hibernation's effect.
+    ///   * HEAP, ARC/ORC: deterministic drops already reclaimed everything
+    ///     unreachable; the slab pools' empty-slab caches are bounded by the
+    ///     live-slab high-watermark policy. Releasing those caches to the OS
+    ///     at hibernate is the numbered deferral (plan 6.4 follow-on).
+    ///
+    /// Returns when a user message is queued (the following `receive`
+    /// consumes it); if one is ALREADY queued, returns immediately without
+    /// shrinking (the process is not idle). A kill while hibernated tears
+    /// the process down through the normal parked-kill path — the suspension
+    /// never returns.
+    pub fn hibernate(context: *ProcessContext) void {
+        const record = context.record;
+        const mailbox = &record.pcb.mailbox;
+        var resume_after: ?*mailbox_module.Envelope = null;
+        while (true) {
+            if (record.pending_kill.load(.acquire)) {
+                record.yield_reason = .reenqueue;
+                context.execution.yield();
+                continue;
+            }
+            switch (mailbox.scanForMatch(0, .user_any, resume_after)) {
+                .found => return,
+                .publish_pending => |last_examined| {
+                    // A producer is mid-publish — a message is arriving.
+                    // Retry next quantum rather than parking on it.
+                    resume_after = last_examined;
+                    record.yield_reason = .reenqueue;
+                    context.execution.yield();
+                },
+                .exhausted => |last_examined| {
+                    if (!mailbox.armCorrelatedWake(last_examined)) {
+                        // A message landed after the probe — re-probe the
+                        // new arrivals instead of parking.
+                        resume_after = last_examined;
+                        continue;
+                    }
+                    record.yield_reason = .hibernating;
+                    context.execution.yield();
+                    mailbox.disarmCorrelatedWake();
+                    // Push wake, kill wake, or spurious resume: loop
+                    // re-probes the new arrivals.
+                    resume_after = last_examined;
                 },
             }
         }
@@ -1804,6 +1901,13 @@ pub const Scheduler = struct {
     /// Blocking-pool re-attaches this core drained back to runnable (P4-J3;
     /// scheduler-thread only — the re-attach-target core counts it).
     blocking_reattach_total: u64,
+    /// `Process.hibernate` parks this core committed (plan item 6.4, P6-J4;
+    /// scheduler-thread only — counted in the `.hibernating` dispatch).
+    hibernate_park_total: u64,
+    /// Committed stack bytes this core released back to the OS at hibernate
+    /// parks (`shrinkHibernatedStack`; scheduler-thread only). The P1-J5
+    /// observability surface for the plan item 6.4 idle-footprint shrink.
+    hibernate_stack_bytes_released: u64,
 
     /// Construction options.
     pub const Options = struct {
@@ -1952,6 +2056,10 @@ pub const Scheduler = struct {
         blocking_offload_total: u64,
         /// Blocking-pool re-attaches drained back to runnable (P4-J3).
         blocking_reattach_total: u64,
+        /// `Process.hibernate` parks committed (plan item 6.4).
+        hibernate_park_total: u64,
+        /// Committed stack bytes released to the OS at hibernate parks.
+        hibernate_stack_bytes_released: u64,
     };
 
     /// Create a scheduler over a shared pid table and envelope reservoir.
@@ -2005,6 +2113,8 @@ pub const Scheduler = struct {
             .unexpected_message_total = 0,
             .blocking_offload_total = 0,
             .blocking_reattach_total = 0,
+            .hibernate_park_total = 0,
+            .hibernate_stack_bytes_released = 0,
         };
     }
 
@@ -2674,6 +2784,8 @@ pub const Scheduler = struct {
             .wake_signal_count = scheduler.wake_signal_count.load(.monotonic),
             .blocking_offload_total = scheduler.blocking_offload_total,
             .blocking_reattach_total = scheduler.blocking_reattach_total,
+            .hibernate_park_total = scheduler.hibernate_park_total,
+            .hibernate_stack_bytes_released = scheduler.hibernate_stack_bytes_released,
         };
     }
 
@@ -2772,6 +2884,26 @@ pub const Scheduler = struct {
                         // immediately; otherwise it stays parked until a wake
                         // (module doc, "Cross-thread wake handshake"). No
                         // lost-wake window across scheduler threads.
+                        _ = scheduler.commitPark(record);
+                    },
+                    .hibernating => {
+                        // `Process.hibernate` (plan item 6.4): identical park
+                        // protocol to `.waiting_for_message`, plus the idle-
+                        // footprint stack shrink. The shrink MUST happen
+                        // BEFORE `commitPark` publishes `.parked`: after the
+                        // publish a producer on another core may win the wake
+                        // race and resume the fiber concurrently, and the
+                        // decommit may only touch a stack no execution can be
+                        // on. Here the fiber is suspended and still owned by
+                        // this core — the release edge that hands it to a
+                        // reviver is `commitPark` itself. If the park is NOT
+                        // committed (a message raced in; `commitPark`
+                        // self-revived), the shrink was still sound — the
+                        // released pages recommit by fault on first touch.
+                        scheduler.emitTrace(.wait, pcb.pid);
+                        scheduler.hibernate_park_total += 1;
+                        scheduler.hibernate_stack_bytes_released += shrinkHibernatedStack(record);
+                        pcb.transitionTo(.waiting);
                         _ = scheduler.commitPark(record);
                     },
                     .waiting_for_message_deadline => {
