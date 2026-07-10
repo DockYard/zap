@@ -125,6 +125,16 @@
 //!   teardown; `abi.zig` exposes the `zap_proc_link/monitor/exit_signal/…`
 //!   intrinsics; `signal_stress.zig` is its cross-core TSan race proof.
 //!
+//! * `blob.zig` — `Zap.Blob` (P6-J2, plan item 6.2): THE one sanctioned
+//!   atomically-refcounted immutable share tier (research.md §6.4 regime 2)
+//!   — its own allocation domain (payloads owned by neither manager), the
+//!   type-stable generational slot table whose packed `{share_count,
+//!   generation}` word is the system's ONLY atomic refcount, the
+//!   per-process ownership ledger (a PCB field, drained at teardown), and
+//!   the persistent-term global registry (lock-free get + replacing put).
+//!   `abi.zig` exposes the `zap_blob_*` intrinsics; blob sends ride the
+//!   moved-envelope transport with a flight-release reclaim hook.
+//!
 //! NOT here yet: the `std.Io` vtable. Since P2-J1 this tree IS wired into Zap
 //! compilation behind the comptime `runtime_concurrency` gate (default
 //! OFF): when the gate is ON, `src/concurrency_driver.zig` compiles
@@ -170,6 +180,7 @@ pub const pid_table = @import("pid_table.zig");
 pub const mailbox = @import("mailbox.zig");
 pub const signal = @import("signal.zig");
 pub const registry = @import("registry.zig");
+pub const blob = @import("blob.zig");
 pub const envelope_pool = @import("envelope_pool.zig");
 pub const timing_wheel = @import("timing_wheel.zig");
 pub const scheduler = @import("scheduler.zig");
@@ -196,6 +207,9 @@ pub const Mailbox = mailbox.Mailbox;
 pub const Envelope = mailbox.Envelope;
 pub const Fragment = mailbox.Fragment;
 pub const SignalRuntime = signal.SignalRuntime;
+pub const BlobDomain = blob.BlobDomain;
+pub const BlobHandle = blob.BlobHandle;
+pub const BlobLedger = blob.BlobLedger;
 pub const ProcessRegistry = registry.ProcessRegistry;
 pub const RegistryLiveness = registry.Liveness;
 pub const RegisterOutcome = registry.RegisterOutcome;
@@ -252,6 +266,10 @@ test {
     _ = mailbox;
     _ = signal;
     _ = registry;
+    // P6-J2: the Zap.Blob atomic immutable share tier + persistent-term
+    // registry — THE one sanctioned cross-process share (research.md §6.4
+    // regime 2). Its cross-thread stress is the atomic tier's TSan proof.
+    _ = blob;
     _ = envelope_pool;
     _ = timing_wheel;
     _ = scheduler;

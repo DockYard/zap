@@ -92,6 +92,7 @@ const fiber_context = @import("fiber_context.zig");
 const pid_table = @import("pid_table.zig");
 const mailbox_module = @import("mailbox.zig");
 const signal_module = @import("signal.zig");
+const blob_module = @import("blob.zig");
 
 /// Process identifier — the generational pid of `pid_table.zig` (plan
 /// Phase 1 item 1.2, locked design decision 4): `{slot, generation,
@@ -355,6 +356,14 @@ pub const ProcessControlBlock = struct {
     /// race resolution — research.md §6.7). Owner-only like `drop_list_head`
     /// (only this process registers/unregisters its own name).
     registered_name: u64,
+    /// The per-process ledger of owned `Zap.Blob` references (P6-J2,
+    /// `blob.zig`): one entry per acquisition (`Blob.new`, an adopted blob
+    /// receive, `Blob.get_global`). Owner-only like `drop_list_head`; the
+    /// scheduler drains it at teardown (`releaseAllOwned`) so a process
+    /// dying with blob handles releases every atomic reference it holds —
+    /// the drop-list discipline (research.md §6.5) applied to the one
+    /// sanctioned share tier.
+    blob_ledger: blob_module.BlobLedger,
 
     /// Assemble a PCB IN PLACE — at its final address, which the mailbox
     /// pins from this call on (its empty state references its embedded
@@ -378,6 +387,7 @@ pub const ProcessControlBlock = struct {
         process.drop_list_head = null;
         process.signal_state = .{};
         process.registered_name = 0;
+        process.blob_ledger = .empty;
     }
 
     /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot
@@ -564,6 +574,7 @@ test "PCB: init defaults — embryo state, empty mailbox and drop-list, full bud
     try testing.expectEqual(mailbox_module.PopOutcome.empty, process.mailbox.pop());
     try testing.expectEqual(@as(usize, 0), process.mailbox.depth());
     try testing.expectEqual(@as(?*DropListNode, null), process.drop_list_head);
+    try testing.expectEqual(@as(u32, 0), process.blob_ledger.ownedCount());
     try testing.expectEqual(fiber_context.LifecycleState.ready, process.fiber.lifecycle_state);
 
     // Drain the embryo through a legal path so the stack returns to the pool.

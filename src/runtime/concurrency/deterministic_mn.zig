@@ -372,6 +372,10 @@ pub const MnSimulator = struct {
         /// or null (registry-free scenarios). The ABI's seeded backend passes the
         /// runtime's shared instance so seeded register/whereis runs work.
         registry: ?*@import("registry.zig").ProcessRegistry = null,
+        /// The `Zap.Blob` domain (P6-J2) shared across the simulated cores,
+        /// or null (blob-free scenarios). The ABI's seeded backend passes the
+        /// runtime's shared instance so seeded blob-share runs work.
+        blob_domain: ?*@import("blob.zig").BlobDomain = null,
     };
 
     /// Build a seeded M:N simulator for `seed` over a BORROWED pid table and
@@ -447,6 +451,7 @@ pub const MnSimulator = struct {
                 .stack_usable_size = options.stack_usable_size,
                 .signal_runtime = options.signal_runtime,
                 .registry = options.registry,
+                .blob_domain = options.blob_domain,
             });
         }
         return simulator;

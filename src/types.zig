@@ -5731,15 +5731,32 @@ pub const TypeChecker = struct {
         return true;
     }
 
+    /// Whether `struct_type` is the `Zap.Blob` handle shape — exactly one
+    /// `u64` field named `zap_blob_handle` (the RESERVED field name of
+    /// `lib/blob.zap`) — the type-checker mirror of `runtime.zig`'s
+    /// `isBlobHandleStruct`, recognized structurally by field shape, never
+    /// by struct name (P6-J2). A blob is sendable only as the TOP-LEVEL
+    /// message (it travels by atomic pointer share, never through the copy
+    /// walker), so the sendability walk rejects it at any nested depth.
+    fn structTypeIsBlobHandle(self: *const TypeChecker, struct_type: Type.StructType) bool {
+        if (struct_type.fields.len != 1) return false;
+        const field = struct_type.fields[0];
+        if (!std.mem.eql(u8, self.store.interner.get(field.name), "zap_blob_handle")) return false;
+        return field.type_id == TypeStore.U64;
+    }
+
     /// Whether `type_id` is a walker-sendable message type — the type-checker
     /// mirror of `runtime.zig`'s `isWalkerSendable` (the two are kept a mirror
     /// image by construction so send and receive agree): a scalar
     /// (`int`/`float`/`Bool`/`Atom`), `String`, a `List`/`Map` of sendable
     /// elements, a by-value struct whose every field is sendable, or a
     /// payload-free non-parametric union (which travels as its `u32` atom id).
-    /// Everything else — functions/closures, payload-bearing or parametric
-    /// unions, tuples, `Term`, opaque and generic-`applied` types — is
-    /// unsendable.
+    /// The `Zap.Blob` handle struct is admitted at the TOP LEVEL only
+    /// (depth 0 — it rides the atomic share path); nested inside a
+    /// struct/List/Map it is rejected, mirroring the runtime's
+    /// `isTopLevelSendable`/`isWalkerSendable` split. Everything else —
+    /// functions/closures, payload-bearing or parametric unions, tuples,
+    /// `Term`, opaque and generic-`applied` types — is unsendable.
     fn typeIsWalkerSendable(self: *const TypeChecker, type_id: TypeId) bool {
         var budget = TypeGraphBudget.init(default_type_graph_limits);
         // A depth/node-limit hit (a recursive/cyclic struct graph, whose
@@ -5772,6 +5789,15 @@ pub const TypeChecker = struct {
                 budget,
             )),
             .struct_type => |struct_type| {
+                // The `Zap.Blob` handle shape is TOP-LEVEL sendable only
+                // (P6-J2, `structTypeIsBlobHandle`): at depth 0 the field
+                // walk below admits it (its one `u64` field is a scalar),
+                // mirroring the runtime's `isTopLevelSendable`; nested it is
+                // rejected — a blob inside a copied payload would leak its
+                // flight reference on dead-letter/teardown (the runtime
+                // mirror excludes it from `walkerStructType` for the same
+                // reason).
+                if (depth > 0 and self.structTypeIsBlobHandle(struct_type)) return false;
                 for (struct_type.fields) |field| {
                     if (!try self.typeIsWalkerSendableBudgeted(
                         field.type_id,

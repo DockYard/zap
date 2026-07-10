@@ -3794,6 +3794,26 @@ const ZapConcurrencyKernel = struct {
     /// gate for the O(1) region-move send (cross-model degrades to copy).
     extern fn zap_proc_pid_is_refcounted(target_pid_bits: u64) callconv(.c) bool;
     extern fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void;
+    // P6-J2 `Zap.Blob` — THE one sanctioned atomically-refcounted immutable
+    // share tier (research.md §6.4 regime 2). Every payload-touching intrinsic
+    // is ownership-gated against the calling process's blob ledger (see
+    // `abi.zig`'s blob section for the full contract); acquisition-granting
+    // intrinsics (`create`/`slice`/`adopt`/`registry_get`) record the granted
+    // reference in that ledger, drained at process teardown.
+    extern fn zap_blob_create(process: *anyopaque, bytes_pointer: ?[*]const u8, byte_length: usize) callconv(.c) u64;
+    extern fn zap_blob_release_owned(process: *anyopaque, handle_bits: u64) callconv(.c) i32;
+    extern fn zap_blob_size(process: *anyopaque, handle_bits: u64) callconv(.c) i64;
+    extern fn zap_blob_byte_at(process: *anyopaque, handle_bits: u64, index: u64) callconv(.c) i64;
+    extern fn zap_blob_bytes_view(process: *anyopaque, handle_bits: u64, out_pointer: *?[*]const u8) callconv(.c) i64;
+    extern fn zap_blob_slice(process: *anyopaque, handle_bits: u64, start: u64, length: u64) callconv(.c) u64;
+    extern fn zap_blob_share_count(process: *anyopaque, handle_bits: u64) callconv(.c) i64;
+    extern fn zap_blob_identity(process: *anyopaque, handle_bits: u64) callconv(.c) u64;
+    extern fn zap_blob_live_count() callconv(.c) u64;
+    extern fn zap_blob_flight_retain(process: *anyopaque, handle_bits: u64, out_byte_length: *usize) callconv(.c) ?[*]const u8;
+    extern fn zap_blob_flight_release(payload_pointer: [*]const u8) callconv(.c) void;
+    extern fn zap_blob_adopt(process: *anyopaque, payload_pointer: [*]const u8) callconv(.c) u64;
+    extern fn zap_blob_registry_put(process: *anyopaque, key: u64, handle_bits: u64) callconv(.c) i32;
+    extern fn zap_blob_registry_get(process: *anyopaque, key: u64) callconv(.c) u64;
     extern fn zap_proc_exit(process: *anyopaque) callconv(.c) noreturn;
     extern fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void;
     /// `Process.blocking` (P4-J3): run `operation` on the blocking / dirty-
@@ -4114,7 +4134,9 @@ fn unsendableMessageTypeError(comptime MessageType: type) noreturn {
     @compileError(
         "Process.send: message type `" ++ @typeName(MessageType) ++ "` is not sendable. " ++
             "Sendable message types are scalars (i64, u64, f64, Bool, Atom), String, List/Map of sendable " ++
-            "elements, and by-value structs of those. Still unsendable: closures / Callable existentials " ++
+            "elements, by-value structs of those, and Blob as the TOP-LEVEL message (a Blob is shared by " ++
+            "atomic pointer, never copied — v1 does not support a Blob nested inside a List/Map/struct " ++
+            "payload; send it as its own message). Still unsendable: closures / Callable existentials " ++
             "(the captured environment is opaque — Phase 3's compiler-emitted per-closure serialize glue), " ++
             "payload-bearing or parametric unions, and values holding external resource handles.",
     );
@@ -4313,17 +4335,55 @@ fn walkerMapCell(comptime T: type) ?type {
     }
 }
 
+/// The RESERVED field name that marks a Zap struct as the `Zap.Blob` handle
+/// (P6-J2, `lib/blob.zap`): a struct with exactly one `u64` field of this
+/// name is the blob-handle shape, recognized STRUCTURALLY — by field shape,
+/// never by struct name — exactly like the `Element`/`len`/`cap` recognition
+/// of `walkerListCell`. The name is documented as reserved in `lib/blob.zap`;
+/// a user struct must not declare it (it would opt that struct into blob
+/// share semantics at a send boundary).
+const blob_handle_field_name = "zap_blob_handle";
+
+/// If `T` is the blob-handle struct shape — exactly one `u64` field named
+/// `zap_blob_handle` — return true. A blob crossing a process boundary is
+/// NEVER walked or copied: the send path shares the payload by pointer with
+/// an atomic flight retain (`sendBlobMessage`), and the receive path adopts
+/// the flight reference (`decodeReceivedEnvelope`). v1 scope: a blob is
+/// sendable only as the TOP-LEVEL message — never inside a `List`/`Map`/
+/// struct payload (the walker's serialized blobs carry no destructor, so an
+/// interior flight reference would leak on dead-letter/teardown-drain; the
+/// documented follow-on is a serialized-payload cleanup walker mirroring the
+/// measure/write grammar). `isWalkerSendable` therefore REJECTS this shape,
+/// and only the top-level send/receive entries accept it.
+fn isBlobHandleStruct(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    const fields = @typeInfo(T).@"struct".fields;
+    if (fields.len != 1) return false;
+    return comptime std.mem.eql(u8, fields[0].name, blob_handle_field_name) and fields[0].type == u64;
+}
+
+/// Whether `T` is acceptable as a TOP-LEVEL message: any walker-sendable
+/// type, or the blob-handle struct (which travels by atomic pointer share,
+/// not by copy). The send/receive entry points assert THIS predicate;
+/// everything inside the walker recursion asserts plain `isWalkerSendable`.
+fn isTopLevelSendable(comptime T: type) bool {
+    return isBlobHandleStruct(T) or isWalkerSendable(T);
+}
+
 /// If `T` is a by-value user-struct message (a plain Zig `struct` value, the
 /// runtime shape a Zap `%Foo{...}` value takes — NOT boxed, no ARC header),
 /// return `T`, else null. A `ProtocolBox` (erased closure/existential fat
 /// pointer) and a `List`/`Map` cell are both `.@"struct"` at the Zig level
 /// but are NOT walkable user structs, so they are excluded here (the cells
 /// are only ever seen through their `?*const Cell` optional-pointer shape by
-/// `walkerListCell`/`walkerMapCell`; the guard is belt-and-suspenders).
+/// `walkerListCell`/`walkerMapCell`; the guard is belt-and-suspenders). The
+/// blob-handle struct is likewise excluded: a blob is never deep-copied —
+/// it rides the atomic share path, top-level only (`isBlobHandleStruct`).
 fn walkerStructType(comptime T: type) ?type {
     if (@typeInfo(T) != .@"struct") return null;
     if (comptime ArcRuntime.isProtocolBox(T)) return null;
     if (comptime ArcRuntime.hasInlineArcHeader(T)) return null;
+    if (comptime isBlobHandleStruct(T)) return null;
     return T;
 }
 
@@ -5005,6 +5065,26 @@ test "message walker: isWalkerSendable vocabulary is locked (N10 send/receive mi
     try std.testing.expect(!isWalkerSendable(*const anyopaque));
     const UnsendableStruct = struct { count: i64, opaque_handle: *i64 };
     try std.testing.expect(!isWalkerSendable(UnsendableStruct));
+
+    // The `Zap.Blob` handle shape (P6-J2): TOP-LEVEL sendable only — it rides
+    // the atomic share path, never the copy walker, so `isWalkerSendable`
+    // rejects it (which transitively rejects a blob NESTED in a struct/List/
+    // Map — the v1 no-interior-blob rule) while `isTopLevelSendable` admits
+    // it. The type-checker mirrors both halves (`typeIsWalkerSendable`'s
+    // blob-handle arm in `src/types.zig`).
+    const BlobHandleShape = struct { zap_blob_handle: u64 };
+    try std.testing.expect(isBlobHandleStruct(BlobHandleShape));
+    try std.testing.expect(isTopLevelSendable(BlobHandleShape));
+    try std.testing.expect(!isWalkerSendable(BlobHandleShape));
+    const StructNestingBlob = struct { count: i64, payload: BlobHandleShape };
+    try std.testing.expect(!isWalkerSendable(StructNestingBlob));
+    try std.testing.expect(!isTopLevelSendable(StructNestingBlob));
+    // Shape-exactness: a differently-named or differently-typed single field,
+    // or extra fields, are ordinary structs (no accidental opt-in).
+    try std.testing.expect(!isBlobHandleStruct(struct { raw: u64 }));
+    try std.testing.expect(!isBlobHandleStruct(struct { zap_blob_handle: i64 }));
+    try std.testing.expect(!isBlobHandleStruct(struct { zap_blob_handle: u64, extra: u64 }));
+    try std.testing.expect(isWalkerSendable(struct { raw: u64 }));
 }
 
 test "message walker: move-eligibility predicates accept exactly the flat container shapes (P6-J1)" {
@@ -5101,6 +5181,16 @@ test "message walker: a struct of scalar+String+List+Map deep-copies by value, i
 /// tracking-list surgery, safe from any thread.
 fn movedOrphanReclaim(payload_pointer: [*]const u8) callconv(.c) void {
     ArcRuntime.freeDetachedRegion(@constCast(payload_pointer));
+}
+
+/// Leak-exactness reclaim for a BLOB flight reference that is never adopted
+/// (a blob envelope drained at the receiver's teardown). Passed to
+/// `zap_proc_send_moved` by `sendBlobMessage`; releases the atomic flight
+/// reference — safe from any thread, the blob tier's whole point. (The
+/// dead-letter leg never reaches this hook: the kernel leaves the orphan to
+/// the caller, and `sendBlobMessage` releases it inline.)
+fn blobFlightReclaim(payload_pointer: [*]const u8) callconv(.c) void {
+    ZapConcurrencyKernel.zap_blob_flight_release(payload_pointer);
 }
 
 pub const ProcessRuntime = struct {
@@ -5280,7 +5370,16 @@ pub const ProcessRuntime = struct {
             comptime_float => f64,
             else => @TypeOf(message),
         };
-        if (comptime !isWalkerSendable(MessageType)) unsendableMessageTypeError(MessageType);
+        if (comptime !isTopLevelSendable(MessageType)) unsendableMessageTypeError(MessageType);
+
+        // `Zap.Blob` (P6-J2): THE sanctioned share path — no walker, no
+        // copy, no manager heap. The handle is bit-copied and the payload
+        // shared by pointer with an atomic flight retain; the send does
+        // NOT consume the sender's own reference (the sender keeps
+        // reading its blob afterwards, Erlang refc-binary semantics).
+        if (comptime isBlobHandleStruct(MessageType)) {
+            return sendBlobMessage(target_pid_bits, @field(message, blob_handle_field_name));
+        }
 
         // Scalar fast-path (incl. atoms as `u32`): a bare bit-copy — the
         // bytes are IDENTICAL to what the walker's scalar arm would emit, so
@@ -5314,6 +5413,37 @@ pub const ProcessRuntime = struct {
             blob.ptr,
             blob.len,
         ));
+    }
+
+    /// Share one blob to `target_pid_bits` — the P6-J2 zero-copy send:
+    /// verify ownership + atomically retain one FLIGHT reference
+    /// (`zap_blob_flight_retain`), then ride the moved-envelope transport
+    /// with the flight-release reclaim hook so an envelope drained at
+    /// receiver teardown releases leak-exactly. On dead-letter/OOM nothing
+    /// consumed the flight reference, so the sender undoes it here. Works
+    /// same-model AND cross-model — the blob payload lives in its own
+    /// domain and never touches either manager (the model-independent
+    /// payload, zap-concurrency-research.md §2.4).
+    fn sendBlobMessage(target_pid_bits: u64, handle_bits: u64) bool {
+        var flight_byte_length: usize = 0;
+        const flight_payload = ZapConcurrencyKernel.zap_blob_flight_retain(
+            requireCurrentProcessHandle(),
+            handle_bits,
+            &flight_byte_length,
+        ) orelse @panic(
+            "zap: Process.send of a Blob this process does not own (a released or stale Blob handle)",
+        );
+        const status = ZapConcurrencyKernel.zap_proc_send_moved(
+            requireCurrentProcessHandle(),
+            target_pid_bits,
+            flight_payload,
+            flight_byte_length,
+            blobFlightReclaim,
+        );
+        if (status == 0) return true;
+        // Not delivered: the flight reference has no consumer — undo it.
+        ZapConcurrencyKernel.zap_blob_flight_release(flight_payload);
+        return interpretSendStatus(status);
     }
 
     /// Map a `zap_proc_send` status code to the `Process.send` `Bool` result:
@@ -5350,12 +5480,29 @@ pub const ProcessRuntime = struct {
             comptime_float => f64,
             else => @TypeOf(message),
         };
-        if (comptime !isWalkerSendable(MessageType)) unsendableMessageTypeError(MessageType);
+        if (comptime !isTopLevelSendable(MessageType)) unsendableMessageTypeError(MessageType);
 
         // A scalar "move" is a bit-copy — identical to the copy send, and the
         // scalar owns no heap, so there is nothing to consume afterward.
         if (comptime isWalkerScalar(MessageType)) {
             return send_message(target_pid_bits, message);
+        }
+
+        // A blob "move" is the same zero-copy share as the plain send, plus
+        // the move's consuming semantics: the sender relinquishes its OWN
+        // reference after the flight retain (a use of the blob after
+        // `send_move` is a use-after-release panic — the honest analogue of
+        // use-after-move for the share tier).
+        if (comptime isBlobHandleStruct(MessageType)) {
+            const handle_bits = @field(message, blob_handle_field_name);
+            const delivered = sendBlobMessage(target_pid_bits, handle_bits);
+            if (ZapConcurrencyKernel.zap_blob_release_owned(
+                requireCurrentProcessHandle(),
+                handle_bits,
+            ) != 0) @panic(
+                "zap: Process.send_move of a Blob this process does not own (a released or stale Blob handle)",
+            );
+            return delivered;
         }
 
         const typed_message: MessageType = message;
@@ -5483,7 +5630,7 @@ pub const ProcessRuntime = struct {
     /// size/shape mismatch between sender and receiver) aborts rather than
     /// fabricating a value — the raw-receive trust contract.
     pub fn receiveMessage(comptime MessageType: type) MessageType {
-        comptime std.debug.assert(isWalkerSendable(MessageType));
+        comptime std.debug.assert(isTopLevelSendable(MessageType));
         requireConcurrencyRuntimeGate();
         const process = requireCurrentProcessHandle();
         var payload_pointer: ?[*]const u8 = null;
@@ -5515,6 +5662,29 @@ pub const ProcessRuntime = struct {
         payload_pointer: ?[*]const u8,
         payload_len: usize,
     ) MessageType {
+        // `Zap.Blob` receive (P6-J2): a blob message always arrives as a
+        // moved envelope carrying the SHARED payload pointer (zero bytes
+        // copied). Adopt the flight reference — it becomes this process's
+        // owned, ledger-tracked reference (no count change) — and rebuild
+        // the one-word handle struct. A copied payload arriving at a Blob
+        // receive is a sender/receiver type disagreement (the raw typed
+        // receive trusts the caller, same contract as below).
+        if (comptime isBlobHandleStruct(MessageType)) {
+            const moved_root = ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope) orelse @panic(
+                "zap: Process.receive got a copied payload for a Blob receive type (protocol violation — the sender and receiver message types disagree)",
+            );
+            const handle_bits = ZapConcurrencyKernel.zap_blob_adopt(
+                requireCurrentProcessHandle(),
+                moved_root,
+            );
+            if (handle_bits == 0) @panic(
+                "zap: Process.receive out of memory recording the received Blob reference",
+            );
+            var blob_message: MessageType = undefined;
+            @field(blob_message, blob_handle_field_name) = handle_bits;
+            return blob_message;
+        }
+
         if (ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope)) |moved_root| {
             if (comptime movableContainerCell(MessageType)) |Cell| {
                 const alignment = comptime Cell.bufferAlign();
@@ -5872,6 +6042,183 @@ pub const ProcessRuntime = struct {
     pub fn correlated_scan_visits() u64 {
         requireConcurrencyRuntimeGate();
         return ZapConcurrencyKernel.zap_proc_correlated_scan_visits(requireCurrentProcessHandle());
+    }
+};
+
+/// `:zig.BlobRuntime.*` — the intrinsic bridge behind `lib/blob.zap`
+/// (P6-J2): `Zap.Blob`, THE one sanctioned atomically-refcounted immutable
+/// share tier (research.md §6.4 regime 2). Every function requires the
+/// concurrency runtime gate (a blob only exists to be shared across
+/// processes; a gate-OFF binary carries none of this — zero cost) and
+/// resolves the calling process ambiently, mirroring `ProcessRuntime`.
+/// Handle bits are the `{slot, generation}` encoding of the blob domain
+/// (`src/runtime/concurrency/blob.zig`); the Zap surface wraps them in the
+/// one-word `Blob` struct whose reserved `zap_blob_handle` field the send/
+/// receive paths recognize structurally.
+pub const BlobRuntime = struct {
+    /// `Blob.new`: copy `bytes` into the blob domain (the one copy of the
+    /// blob's life) and grant the calling process one owned reference.
+    pub fn create(bytes: []const u8) u64 {
+        requireConcurrencyRuntimeGate();
+        const handle_bits = ZapConcurrencyKernel.zap_blob_create(
+            requireCurrentProcessHandle(),
+            bytes.ptr,
+            bytes.len,
+        );
+        if (handle_bits == 0) @panic("zap: Blob.new failed (out of memory in the blob domain)");
+        return handle_bits;
+    }
+
+    /// `Blob.size`: payload byte length. Panics on a handle the calling
+    /// process does not own (use-after-release / forged handle).
+    pub fn size(handle_bits: u64) i64 {
+        requireConcurrencyRuntimeGate();
+        const length = ZapConcurrencyKernel.zap_blob_size(requireCurrentProcessHandle(), handle_bits);
+        if (length < 0) @panic(
+            "zap: Blob operation on a Blob this process does not own (a released or stale Blob handle)",
+        );
+        return length;
+    }
+
+    /// `Blob.at`: the byte at `index` (0–255). Panics on an unowned handle
+    /// or an out-of-bounds index.
+    pub fn byte_at(handle_bits: u64, index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        if (index < 0) @panic("zap: Blob.at index is negative");
+        const value = ZapConcurrencyKernel.zap_blob_byte_at(
+            requireCurrentProcessHandle(),
+            handle_bits,
+            @intCast(index),
+        );
+        if (value == -1) @panic(
+            "zap: Blob operation on a Blob this process does not own (a released or stale Blob handle)",
+        );
+        if (value == -2) @panic("zap: Blob.at index is out of bounds");
+        return value;
+    }
+
+    /// `Blob.to_string`: copy the WHOLE payload out into a fresh
+    /// process-owned `String`. The copy-out is the point — the returned
+    /// string's lifetime is the process's, fully decoupled from the blob's
+    /// (releasing the blob never dangles the string).
+    pub fn to_string(handle_bits: u64) []const u8 {
+        requireConcurrencyRuntimeGate();
+        var view_pointer: ?[*]const u8 = null;
+        const view_length = ZapConcurrencyKernel.zap_blob_bytes_view(
+            requireCurrentProcessHandle(),
+            handle_bits,
+            &view_pointer,
+        );
+        if (view_length < 0) @panic(
+            "zap: Blob operation on a Blob this process does not own (a released or stale Blob handle)",
+        );
+        if (view_length == 0) return &.{};
+        const byte_length: usize = @intCast(view_length);
+        // The same receiver-owned allocation route as the message walker's
+        // `readStringCopy`: the string lands in THIS process's own heap.
+        const destination_raw = ArcRuntime.containerBufferAlloc(byte_length, .@"1") orelse
+            @panic("zap: Blob.to_string out of memory copying the payload out");
+        const destination = destination_raw[0..byte_length];
+        @memcpy(destination, view_pointer.?[0..byte_length]);
+        return destination;
+    }
+
+    /// `Blob.slice`: COPY the byte range out into a FRESH blob — never an
+    /// aliasing sub-blob (the v1 anti-pin rule: a small slice must not pin
+    /// a huge parent the way Erlang sub-binaries and pre-7u6 Java
+    /// substrings did). Panics on an unowned handle or an out-of-range
+    /// `[start, start+length)`.
+    pub fn slice(handle_bits: u64, start: i64, length: i64) u64 {
+        requireConcurrencyRuntimeGate();
+        if (start < 0 or length < 0) @panic("zap: Blob.slice start/length is negative");
+        const process = requireCurrentProcessHandle();
+        // Validate ownership and bounds FIRST so the failure modes get
+        // distinct, actionable panics (the intrinsic's 0 return folds them).
+        const total = ZapConcurrencyKernel.zap_blob_size(process, handle_bits);
+        if (total < 0) @panic(
+            "zap: Blob operation on a Blob this process does not own (a released or stale Blob handle)",
+        );
+        if (start > total or length > total - start) @panic("zap: Blob.slice range is out of bounds");
+        const slice_bits = ZapConcurrencyKernel.zap_blob_slice(
+            process,
+            handle_bits,
+            @intCast(start),
+            @intCast(length),
+        );
+        if (slice_bits == 0) @panic("zap: Blob.slice failed (out of memory in the blob domain)");
+        return slice_bits;
+    }
+
+    /// `Blob.release`: drop the calling process's owned reference early
+    /// (unreleased references drain automatically at process exit). Panics
+    /// when this process owns no reference — a double release or a release
+    /// of a blob it never acquired.
+    pub fn release(handle_bits: u64) bool {
+        requireConcurrencyRuntimeGate();
+        if (ZapConcurrencyKernel.zap_blob_release_owned(requireCurrentProcessHandle(), handle_bits) != 0) {
+            @panic("zap: Blob.release of a Blob this process does not own (double release, or never acquired)");
+        }
+        return true;
+    }
+
+    /// `Blob.ref_count`: the current share count — advisory under
+    /// concurrency, exact at quiescence (the test surface for "the atomic
+    /// count reflects both holders"). Panics on an unowned handle.
+    pub fn ref_count(handle_bits: u64) i64 {
+        requireConcurrencyRuntimeGate();
+        const count = ZapConcurrencyKernel.zap_blob_share_count(requireCurrentProcessHandle(), handle_bits);
+        if (count < 0) @panic(
+            "zap: Blob operation on a Blob this process does not own (a released or stale Blob handle)",
+        );
+        return count;
+    }
+
+    /// `Blob.identity`: an opaque identity token of the payload buffer —
+    /// equal tokens mean the SAME bytes in memory (the zero-copy witness).
+    /// Panics on an unowned handle.
+    pub fn identity(handle_bits: u64) u64 {
+        requireConcurrencyRuntimeGate();
+        const token = ZapConcurrencyKernel.zap_blob_identity(requireCurrentProcessHandle(), handle_bits);
+        if (token == 0) @panic(
+            "zap: Blob operation on a Blob this process does not own (a released or stale Blob handle)",
+        );
+        return token;
+    }
+
+    /// `Blob.live_count`: number of live blobs in the domain (the
+    /// leak-exactness observability surface).
+    pub fn live_count() i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_blob_live_count());
+    }
+
+    /// `Blob.put_global`: store the blob under an atom key in the global
+    /// immutable registry (the `persistent_term` analogue); a put on an
+    /// existing key replaces (the old value dies with its last outside
+    /// holder). Panics on an unowned handle or a full registry.
+    pub fn registry_put(key_atom: anytype, handle_bits: u64) bool {
+        requireConcurrencyRuntimeGate();
+        const status = ZapConcurrencyKernel.zap_blob_registry_put(
+            requireCurrentProcessHandle(),
+            @as(u64, key_atom),
+            handle_bits,
+        );
+        if (status == -6) @panic(
+            "zap: Blob.put_global of a Blob this process does not own (a released or stale Blob handle)",
+        );
+        if (status != 0) @panic("zap: Blob.put_global failed (the global blob registry is full)");
+        return true;
+    }
+
+    /// `Blob.get_global`: lock-free lookup + atomic retain; the returned
+    /// handle (0 when the key is absent) is an owned reference recorded in
+    /// the calling process's ledger, released explicitly or at exit.
+    pub fn registry_get(key_atom: anytype) u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_blob_registry_get(
+            requireCurrentProcessHandle(),
+            @as(u64, key_atom),
+        );
     }
 };
 

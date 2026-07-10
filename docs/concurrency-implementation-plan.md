@@ -860,6 +860,58 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
 - **6.2** `Blob` (atomically-refcounted immutable byte buffer; naming folds into the pending
   V8→dense rename sweep): the one sanctioned share tier; global immutable registry
   (`persistent_term` analogue).
+  **DONE (P6-J2, 2026-07-10)** — the share tier landed end to end. The blob domain
+  (`src/runtime/concurrency/blob.zig`) is its own allocation domain (page-backed
+  `[header | bytes]` payloads owned by NEITHER manager — the envelope-pool third-domain
+  discipline): a segmented, type-stable generational slot table whose packed per-slot
+  `{share_count, generation}` word is THE one atomic refcount in the system (the freeing
+  1→0 CAS bumps the generation in the same word, so stale/forged handles can never
+  resurrect or fault — every validate/mutate touches only stable slot memory; Constraint 3
+  atomicity confined to this module + the two cold-path spinlocks). Handles are
+  `{slot, generation}` `u64`s carried by the Zap-level `Blob` struct (`lib/blob.zap`)
+  whose reserved `zap_blob_handle` field the runtime recognizes STRUCTURALLY (field shape,
+  never struct name) — top-level messages only in v1: `isWalkerSendable` rejects nested
+  blobs (an interior flight reference would leak through dead-letter/teardown; the
+  serialized-payload cleanup walker is the documented follow-on), mirrored in the checker
+  (`typeIsWalkerSendable`'s depth-gated blob arm) and locked in the N10 vocabulary test.
+  A send is ownership-gated (per-process `BlobLedger`, a PCB field drained at teardown
+  step 4b — the drop-list discipline) + one atomic flight retain riding the EXISTING
+  moved-envelope transport (`zap_proc_send_moved` with a `zap_blob_flight_release`
+  reclaim hook), so dead-letter undo and receiver-teardown drain are leak-exact for free;
+  the receiver adopts the flight reference into its own ledger — zero bytes copied,
+  same-model AND cross-model (the model-independent payload). Slices/`to_string` COPY OUT
+  (the anti-pin rule; no sub-blob aliasing). The persistent-term registry is
+  runtime-owned: `put` replaces under a write lock (old value released after publication,
+  dying with its last outside reader); `get` is a LOCK-FREE seqlock read + gen-validated
+  retain CAS (a racing replace fails the CAS cleanly and the probe retries) — no hazard
+  pointers or thread-progress machinery needed, the type-stable table is what Erlang
+  lacks. Leak-exactness oracles: `Blob.live_count` baselines in every Zap test +
+  `BlobDomain.deinit`'s zero-live assert at `zap_proc_runtime_deinit`. Proofs: kernel
+  cross-thread retain/release/registry stress TSan-clean Debug+ReleaseFast; abi-level
+  sender-dies-receiver-survives (same payload address across the sender's death, count
+  exactly 1 after its ledger drain), queued-blob teardown reclaim, dead-letter undo,
+  registry-survives-publisher-death; Zap-level `test_concurrency/blob_test.zap` (15
+  tests: create/read/slice-independence, zero-copy identity witness across the boundary,
+  cross-model Arena share, send_move relinquish, dead-letter, sender-dies, registry
+  put/get/replace + 4 concurrent readers racing 25 replacing puts on the M:N pool, and a
+  200-blob send storm returning the domain to baseline; gate-ON suite 144/0, 361
+  assertions). Blob is gate-ON-only by design (it exists to be shared across processes;
+  gate-OFF binaries carry zero blob code — `BlobRuntime` is unreferenced and elided).
+  Blob correlated replies (`Task`) and blob-inside-containers are documented v1
+  exclusions; 6.3's String work builds on the header-recoverable payload layout
+  (`BlobHeader.fromPayloadPointer`).
+  **Follow-on — PRE-EXISTING compiler defect discovered by this job (needs its own
+  fix):** instantiating `Option(<user struct>)` (an applied union over a struct — e.g.
+  `Option(Blob)` or `Option(%Marker{value :: i64})`) in ANY `runtime_concurrency: true`
+  binary mis-compiles: warm builds fail with the whole binary spuriously treated as
+  gate-OFF (86× "Process operations require the concurrency runtime" across the suite),
+  cold builds ICE inside the fork's LLVM bitcode emitter (`Builder.zig getConstantIndex`
+  null-global panic). Bisected minimally to `never = Option(BlobProbeMarker).None` in a
+  gate-ON test (`Option(i64)` is fine; the same code is fine gate-OFF — the `test/`
+  suite uses Option(struct) freely). Unrelated to Blob. Consequence here:
+  `Blob.get_global` ships the Elixir-canonical `:persistent_term.get(key, default)`
+  shape plus `Blob.has_global?` instead of the intended `-> Option(Blob)`, which is the
+  documented eventual surface once this defect is fixed.
 - **6.3** Blob-backed String per rev 2 §5.4: copy-out slices, SSO, 64 B promotion (tuned by
   measurement), rc==1 in-place append via the uniqueness prover, opt-in aliasing view.
 - **6.4** Arena auto-reset at the receive back-edge for solver-proven loop-closed processes;

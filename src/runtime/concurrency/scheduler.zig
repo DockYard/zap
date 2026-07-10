@@ -291,6 +291,7 @@ const crash_report_module = @import("crash_report.zig");
 const timing_wheel_module = @import("timing_wheel.zig");
 const signal_module = @import("signal.zig");
 const registry_module = @import("registry.zig");
+const blob_module = @import("blob.zig");
 
 const Pid = pid_table_module.Pid;
 const PidTable = pid_table_module.PidTable;
@@ -791,6 +792,19 @@ pub const ProcessContext = struct {
     /// (LIFO; see `process.ProcessControlBlock.registerDropResource`).
     pub fn registerDropResource(context: *ProcessContext, node: *process_module.DropListNode) void {
         context.record.pcb.registerDropResource(node);
+    }
+
+    /// This process's blob-ownership ledger (P6-J2 — owner-only, like
+    /// every PCB field; the blob intrinsics append/verify/remove through
+    /// it and teardown drains it).
+    pub fn blobLedger(context: *ProcessContext) *blob_module.BlobLedger {
+        return &context.record.pcb.blob_ledger;
+    }
+
+    /// The shared blob domain this scheduler runs over, or null when the
+    /// runtime was built without one (standalone schedulers).
+    pub fn blobDomain(context: *ProcessContext) ?*blob_module.BlobDomain {
+        return context.scheduler.options.blob_domain;
     }
 
     /// Voluntarily end this quantum; the process is re-enqueued runnable.
@@ -1869,6 +1883,14 @@ pub const Scheduler = struct {
         /// `pid_table` (`registryLiveness`), giving registration and lookup
         /// their generation validation.
         registry: ?*registry_module.ProcessRegistry = null,
+        /// The `Zap.Blob` allocation domain (P6-J2, `blob.zig`): the one
+        /// sanctioned atomically-refcounted share tier. Shared across every
+        /// core exactly like the pid table and signal runtime; teardown
+        /// drains each process's blob ledger into it (`releaseAllOwned`) so
+        /// a dying process releases every blob reference it holds. Null for
+        /// a standalone scheduler with no blob usage (its processes' ledgers
+        /// are empty, asserted at teardown).
+        blob_domain: ?*blob_module.BlobDomain = null,
     };
 
     /// Per-spawn options.
@@ -3638,6 +3660,18 @@ pub const Scheduler = struct {
             pcb.drop_list_head = node.next;
             node.destructor(node);
         }
+
+        // (4b) Drain the blob ledger (P6-J2): release every `Zap.Blob`
+        // reference this process still owns — atomic decrements into the
+        // shared blob domain, safe from any thread by design (the one
+        // sanctioned atomic tier). This is what makes "sender dies,
+        // receiver's blob survives; last holder dies, blob freed" hold:
+        // a crashed process merely drops its references, never another
+        // heap's memory. Blob payloads live in the blob domain, not this
+        // process's manager heap, so ordering against the manager
+        // teardown below is immaterial; the ledger's storage itself is
+        // freed here.
+        pcb.blob_ledger.releaseAllOwned(scheduler.options.blob_domain);
 
         // (5) Close the mailbox to cross-core senders and wait out every send
         // that passed lookup before the unregister above (the P4 PCB-lifetime

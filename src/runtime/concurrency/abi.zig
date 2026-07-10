@@ -147,6 +147,11 @@ pub const ZapProcStatus = struct {
     /// `zap_proc_register_manager` / `zap_proc_spawn_at` was given a manager
     /// index outside `[0, MAX_MANAGER_SLOTS)`.
     pub const manager_index_out_of_range: i32 = -5;
+    /// A `zap_blob_*` intrinsic was handed a blob handle the calling process
+    /// does not own (its ledger holds no reference — a use-after-release, a
+    /// forged/re-typed handle, or a release without a matching acquisition).
+    /// The runtime surfaces this as a loud panic, never a silent no-op.
+    pub const blob_not_owned: i32 = -6;
 };
 
 /// The C-ABI process entry shape `zap_proc_spawn` accepts. `process` is
@@ -546,6 +551,15 @@ const RuntimeState = struct {
     /// stand on. Shared across every scheduler core via
     /// `Scheduler.Options.registry`; validated against `pid_table` for liveness.
     registry: concurrency.ProcessRegistry,
+    /// The `Zap.Blob` allocation domain + persistent-term registry (P6-J2,
+    /// `blob.zig`): THE one sanctioned atomically-refcounted share tier.
+    /// Owned by the runtime (blob payloads belong to NEITHER process's
+    /// manager — the envelope-pool third-allocation-domain discipline),
+    /// shared across every scheduler core via `Scheduler.Options.blob_domain`
+    /// (teardown ledger drains), and torn down leak-exactly at
+    /// `zap_proc_runtime_deinit` (its `deinit` releases the registry's
+    /// references and asserts zero live blobs).
+    blob_domain: concurrency.BlobDomain,
     /// The per-spawn manager registry (plan item 3.1/3.3, P3-J3): core
     /// vtables indexed by manager id. Slot 0 is the manifest default (bound by
     /// `zap_proc_bind_manager`); slots 1.. are the distinct `spawn(f, .{
@@ -727,6 +741,13 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
         runtime_state.pid_table.deinit();
         return ZapProcStatus.out_of_memory;
     };
+    runtime_state.blob_domain = concurrency.BlobDomain.init() catch {
+        runtime_state.registry.deinit();
+        runtime_state.signal_runtime.deinit();
+        runtime_state.envelope_pool.deinit();
+        runtime_state.pid_table.deinit();
+        return ZapProcStatus.out_of_memory;
+    };
 
     if (readSeededSchedulerSeed()) |seed| {
         // Seeded deterministic M:N backend (P4-J4): a single-threaded,
@@ -742,8 +763,10 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
                 .core_count = core_count,
                 .signal_runtime = &runtime_state.signal_runtime,
                 .registry = &runtime_state.registry,
+                .blob_domain = &runtime_state.blob_domain,
             },
         ) catch {
+            runtime_state.blob_domain.deinit();
             runtime_state.registry.deinit();
             runtime_state.signal_runtime.deinit();
             runtime_state.envelope_pool.deinit();
@@ -769,8 +792,10 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
             .{ .core_options = .{
                 .signal_runtime = &runtime_state.signal_runtime,
                 .registry = &runtime_state.registry,
+                .blob_domain = &runtime_state.blob_domain,
             } },
         ) catch {
+            runtime_state.blob_domain.deinit();
             runtime_state.registry.deinit();
             runtime_state.signal_runtime.deinit();
             runtime_state.envelope_pool.deinit();
@@ -800,6 +825,13 @@ fn runtimeInitSeededForTest(seed: u64, core_count: usize) i32 {
         runtime_state.pid_table.deinit();
         return ZapProcStatus.out_of_memory;
     };
+    runtime_state.blob_domain = concurrency.BlobDomain.init() catch {
+        runtime_state.registry.deinit();
+        runtime_state.signal_runtime.deinit();
+        runtime_state.envelope_pool.deinit();
+        runtime_state.pid_table.deinit();
+        return ZapProcStatus.out_of_memory;
+    };
     const simulator = concurrency.MnSimulator.create(
         backing_allocator,
         &runtime_state.pid_table,
@@ -809,8 +841,10 @@ fn runtimeInitSeededForTest(seed: u64, core_count: usize) i32 {
             .core_count = core_count,
             .signal_runtime = &runtime_state.signal_runtime,
             .registry = &runtime_state.registry,
+            .blob_domain = &runtime_state.blob_domain,
         },
     ) catch {
+        runtime_state.blob_domain.deinit();
         runtime_state.registry.deinit();
         runtime_state.signal_runtime.deinit();
         runtime_state.envelope_pool.deinit();
@@ -887,6 +921,12 @@ export fn zap_proc_runtime_deinit() callconv(.c) void {
     // registration is live — `deinit` asserts that (the leak oracle) and frees
     // the slot storage.
     runtime_state.registry.deinit();
+    // Every process's blob ledger drained at its teardown and every in-flight
+    // blob envelope was reclaimed by the mailbox drains (both above), so the
+    // only remaining references are the persistent-term registry's own —
+    // `deinit` releases those and asserts ZERO live blobs (the share tier's
+    // leak-exactness oracle), then frees the domain.
+    runtime_state.blob_domain.deinit();
     runtime_initialized = false;
 }
 
@@ -1241,6 +1281,233 @@ export fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void 
         envelope.fragment = .{};
     }
     envelope_pool_module.free(envelope);
+}
+
+// ---------------------------------------------------------------------------
+// Intrinsics — Zap.Blob, the sanctioned atomic immutable share tier (P6-J2)
+//
+// The `zap_blob_*` surface over `blob.zig`'s `BlobDomain` + the per-process
+// `BlobLedger`. Two disciplines govern every entry point:
+//
+//   * **Ownership-gated payload access.** Every intrinsic that could touch
+//     payload bytes (or mint a new reference from an existing one) takes the
+//     calling process handle and VERIFIES the handle against the caller's
+//     ledger first. A blob operation on a handle this process does not own
+//     is a program bug surfaced as a sentinel (the runtime panics loudly),
+//     never a racy read of memory another owner may free concurrently. The
+//     generation-validated slot CAS already makes stale/forged handles
+//     memory-safe (they touch only type-stable slot words); the ledger gate
+//     upgrades "memory-safe" to "semantically rejected".
+//   * **Acquisition = ledger entry.** `create`/`slice`/`adopt`/
+//     `registry_get` append the granted reference to the caller's ledger;
+//     `release_owned` removes one; teardown drains the rest
+//     (`scheduler.zig` step 4b). The flight reference a send mints is NOT
+//     ledger-tracked — it belongs to the in-flight envelope and is released
+//     by adoption transfer, dead-letter undo, or the envelope reclaim hook.
+// ---------------------------------------------------------------------------
+
+/// Resolve the calling process's ledger and verify it owns `handle_bits`.
+fn callerOwnsBlob(process: *anyopaque, handle_bits: u64) bool {
+    return contextFromHandle(process).blobLedger().contains(handle_bits);
+}
+
+/// Create a blob by copying `byte_length` bytes from `bytes_pointer` into
+/// the blob domain (the one copy of the blob's life), granting the calling
+/// process one owned (ledger-tracked) reference. Zero-length blobs are
+/// legal (`bytes_pointer` may then be null). Returns the handle bits, or 0
+/// on allocation failure / table exhaustion (the runtime panics — OOM
+/// posture).
+export fn zap_blob_create(
+    process: *anyopaque,
+    bytes_pointer: ?[*]const u8,
+    byte_length: usize,
+) callconv(.c) u64 {
+    const bytes: []const u8 = if (byte_length == 0) &.{} else bytes_pointer.?[0..byte_length];
+    const handle = runtime_state.blob_domain.create(bytes) catch return 0;
+    contextFromHandle(process).blobLedger().append(handle.toBits()) catch {
+        _ = runtime_state.blob_domain.release(handle);
+        return 0;
+    };
+    return handle.toBits();
+}
+
+/// Release ONE owned reference the calling process holds on `handle_bits`
+/// (the explicit early release; unreleased references drain at teardown).
+/// Returns `ZapProcStatus.ok`, or `blob_not_owned` when the caller's ledger
+/// holds no such reference (a use-after-release or a release of a blob this
+/// process never acquired — the runtime panics).
+export fn zap_blob_release_owned(process: *anyopaque, handle_bits: u64) callconv(.c) i32 {
+    const ledger = contextFromHandle(process).blobLedger();
+    if (!ledger.removeOne(handle_bits)) return ZapProcStatus.blob_not_owned;
+    _ = runtime_state.blob_domain.release(concurrency.BlobHandle.fromBits(handle_bits));
+    return ZapProcStatus.ok;
+}
+
+/// Payload byte length. Returns −1 when the caller does not own
+/// `handle_bits` (stale handles are never owned — the ledger gate subsumes
+/// the generation check).
+export fn zap_blob_size(process: *anyopaque, handle_bits: u64) callconv(.c) i64 {
+    if (!callerOwnsBlob(process, handle_bits)) return -1;
+    const length = runtime_state.blob_domain.byteLength(concurrency.BlobHandle.fromBits(handle_bits)) orelse return -1;
+    return @intCast(length);
+}
+
+/// The byte at `index` (0–255). Returns −1 when not owned/stale, −2 when
+/// `index` is out of bounds.
+export fn zap_blob_byte_at(process: *anyopaque, handle_bits: u64, index: u64) callconv(.c) i64 {
+    if (!callerOwnsBlob(process, handle_bits)) return -1;
+    const view = runtime_state.blob_domain.bytesView(concurrency.BlobHandle.fromBits(handle_bits)) orelse return -1;
+    if (index >= view.len) return -2;
+    return view[@intCast(index)];
+}
+
+/// A BORROWED view of the payload bytes, written through `out_pointer`;
+/// returns the byte length, or −1 when not owned/stale. The view is valid
+/// while the caller retains its owned reference (the immutable payload is
+/// never moved or mutated) — the runtime copies out of it synchronously.
+export fn zap_blob_bytes_view(
+    process: *anyopaque,
+    handle_bits: u64,
+    out_pointer: *?[*]const u8,
+) callconv(.c) i64 {
+    out_pointer.* = null;
+    if (!callerOwnsBlob(process, handle_bits)) return -1;
+    const view = runtime_state.blob_domain.bytesView(concurrency.BlobHandle.fromBits(handle_bits)) orelse return -1;
+    out_pointer.* = view.ptr;
+    return @intCast(view.len);
+}
+
+/// COPY the byte range `[start, start+length)` OUT into a fresh blob (the
+/// v1 no-aliasing slice — module doc of `blob.zig`: the Erlang sub-binary /
+/// Java substring pin pathology is defeated by construction), granting the
+/// caller one owned reference on the new blob. Returns the new handle bits;
+/// 0 when the source is not owned/stale, the range is out of bounds, or
+/// allocation fails (the runtime distinguishes via prior size validation).
+export fn zap_blob_slice(
+    process: *anyopaque,
+    handle_bits: u64,
+    start: u64,
+    length: u64,
+) callconv(.c) u64 {
+    if (!callerOwnsBlob(process, handle_bits)) return 0;
+    const view = runtime_state.blob_domain.bytesView(concurrency.BlobHandle.fromBits(handle_bits)) orelse return 0;
+    if (start > view.len or length > view.len - @as(usize, @intCast(start))) return 0;
+    const slice_start: usize = @intCast(start);
+    const slice_length: usize = @intCast(length);
+    const handle = runtime_state.blob_domain.create(view[slice_start .. slice_start + slice_length]) catch return 0;
+    contextFromHandle(process).blobLedger().append(handle.toBits()) catch {
+        _ = runtime_state.blob_domain.release(handle);
+        return 0;
+    };
+    return handle.toBits();
+}
+
+/// Current share count (advisory — exact at quiescence; the test surface
+/// for "the atomic count reflects both holders"). −1 when not owned/stale.
+export fn zap_blob_share_count(process: *anyopaque, handle_bits: u64) callconv(.c) i64 {
+    if (!callerOwnsBlob(process, handle_bits)) return -1;
+    const count = runtime_state.blob_domain.shareCount(concurrency.BlobHandle.fromBits(handle_bits)) orelse return -1;
+    return @intCast(count);
+}
+
+/// Opaque identity token of the payload buffer (its address bits): equal
+/// tokens ⟺ the SAME bytes in memory — the pointer-identity witness the
+/// zero-copy share tests assert on. 0 when not owned/stale.
+export fn zap_blob_identity(process: *anyopaque, handle_bits: u64) callconv(.c) u64 {
+    if (!callerOwnsBlob(process, handle_bits)) return 0;
+    const payload = runtime_state.blob_domain.payloadPointer(concurrency.BlobHandle.fromBits(handle_bits)) orelse return 0;
+    return @intFromPtr(payload);
+}
+
+/// Number of live blobs in the domain (test/observability surface — the
+/// leak-exactness oracle Zap tests assert against).
+export fn zap_blob_live_count() callconv(.c) u64 {
+    if (!runtime_initialized) return 0;
+    return runtime_state.blob_domain.statistics().live_blob_count;
+}
+
+/// SEND half of the blob share: verify the sender owns `handle_bits`,
+/// atomically retain one FLIGHT reference (owned by the in-flight envelope,
+/// not any ledger), and return the payload pointer to ride the moved
+/// envelope (`zap_proc_send_moved`) with `byte_length` written through.
+/// Null when the sender does not own the handle. The flight reference is
+/// consumed by receiver adoption (`zap_blob_adopt`), released by the sender
+/// on dead-letter, or released by the envelope reclaim hook
+/// (`zap_blob_flight_release`) when the receiver dies with the envelope
+/// still queued.
+export fn zap_blob_flight_retain(
+    process: *anyopaque,
+    handle_bits: u64,
+    out_byte_length: *usize,
+) callconv(.c) ?[*]const u8 {
+    out_byte_length.* = 0;
+    if (!callerOwnsBlob(process, handle_bits)) return null;
+    const handle = concurrency.BlobHandle.fromBits(handle_bits);
+    // Rooted in the ledger-verified owned reference, so the count is
+    // pinned above zero and the retain cannot race a free.
+    if (!runtime_state.blob_domain.tryRetain(handle)) return null;
+    const payload = runtime_state.blob_domain.payloadPointer(handle).?;
+    out_byte_length.* = runtime_state.blob_domain.byteLength(handle).?;
+    return payload;
+}
+
+/// Release one FLIGHT reference by payload pointer — the moved-envelope
+/// reclaim hook (a blob envelope drained at receiver teardown) and the
+/// sender's dead-letter undo path. Callable from ANY thread (the atomic
+/// tier's whole point).
+export fn zap_blob_flight_release(payload_pointer: [*]const u8) callconv(.c) void {
+    _ = runtime_state.blob_domain.release(concurrency.BlobDomain.handleForPayloadPointer(payload_pointer));
+}
+
+/// RECEIVE half of the blob share: transfer the moved envelope's flight
+/// reference to the calling process — recover the handle from the payload
+/// header and record it in the receiver's ledger (no count change: the
+/// flight +1 becomes the receiver's owned reference). Returns the handle
+/// bits, or 0 when the ledger allocation fails (the flight reference is
+/// then released so nothing leaks; the runtime panics — OOM posture).
+export fn zap_blob_adopt(process: *anyopaque, payload_pointer: [*]const u8) callconv(.c) u64 {
+    const handle = concurrency.BlobDomain.handleForPayloadPointer(payload_pointer);
+    contextFromHandle(process).blobLedger().append(handle.toBits()) catch {
+        _ = runtime_state.blob_domain.release(handle);
+        return 0;
+    };
+    return handle.toBits();
+}
+
+/// Store the caller-owned blob under atom `key` in the global immutable
+/// registry (the `persistent_term` analogue), retaining one reference FOR
+/// THE REGISTRY; a put on an existing key REPLACES and releases the old
+/// value's registry reference (it dies with its last outside holder).
+/// Returns `ZapProcStatus.ok`, `blob_not_owned`, or `out_of_memory` (the
+/// fixed registry is full).
+export fn zap_blob_registry_put(process: *anyopaque, key: u64, handle_bits: u64) callconv(.c) i32 {
+    if (!callerOwnsBlob(process, handle_bits)) return ZapProcStatus.blob_not_owned;
+    runtime_state.blob_domain.registryPut(
+        @truncate(key),
+        concurrency.BlobHandle.fromBits(handle_bits),
+    ) catch |err| return switch (err) {
+        error.RegistryFull => ZapProcStatus.out_of_memory,
+        // The ledger gate above already vouched for the handle; a stale
+        // result here would mean the owned count hit zero concurrently,
+        // which ownership precludes — kernel bug.
+        error.StaleBlobHandle => unreachable,
+    };
+    return ZapProcStatus.ok;
+}
+
+/// Look up atom `key` in the global registry; when present, atomically
+/// retain one reference for the calling process (recorded in its ledger —
+/// released explicitly or at teardown like any acquisition). Lock-free
+/// (see `blob.zig`, `registryGet`). Returns the handle bits, or 0 when the
+/// key is absent (or the ledger allocation failed, in which case the
+/// granted reference is released first).
+export fn zap_blob_registry_get(process: *anyopaque, key: u64) callconv(.c) u64 {
+    const handle = runtime_state.blob_domain.registryGet(@truncate(key)) orelse return 0;
+    contextFromHandle(process).blobLedger().append(handle.toBits()) catch {
+        _ = runtime_state.blob_domain.release(handle);
+        return 0;
+    };
+    return handle.toBits();
 }
 
 /// Terminate the calling process NORMALLY (reason `normal`, P5-J1): the same
@@ -2827,4 +3094,299 @@ test "abi: an unexpected message dead-letters with telemetry and does not crash 
     try testing.expectEqual(@as(i64, 0), stats.live_process_count);
     try testing.expect(stats.kill_total >= 1);
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
+}
+
+// ---------------------------------------------------------------------------
+// Zap.Blob share tier — kernel-level lifecycle proofs (P6-J2).
+//
+// The Zap-visible behavior is covered by `test_concurrency/blob_test.zap`;
+// these tests pin the KERNEL contract underneath it, in particular the two
+// legs that need surgical process-lifecycle control:
+//
+//   * sender-dies-receiver-survives — THE point of the tier: the sender's
+//     teardown drains its blob ledger (one atomic decrement), and the
+//     receiver's adopted reference keeps the payload alive, byte-identical
+//     and at the SAME address (zero copy);
+//   * receiver-dies-with-queued-blob — the flight reference is released by
+//     the teardown drain's `moved_reclaim` (`zap_blob_flight_release`),
+//     leak-exactly.
+// ---------------------------------------------------------------------------
+
+/// Probe for the sender-dies-receiver-survives proof.
+const BlobShareProbe = struct {
+    receiver_pid_bits: u64 = 0,
+    /// Identity token (payload address bits) the SENDER observed.
+    sender_identity: u64 = 0,
+    /// Identity token the RECEIVER observed after the sender died.
+    receiver_identity: u64 = 0,
+    /// Share count the receiver observed AFTER the sender's death (must be
+    /// exactly 1 — the receiver is the sole remaining holder).
+    receiver_observed_share_count: i64 = -99,
+    /// Whether the receiver's post-death byte read matched the payload.
+    receiver_bytes_match: bool = false,
+    send_status: i32 = std.math.minInt(i32),
+};
+
+const blob_share_payload = "the sender is dead; long live the bytes";
+
+fn blobShareSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *BlobShareProbe = @ptrCast(@alignCast(argument.?));
+
+    // Hand the receiver our pid (so it can monitor our death) as a plain
+    // copied message — pairwise FIFO puts it ahead of the blob envelope.
+    var self_bits = zap_proc_self(process);
+    _ = zap_proc_send(process, probe.receiver_pid_bits, @ptrCast(&self_bits), @sizeOf(u64));
+
+    // Create the blob (share 1, ours) and record its payload identity.
+    const handle_bits = zap_blob_create(process, blob_share_payload.ptr, blob_share_payload.len);
+    std.debug.assert(handle_bits != 0);
+    probe.sender_identity = zap_blob_identity(process, handle_bits);
+
+    // Share it: flight-retain (+1) and send the pointer through a moved
+    // envelope. No byte is copied anywhere on this path.
+    var flight_byte_length: usize = 0;
+    const flight = zap_blob_flight_retain(process, handle_bits, &flight_byte_length).?;
+    std.debug.assert(flight_byte_length == blob_share_payload.len);
+    probe.send_status = zap_proc_send_moved(
+        process,
+        probe.receiver_pid_bits,
+        flight,
+        flight_byte_length,
+        zap_blob_flight_release,
+    );
+
+    // Die WITHOUT releasing: the teardown ledger drain performs our
+    // release — the crash-safety leg (a process dying with blob handles
+    // releases them).
+}
+
+fn blobShareReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *BlobShareProbe = @ptrCast(@alignCast(argument.?));
+
+    // (1) The sender's pid.
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    var envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    std.debug.assert(payload_len == @sizeOf(u64));
+    var sender_bits: u64 = undefined;
+    @memcpy(std.mem.asBytes(&sender_bits), payload_pointer.?[0..@sizeOf(u64)]);
+    zap_proc_envelope_free(envelope);
+
+    // (2) The blob envelope: adopt the flight reference as our own.
+    envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    const moved_root = zap_proc_envelope_take_moved(envelope).?;
+    const handle_bits = zap_blob_adopt(process, moved_root);
+    std.debug.assert(handle_bits != 0);
+    zap_proc_envelope_free(envelope);
+
+    // (3) Wait for the sender to be FULLY dead (its teardown drains its
+    // blob ledger BEFORE exit signals propagate — scheduler.zig steps 4b
+    // and 5b — so the DOWN observation orders our reads after its
+    // release; a monitor on an already-dead pid fires `noproc`
+    // immediately, covering both interleavings).
+    _ = zap_proc_monitor(process, sender_bits);
+    _ = zap_proc_await_signal(process);
+
+    // (4) THE tier's point: the dead sender's payload is alive, byte-
+    // identical, at the SAME address, and we are its sole holder.
+    probe.receiver_identity = zap_blob_identity(process, handle_bits);
+    probe.receiver_observed_share_count = zap_blob_share_count(process, handle_bits);
+    var view_pointer: ?[*]const u8 = null;
+    const view_length = zap_blob_bytes_view(process, handle_bits, &view_pointer);
+    probe.receiver_bytes_match = view_length == blob_share_payload.len and
+        std.mem.eql(u8, view_pointer.?[0..blob_share_payload.len], blob_share_payload);
+
+    // Die without releasing: OUR teardown drain is the last release —
+    // the "both die → freed, count 0" leg, asserted by the test body's
+    // live count and the runtime deinit's leak gate.
+}
+
+test "abi: blob share — sender dies, receiver's blob survives at the same address; both die, freed leak-exactly" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    var probe = BlobShareProbe{};
+    const receiver_bits = zap_proc_spawn(blobShareReceiverEntry, &probe);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.receiver_pid_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(blobShareSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expectEqual(ZapProcStatus.ok, probe.send_status);
+    // Zero copy: the receiver read the SAME payload address the sender
+    // created (pointer identity across the process boundary and across
+    // the sender's death).
+    try testing.expect(probe.sender_identity != 0);
+    try testing.expectEqual(probe.sender_identity, probe.receiver_identity);
+    // After the sender's death the receiver was the SOLE holder.
+    try testing.expectEqual(@as(i64, 1), probe.receiver_observed_share_count);
+    try testing.expect(probe.receiver_bytes_match);
+    // Both holders are dead: the payload was freed by the receiver's
+    // teardown ledger drain — leak-exact (the deferred runtime deinit
+    // re-asserts this domain-wide).
+    try testing.expectEqual(@as(u64, 0), zap_blob_live_count());
+}
+
+/// Probe for the receiver-dies-with-queued-blob proof.
+const BlobTeardownProbe = struct {
+    receiver_pid_bits: u64 = 0,
+    send_status: i32 = std.math.minInt(i32),
+    release_status: i32 = std.math.minInt(i32),
+};
+
+fn blobTeardownSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *BlobTeardownProbe = @ptrCast(@alignCast(argument.?));
+
+    const handle_bits = zap_blob_create(process, "queued at death", 15);
+    std.debug.assert(handle_bits != 0);
+
+    // Pairwise FIFO: the plain marker is received first; the blob envelope
+    // is still queued when the receiver exits after its single receive.
+    _ = zap_proc_send(process, probe.receiver_pid_bits, "m", 1);
+    var flight_byte_length: usize = 0;
+    const flight = zap_blob_flight_retain(process, handle_bits, &flight_byte_length).?;
+    probe.send_status = zap_proc_send_moved(
+        process,
+        probe.receiver_pid_bits,
+        flight,
+        flight_byte_length,
+        zap_blob_flight_release,
+    );
+
+    // Release our own reference EXPLICITLY (the early-release path): the
+    // flight reference is now the blob's only tether, held by the queued
+    // envelope the receiver will never adopt.
+    probe.release_status = zap_blob_release_owned(process, handle_bits);
+}
+
+test "abi: a blob envelope drained at receiver teardown releases the flight reference leak-exactly" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    // Reuses the moved-teardown receiver shape: ONE plain receive, then
+    // exit with the blob envelope still queued.
+    var probe = BlobTeardownProbe{};
+    const receiver_bits = zap_proc_spawn(movedTeardownReceiverEntry, null);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.receiver_pid_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(blobTeardownSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expectEqual(ZapProcStatus.ok, probe.send_status);
+    try testing.expectEqual(ZapProcStatus.ok, probe.release_status);
+    // The teardown drain ran `zap_blob_flight_release` on the undelivered
+    // envelope: nothing lives.
+    try testing.expectEqual(@as(u64, 0), zap_blob_live_count());
+}
+
+/// Probe for the dead-letter undo proof.
+const BlobDeadLetterProbe = struct {
+    send_status: i32 = std.math.minInt(i32),
+    share_count_after_undo: i64 = -99,
+    release_status: i32 = std.math.minInt(i32),
+};
+
+fn blobDeadLetterSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *BlobDeadLetterProbe = @ptrCast(@alignCast(argument.?));
+
+    const handle_bits = zap_blob_create(process, "undeliverable", 13);
+    std.debug.assert(handle_bits != 0);
+
+    const forged = concurrency.Pid{ .slot = 7, .generation = 999, .model = .refcounted, .node = 0 };
+    var flight_byte_length: usize = 0;
+    const flight = zap_blob_flight_retain(process, handle_bits, &flight_byte_length).?;
+    probe.send_status = zap_proc_send_moved(
+        process,
+        forged.toBits(),
+        flight,
+        flight_byte_length,
+        zap_blob_flight_release,
+    );
+    // Dead-letter: nothing was enqueued and nothing consumed the flight
+    // reference — the sender undoes it (the runtime's send path does
+    // exactly this on a non-ok status).
+    zap_blob_flight_release(flight);
+    probe.share_count_after_undo = zap_blob_share_count(process, handle_bits);
+    probe.release_status = zap_blob_release_owned(process, handle_bits);
+}
+
+test "abi: a dead-lettered blob send undoes the flight reference — Erlang semantics, no leak" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    var probe = BlobDeadLetterProbe{};
+    const sender_bits = zap_proc_spawn(blobDeadLetterSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expectEqual(ZapProcStatus.dead_lettered, probe.send_status);
+    try testing.expectEqual(@as(i64, 1), probe.share_count_after_undo);
+    try testing.expectEqual(ZapProcStatus.ok, probe.release_status);
+    try testing.expectEqual(@as(u64, 0), zap_blob_live_count());
+}
+
+/// Probes for the registry-survives-process-churn proof.
+const BlobRegistryPutProbe = struct {
+    put_status: i32 = std.math.minInt(i32),
+};
+
+const BlobRegistryGetProbe = struct {
+    got_bytes_match: bool = false,
+    missing_key_is_zero: bool = false,
+};
+
+const blob_registry_test_key: u64 = 0xC0FF33;
+
+fn blobRegistryPublisherEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *BlobRegistryPutProbe = @ptrCast(@alignCast(argument.?));
+    const handle_bits = zap_blob_create(process, "global config", 13);
+    std.debug.assert(handle_bits != 0);
+    probe.put_status = zap_blob_registry_put(process, blob_registry_test_key, handle_bits);
+    // Die: the registry's own reference — NOT ours — keeps the value
+    // alive across our death (persistent-term survives process churn).
+}
+
+fn blobRegistryConsumerEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *BlobRegistryGetProbe = @ptrCast(@alignCast(argument.?));
+    probe.missing_key_is_zero = zap_blob_registry_get(process, 0xDEAD_BEEF) == 0;
+    const handle_bits = zap_blob_registry_get(process, blob_registry_test_key);
+    std.debug.assert(handle_bits != 0);
+    var view_pointer: ?[*]const u8 = null;
+    const view_length = zap_blob_bytes_view(process, handle_bits, &view_pointer);
+    probe.got_bytes_match = view_length == 13 and
+        std.mem.eql(u8, view_pointer.?[0..13], "global config");
+    // Die without releasing the get-granted reference: the teardown drain
+    // returns it, leaving the registry's own reference as the sole holder.
+}
+
+test "abi: the blob registry survives the publisher's death; get grants a teardown-drained reference; deinit sweeps leak-exactly" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    // The publisher runs to completion (and death) FIRST — the consumer is
+    // spawned into a world where the publisher no longer exists.
+    var put_probe = BlobRegistryPutProbe{};
+    const publisher_bits = zap_proc_spawn(blobRegistryPublisherEntry, &put_probe);
+    try testing.expect(publisher_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+    try testing.expectEqual(ZapProcStatus.ok, put_probe.put_status);
+    try testing.expectEqual(@as(u64, 1), zap_blob_live_count());
+
+    var get_probe = BlobRegistryGetProbe{};
+    const consumer_bits = zap_proc_spawn(blobRegistryConsumerEntry, &get_probe);
+    try testing.expect(consumer_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+    try testing.expect(get_probe.missing_key_is_zero);
+    try testing.expect(get_probe.got_bytes_match);
+
+    // The registry's reference is the one remaining holder; the deferred
+    // runtime deinit releases it and asserts zero live blobs (the
+    // shutdown leak-exactness gate).
+    try testing.expectEqual(@as(u64, 1), zap_blob_live_count());
 }
