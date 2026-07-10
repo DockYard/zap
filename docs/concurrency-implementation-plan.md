@@ -942,6 +942,90 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
   leak-exact registry test.
 - **6.3** Blob-backed String per rev 2 §5.4: copy-out slices, SSO, 64 B promotion (tuned by
   measurement), rc==1 in-place append via the uniqueness prover, opt-in aliasing view.
+  **DONE at the send-path scope (P6-J3, 2026-07-10)** — large strings ride the P6-J2 share
+  tier; the String VALUE representation (`[]const u8`) is untouched, which is the honest
+  scope decision (see the 6.3a deferral). Mechanism (`blob.zig` + the `zap_blob_string_*`
+  ABI in `abi.zig`) vs policy (`src/runtime.zig`, the threshold + send/receive/concat
+  integration):
+  - **Recognition by layout, not by type.** A Zap `String` has no room for a handle, so a
+    blob-backed string is recognized from its POINTER: every blob payload sits at exactly
+    `header_byte_length` (24) bytes past a page boundary, so `resolveWholePayloadView`
+    rejects any other page offset without touching memory, reads the same-page preceding
+    `BlobHeader` otherwise, and accepts only when the header's handle round-trips through
+    the slot table back to that exact payload address — a false positive is structurally
+    impossible, a garbage probe can never fault, and the formal-race surface (probing a
+    candidate that names a live FOREIGN slot mid-churn) is closed by making the two probed
+    slot words (`header_address`, `byte_length`) atomic loads/stores (cold paths; TSan-clean
+    by construction, verified under `-fsanitize-thread`).
+  - **Copy-out slices, airtight cross-process.** Only the WHOLE-payload view
+    (`length == byte_length`) ever resolves — a prefix/interior slice re-copies at every
+    process boundary (sub-threshold → walker bytes; ≥ threshold → a fresh blob), so a small
+    view can never pin a large payload in another process: the Erlang sub-binary /
+    JDK-4513622 / SE-0163 pin pathology is defeated by construction. WITHIN a process,
+    `String.slice` remains the aliasing view it always was — harmless because a blob-backed
+    string's blob is ledger-pinned for the process's life (exactly the process-lifetime
+    backing arena strings already have), so a local slice adds ZERO pinning.
+  - **Send-boundary promotion, measured threshold.** A top-level `Process.send` of a string
+    ≥ `string_blob_promotion_threshold` (65536 — measured, NOT Erlang's 64-byte instinct,
+    which assumes a fitted binary allocator; the blob domain is mmap-backed at ~1.5 µs a
+    create) promotes with ONE copy (`zap_blob_string_create_flight`; the single reference
+    IS the flight reference) or, when already blob-backed, shares with ZERO copies
+    (`zap_blob_string_flight_retain`); the envelope carries the payload pointer + STRING
+    length and the P6-J2 `blobFlightReclaim` hook, so dead-letter undo and teardown drain
+    are leak-exact for free. The receiver's string IS the payload view (`zap_blob_adopt`
+    into its ledger — the same process-lifetime discipline P3-J4 gave adopted walker
+    strings). Crossover measured substrate-honestly (the gate-ON walker's receiver copy is
+    itself page-backed above the P3-J5 slab boundary): between 32 KiB and 64 KiB one-shot;
+    a re-send/forward of a backed string is ~42 ns FLAT (165× at 64 KiB, ~2,400× at 1 MB).
+    Ledger § "P6-J3 string-blob crossover" (harness
+    `bench/concurrency-copy/run-string-blob-bench.sh`, kept for retuning).
+  - **rc==1 in-place append** (`zap_blob_string_concat` behind `String.concat`): when the
+    blob's atomic count is EXACTLY 1 and the caller owns that reference (ledger-gated), no
+    other holder exists anywhere — no process, envelope, or registry entry — so appending
+    at the frontier (only at `byte_length`; a stale shorter view is refused so it can never
+    clobber a longer same-process alias) mutates nothing any other holder can observe:
+    immutability is OBSERVATIONALLY absolute for every holder that is not the sole owner,
+    and later shares are ordered behind the append by the flight-retain CAS edge. Once
+    shared, the payload is frozen forever from the appender's side — the append copies into
+    a geometrically-grown fresh blob (capacity ≥ 2×, page-slack included; the base blob's
+    ledger reference is deliberately KEPT so same-process aliases stay readable, the
+    bump-arena lifetime discipline). Every payload is page-rounded with the slack recorded
+    as capacity, so promoted/received strings carry natural append room.
+  - **Local-only strings untouched.** No construction-time promotion: concat's blob leg
+    engages only for an already-backed base (two inline pre-filters — length ≥ threshold
+    and the page-offset mask — answer ~every call without a C-ABI crossing); arena concat,
+    interpolation, and every `String.*` builder are byte-for-byte pre-P6-J3, gate-ON and
+    gate-OFF (the gate-OFF binary contains none of this — comptime-elided; CLBG unaffected).
+  - **v1 exclusions** (mirroring Blob's): strings nested in `List`/`Map`/struct payloads
+    keep the walker byte-copy (interior flight references would leak through
+    dead-letter/teardown — same follow-on as blob-in-containers); correlated `call`/`Task`
+    replies keep the walker copy (`zap_proc_send_correlated` is bytes-only — same exclusion
+    as Blob correlated replies).
+  - **Proofs:** kernel `blob.zig` (7 new tests: page-offset/capacity invariants,
+    `createFromParts`, frontier/shared/capacity append rules, whole-view-only + stale-header
+    probe rejection, and a 6-thread append-chain + adversarial fake-header probe stress —
+    TSan-clean); abi-level string-tier lifecycle tests (promote/adopt, in-place vs
+    freeze-on-share append, ownership/decline gates, promoted-send
+    sender-dies-receiver-survives at the SAME address with a receiver in-place append);
+    Zap-level `test_concurrency/string_blob_test.zap` (12 tests: threshold gating,
+    local-only untouched, promote-exactly-one-blob + zero-copy adopt identity, zero-copy
+    forward (ARC→ARC and ARC→Arena→ARC cross-model), sender-dies, small-slice pin
+    avoidance + large-slice copy-out, rc==1 in-place vs copy-on-shared vs 40-append
+    growth chains, 50-send storm leak-exactness — all `Blob.live_count`-baselined);
+    `String.identity` (diagnostic, `lib/string.zap`) is the Zap-level pointer-identity
+    witness.
+  - **6.3a (DEFERRED — full String representation: SSO + owned string cells).** The ~15-byte
+    SSO and any refcounted/handle-carrying String value require replacing `[]const u8` as
+    the runtime String representation across the compiler (ZIR string ABI), every runtime
+    string function, and FFI — a representation overhaul, not a send-path feature. Deferred
+    with the §5.4 design intact (SSO inline capacity to be tuned to the final struct size);
+    the send-path tier above neither blocks nor prejudges it.
+  - **6.3b (DEFERRED — explicit opt-in aliasing view, `String.share`/`Blob.view`).** A
+    zero-copy `Blob→String` aliasing view is the §5.4 resolution-4 capability (the
+    `bytes::Bytes` trade), but with strings as bare slices the view would dangle after an
+    explicit `Blob.release` — Zap has no borrow tracking to make "documented as pinning"
+    enforceable, so it does not fit v1 cleanly. Ships with 6.3a's owned representation
+    (the view can then hold a counted reference), documented as pinning.
 - **6.4** Arena auto-reset at the receive back-edge for solver-proven loop-closed processes;
   `hibernate` intrinsic (arena reset + stack shrink).
 - **6.5** Full observability: send/receive trace points (compile-time-optional), scheduler

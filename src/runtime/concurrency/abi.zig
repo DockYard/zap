@@ -134,6 +134,12 @@ pub const ZapProcStatus = struct {
     /// Send-only outcome: the target pid did not resolve; the message
     /// was dropped (Erlang dead-letter semantics — not an error).
     pub const dead_lettered: i32 = 1;
+    /// String-tier outcome (`zap_blob_string_concat`): the base pointer
+    /// is not the calling process's whole-blob-backed string view, so
+    /// the blob tier declines and the runtime keeps its ordinary string
+    /// path (not an error — the common case for every non-promoted
+    /// string).
+    pub const string_not_blob_backed: i32 = 2;
     /// The runtime is not initialized (or was already deinitialized).
     pub const not_initialized: i32 = -1;
     /// `zap_proc_runtime_init` was called on an already-live runtime.
@@ -1508,6 +1514,126 @@ export fn zap_blob_registry_get(process: *anyopaque, key: u64) callconv(.c) u64 
         return 0;
     };
     return handle.toBits();
+}
+
+// ---------------------------------------------------------------------------
+// Intrinsics — the Blob-backed String tier (P6-J3, plan item 6.3)
+//
+// The `zap_blob_string_*` surface behind `src/runtime.zig`'s large-string
+// send/receive/concat integration (rev-2 §5.4). A Zap `String` is a bare
+// `[]const u8`, so blob-backing is recognized from the pointer LAYOUT
+// (`BlobDomain.resolveWholePayloadView` — whole-payload views only, the
+// copy-out-slices law) and gated on the caller's ledger exactly like every
+// other blob intrinsic. POLICY (the promotion threshold, when a send
+// promotes) lives in the runtime; these entry points are mechanism only.
+// ---------------------------------------------------------------------------
+
+/// The fixed page offset of every blob payload — the runtime caches this at
+/// startup for its inline pre-filter on the string-concat hot path (one
+/// mask-and-compare before any C-ABI call). Pure layout constant; callable
+/// before runtime init.
+export fn zap_blob_string_payload_offset() callconv(.c) u64 {
+    return concurrency.blob.payloadPageOffset();
+}
+
+/// SEND half for an ALREADY blob-backed string: when `{string_pointer,
+/// string_length}` is the whole-payload view of a live blob the calling
+/// process owns, atomically retain one FLIGHT reference and return the
+/// payload pointer to ride the moved envelope (the sender keeps its own
+/// reference — its string stays readable). Null when the string is not
+/// this process's whole-blob view — the caller then promotes a fresh copy
+/// (`zap_blob_string_create_flight`), which is sound in every case.
+export fn zap_blob_string_flight_retain(
+    process: *anyopaque,
+    string_pointer: [*]const u8,
+    string_length: usize,
+) callconv(.c) ?[*]const u8 {
+    const handle = runtime_state.blob_domain.resolveWholePayloadView(
+        string_pointer,
+        string_length,
+    ) orelse return null;
+    if (!contextFromHandle(process).blobLedger().contains(handle.toBits())) return null;
+    // Rooted in the ledger-verified owned reference, so the count is pinned
+    // above zero; a failed retain is unreachable for an owned handle, and
+    // declining here would still be sound (the caller promotes a copy).
+    if (!runtime_state.blob_domain.tryRetain(handle)) return null;
+    return string_pointer;
+}
+
+/// Promote a string's bytes into a fresh blob at the SEND BOUNDARY — the
+/// one copy of the string's cross-process life. The new blob's single
+/// reference IS the flight reference (no ledger entry anywhere): it is
+/// consumed by receiver adoption (`zap_blob_adopt`), released by the sender
+/// on dead-letter, or released by the envelope reclaim hook
+/// (`zap_blob_flight_release`). Returns the payload pointer (page-slack
+/// capacity included, so the receiver can append in place), or null on
+/// allocation failure / table exhaustion (the runtime panics — OOM posture).
+export fn zap_blob_string_create_flight(
+    bytes_pointer: [*]const u8,
+    byte_length: usize,
+) callconv(.c) ?[*]const u8 {
+    const handle = runtime_state.blob_domain.createFromParts(
+        bytes_pointer[0..byte_length],
+        &.{},
+        0,
+    ) catch return null;
+    return runtime_state.blob_domain.payloadPointer(handle).?;
+}
+
+/// String concat over a blob-backed base — the `String.concat` integration
+/// (the `<>` operator's runtime). Two legs, one call:
+///
+///   * **rc==1 in-place append** (the Erlang writable-binary optimization):
+///     when the base is the whole view of a blob this process solely owns
+///     and the capacity has room, `extra` is copied in at the frontier and
+///     `out_payload` is the UNCHANGED base pointer — no allocation, no
+///     copy of the base.
+///   * **copy-on-shared / growth re-promotion**: otherwise a fresh blob is
+///     created carrying `base ++ extra` with capacity ≥ 2× the base blob's
+///     (geometric growth — amortized O(1) per appended byte), recorded in
+///     the caller's ledger, and `out_payload` is the NEW payload. The base
+///     blob's ledger reference is deliberately KEPT (it drains at teardown):
+///     same-process aliases of the base string must stay readable, exactly
+///     the bump-arena lifetime discipline ordinary strings already have.
+///
+/// Returns `ok` with `out_payload` set, `string_not_blob_backed` when the
+/// base is not this process's whole-blob view (the runtime keeps its
+/// ordinary string path), or `out_of_memory`.
+export fn zap_blob_string_concat(
+    process: *anyopaque,
+    base_pointer: [*]const u8,
+    base_length: usize,
+    extra_pointer: [*]const u8,
+    extra_length: usize,
+    out_payload: *?[*]const u8,
+) callconv(.c) i32 {
+    out_payload.* = null;
+    const handle = runtime_state.blob_domain.resolveWholePayloadView(
+        base_pointer,
+        base_length,
+    ) orelse return ZapProcStatus.string_not_blob_backed;
+    const ledger = contextFromHandle(process).blobLedger();
+    if (!ledger.contains(handle.toBits())) return ZapProcStatus.string_not_blob_backed;
+
+    const extra = extra_pointer[0..extra_length];
+    if (runtime_state.blob_domain.tryAppendInPlace(handle, base_length, extra)) {
+        out_payload.* = base_pointer;
+        return ZapProcStatus.ok;
+    }
+
+    // Shared (frozen) or out of capacity: re-promote with geometric growth.
+    const base = base_pointer[0..base_length];
+    const base_capacity = runtime_state.blob_domain.payloadCapacity(handle).?;
+    const growth_capacity = std.math.mul(usize, base_capacity, 2) catch
+        return ZapProcStatus.out_of_memory;
+    const promoted = runtime_state.blob_domain.createFromParts(base, extra, growth_capacity) catch
+        return ZapProcStatus.out_of_memory;
+    ledger.append(promoted.toBits()) catch {
+        _ = runtime_state.blob_domain.release(promoted);
+        return ZapProcStatus.out_of_memory;
+    };
+    out_payload.* = runtime_state.blob_domain.payloadPointer(promoted).?;
+    return ZapProcStatus.ok;
 }
 
 /// Terminate the calling process NORMALLY (reason `normal`, P5-J1): the same
@@ -3389,4 +3515,270 @@ test "abi: the blob registry survives the publisher's death; get grants a teardo
     // runtime deinit releases it and asserts zero live blobs (the
     // shutdown leak-exactness gate).
     try testing.expectEqual(@as(u64, 1), zap_blob_live_count());
+}
+
+// ---------------------------------------------------------------------------
+// Blob-backed String tier — kernel-level lifecycle proofs (P6-J3).
+//
+// The Zap-visible behavior is covered by
+// `test_concurrency/string_blob_test.zap`; these tests pin the
+// `zap_blob_string_*` ABI contract underneath it: promotion at the send
+// boundary (create_flight), layout recognition + the ledger ownership gate
+// (string_flight_retain / string_concat decline anything that is not the
+// CALLING process's whole-blob view), the rc==1 in-place append vs the
+// copy-on-shared re-promotion, and the sender-dies-receiver-survives +
+// teardown leak-exactness legs.
+// ---------------------------------------------------------------------------
+
+/// Probe for the single-process string-tier semantics proof.
+const StringTierSemanticsProbe = struct {
+    promoted_payload_nonnull: bool = false,
+    adopt_handle_nonzero: bool = false,
+    whole_view_retains: bool = false,
+    stale_frontier_declines: bool = false,
+    append_status: i32 = std.math.minInt(i32),
+    append_in_place: bool = false,
+    appended_bytes_match: bool = false,
+    shared_append_status: i32 = std.math.minInt(i32),
+    shared_append_copied: bool = false,
+    shared_base_frozen: bool = false,
+    foreign_base_declines: bool = false,
+    live_count_inside: u64 = 0,
+};
+
+fn stringTierSemanticsEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *StringTierSemanticsProbe = @ptrCast(@alignCast(argument.?));
+    const original = "promoted string payload";
+
+    // Promote (the send-boundary copy) and adopt the flight reference into
+    // our own ledger — the exact pair a self-send performs.
+    const payload = zap_blob_string_create_flight(original.ptr, original.len) orelse return;
+    probe.promoted_payload_nonnull = true;
+    probe.adopt_handle_nonzero = zap_blob_adopt(process, payload) != 0;
+
+    // The whole-blob view retains (the zero-copy forward half)...
+    if (zap_blob_string_flight_retain(process, payload, original.len)) |retained| {
+        probe.whole_view_retains = retained == payload;
+        zap_blob_flight_release(retained);
+    }
+
+    // rc==1 in-place append: same pointer out, frontier grows.
+    var out_payload: ?[*]const u8 = null;
+    probe.append_status = zap_blob_string_concat(
+        process,
+        payload,
+        original.len,
+        "!",
+        1,
+        &out_payload,
+    );
+    const grown_length = original.len + 1;
+    probe.append_in_place = out_payload == payload;
+    probe.appended_bytes_match =
+        std.mem.eql(u8, payload[0..grown_length], "promoted string payload!");
+
+    // ...after which the STALE frontier view no longer resolves (a shorter
+    // alias never rides the share tier or clobbers the longer one).
+    probe.stale_frontier_declines =
+        zap_blob_string_flight_retain(process, payload, original.len) == null;
+
+    // Shared → frozen: with a second (flight) reference outstanding, the
+    // append must COPY into a fresh blob and leave the base untouched.
+    const held = zap_blob_string_flight_retain(process, payload, grown_length).?;
+    var shared_out: ?[*]const u8 = null;
+    probe.shared_append_status = zap_blob_string_concat(
+        process,
+        payload,
+        grown_length,
+        "?",
+        1,
+        &shared_out,
+    );
+    probe.shared_append_copied = shared_out != null and shared_out != payload;
+    probe.shared_base_frozen =
+        std.mem.eql(u8, payload[0..grown_length], "promoted string payload!") and
+        shared_out != null and
+        std.mem.eql(u8, shared_out.?[0 .. grown_length + 1], "promoted string payload!?");
+    zap_blob_flight_release(held);
+
+    // A base that is not blob-backed declines — the runtime keeps its
+    // ordinary string path. (Deterministic: even if the stack buffer lands
+    // at the payload page offset by chance, no live slot's header can sit
+    // on this stack page, so the address round-trip rejects it.)
+    var foreign_buffer: [64]u8 = @splat('f');
+    var foreign_out: ?[*]const u8 = null;
+    probe.foreign_base_declines = zap_blob_string_concat(
+        process,
+        &foreign_buffer,
+        foreign_buffer.len,
+        "x",
+        1,
+        &foreign_out,
+    ) == ZapProcStatus.string_not_blob_backed and foreign_out == null;
+
+    // Two blobs live: the appended original + the shared-append copy, both
+    // ledger-owned. Die WITHOUT releasing — the teardown drain frees both
+    // (asserted by the test body and the runtime deinit's zero-live gate).
+    probe.live_count_inside = zap_blob_live_count();
+}
+
+test "abi: string tier — promote/adopt, rc==1 in-place append, freeze-on-share copy, decline gates, teardown drain" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    var probe = StringTierSemanticsProbe{};
+    const process_bits = zap_proc_spawn(stringTierSemanticsEntry, &probe);
+    try testing.expect(process_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expect(probe.promoted_payload_nonnull);
+    try testing.expect(probe.adopt_handle_nonzero);
+    try testing.expect(probe.whole_view_retains);
+    try testing.expectEqual(ZapProcStatus.ok, probe.append_status);
+    try testing.expect(probe.append_in_place);
+    try testing.expect(probe.appended_bytes_match);
+    try testing.expect(probe.stale_frontier_declines);
+    try testing.expectEqual(ZapProcStatus.ok, probe.shared_append_status);
+    try testing.expect(probe.shared_append_copied);
+    try testing.expect(probe.shared_base_frozen);
+    try testing.expect(probe.foreign_base_declines);
+    try testing.expectEqual(@as(u64, 2), probe.live_count_inside);
+    // The teardown ledger drain released both blobs.
+    try testing.expectEqual(@as(u64, 0), zap_blob_live_count());
+}
+
+/// Probe for the promoted-string send / sender-dies proof.
+const StringSendProbe = struct {
+    receiver_pid_bits: u64 = 0,
+    send_status: i32 = std.math.minInt(i32),
+    /// Payload identity the SENDER observed at promotion.
+    sender_identity: u64 = 0,
+    /// The sender does NOT own the flight blob (promotion is flight-only):
+    /// the ownership gate must decline its own probe of the payload.
+    sender_probe_declined: bool = false,
+    /// What the RECEIVER observed after the sender died.
+    receiver_payload_len: usize = 0,
+    receiver_identity: u64 = 0,
+    receiver_bytes_match: bool = false,
+    receiver_share_count: i64 = -99,
+    receiver_append_in_place: bool = false,
+    receiver_appended_bytes_match: bool = false,
+};
+
+const string_send_payload = "the string outlives its sender by riding the share tier";
+
+fn stringSendSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *StringSendProbe = @ptrCast(@alignCast(argument.?));
+
+    // Hand the receiver our pid first (pairwise FIFO — it arrives ahead of
+    // the string envelope) so it can monitor our death.
+    var self_bits = zap_proc_self(process);
+    _ = zap_proc_send(process, probe.receiver_pid_bits, @ptrCast(&self_bits), @sizeOf(u64));
+
+    // Promote at the send boundary — the runtime's large-string send: one
+    // copy into the blob domain, the single reference riding as flight.
+    const payload = zap_blob_string_create_flight(
+        string_send_payload.ptr,
+        string_send_payload.len,
+    ).?;
+    probe.sender_identity = @intFromPtr(payload);
+
+    // The ownership gate: this process holds NO ledger reference to the
+    // flight blob, so probing it declines (flight references belong to the
+    // envelope, never to a ledger).
+    probe.sender_probe_declined =
+        zap_blob_string_flight_retain(process, payload, string_send_payload.len) == null;
+
+    probe.send_status = zap_proc_send_moved(
+        process,
+        probe.receiver_pid_bits,
+        payload,
+        string_send_payload.len, // the STRING length rides the envelope
+        zap_blob_flight_release,
+    );
+    // Die immediately: nothing of the string tethers to this process.
+}
+
+fn stringSendReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *StringSendProbe = @ptrCast(@alignCast(argument.?));
+
+    // (1) The sender's pid.
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    var envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    std.debug.assert(payload_len == @sizeOf(u64));
+    var sender_bits: u64 = undefined;
+    @memcpy(std.mem.asBytes(&sender_bits), payload_pointer.?[0..@sizeOf(u64)]);
+    zap_proc_envelope_free(envelope);
+
+    // (2) The string envelope: adopt the flight reference; the received
+    // string is the payload view itself — zero bytes copied.
+    envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    const moved_root = zap_proc_envelope_take_moved(envelope).?;
+    std.debug.assert(zap_blob_adopt(process, moved_root) != 0);
+    zap_proc_envelope_free(envelope);
+    const received: []const u8 = moved_root[0..payload_len];
+
+    // (3) Wait for the sender to be FULLY dead.
+    _ = zap_proc_monitor(process, sender_bits);
+    _ = zap_proc_await_signal(process);
+
+    // (4) The dead sender's bytes: alive, byte-identical, SAME address.
+    probe.receiver_payload_len = received.len;
+    probe.receiver_identity = @intFromPtr(received.ptr);
+    probe.receiver_bytes_match = std.mem.eql(u8, received, string_send_payload);
+
+    // (5) Sole holder after the sender's death → the in-place append works
+    // on the received string directly (the accumulate-received-chunks
+    // pattern), pointer unchanged.
+    const handle_bits = concurrency.BlobDomain.handleForPayloadPointer(received.ptr).toBits();
+    probe.receiver_share_count = zap_blob_share_count(process, handle_bits);
+    var out_payload: ?[*]const u8 = null;
+    const append_status = zap_blob_string_concat(
+        process,
+        received.ptr,
+        received.len,
+        " -- appended by the receiver",
+        28,
+        &out_payload,
+    );
+    probe.receiver_append_in_place = append_status == ZapProcStatus.ok and
+        out_payload == received.ptr;
+    probe.receiver_appended_bytes_match = std.mem.eql(
+        u8,
+        received.ptr[0 .. received.len + 28],
+        string_send_payload ++ " -- appended by the receiver",
+    );
+    // Die without releasing: the teardown drain is the last release.
+}
+
+test "abi: string tier — a promoted string send survives its sender at the same address; the receiver appends in place" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    var probe = StringSendProbe{};
+    const receiver_bits = zap_proc_spawn(stringSendReceiverEntry, &probe);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.receiver_pid_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(stringSendSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expectEqual(ZapProcStatus.ok, probe.send_status);
+    try testing.expect(probe.sender_probe_declined);
+    // Zero copy: the receiver's STRING is the sender's promoted payload —
+    // pointer identity across the process boundary and the sender's death.
+    try testing.expectEqual(string_send_payload.len, probe.receiver_payload_len);
+    try testing.expect(probe.sender_identity != 0);
+    try testing.expectEqual(probe.sender_identity, probe.receiver_identity);
+    try testing.expect(probe.receiver_bytes_match);
+    // After the sender's death the receiver was the SOLE holder, so the
+    // append ran in place on the shared-tier buffer.
+    try testing.expectEqual(@as(i64, 1), probe.receiver_share_count);
+    try testing.expect(probe.receiver_append_in_place);
+    try testing.expect(probe.receiver_appended_bytes_match);
+    // Both processes are dead; the teardown drains freed the blob.
+    try testing.expectEqual(@as(u64, 0), zap_blob_live_count());
 }

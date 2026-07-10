@@ -3733,6 +3733,96 @@ const ProcessManagerBinding = extern struct {
 /// concurrency gate.
 var concurrency_bootstrap_binding: ProcessManagerBinding = undefined;
 
+// ============================================================
+// Blob-backed String tier — the large-string share policy (P6-J3,
+// plan item 6.3; zap-concurrency-research.md §5.4)
+//
+// A Zap `String` is a bare `[]const u8`. Under the concurrency gate,
+// LARGE strings ride the `Zap.Blob` share tier so a cross-process
+// string send is a zero-copy handle share instead of the deep-copy
+// walker's byte-copy:
+//
+//   * **Send-boundary promotion.** A top-level `Process.send` of a
+//     string at or above `string_blob_promotion_threshold` copies the
+//     bytes ONCE into a fresh blob (`zap_blob_string_create_flight`)
+//     whose single reference rides the moved envelope as the flight
+//     reference — replacing the walker path's three copies (serialize,
+//     kernel mailbox, receiver reconstruct). A string that is ALREADY
+//     blob-backed (a received large string, or an append-promoted
+//     accumulator) skips even that one copy: the send is an atomic
+//     retain and a pointer (`zap_blob_string_flight_retain`).
+//   * **Zero-copy adoption.** The receiver's string IS the blob payload
+//     view (`decodeReceivedEnvelope`'s string arm); the flight
+//     reference transfers to the receiver's ledger and drains at its
+//     teardown — the same process-lifetime discipline adopted walker
+//     strings already have (P3-J4: individually unreclaimed, freed with
+//     the process).
+//   * **Copy-out slices, airtight.** Only the WHOLE-payload view of a
+//     blob ever shares (the kernel probe rejects prefixes/interior
+//     slices), so a slice crossing a process boundary is always a fresh
+//     copy: a small view can never pin a large payload in another
+//     process — the Erlang sub-binary / pre-7u6 Java substring pin
+//     pathology is defeated by construction (§5.4 resolution 1).
+//   * **rc==1 in-place append.** `String.concat` over a blob-backed
+//     base appends IN PLACE when the blob's atomic count is exactly 1
+//     (sole owner — no other process, envelope, or registry entry can
+//     observe the mutation; the Erlang writable-binary optimization)
+//     and copies into a geometrically-grown fresh blob when shared or
+//     full (`zap_blob_string_concat`). Once shared, a payload is frozen
+//     forever from the appender's point of view.
+//
+// Locally-constructed strings that are never sent NEVER touch the blob
+// domain (no construction-time promotion in v1): the local-only string
+// paths — arena concat/extend, interpolation, every `String.*` builder
+// — are byte-for-byte what they were, gate-ON and gate-OFF. With the
+// gate OFF this whole section folds away (comptime branches on
+// `runtime_concurrency_active`); gate-OFF strings are untouched.
+//
+// v1 exclusions (mirroring the `Zap.Blob` v1 scope): strings nested in
+// `List`/`Map`/struct payloads keep the walker byte-copy (an interior
+// flight reference would leak through dead-letter/teardown — the
+// documented serialized-payload-cleanup follow-on), and correlated
+// `call`/`Task` replies keep the walker copy (`zap_proc_send_correlated`
+// carries bytes only — the same exclusion as Blob correlated replies).
+// The ~15-byte SSO and any full String-representation change are
+// FORMALLY DEFERRED (plan item 6.3a): they require a new String value
+// layout, out of scope for the send-path tier.
+// ============================================================
+
+/// Heap→Blob promotion threshold in bytes: a top-level string send at or
+/// above this length rides the blob share tier; below it, the walker's
+/// byte-copy. MEASURED, not guessed — `bench/concurrency-copy/
+/// run-string-blob-bench.sh` (ledger § "P6-J3 string-blob crossover",
+/// `docs/concurrency-bench-results.md`): against the substrate-honest
+/// walker model (whose receiver copy is page-backed above the ARC slab
+/// boundary, exactly the gate-ON `readStringCopy` route), one-shot
+/// promotion crosses over between 32 KiB (walker 3.4 µs vs promote
+/// 3.8 µs) and 64 KiB (6.9 µs vs 5.5 µs) on Apple Silicon; 64 KiB is the
+/// smallest power of two where promotion wins outright, so no one-shot
+/// send regresses at any size. Above it the win compounds: an
+/// already-backed string RE-sends (a pipeline forward, an accumulator
+/// re-send) at a flat ~42 ns — 165× at 64 KiB, ~2,400× at 1 MB — and the
+/// payload survives its sender for free. 64 KiB also bounds the
+/// receiver-side page-rounding overhead to ≤1.25× at the threshold.
+/// Tune by re-running the benchmark; Erlang's 64-BYTE instinct does NOT
+/// transfer — its refc binaries come from a fitted binary allocator,
+/// Zap's blob domain from whole mmap'd pages (~1.5 µs a create).
+const string_blob_promotion_threshold: usize = 65536;
+
+/// Cached blob-payload page layout (`{page_mask, payload_offset}`) for the
+/// inline pre-filter on the string-concat hot path: a pointer can only be
+/// a blob payload if `address & page_mask == payload_offset`, so ordinary
+/// arena/rodata strings skip the C-ABI probe on one mask-and-compare.
+/// Written exactly once by `concurrencyStartupForEntry` (before any
+/// scheduler thread runs Zap code), read-only afterwards; `page_mask == 0`
+/// means "not initialized" and disables the blob concat path (kernel
+/// tests and host builds never initialize it).
+const StringBlobLayout = struct {
+    page_mask: usize = 0,
+    payload_offset: usize = 0,
+};
+var string_blob_layout: StringBlobLayout = .{};
+
 /// Extern mirror of the kernel's C-ABI intrinsic bridge. MUST stay
 /// signature-identical to the `export fn zap_proc_*` declarations in
 /// `src/runtime/concurrency/abi.zig` (the authoritative ABI contract,
@@ -3814,6 +3904,28 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_blob_adopt(process: *anyopaque, payload_pointer: [*]const u8) callconv(.c) u64;
     extern fn zap_blob_registry_put(process: *anyopaque, key: u64, handle_bits: u64) callconv(.c) i32;
     extern fn zap_blob_registry_get(process: *anyopaque, key: u64) callconv(.c) u64;
+    // P6-J3 Blob-backed String tier (plan item 6.3): the string-shaped
+    // entries over the same domain — layout recognition of whole-blob
+    // string views (`abi.zig`'s `zap_blob_string_*` section for the full
+    // contract), send-boundary promotion, and the rc==1 in-place append.
+    extern fn zap_blob_string_payload_offset() callconv(.c) u64;
+    extern fn zap_blob_string_flight_retain(
+        process: *anyopaque,
+        string_pointer: [*]const u8,
+        string_length: usize,
+    ) callconv(.c) ?[*]const u8;
+    extern fn zap_blob_string_create_flight(
+        bytes_pointer: [*]const u8,
+        byte_length: usize,
+    ) callconv(.c) ?[*]const u8;
+    extern fn zap_blob_string_concat(
+        process: *anyopaque,
+        base_pointer: [*]const u8,
+        base_length: usize,
+        extra_pointer: [*]const u8,
+        extra_length: usize,
+        out_payload: *?[*]const u8,
+    ) callconv(.c) i32;
     extern fn zap_proc_exit(process: *anyopaque) callconv(.c) noreturn;
     extern fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void;
     /// `Process.blocking` (P4-J3): run `operation` on the blocking / dirty-
@@ -3966,6 +4078,16 @@ fn concurrencyStartupForEntry() void {
     // (`process.zig`, `zap_proc_active_arc_context`).
     concurrency_bootstrap_binding = .{ .core = manager_core, .context = bootstrap_context };
     ZapConcurrencyKernel.zap_proc_active_arc_context = @ptrCast(&concurrency_bootstrap_binding);
+
+    // P6-J3 Blob-backed String tier: cache the blob payload page layout for
+    // the inline pre-filter on the string-concat hot path (`blobStringConcat`
+    // — one mask-and-compare instead of a C-ABI call per concat). Written
+    // exactly once here, before any scheduler thread runs Zap code, and
+    // read-only forever after (no synchronization needed).
+    string_blob_layout = .{
+        .page_mask = std.heap.pageSize() - 1,
+        .payload_offset = @intCast(ZapConcurrencyKernel.zap_blob_string_payload_offset()),
+    };
 
     // LIFO ordering: registered AFTER `zapMemoryShutdownAtexit`
     // (registered inside `zapMemoryStartup` above), so this handler
@@ -5396,6 +5518,18 @@ pub const ProcessRuntime = struct {
             ));
         }
 
+        // Large top-level `String` (P6-J3, plan item 6.3): ride the blob
+        // share tier — an already-blob-backed string shares by pointer
+        // (zero copy), anything else promotes with ONE copy into the blob
+        // domain — instead of the walker's serialize + kernel + reconstruct
+        // three-copy path. Below the measured threshold the walker path
+        // stays cheaper (see `string_blob_promotion_threshold`).
+        if (comptime MessageType == []const u8) {
+            if (message.len >= string_blob_promotion_threshold) {
+                return sendLargeStringMessage(target_pid_bits, message);
+            }
+        }
+
         // Rich payloads (`String` / `List` / `Map` / struct): deep-copy the
         // value graph into a neutral blob (`serializeMessage`), hand the bytes
         // to the kernel (which copies them into the mailbox ledger), then free
@@ -5438,6 +5572,48 @@ pub const ProcessRuntime = struct {
             target_pid_bits,
             flight_payload,
             flight_byte_length,
+            blobFlightReclaim,
+        );
+        if (status == 0) return true;
+        // Not delivered: the flight reference has no consumer — undo it.
+        ZapConcurrencyKernel.zap_blob_flight_release(flight_payload);
+        return interpretSendStatus(status);
+    }
+
+    /// Send one large top-level string to `target_pid_bits` through the blob
+    /// share tier (P6-J3). Two legs:
+    ///
+    ///   * the string is ALREADY this process's whole-blob view (a received
+    ///     large string, or an append-promoted accumulator): one atomic
+    ///     flight retain, zero bytes copied — the sender keeps its own
+    ///     reference and its string stays readable;
+    ///   * anything else (arena/rodata backing, or a sub-view of a blob —
+    ///     the copy-out-slices law): promote with ONE copy into a fresh
+    ///     blob whose single reference IS the flight reference.
+    ///
+    /// Either way the envelope carries the payload pointer plus the STRING
+    /// length (the receiver's view — the blob's capacity/frontier are the
+    /// tier's internals), with `blobFlightReclaim` as the leak-exactness
+    /// hook for an envelope drained at receiver teardown. On dead-letter or
+    /// enqueue failure nothing consumed the flight reference; undo it here
+    /// (the P6-J2 discipline).
+    fn sendLargeStringMessage(target_pid_bits: u64, message: []const u8) bool {
+        const process = requireCurrentProcessHandle();
+        const flight_payload = ZapConcurrencyKernel.zap_blob_string_flight_retain(
+            process,
+            message.ptr,
+            message.len,
+        ) orelse ZapConcurrencyKernel.zap_blob_string_create_flight(
+            message.ptr,
+            message.len,
+        ) orelse @panic(
+            "zap: Process.send failed inside the concurrency runtime (out of memory promoting the string to the blob share tier)",
+        );
+        const status = ZapConcurrencyKernel.zap_proc_send_moved(
+            process,
+            target_pid_bits,
+            flight_payload,
+            message.len,
             blobFlightReclaim,
         );
         if (status == 0) return true;
@@ -5683,6 +5859,27 @@ pub const ProcessRuntime = struct {
             var blob_message: MessageType = undefined;
             @field(blob_message, blob_handle_field_name) = handle_bits;
             return blob_message;
+        }
+
+        // Large blob-backed `String` receive (P6-J3): the envelope carries
+        // the shared payload pointer plus the STRING length. Adopt the
+        // flight reference into this process's ledger (drained at teardown
+        // — the same process-lifetime discipline adopted walker strings
+        // already have) and return the payload view ITSELF as the string:
+        // zero bytes copied, the received string's pointer IS the sender's.
+        // A copied (sub-threshold) string payload takes the walker decode
+        // below unchanged.
+        if (comptime MessageType == []const u8) {
+            if (ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope)) |moved_root| {
+                const handle_bits = ZapConcurrencyKernel.zap_blob_adopt(
+                    requireCurrentProcessHandle(),
+                    moved_root,
+                );
+                if (handle_bits == 0) @panic(
+                    "zap: Process.receive out of memory recording the received String's blob reference",
+                );
+                return moved_root[0..payload_len];
+            }
         }
 
         if (ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope)) |moved_root| {
@@ -13019,6 +13216,16 @@ pub const String = struct {
     /// satisfied.
     pub fn concat(a: []const u8, b: []const u8) []const u8 {
         if (b.len == 0) return a;
+        // P6-J3 Blob-backed String tier: a blob-backed base (a received
+        // large string, or a previous blob concat's result) extends inside
+        // the blob domain — rc==1 in place (the Erlang writable-binary
+        // optimization), copy-on-shared otherwise — so accumulators built
+        // from received strings stay zero-copy sendable. Every other base
+        // (the entirety of gate-OFF, and every never-shared local string
+        // gate-ON) takes the arena path below unchanged.
+        if (comptime runtime_concurrency_active) {
+            if (blobBackedConcat(a, b)) |extended| return extended;
+        }
         if (a.len > 0 and tryArenaExtend(a, a.len + b.len)) {
             recordBump(.string_concat, b.len);
             const extended = @as([*]u8, @constCast(a.ptr))[0 .. a.len + b.len];
@@ -13030,6 +13237,41 @@ pub const String = struct {
         @memcpy(result[0..a.len], a);
         @memcpy(result[a.len..], b);
         return result;
+    }
+
+    /// The blob-tier leg of `concat` (P6-J3): when `a` is the calling
+    /// process's whole-blob-backed string view, extend it through
+    /// `zap_blob_string_concat` — in place when the blob's count is 1
+    /// (sole owner) and capacity allows, else into a geometrically-grown
+    /// fresh blob (the base blob's ledger reference is kept, so aliases of
+    /// `a` stay readable — the arena discipline). Returns null when `a` is
+    /// not a blob string (the caller's arena path handles it), which the
+    /// two inline pre-filters answer for almost every call without a
+    /// C-ABI crossing: a blob-backed string is never shorter than the
+    /// promotion threshold, and its pointer always sits at the blob
+    /// payload page offset.
+    fn blobBackedConcat(a: []const u8, b: []const u8) ?[]const u8 {
+        if (a.len < string_blob_promotion_threshold) return null;
+        const layout = string_blob_layout;
+        if (layout.page_mask == 0) return null; // tier not initialized
+        if ((@intFromPtr(a.ptr) & layout.page_mask) != layout.payload_offset) return null;
+        const process = ZapConcurrencyKernel.zap_proc_current() orelse return null;
+        var out_payload: ?[*]const u8 = null;
+        const status = ZapConcurrencyKernel.zap_blob_string_concat(
+            process,
+            a.ptr,
+            a.len,
+            b.ptr,
+            b.len,
+            &out_payload,
+        );
+        return switch (status) {
+            0 => out_payload.?[0 .. a.len + b.len], // ok — in place or promoted
+            2 => null, // string_not_blob_backed — the arena path's case
+            else => @panic(
+                "zap: String concat failed inside the concurrency runtime (out of memory growing the blob-backed string)",
+            ),
+        };
     }
 
     pub fn length(s: []const u8) i64 {
@@ -13082,6 +13324,17 @@ pub const String = struct {
     pub fn from_byte(byte: i64) []const u8 {
         const b: u8 = @intCast(@as(u64, @bitCast(byte)) & 0xFF);
         return byte_intern_table[b .. b + 1];
+    }
+
+    /// Opaque identity token of the string's backing buffer (its address
+    /// bits): equal tokens ⟺ the SAME bytes in memory. The pointer-
+    /// identity witness of the Blob-backed String tier's zero-copy tests
+    /// (P6-J3) — send a large string plus its identity to another
+    /// process, and the receiver's matching token proves no byte was
+    /// copied. Diagnostics only; meaningless beyond equality comparison
+    /// within one run.
+    pub fn identity(s: []const u8) u64 {
+        return @intFromPtr(s.ptr);
     }
 
     /// Lexicographic byte-wise comparison. Returns a negative integer

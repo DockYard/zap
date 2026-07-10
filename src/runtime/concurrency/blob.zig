@@ -43,6 +43,48 @@
 //!   construction (rev-2 §5.4 resolution 1); an explicit opt-in aliasing
 //!   view is the documented FOLLOW-ON (resolution 4), not the default.
 //!
+//! ## The Blob-backed String tier (P6-J3, plan item 6.3)
+//!
+//! Large `String` values ride this domain so a cross-process string send
+//! is a zero-copy handle share instead of the deep-copy walker's
+//! byte-copy (rev-2 §5.4). The domain provides the MECHANISM only —
+//! policy (the promotion threshold, when a send promotes) lives in the
+//! runtime (`src/runtime.zig`). Three mechanisms:
+//!
+//! * **Recognition by layout, not by type** (`resolveWholePayloadView`).
+//!   A Zap `String` is a bare `[]const u8` — there is no room in the
+//!   value for a handle — so a blob-backed string is recognized from its
+//!   pointer: every payload sits at exactly `header_byte_length` bytes
+//!   past a page boundary (the page allocator returns page-aligned
+//!   blocks), so a candidate pointer at any other page offset is
+//!   rejected without touching memory, and a pointer AT that offset has
+//!   its 24 preceding same-page bytes read as a `BlobHeader` whose
+//!   handle must round-trip through the slot table back to this exact
+//!   payload address. A false positive is therefore impossible: the
+//!   probe accepts only pointers whose preceding header IS a live slot's
+//!   real header. The probe accepts only the WHOLE-payload view
+//!   (`length == byte_length`) — a prefix or interior slice NEVER
+//!   shares (it re-copies at the boundary), which is what makes the
+//!   copy-out-slices law airtight cross-process: no small view can pin
+//!   a large payload in another process.
+//! * **Capacity slack + `createFromParts`.** Every payload allocation is
+//!   rounded up to whole pages (free real-memory-wise under the page
+//!   allocator) and the slack recorded as `payload_capacity`, so a
+//!   string-backing blob has append room. `createFromParts` builds a
+//!   promoted concat result (`base ++ extra`) in one copy with a
+//!   caller-chosen minimum capacity (the geometric-growth hook).
+//! * **rc==1 in-place append** (`tryAppendInPlace`) — the Erlang
+//!   writable-binary optimization. When the share count is EXACTLY 1 and
+//!   the caller owns that one reference, no other holder exists anywhere
+//!   — no process, no in-flight envelope, no registry entry — so
+//!   appending within capacity mutates nothing any other holder can
+//!   observe: immutability is OBSERVATIONALLY absolute for every holder
+//!   that is not the sole owner. The append writes only at the frontier
+//!   (`[byte_length, byte_length+extra)`), so even same-process aliases
+//!   (whose extent is ≤ the frontier by construction) see unchanged
+//!   bytes. Once shared (count > 1) the payload is frozen forever from
+//!   the appender's point of view — the caller copies instead.
+//!
 //! ## Constraint 3 — the atomic confinement contract
 //!
 //! Zap's ordinary ARC is NON-atomic by sacred invariant (every
@@ -61,10 +103,15 @@
 //! `.release` store of the slot state), `BlobSlot.header`/`byte_length`
 //! (written only while the slot is privately held — before publication
 //! or after winning the freeing CAS — with the spinlock's release/acquire
-//! edge ordering one slot life against the next), every per-process
-//! `BlobLedger` (owner-only, like all PCB state), and everything outside
-//! this module — ordinary Zap ARC stays non-atomic, which the Constraint
-//! 3 audit greps for.
+//! edge ordering one slot life against the next; PLUS the one sanctioned
+//! sole-owner mutation: `tryAppendInPlace` writes them when the share
+//! count is exactly 1 and the caller owns that reference, so no
+//! concurrent access can exist, and any LATER cross-thread reader is
+//! ordered behind the append by the flight-retain CAS release/acquire
+//! edge the share must cross first), every per-process `BlobLedger`
+//! (owner-only, like all PCB state), and everything outside this module
+//! — ordinary Zap ARC stays non-atomic, which the Constraint 3 audit
+//! greps for.
 //!
 //! ## Why the count lives in the SLOT, not the payload header
 //!
@@ -179,19 +226,31 @@ const SlotState = packed struct(u64) {
 // ---------------------------------------------------------------------------
 
 /// Header of one blob payload allocation: `[BlobHeader | bytes]` in a
-/// single page-allocator allocation. Both fields are IMMUTABLE after
-/// creation — they exist so the in-flight message path (which carries
-/// only the payload pointer through a moved envelope) can resolve back
-/// to the owning slot (`handle_bits`) and so the free path knows the
-/// allocation length without touching the slot.
+/// single page-allocator allocation. `handle_bits` and
+/// `payload_capacity` are IMMUTABLE after creation; `byte_length` is
+/// mutable ONLY by the sole-owner in-place append (`tryAppendInPlace` —
+/// module doc, "The Blob-backed String tier"). The header exists so the
+/// in-flight message path (which carries only the payload pointer
+/// through a moved envelope) can resolve back to the owning slot
+/// (`handle_bits`) and so the free path knows the allocation length
+/// without touching the slot.
 pub const BlobHeader = struct {
     /// The owning handle's bits — written once at create, read by
     /// `handleForPayloadPointer` (the moved-envelope reclaim/adopt path).
     handle_bits: u64,
-    /// Payload byte length (excluding this header).
+    /// Payload byte length (excluding this header). Grows — never
+    /// shrinks — under `tryAppendInPlace`'s sole-owner discipline.
     byte_length: usize,
+    /// Payload byte CAPACITY of the allocation (excluding this header):
+    /// the page-rounding slack plus any extra the creator requested
+    /// (`createFromParts`'s `minimum_capacity`). `byte_length ≤
+    /// payload_capacity` always; the free path computes the allocation
+    /// length from THIS field, never from `byte_length`.
+    payload_capacity: usize,
 
-    /// First payload byte (carved from the same allocation).
+    /// First payload byte (carved from the same allocation). Pure
+    /// pointer arithmetic — never dereferences the header — so it is
+    /// also safe on a header pointer read from a slot mid-probe.
     pub fn payloadPointer(header: *const BlobHeader) [*]const u8 {
         const raw: [*]const u8 = @ptrCast(header);
         return raw + header_byte_length;
@@ -204,8 +263,18 @@ pub const BlobHeader = struct {
 };
 
 /// Header bytes preceding the payload, rounded so the payload starts at
-/// the header's alignment boundary (byte payloads need no more).
+/// the header's alignment boundary (byte payloads need no more). This is
+/// also the payload's fixed PAGE OFFSET (allocations are page-aligned
+/// and page-rounded), which `resolveWholePayloadView`'s memory-safe
+/// probe rests on; `payloadPageOffset` exports it across the C ABI.
 const header_byte_length = std.mem.alignForward(usize, @sizeOf(BlobHeader), @alignOf(BlobHeader));
+
+/// The fixed page offset of every blob payload (see `header_byte_length`)
+/// — the runtime side caches it at startup for its inline pre-filter on
+/// the string-concat hot path.
+pub fn payloadPageOffset() usize {
+    return header_byte_length;
+}
 
 // ---------------------------------------------------------------------------
 // Slot table geometry
@@ -223,21 +292,39 @@ const slots_per_segment: u32 = 1024;
 /// `create` loudly (`error.BlobTableExhausted`), never silently.
 const max_segment_count: u32 = 1024;
 
-/// One slot of the blob table. `state` is the ONLY cross-thread-mutated
-/// field; the plain fields are written exclusively while the slot is
+/// One slot of the blob table. `state` carries the retain/release
+/// protocol; `header_address` and `byte_length` are ATOMIC WORDS (loads/
+/// stores only, no RMW) because the string-tier probe
+/// (`resolveWholePayloadView`) may legally read them for a blob the
+/// caller does NOT own — a garbage candidate pointer whose preceding
+/// bytes happen to name a live foreign slot — racing that owner's
+/// create/append/free. The atomicity keeps that read formally race-free;
+/// a stale value is harmless (the probe's validation chain rejects it,
+/// and every USE of a resolved handle re-validates through its own
+/// generation-checked CAS). They are written only while the slot is
 /// privately held (before the publishing state store, or after winning
-/// the freeing CAS) and their visibility across slot lives rides the
-/// domain lock's release/acquire edge (module doc).
+/// the freeing CAS) or by the sole-owner append (module doc).
 const BlobSlot = struct {
     /// Packed `{share_count, generation}` — see `SlotState`.
     state: std.atomic.Value(u64),
-    /// The payload allocation, null while the slot is vacant.
-    header: ?*BlobHeader,
+    /// Address of the payload allocation's `BlobHeader`, 0 while the
+    /// slot is vacant. See `headerPointer`.
+    header_address: std.atomic.Value(usize),
     /// Payload byte length mirror (advisory reads — `byteLength` — read
-    /// it after a generation validation without touching the header).
-    byte_length: usize,
+    /// it after a generation validation without touching the header;
+    /// grown by the sole-owner append in lockstep with the header's).
+    byte_length: std.atomic.Value(usize),
     /// Intrusive free-list link (slot index; guarded by the domain lock).
     next_free: u32,
+
+    /// The payload header this slot currently owns, or null when vacant.
+    /// Callers must have validated the slot state first (the publishing
+    /// `.release`/`.acquire` pair is what makes the pointee visible).
+    fn headerPointer(slot: *const BlobSlot) ?*BlobHeader {
+        const address = slot.header_address.load(.monotonic);
+        if (address == 0) return null;
+        return @ptrFromInt(address);
+    }
 };
 
 /// Free-list terminator for `BlobSlot.next_free`.
@@ -427,20 +514,53 @@ pub const BlobDomain = struct {
     /// that reference (the surface records it in the calling process's
     /// ledger).
     pub fn create(domain: *BlobDomain, bytes: []const u8) CreateError!BlobHandle {
+        return domain.createFromParts(bytes, &.{}, 0);
+    }
+
+    /// Create a blob whose payload is `first ++ second` (one copy each —
+    /// the promoted-concat constructor of the Blob-backed String tier;
+    /// `create` is the `second`-empty special case), with a payload
+    /// capacity of at least `minimum_capacity` bytes (the geometric-
+    /// growth hook for the append path). The allocation is rounded up to
+    /// whole pages — free in real memory under the page allocator — and
+    /// the whole rounded size is recorded as `payload_capacity`, so
+    /// every blob carries its natural append slack.
+    pub fn createFromParts(
+        domain: *BlobDomain,
+        first: []const u8,
+        second: []const u8,
+        minimum_capacity: usize,
+    ) CreateError!BlobHandle {
+        const byte_length = std.math.add(usize, first.len, second.len) catch
+            return error.OutOfMemory;
+        const requested_capacity = @max(byte_length, minimum_capacity);
+        const padded_byte_length = std.math.add(usize, header_byte_length, requested_capacity) catch
+            return error.OutOfMemory;
+        const allocation_byte_length = std.mem.alignForward(
+            usize,
+            padded_byte_length,
+            std.heap.pageSize(),
+        );
         const allocation = backing_allocator.alignedAlloc(
             u8,
             .of(BlobHeader),
-            header_byte_length + bytes.len,
+            allocation_byte_length,
         ) catch return error.OutOfMemory;
         errdefer backing_allocator.free(allocation);
+        // The probe precondition (`resolveWholePayloadView`): the page
+        // allocator returns page-aligned blocks, so every payload sits at
+        // page offset `header_byte_length`.
+        std.debug.assert(@intFromPtr(allocation.ptr) % std.heap.pageSize() == 0);
         const header: *BlobHeader = @ptrCast(@alignCast(allocation.ptr));
-        header.byte_length = bytes.len;
-        @memcpy(allocation[header_byte_length..], bytes);
+        header.byte_length = byte_length;
+        header.payload_capacity = allocation_byte_length - header_byte_length;
+        @memcpy(allocation[header_byte_length..][0..first.len], first);
+        @memcpy(allocation[header_byte_length + first.len ..][0..second.len], second);
 
         const acquired = try domain.acquireSlot();
         header.handle_bits = acquired.handle.toBits();
-        acquired.slot.header = header;
-        acquired.slot.byte_length = bytes.len;
+        acquired.slot.header_address.store(@intFromPtr(header), .monotonic);
+        acquired.slot.byte_length.store(byte_length, .monotonic);
         // Publish: count 1, this generation. `.release` orders the
         // header/payload writes above before any acquire-load of the
         // state — a reader that validates the generation is guaranteed
@@ -525,7 +645,7 @@ pub const BlobDomain = struct {
         const slot = domain.slotPointer(handle) orelse return null;
         const state: SlotState = @bitCast(slot.state.load(.acquire));
         if (state.generation != handle.generation or state.share_count == 0) return null;
-        return slot.byte_length;
+        return slot.byte_length.load(.monotonic);
     }
 
     /// A BORROWED view of the payload bytes, or null when the handle is
@@ -536,7 +656,7 @@ pub const BlobDomain = struct {
         const slot = domain.slotPointer(handle) orelse return null;
         const state: SlotState = @bitCast(slot.state.load(.acquire));
         if (state.generation != handle.generation or state.share_count == 0) return null;
-        const header = slot.header.?;
+        const header = slot.headerPointer().?;
         return header.payloadPointer()[0..header.byte_length];
     }
 
@@ -549,6 +669,104 @@ pub const BlobDomain = struct {
         return state.share_count;
     }
 
+    /// Payload byte capacity (allocation slack included), or null when
+    /// the handle is stale. The append path's growth arithmetic and the
+    /// capacity tests read this.
+    pub fn payloadCapacity(domain: *BlobDomain, handle: BlobHandle) ?usize {
+        const slot = domain.slotPointer(handle) orelse return null;
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        if (state.generation != handle.generation or state.share_count == 0) return null;
+        return slot.headerPointer().?.payload_capacity;
+    }
+
+    // -- the Blob-backed String tier (P6-J3) ----------------------------------
+
+    /// The rc==1 in-place append (module doc, "The Blob-backed String
+    /// tier"): when the blob is live, the share count is EXACTLY 1, the
+    /// caller's view is the current frontier (`frontier_length ==
+    /// byte_length` — appending behind the frontier would clobber bytes
+    /// a longer same-process alias may still read), and the capacity has
+    /// room, copy `extra` in at the frontier and grow `byte_length`.
+    /// Returns false — mutating NOTHING — when any condition fails; the
+    /// caller then copies (the shared/full path).
+    ///
+    /// CALLER CONTRACT: the caller must OWN the single reference (the
+    /// ABI layer verifies the handle against the calling process's
+    /// ledger first). That ownership is what makes the non-atomic header
+    /// mutation sound: with count == 1 and the 1 provably ours, no other
+    /// process, envelope, or registry entry holds the blob, and no
+    /// concurrent retain can exist (every retain must be rooted in an
+    /// existing owned reference). Immutability stays observationally
+    /// absolute for any holder that is not the sole owner — a holder
+    /// that could observe the mutation cannot exist while it happens,
+    /// and any holder that comes into existence LATER (a share) is
+    /// ordered behind it by the flight-retain CAS edge.
+    pub fn tryAppendInPlace(
+        domain: *BlobDomain,
+        handle: BlobHandle,
+        frontier_length: usize,
+        extra: []const u8,
+    ) bool {
+        const slot = domain.slotPointer(handle) orelse return false;
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        if (state.generation != handle.generation or state.share_count != 1) return false;
+        const header = slot.headerPointer().?;
+        if (header.byte_length != frontier_length) return false;
+        if (header.payload_capacity - header.byte_length < extra.len) return false;
+        const destination: [*]u8 = @constCast(header.payloadPointer());
+        // `extra` may alias a prefix of this very payload (`s <> s.slice`):
+        // the destination starts at the frontier and every legal alias
+        // ends at or before it, so source and destination are disjoint.
+        @memcpy(destination[frontier_length .. frontier_length + extra.len], extra);
+        header.byte_length = frontier_length + extra.len;
+        slot.byte_length.store(header.byte_length, .monotonic);
+        return true;
+    }
+
+    /// Recognize a `{pointer, length}` pair as the WHOLE-payload view of
+    /// a live blob — the string-tier probe (module doc, "Recognition by
+    /// layout"). Returns the owning handle, or null for anything else.
+    ///
+    /// Memory safety of the probe: bytes are only ever read at
+    /// `pointer - header_byte_length` AFTER the page-offset filter
+    /// proves that address lies on the SAME page as `pointer` (a mapped
+    /// page, since the caller's slice is readable), so a non-blob
+    /// candidate can never fault. Correctness: a garbage header can
+    /// only be accepted if its handle bits resolve to a live slot WHOSE
+    /// OWN header sits exactly `header_byte_length` bytes before
+    /// `pointer` — in which case the bytes read ARE that blob's real
+    /// header and the recognition is true, not a false positive.
+    ///
+    /// Only the exact whole view (`length == byte_length`) resolves:
+    /// a prefix alias re-copies at every boundary (the copy-out-slices
+    /// law — a short view must never pin a long payload in another
+    /// process). Racing frees (possible only for a probe on a blob the
+    /// caller does NOT own) fail the generation validation or the
+    /// address round-trip and return null — and every USE of a resolved
+    /// handle (flight retain, append) re-validates through its own
+    /// generation-checked CAS anyway.
+    pub fn resolveWholePayloadView(
+        domain: *BlobDomain,
+        pointer: [*]const u8,
+        length: usize,
+    ) ?BlobHandle {
+        // A zero-length slice's pointer may dangle (Zig's `&.{}`), so the
+        // "same mapped page" premise below needs length ≥ 1. Zero-length
+        // strings are never blob-backed anyway.
+        if (length == 0) return null;
+        const address = @intFromPtr(pointer);
+        if (address % std.heap.pageSize() != header_byte_length) return null;
+        const header: *const BlobHeader = @ptrFromInt(address - header_byte_length);
+        const handle = BlobHandle.fromBits(header.handle_bits);
+        const slot = domain.slotPointer(handle) orelse return null;
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        if (state.generation != handle.generation or state.share_count == 0) return null;
+        const slot_header = slot.headerPointer() orelse return null;
+        if (@intFromPtr(slot_header) + header_byte_length != address) return null;
+        if (slot.byte_length.load(.monotonic) != length) return null;
+        return handle;
+    }
+
     // -- the in-flight (moved-envelope) seam ---------------------------------
 
     /// The payload pointer for a live blob the caller owns, or null when
@@ -559,7 +777,7 @@ pub const BlobDomain = struct {
         const slot = domain.slotPointer(handle) orelse return null;
         const state: SlotState = @bitCast(slot.state.load(.acquire));
         if (state.generation != handle.generation or state.share_count == 0) return null;
-        return slot.header.?.payloadPointer();
+        return slot.headerPointer().?.payloadPointer();
     }
 
     /// Recover the handle from a payload pointer (the receive/adopt and
@@ -720,8 +938,8 @@ pub const BlobDomain = struct {
             // Generation 1 is the first issued generation (0 is the
             // reserved invalid — a zero handle never validates).
             .state = .init(@bitCast(SlotState{ .share_count = 0, .generation = 1 })),
-            .header = null,
-            .byte_length = 0,
+            .header_address = .init(0),
+            .byte_length = .init(0),
             .next_free = no_free_slot,
         };
         // Publish the carve AFTER the slot (and its segment pointer) are
@@ -742,14 +960,14 @@ pub const BlobDomain = struct {
     /// release/acquire edge orders this slot life's plain-field reads
     /// before the next life's writes.
     fn destroyPayloadAndRecycleSlot(domain: *BlobDomain, slot_index: u32, slot: *BlobSlot) void {
-        const header = slot.header.?;
-        const allocation_length = header_byte_length + header.byte_length;
+        const header = slot.headerPointer().?;
+        const allocation_length = header_byte_length + header.payload_capacity;
         const raw: [*]align(@alignOf(BlobHeader)) u8 = @ptrCast(@alignCast(header));
         backing_allocator.free(raw[0..allocation_length]);
 
         domain.lockDomain();
-        slot.header = null;
-        slot.byte_length = 0;
+        slot.header_address.store(0, .monotonic);
+        slot.byte_length.store(0, .monotonic);
         slot.next_free = domain.free_list_head;
         domain.free_list_head = slot_index;
         std.debug.assert(domain.live_blob_count > 0);
@@ -1070,6 +1288,164 @@ test "BlobLedger: growth beyond the initial capacity keeps every entry" {
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_blob_count);
 }
 
+// -- the Blob-backed String tier (P6-J3) --------------------------------------
+
+test "BlobDomain: every payload sits at the fixed page offset with page-rounded capacity — the probe precondition" {
+    var domain = try BlobDomain.init();
+    defer domain.deinit();
+
+    const page_size = std.heap.pageSize();
+    const handle = try domain.create("probe precondition payload");
+    const payload = domain.payloadPointer(handle).?;
+    // The layout invariant `resolveWholePayloadView` rests on: payload at
+    // exactly `header_byte_length` past a page boundary.
+    try testing.expectEqual(header_byte_length, @intFromPtr(payload) % page_size);
+    try testing.expectEqual(header_byte_length, payloadPageOffset());
+    // Page-rounded capacity: the whole rounded allocation minus the header,
+    // never less than the payload itself.
+    const capacity = domain.payloadCapacity(handle).?;
+    try testing.expectEqual(page_size - header_byte_length, capacity);
+    try testing.expect(capacity >= domain.byteLength(handle).?);
+    _ = domain.release(handle);
+}
+
+test "BlobDomain: createFromParts concatenates both parts and honors the minimum capacity" {
+    var domain = try BlobDomain.init();
+    defer domain.deinit();
+
+    const page_size = std.heap.pageSize();
+    const handle = try domain.createFromParts("hello ", "world", 3 * page_size);
+    try testing.expectEqualSlices(u8, "hello world", domain.bytesView(handle).?);
+    try testing.expectEqual(@as(usize, 11), domain.byteLength(handle).?);
+    // minimum_capacity 3 pages → allocation rounds to 4 pages (header + 3
+    // pages of requested capacity spill into a fourth page).
+    try testing.expect(domain.payloadCapacity(handle).? >= 3 * page_size);
+    _ = domain.release(handle);
+}
+
+test "BlobDomain: tryAppendInPlace appends at the frontier when sole-owned; the pointer never moves" {
+    var domain = try BlobDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.create("frontier");
+    const payload_before = domain.payloadPointer(handle).?;
+    try testing.expect(domain.tryAppendInPlace(handle, 8, " grows"));
+    // Same buffer (no realloc), grown length, correct bytes.
+    try testing.expectEqual(payload_before, domain.payloadPointer(handle).?);
+    try testing.expectEqual(@as(usize, 14), domain.byteLength(handle).?);
+    try testing.expectEqualSlices(u8, "frontier grows", domain.bytesView(handle).?);
+
+    // A second append continues from the NEW frontier; the stale frontier
+    // is rejected (a shorter alias must never clobber a longer one).
+    try testing.expect(!domain.tryAppendInPlace(handle, 8, "clobber"));
+    try testing.expect(domain.tryAppendInPlace(handle, 14, "!"));
+    try testing.expectEqualSlices(u8, "frontier grows!", domain.bytesView(handle).?);
+    _ = domain.release(handle);
+}
+
+test "BlobDomain: tryAppendInPlace refuses a shared blob and never mutates it — observational immutability" {
+    var domain = try BlobDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.create("shared payload");
+    try testing.expect(domain.tryRetain(handle)); // a second holder exists
+    try testing.expect(!domain.tryAppendInPlace(handle, 14, " mutation"));
+    // Frozen: length and bytes unchanged for the other holder.
+    try testing.expectEqual(@as(usize, 14), domain.byteLength(handle).?);
+    try testing.expectEqualSlices(u8, "shared payload", domain.bytesView(handle).?);
+
+    // Back to sole ownership (the other holder released): appendable again
+    // — rc==1 is the whole test, not "never shared in the past".
+    _ = domain.release(handle);
+    try testing.expect(domain.tryAppendInPlace(handle, 14, " again"));
+    try testing.expectEqualSlices(u8, "shared payload again", domain.bytesView(handle).?);
+    _ = domain.release(handle);
+}
+
+test "BlobDomain: tryAppendInPlace refuses an append beyond the capacity" {
+    var domain = try BlobDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.create("x");
+    const capacity = domain.payloadCapacity(handle).?;
+    const oversized = try backing_allocator.alloc(u8, capacity);
+    defer backing_allocator.free(oversized);
+    @memset(oversized, 'y');
+    // 1 (frontier) + capacity > capacity → refuse, mutate nothing.
+    try testing.expect(!domain.tryAppendInPlace(handle, 1, oversized));
+    try testing.expectEqual(@as(usize, 1), domain.byteLength(handle).?);
+    // Exactly filling the capacity is legal.
+    try testing.expect(domain.tryAppendInPlace(handle, 1, oversized[0 .. capacity - 1]));
+    try testing.expectEqual(capacity, domain.byteLength(handle).?);
+    _ = domain.release(handle);
+}
+
+test "BlobDomain: resolveWholePayloadView accepts exactly the whole live view and nothing else" {
+    var domain = try BlobDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.create("resolve me by layout");
+    const payload = domain.payloadPointer(handle).?;
+    const byte_length = domain.byteLength(handle).?;
+
+    // The whole view resolves to the owning handle.
+    const resolved = domain.resolveWholePayloadView(payload, byte_length).?;
+    try testing.expectEqual(handle.toBits(), resolved.toBits());
+
+    // A prefix view does NOT resolve (the copy-out-slices law: a short
+    // view never rides the share tier).
+    try testing.expect(domain.resolveWholePayloadView(payload, byte_length - 1) == null);
+    // An interior pointer fails the page-offset filter without any read.
+    try testing.expect(domain.resolveWholePayloadView(payload + 1, byte_length - 1) == null);
+    // An ordinary heap slice is rejected.
+    const foreign = try backing_allocator.alloc(u8, 64);
+    defer backing_allocator.free(foreign);
+    try testing.expect(domain.resolveWholePayloadView(foreign.ptr, 64) == null);
+    // A zero-length view never resolves (and must not read behind a
+    // possibly-dangling pointer).
+    try testing.expect(domain.resolveWholePayloadView(payload, 0) == null);
+
+    // A STALE header — the exact bytes of a real header, still mapped
+    // after its blob was freed (a probe input can never be unmapped
+    // memory: every Zap string is readable, and a blob-backed string's
+    // blob is ledger-pinned for the string's whole life; this fake page
+    // models leftover header bytes in recycled memory). The generation
+    // bumped in the freeing CAS, so the probe rejects it.
+    const stale_page = try backing_allocator.alignedAlloc(u8, .of(BlobHeader), std.heap.pageSize());
+    defer backing_allocator.free(stale_page);
+    const live_header: [*]const u8 = @ptrCast(BlobHeader.fromPayloadPointer(payload));
+    @memcpy(stale_page[0..header_byte_length], live_header[0..header_byte_length]);
+    // While the blob lives, the copied header still fails (address
+    // round-trip: the slot's header is not on this page)...
+    try testing.expect(domain.resolveWholePayloadView(
+        stale_page.ptr + header_byte_length,
+        byte_length,
+    ) == null);
+    // ...and after the free it fails one gate earlier (stale generation).
+    _ = domain.release(handle);
+    try testing.expect(domain.resolveWholePayloadView(
+        stale_page.ptr + header_byte_length,
+        byte_length,
+    ) == null);
+}
+
+test "BlobDomain: resolveWholePayloadView tracks the frontier across in-place appends" {
+    var domain = try BlobDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.create("frontier view");
+    const payload = domain.payloadPointer(handle).?;
+    try testing.expect(domain.tryAppendInPlace(handle, 13, " grew"));
+    // The OLD whole view is now a prefix — it must no longer resolve —
+    // and the new frontier view resolves.
+    try testing.expect(domain.resolveWholePayloadView(payload, 13) == null);
+    try testing.expectEqual(
+        handle.toBits(),
+        domain.resolveWholePayloadView(payload, 18).?.toBits(),
+    );
+    _ = domain.release(handle);
+}
+
 // -- multi-threaded atomic-tier stress (the TSan proof surface) --------------
 
 /// One worker of the atomic-tier stress: hammers retain/release on the
@@ -1192,6 +1568,131 @@ test "BlobDomain: cross-thread retain/release/read + lock-free registry get unde
     // The final registry value survives until deinit's sweep (asserted
     // leak-exact by the deferred deinit).
     try testing.expectEqual(@as(u32, 1), domain.statistics().live_blob_count);
+}
+
+/// One worker of the string-tier stress: runs a PRIVATE append chain
+/// (create → in-place appends → geometric re-promotion, the exact
+/// mechanism sequence `String.concat` drives) while probing the SHARED
+/// frozen blobs and adversarial fake-header candidates from its own OS
+/// thread. Private chains never race (sole-owner discipline); the probes
+/// are the cross-thread surface under test.
+const StringTierWorker = struct {
+    domain: *BlobDomain,
+    shared_handle: BlobHandle,
+    shared_payload: [*]const u8,
+    shared_byte_length: usize,
+    /// A page-aligned NON-blob buffer primed with a byte-copy of the
+    /// shared blob's header — the adversarial false-positive candidate:
+    /// its handle bits name a LIVE blob, so only the address round-trip
+    /// can reject it.
+    fake_header_page: [*]const u8,
+    rounds: usize,
+    failed: bool = false,
+
+    fn run(worker: *StringTierWorker) void {
+        var round: usize = 0;
+        while (round < worker.rounds) : (round += 1) {
+            // Private append chain: create, fill the slack, re-promote once.
+            const first = worker.domain.create("chain-seed") catch {
+                worker.failed = true;
+                return;
+            };
+            var frontier: usize = "chain-seed".len;
+            const capacity = worker.domain.payloadCapacity(first).?;
+            while (worker.domain.tryAppendInPlace(first, frontier, "-append")) {
+                frontier += "-append".len;
+            }
+            if (capacity - frontier >= "-append".len) {
+                worker.failed = true; // the loop must stop only at capacity
+                return;
+            }
+            const view = worker.domain.bytesView(first).?;
+            const grown = worker.domain.createFromParts(view, "-grown", capacity * 2) catch {
+                worker.failed = true;
+                return;
+            };
+            if (worker.domain.payloadCapacity(grown).? < capacity * 2) worker.failed = true;
+            const grown_view = worker.domain.bytesView(grown).?;
+            if (!std.mem.eql(u8, grown_view[0..10], "chain-seed")) worker.failed = true;
+            if (!std.mem.eql(u8, grown_view[grown_view.len - 6 ..], "-grown")) worker.failed = true;
+            // The grown blob's whole view resolves; the superseded one too
+            // (both are live and this worker owns them).
+            if (worker.domain.resolveWholePayloadView(grown_view.ptr, grown_view.len) == null) {
+                worker.failed = true;
+            }
+            _ = worker.domain.release(first);
+            _ = worker.domain.release(grown);
+
+            // Cross-thread probes of the SHARED frozen blob: the whole view
+            // resolves, a prefix and an interior pointer never do.
+            const resolved = worker.domain.resolveWholePayloadView(
+                worker.shared_payload,
+                worker.shared_byte_length,
+            ) orelse {
+                worker.failed = true;
+                return;
+            };
+            if (resolved.toBits() != worker.shared_handle.toBits()) worker.failed = true;
+            if (worker.domain.resolveWholePayloadView(
+                worker.shared_payload,
+                worker.shared_byte_length - 1,
+            ) != null) worker.failed = true;
+            if (worker.domain.resolveWholePayloadView(
+                worker.shared_payload + 1,
+                worker.shared_byte_length - 1,
+            ) != null) worker.failed = true;
+
+            // Adversarial fake-header candidate racing the other workers'
+            // create/free churn: handle bits name a live blob, address
+            // round-trip must reject it — every time.
+            if (worker.domain.resolveWholePayloadView(
+                worker.fake_header_page + header_byte_length,
+                worker.shared_byte_length,
+            ) != null) worker.failed = true;
+        }
+    }
+};
+
+test "BlobDomain: string-tier append chains + probes race across threads — no false positive, exact counts" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var domain = try BlobDomain.init();
+    defer domain.deinit();
+
+    const shared = try domain.create("shared frozen string payload");
+    const shared_payload = domain.payloadPointer(shared).?;
+    const shared_byte_length = domain.byteLength(shared).?;
+
+    // Prime the adversarial candidate: a page-aligned non-blob buffer whose
+    // first bytes are a byte-copy of the shared blob's REAL header.
+    const fake_page = try backing_allocator.alignedAlloc(u8, .of(BlobHeader), std.heap.pageSize());
+    defer backing_allocator.free(fake_page);
+    const real_header: [*]const u8 = @ptrCast(BlobHeader.fromPayloadPointer(shared_payload));
+    @memcpy(fake_page[0..header_byte_length], real_header[0..header_byte_length]);
+
+    const worker_count = 6;
+    var workers: [worker_count]StringTierWorker = undefined;
+    for (&workers) |*worker| {
+        worker.* = .{
+            .domain = &domain,
+            .shared_handle = shared,
+            .shared_payload = shared_payload,
+            .shared_byte_length = shared_byte_length,
+            .fake_header_page = fake_page.ptr,
+            .rounds = 2_000,
+        };
+    }
+    var threads: [worker_count]std.Thread = undefined;
+    for (&threads, &workers) |*thread, *worker| {
+        thread.* = try std.Thread.spawn(.{}, StringTierWorker.run, .{worker});
+    }
+    for (&threads) |*thread| thread.join();
+    for (&workers) |*worker| try testing.expect(!worker.failed);
+
+    // Quiescence: every chain blob was released; only the shared one lives.
+    try testing.expectEqual(@as(u32, 1), domain.statistics().live_blob_count);
+    try testing.expectEqual(BlobDomain.ReleaseOutcome.freed, domain.release(shared));
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_blob_count);
 }
 
 test "BlobDomain: concurrent create/release churn across threads — slot recycling stays exact" {

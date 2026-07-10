@@ -2048,6 +2048,108 @@ blocking / dirty-scheduler pool + the `Process.blocking` fiber-evacuation handof
 — is what P4-J3 built (`src/runtime/concurrency/blocking_pool.zig`,
 `ProcessContext.blocking`; proven in `blocking_stress.zig`).
 
+## P6-J3 string-blob crossover (2026-07-10) — the `string_blob_promotion_threshold` measurement
+
+**VERDICT: the promotion threshold ships at 64 KiB (`string_blob_promotion_threshold
+= 65536`, `src/runtime.zig`).** On the substrate-honest comparison (below), one-shot
+promotion crosses over between 32 KiB and 64 KiB; 64 KiB is the smallest power of
+two where promotion wins outright, so **no one-shot send regresses at any size**,
+and above it the compounding wins engage: a RE-send of an already-backed string (a
+pipeline forward, an accumulator re-send, a registry-style fan-out) is a flat
+**~42 ns at every size — 165× at 64 KiB, ~2,400× at 1 MB** — and the payload
+survives its sender for free (the sender-dies guarantee costs nothing extra).
+Local-only strings are untouched BY CONSTRUCTION (no construction-time promotion;
+the arena concat/interpolation/builder paths are byte-for-byte pre-P6-J3, gate-ON
+and gate-OFF), so the "not hurt local-only strings" half of the tuning criterion
+holds trivially — verified by the gate-ON Zap test "locally-constructed large
+strings never touch the blob domain" and by the CLBG k-nucleotide spot-check on
+the unchanged gate-OFF path (strings are its hot path): output byte-identical
+to `expected.txt`, 380.5 ms ± 64.5 (min 315.0, 10 runs, hyperfine, post-change
+HEAD compiler) vs the 750 ms recorded ARC baseline — unregressed.
+
+### Methodology
+
+- **Date:** 2026-07-10. Same machine as the series (MacBook Air `Mac16,13`,
+  Apple M4, 10 cores, 32 GB). **Load 1-min ~5–6.5 during the runs** (agent
+  sessions active) — medians carry that load; the mins are the load-robust
+  floor; the walker-vs-promote RELATIVE ordering is what the threshold reads,
+  and both alternate inside the same sampling loop (fair under load).
+- **Harness:** `bench/concurrency-copy/string-blob-bench.zig` (runner
+  `run-string-blob-bench.sh`; NOT throwaway — re-run to retune), fork compiler,
+  `-OReleaseFast`, real runtime + real ARC manager module graph (E6
+  conventions: `CLOCK_UPTIME_RAW`, warmup + 7 reps pooled → median/min/p99,
+  anti-elision checksums printed).
+- **Columns (per string size, ns/op):**
+  1. **walker (warm-arena C)** — `serializeMessage` (Copy A) + kernel-transport
+     `@memcpy` model (Copy B) + `deserializeMessage` (Copy C into the
+     gate-OFF `runtime_arena`). This is the GATE-OFF substrate — an
+     UNDERESTIMATE of the real gate-ON walker at >4096 B (see column 2).
+  2. **walker (page-backed C)** — same A + B, with Copy C allocated from the
+     page allocator: the REAL gate-ON receiver substrate for large strings
+     (`readStringCopy` → `containerBufferAlloc` routes >4096-byte buffers to
+     page-backed large allocations — the P3-J5 slab boundary) plus its
+     teardown munmap. **This is the honest comparison column.**
+  3. **promote** — `BlobDomain.createFromParts` (the ONE copy: mmap + memcpy +
+     slot publish) + the receive side's header→handle recovery + payload
+     touch + release (the teardown drain's munmap): the full steady-state
+     lifecycle of one promoted send.
+  4. **share** — the already-backed re-send: whole-view probe
+     (`resolveWholePayloadView`) + atomic flight retain + payload touch +
+     release. Zero copies, size-independent.
+
+### Results (median / min / p99 ns per op, 7 reps)
+
+| Bytes | walker warm-arena C | walker page-backed C (honest) | promote | share |
+|---:|---:|---:|---:|---:|
+| 256 | 42 / 0 / 84 | 792 / 625 / 1,500 | 1,584 / 1,083 / 3,375 | ~42 flat |
+| 1,024 | 42 / 0 / 84 | 875 / 666 / 1,792 | 1,584 / 1,083 / 3,500 | ~42 flat |
+| 4,096 | 208 / 125 / 375 | 1,167 / 791 / 2,041 | 1,792 / 1,167 / 3,500 | ~42 flat |
+| 8,192 | 416 / 250 / 667 | 1,333 / 916 / 2,625 | 2,000 / 1,250 / 4,209 | ~42 flat |
+| 16,384 | 667 / 500 / 3,542 | 1,542 / 1,208 / 2,917 | 2,625 / 1,958 / 7,083 | ~42 flat |
+| 32,768 | 2,041 / 1,500 / 4,708 | 3,375 / 2,667 / 7,584 | 3,750 / 2,833 / 8,916 | ~42 flat |
+| **65,536** | 3,750 / 2,542 / 5,459 | **6,875 / 5,167 / 12,583** | **5,458 / 4,208 / 11,875** | ~42 flat |
+| 262,144 | 13,500 / 11,083 / 26,584 | 23,417 / 19,500 / 33,750 | 16,833 / 13,875 / 26,208 | ~42 flat |
+| 1,048,576 | 67,459 / 53,334 / 136,500 | 99,667 / 83,209 / 152,667 | 67,917 / 55,209 / 103,166 | ~42 flat |
+
+Reading: promote is mmap-dominated (~1.5 µs flat floor — Erlang's 64-BYTE
+threshold instinct does NOT transfer: its refc binaries come from a fitted
+binary allocator, Zap's blob domain from whole mmap'd pages), so tiny strings
+must stay on the walker. Against the honest column the crossover falls between
+32 KiB (3.4 vs 3.8 µs — walker ahead) and 64 KiB (6.9 vs 5.5 µs — promote
+ahead, widening to 1.4× at 256 KiB and 1 MB). The 42 ns share row is the tier's
+actual prize: every send of a string that is ALREADY blob-backed — including
+every hop after the first in a pipeline — costs a probe + one atomic retain.
+
+### Append (the rc==1 in-place leg): 512 × 1 KiB chains, ns per appended KiB
+
+| blob in-place append | arena concat (the local path) |
+|---:|---:|
+| 96 med / 81 min | 23 med / 21 min |
+
+The blob frontier append is ~4× the arena's resize fast path per KiB —
+irrelevant to local-only strings (which never enter the tier) and the right
+trade for tier-resident accumulators: falling out of the tier would cost a
+fresh ≥1.5 µs re-promotion (plus a full re-copy) at the next send, ~15×
+the ~75 ns/KiB append premium for a typical 1 KiB chunk.
+
+### Memory-overhead note (why not lower than 64 KiB)
+
+An adopted blob string pins whole pages: `pageRound(24 + len)` bytes plus
+geometric append slack (capacity ≤ 2× after growth). At the 64 KiB threshold
+the page-rounding overhead is ≤1.25× (16 KiB pages); at a 4 KiB threshold it
+would be up to 4×. Receivers hold adopted strings until teardown (the same
+process-lifetime discipline P3-J4 gave adopted walker strings), so the
+overhead multiplies across a mailbox-heavy server's working set — another
+reason the threshold sits at the measured crossover rather than below it.
+
+### How to retune
+
+`cd bench/concurrency-copy && ./run-string-blob-bench.sh` on a quiet machine;
+move `string_blob_promotion_threshold` (`src/runtime.zig`) to the smallest
+power of two at or above the walker(page-backed-C)-vs-promote crossover; keep
+the gate-ON `test_concurrency/string_blob_test.zap` payload sizes at 2× the
+threshold.
+
 ## Baseline comparison yardstick
 
 External systems' spawn/RTT numbers (from `research-round-2.md` Q10) — the

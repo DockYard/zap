@@ -104,6 +104,25 @@ pub struct String {
   }
 
   @doc = """
+    Returns an opaque identity token for the string's backing buffer.
+    Two strings with equal tokens share the SAME bytes in memory — the
+    zero-copy witness of the large-string share tier: send a large
+    string to another process along with its identity, and the
+    receiver's `String.identity` returning the same token proves no
+    byte was copied. Intended for tests and diagnostics; the token is
+    meaningless beyond equality comparison within one run.
+
+    ## Examples
+
+        s = "witness"
+        String.identity(s) == String.identity(s)   # => true
+    """
+
+  pub fn identity(s :: String) -> u64 {
+    :zig.String.identity(s)
+  }
+
+  @doc = """
     Returns `true` if the string starts with the given prefix.
 
     ## Examples
