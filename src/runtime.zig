@@ -3827,6 +3827,7 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_trap_exit(process: *anyopaque) callconv(.c) bool;
     extern fn zap_proc_exit_reason(process: *anyopaque, reason_kind: u8, reason_term: u64) callconv(.c) noreturn;
     extern fn zap_proc_await_signal(process: *anyopaque) callconv(.c) u64;
+    extern fn zap_proc_await_signal_timeout(process: *anyopaque, timeout_nanoseconds: u64) callconv(.c) i32;
     extern fn zap_proc_last_signal_from(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_last_signal_ref(process: *anyopaque) callconv(.c) u64;
     extern fn zap_proc_last_signal_kind(process: *anyopaque) callconv(.c) i64;
@@ -5349,8 +5350,9 @@ pub const ProcessRuntime = struct {
         return receiveScalarMessage(u32);
     }
 
-    /// Blocking GENERIC receive: park until the mailbox is nonempty, then
-    /// reconstruct the oldest message as `MessageType` through the deep-copy
+    /// Blocking GENERIC receive: park until a USER message is queued (signal
+    /// envelopes are skipped and stay queued for `await_signal` — P5-R1), then
+    /// reconstruct the oldest user message as `MessageType` through the deep-copy
     /// walker (`deserializeMessage`), adopting its `List`/`Map`/`String`
     /// subterms as fresh receiver-owned copies. This is the decode behind
     /// every rich `receive`/`receive_raw` — the ZIR backend monomorphizes it
@@ -5503,11 +5505,33 @@ pub const ProcessRuntime = struct {
     }
 
     /// Blocking receive of the next signal message (raw J1 surface): consume the
-    /// mailbox head (an exit/`DOWN`), cache its fields, and return the reason as
+    /// oldest exit/`DOWN` — user messages are skipped and stay queued, in order,
+    /// for the typed receive (P5-R1) — cache its fields, and return the reason as
     /// its binary-global `u32` atom id. `last_signal_*` read the other fields.
     pub fn await_signal() u32 {
         requireConcurrencyRuntimeGate();
         return @truncate(ZapConcurrencyKernel.zap_proc_await_signal(requireCurrentProcessHandle()));
+    }
+
+    /// `await_signal` bounded by a deadline — the timed signal wait behind the
+    /// supervisor `:timeout` shutdown protocol (P5-R1). Blocks until a signal
+    /// is consumed (fields cached; read the reason via `last_signal_reason`)
+    /// or `timeout_milliseconds` elapses, returning whether a signal was
+    /// consumed. `timeout_milliseconds <= 0` probes once WITHOUT parking.
+    /// User messages are skipped and stay queued.
+    pub fn await_signal_timeout(timeout_milliseconds: i64) bool {
+        requireConcurrencyRuntimeGate();
+        const timeout_nanoseconds: u64 = if (timeout_milliseconds <= 0)
+            0
+        else
+            @as(u64, @intCast(timeout_milliseconds)) *| std.time.ns_per_ms;
+        const outcome = ZapConcurrencyKernel.zap_proc_await_signal_timeout(
+            requireCurrentProcessHandle(),
+            timeout_nanoseconds,
+        );
+        // 0 = a signal was consumed; 1 = timed out (see `abi.zig`'s
+        // ZapProcSignalWaitOutcome).
+        return outcome == 0;
     }
 
     /// The `from` pid bits of the most recently `await_signal`-consumed signal.
@@ -5554,13 +5578,15 @@ pub const ProcessRuntime = struct {
         return ZapConcurrencyKernel.zap_proc_whereis(requireCurrentProcessHandle(), @as(u64, name));
     }
 
-    /// Park the calling process until a message is at the mailbox head or
+    /// Park the calling process until a USER message is queued or
     /// `timeout_milliseconds` elapses — the `receive … after` timeout
-    /// mechanism. Returns `true` when a message is now deliverable (a
-    /// following `receive_*` pops it without blocking) and `false` on
-    /// timeout. `timeout_milliseconds <= 0` polls once WITHOUT parking
-    /// (`after 0`). Erlang-style millisecond durations, converted to the
-    /// kernel's nanosecond deadline here; the wait is non-consuming.
+    /// mechanism. Queued signal envelopes do NOT satisfy the wait (P5-R1:
+    /// the receive would skip them). Returns `true` when a user message is
+    /// now deliverable (a following `receive_*` takes it without blocking)
+    /// and `false` on timeout. `timeout_milliseconds <= 0` probes once
+    /// WITHOUT parking (`after 0`). Erlang-style millisecond durations,
+    /// converted to the kernel's nanosecond deadline here; the wait is
+    /// non-consuming.
     pub fn wait_for_message(timeout_milliseconds: i64) bool {
         requireConcurrencyRuntimeGate();
         const timeout_nanoseconds: u64 = if (timeout_milliseconds <= 0)

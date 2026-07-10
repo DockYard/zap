@@ -57,11 +57,15 @@
   receiver aborts at runtime rather than fabricating bytes. The
   `receive`/`after` LANGUAGE CONSTRUCT (plan item 2.3, P2-J3) is the
   surface for ordinary code: `receive <t> { <pattern> -> <body> … }`
-  blocks, pops the mailbox head, decodes it as the same fixed scalar
-  transport, and dispatches by pattern match (with an optional `after
-  <ms> -> <body>` timeout arm). Compiler-inferred per-process message
-  unions and exhaustiveness (plan item 2.2, P2-J4) will make its
-  explicit `<t>` token optional and prove every arm reachable.
+  blocks, takes the oldest USER message, decodes it as the same fixed
+  scalar transport, and dispatches by pattern match (with an optional
+  `after <ms> -> <body>` timeout arm). Signal envelopes (a trapped
+  `{'EXIT', …}` or a `{'DOWN', …}`) are NOT user messages: every
+  receive surface skips them, leaving them queued in order for
+  `await_signal` (Erlang: an unmatched trapped exit sits in the
+  mailbox). Compiler-inferred per-process message unions and
+  exhaustiveness (plan item 2.2, P2-J4) will make its explicit `<t>`
+  token optional and prove every arm reachable.
 
   ## Examples
 
@@ -181,6 +185,11 @@ pub struct Process {
     """
 
   pub fn spawn_link(entry :: fn() -> Nil) -> u64 {
+    # Register the kernel reason atoms BEFORE the link exists: a child that
+    # exits immediately must deliver its real reason atom (e.g. `:normal`),
+    # not the unregistered term, even when this spawn is the program's first
+    # signal operation.
+    _registered = ensure_reason_atoms_registered()
     :zig.ProcessRuntime.spawn_link_process(entry)
   }
 
@@ -200,6 +209,11 @@ pub struct Process {
     """
 
   pub fn spawn_monitor(entry :: fn() -> Nil) -> {u64, u64} {
+    # Register the kernel reason atoms BEFORE the monitor exists: a child
+    # that exits immediately must fire a `DOWN` carrying its real reason
+    # atom (e.g. `:normal`), not the unregistered term, even when this
+    # spawn is the program's first signal operation.
+    _registered = ensure_reason_atoms_registered()
     pid = :zig.ProcessRuntime.spawn_monitor_process(entry)
     ref = :zig.ProcessRuntime.spawn_monitor_ref()
     {pid, ref}
@@ -597,18 +611,37 @@ pub struct Process {
   }
 
   @doc = """
-    Sends a TRAPPABLE exit signal carrying `reason` (an atom) to `target_pid`.
-    `:normal` is special — it does NOT kill a non-trapping target (a trapping
-    one still receives `{'EXIT', From, :normal}`); any other reason kills a
-    non-trapping target (which then propagates the reason to ITS links) or is
-    delivered as a message to a trapping one. Returns `true` when the target
-    resolved (a signal to a dead process is a silent no-op, not an error). For
-    the untrappable kill, use `Process.kill`.
+    Sends an exit signal carrying `reason` (an atom) to `target_pid` — Erlang
+    `exit/2`, with its two special reasons implemented exactly:
+
+    - `:kill` is the UNTRAPPABLE kill: it routes to the kill path, so the
+      target dies with reason `:killed` REGARDLESS of `trap_exit` (identical
+      to `Process.kill`). Only `exit/2`'s literal `:kill` is untrappable — a
+      `:kill` that arrives by LINK cascade (a process that died calling
+      `Process.exit_with(:kill)`) is an ordinary trappable reason.
+    - `:normal` does NOT kill a non-trapping target (a trapping one still
+      receives `{'EXIT', From, :normal}`) — with ONE exception: sending
+      `:normal` to YOURSELF while not trapping terminates the caller with
+      reason `:normal` (erlang.org `exit/2`'s self-normal special case; the
+      call then never returns).
+
+    Any other reason kills a non-trapping target (which then propagates the
+    reason to ITS links) or is delivered as an `{'EXIT', From, Reason}`
+    message to a trapping one. Returns `true` when the target resolved (a
+    signal to a dead process is a silent no-op, not an error).
     """
 
   pub fn exit_signal(target_pid :: u64, reason :: Atom) -> Bool {
     _registered = ensure_reason_atoms_registered()
-    :zig.ProcessRuntime.send_exit_signal(target_pid, reason != :normal, reason)
+    case reason {
+      :kill -> :zig.ProcessRuntime.kill_process(target_pid)
+      :normal ->
+        case target_pid == Process.self() and Process.traps_exits() == false {
+          true -> Process.exit()
+          false -> :zig.ProcessRuntime.send_exit_signal(target_pid, false, :normal)
+        }
+      _ -> :zig.ProcessRuntime.send_exit_signal(target_pid, true, reason)
+    }
   }
 
   @doc = """
@@ -638,12 +671,20 @@ pub struct Process {
 
   @doc = """
     Blocks until the next SIGNAL message (a trapped `{'EXIT', …}` or a
-    `{'DOWN', …}`) is at the mailbox head, consumes it, and returns its reason
-    as an `Atom`. The other fields of the just-consumed signal are read with
-    `last_signal_from`, `last_signal_ref`, and `last_signal_kind`. This is the
-    raw primitive a trapping/monitoring process uses to observe a signal; the
-    typed `receive` construct (J2/J3) decodes signals into tuples. Aborts if the
-    mailbox head is an ordinary user message.
+    `{'DOWN', …}`) is queued, consumes the OLDEST one, and returns its reason
+    as an `Atom`. Ordinary user messages are SKIPPED and stay queued, in
+    order, for the typed `receive` (Erlang selective-receive semantics — a
+    registered process sent unrelated user messages still observes its
+    signals; the skipped messages are never consumed or reordered). The other
+    fields of the just-consumed signal are read with `last_signal_from`,
+    `last_signal_ref`, and `last_signal_kind`.
+
+    This is the raw primitive a trapping/monitoring process uses to observe a
+    signal. The typed `receive` construct is the mirror image: it consumes
+    only USER messages, skipping queued signals (which stay queued for this
+    surface) — decoding signals into `{'EXIT', from, reason}` /
+    `{'DOWN', ref, pid, reason}` tuples inside `receive` is planned as
+    concurrency plan item 5.5 and NOT yet available.
     """
 
   pub fn await_signal() -> Atom {

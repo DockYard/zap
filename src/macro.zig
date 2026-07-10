@@ -4926,12 +4926,15 @@ pub const MacroEngine = struct {
     // `receive`/`after` desugar (concurrency plan Phase 2 item 2.3)
     //
     // `receive T { arms }` becomes a `case` over a blocking
-    // `:zig.ProcessRuntime.receive_<t>()` decode of the mailbox head. The
-    // optional `after D -> body` timeout arm wraps that dispatch in a
-    // second `case` over `:zig.ProcessRuntime.wait_for_message(D)` (true =
-    // a message arrived within D, so pop+dispatch; false = timed out, so
-    // run the timeout body). `after 0` polls once without blocking. An
-    // unmatched message routes through a synthesized dead-letter catch-all
+    // `:zig.ProcessRuntime.receive_<t>()` decode of the oldest USER
+    // message (signal envelopes are skipped and stay queued for
+    // `await_signal` — P5-R1). The optional `after D -> body` timeout arm
+    // wraps that dispatch in a second `case` over
+    // `:zig.ProcessRuntime.wait_for_message(D)` (true = a user message
+    // arrived within D, so take+dispatch; false = timed out, so run the
+    // timeout body — queued signals do not satisfy the wait). `after 0`
+    // polls once without blocking. An unmatched message routes through a
+    // synthesized dead-letter catch-all
     // (`:zig.ProcessRuntime.dead_letter_unexpected()`) rather than the
     // panicking `match_fail` a bare non-exhaustive `case` would emit.
     // ============================================================

@@ -165,6 +165,87 @@ pub struct TestConcurrency.SupervisorTest {
     }
   }
 
+  describe("stray signals during teardown (P5-R1 S1)") {
+    test("one_for_all collects a stray sibling crash during a timeout shutdown without hanging") {
+      # THE hang scenario: one_for_all A,B,C; C crashes; during the
+      # right-to-left shutdown sweep B (a trapping child that ignores its
+      # shutdown request) holds the sweep open for its :timeout window; A
+      # crashes spontaneously inside that window. The supervisor must
+      # COLLECT A's exit (not discard it), skip A in the sweep (no reap of
+      # an already-collected pid — the old discard-then-reap path hung
+      # forever here), and restart all three children.
+      sup = TestConcurrency.SupervisorTest.start(&TestConcurrency.SupervisorTest.ofa_stray_sup/0)
+      _s1 = TestConcurrency.SupervisorTest.recv()
+      _s2 = TestConcurrency.SupervisorTest.recv()
+      _s3 = TestConcurrency.SupervisorTest.recv()
+      a0 = Process.whereis(:osa_a)
+      b0 = Process.whereis(:osa_b)
+      c0 = Process.whereis(:osa_c)
+      _kill = Process.exit_signal(c0, :boom)
+      # B acknowledged its shutdown request: the sweep is now parked inside
+      # B's :timeout window — the widest stray window.
+      asked = TestConcurrency.SupervisorTest.recv()
+      assert(asked == :osa_b_asked)
+      # A crashes spontaneously mid-sweep.
+      _stray = Process.exit_signal(a0, :boom_too)
+      # No hang: every child is restarted with a fresh pid.
+      assert(TestConcurrency.SupervisorTest.wait_fresh(:osa_a, a0, 200))
+      assert(TestConcurrency.SupervisorTest.wait_fresh(:osa_b, b0, 200))
+      assert(TestConcurrency.SupervisorTest.wait_fresh(:osa_c, c0, 200))
+      TestConcurrency.SupervisorTest.cleanup(sup)
+      # The restarted :osa_b traps exits, so the cleanup kill's cascade does
+      # not stop it — kill the orphan directly (untrappable).
+      _kb = Process.kill(Process.whereis(:osa_b))
+    }
+
+    test("rest_for_one restarts an out-of-scope child that crashes during scope teardown") {
+      # rest_for_one A,B,C; B crashes (scope B..C); while C (a trapping
+      # child ignoring its shutdown request) holds the sweep open, A — OUT
+      # of the restart scope — crashes. The old code popped and discarded
+      # A's exit, leaving a stale live_pids slot: a PERMANENT child was
+      # silently never restarted. The fix folds the collected stray back in
+      # as a fresh child death, so A is restarted per the strategy.
+      sup = TestConcurrency.SupervisorTest.start(&TestConcurrency.SupervisorTest.rfo_stray_sup/0)
+      _s1 = TestConcurrency.SupervisorTest.recv()
+      _s2 = TestConcurrency.SupervisorTest.recv()
+      _s3 = TestConcurrency.SupervisorTest.recv()
+      a0 = Process.whereis(:rsa_a)
+      b0 = Process.whereis(:rsa_b)
+      c0 = Process.whereis(:rsa_c)
+      _kill = Process.exit_signal(b0, :boom)
+      asked = TestConcurrency.SupervisorTest.recv()
+      assert(asked == :rsa_c_asked)
+      # A (out of the B..C scope) crashes during the sweep.
+      _stray = Process.exit_signal(a0, :boom_too)
+      # A is permanent: it MUST come back — the acceptance point.
+      assert(TestConcurrency.SupervisorTest.wait_fresh(:rsa_a, a0, 200))
+      assert(TestConcurrency.SupervisorTest.wait_fresh(:rsa_b, b0, 200))
+      assert(TestConcurrency.SupervisorTest.wait_fresh(:rsa_c, c0, 200))
+      TestConcurrency.SupervisorTest.cleanup(sup)
+      # The restarted :rsa_c traps exits, so the cleanup kill's cascade does
+      # not stop it — kill the orphan directly (untrappable).
+      _kc = Process.kill(Process.whereis(:rsa_c))
+    }
+
+    test("a supervisor skips a stray user message sent to its registered name") {
+      # A registered supervisor can be sent ordinary user messages by anyone.
+      # Its signal waits must SKIP them (left queued), never abort — and a
+      # child crash arriving behind the noise must still be handled.
+      sup = TestConcurrency.SupervisorTest.start(&TestConcurrency.SupervisorTest.stray_msg_sup/0)
+      _s = TestConcurrency.SupervisorTest.recv()
+      w0 = Process.whereis(:smw)
+      _noise = Process.send(:stray_msg_sup, :noise)
+      # Yield so the parked supervisor observes (and must survive) the noise.
+      _park = receive Atom { _ -> :message after 30 -> :waited }
+      _kill = Process.exit_signal(w0, :boom)
+      _r = TestConcurrency.SupervisorTest.recv()
+      w1 = Process.whereis(:smw)
+      assert(w1 != w0)
+      assert(w1 != 0)
+      TestConcurrency.SupervisorTest.cleanup(sup)
+    }
+  }
+
   describe("child order") {
     test("children start left-to-right and terminate right-to-left") {
       sup = TestConcurrency.SupervisorTest.start(&TestConcurrency.SupervisorTest.order_sup/0)
@@ -284,14 +365,37 @@ pub struct TestConcurrency.SupervisorTest {
       :bk -> Process.spawn_link(&TestConcurrency.SupervisorTest.bk_entry/0)
       :to -> Process.spawn_link(&TestConcurrency.SupervisorTest.to_entry/0)
       :inf -> Process.spawn_link(&TestConcurrency.SupervisorTest.inf_entry/0)
+      :osa_a -> Process.spawn_link(&TestConcurrency.SupervisorTest.osa_a_entry/0)
+      :osa_b -> Process.spawn_link(&TestConcurrency.SupervisorTest.osa_b_entry/0)
+      :osa_c -> Process.spawn_link(&TestConcurrency.SupervisorTest.osa_c_entry/0)
+      :rsa_a -> Process.spawn_link(&TestConcurrency.SupervisorTest.rsa_a_entry/0)
+      :rsa_b -> Process.spawn_link(&TestConcurrency.SupervisorTest.rsa_b_entry/0)
+      :rsa_c -> Process.spawn_link(&TestConcurrency.SupervisorTest.rsa_c_entry/0)
+      :smw -> Process.spawn_link(&TestConcurrency.SupervisorTest.smw_entry/0)
       :nest_w1 -> Process.spawn_link(&TestConcurrency.SupervisorTest.nest_w1_entry/0)
       :nest_w2 -> Process.spawn_link(&TestConcurrency.SupervisorTest.nest_w2_entry/0)
       _ -> Process.spawn_link(&TestConcurrency.SupervisorTest.child_sup_entry/0)
     }
     _give = Process.send(Process.pid(u64, child), Process.self())
-    _ready = receive Atom { :ready -> :ready }
+    _ready = TestConcurrency.SupervisorTest.await_ready()
     _notify = Process.send(:sup_observer, child_id)
     child
+  }
+
+  # Wait for the child's readiness ack, DROPPING any other user message that
+  # arrives first (a stray message sent to the supervisor's registered name):
+  # OTP supervisors log-and-drop unknown messages; a bare `receive :ready`
+  # would route the stray into the dead-letter catch-all and kill the
+  # supervisor process instead.
+  fn await_ready() -> Atom {
+    got = receive Atom {
+      :ready -> :ready
+      _ -> :other_message
+    }
+    case got {
+      :ready -> :ready
+      _ -> TestConcurrency.SupervisorTest.await_ready()
+    }
   }
 
   # -- supervisor entry points (each registers a name for liveness observation) --
@@ -373,6 +477,35 @@ pub struct TestConcurrency.SupervisorTest {
     TestConcurrency.SupervisorTest.run([Supervisor.supervisor(:child_sup)], Supervisor.options(:one_for_one, 9, 5000))
   }
 
+  # one_for_all with a middle child whose :timeout shutdown window (400 ms,
+  # held open by a trapping ignorer) gives a sibling crash a wide window to
+  # land as a stray during the teardown sweep (P5-R1 S1 acceptance a).
+  pub fn ofa_stray_sup() -> Nil {
+    _reg = Process.register(:osa_sup)
+    a = Supervisor.worker(:osa_a)
+    b = Supervisor.child_spec(:osa_b, :permanent, :timeout, 400, :worker)
+    c = Supervisor.worker(:osa_c)
+    TestConcurrency.SupervisorTest.run([a, b, c], Supervisor.options(:one_for_all, 9, 5000))
+  }
+
+  # rest_for_one whose LAST child holds the sweep open (trapping ignorer,
+  # 400 ms :timeout) so an OUT-OF-SCOPE crash of the first child lands as a
+  # stray during the scope teardown (P5-R1 S1 acceptance b).
+  pub fn rfo_stray_sup() -> Nil {
+    _reg = Process.register(:rsa_sup)
+    a = Supervisor.worker(:rsa_a)
+    b = Supervisor.worker(:rsa_b)
+    c = Supervisor.child_spec(:rsa_c, :permanent, :timeout, 400, :worker)
+    TestConcurrency.SupervisorTest.run([a, b, c], Supervisor.options(:rest_for_one, 9, 5000))
+  }
+
+  # A registered supervisor whose mailbox receives ordinary user messages
+  # from outside — its signal waits must skip (not abort on) them (S2×S1).
+  pub fn stray_msg_sup() -> Nil {
+    _reg = Process.register(:stray_msg_sup)
+    TestConcurrency.SupervisorTest.run([Supervisor.worker(:smw)], Supervisor.options(:one_for_one, 9, 5000))
+  }
+
   # A nested child supervisor: ack the parent's handshake, then run its own
   # subtree of two workers.
   pub fn child_sup_entry() -> Nil {
@@ -412,6 +545,14 @@ pub struct TestConcurrency.SupervisorTest {
   pub fn bk_entry() -> Nil { TestConcurrency.SupervisorTest.trapping_blocker_body(:bk) }
   pub fn to_entry() -> Nil { TestConcurrency.SupervisorTest.ignore_shutdown_body(:to, :to_asked) }
   pub fn inf_entry() -> Nil { TestConcurrency.SupervisorTest.graceful_shutdown_body(:inf, :inf_graceful) }
+
+  pub fn osa_a_entry() -> Nil { TestConcurrency.SupervisorTest.worker_body(:osa_a) }
+  pub fn osa_b_entry() -> Nil { TestConcurrency.SupervisorTest.ignore_shutdown_body(:osa_b, :osa_b_asked) }
+  pub fn osa_c_entry() -> Nil { TestConcurrency.SupervisorTest.worker_body(:osa_c) }
+  pub fn rsa_a_entry() -> Nil { TestConcurrency.SupervisorTest.worker_body(:rsa_a) }
+  pub fn rsa_b_entry() -> Nil { TestConcurrency.SupervisorTest.worker_body(:rsa_b) }
+  pub fn rsa_c_entry() -> Nil { TestConcurrency.SupervisorTest.ignore_shutdown_body(:rsa_c, :rsa_c_asked) }
+  pub fn smw_entry() -> Nil { TestConcurrency.SupervisorTest.worker_body(:smw) }
 
   # A plain worker: receive the supervisor pid, register `name`, ack readiness,
   # then block forever (an abnormal exit signal from outside kills it, its exit
@@ -497,6 +638,27 @@ pub struct TestConcurrency.SupervisorTest {
   # Block for the next observer notification (a child id or a down atom).
   fn recv() -> Atom {
     receive Atom { notification -> notification }
+  }
+
+  # Poll `whereis(name)` until it resolves to a LIVE pid that differs from
+  # `old_pid` (a restart is observable as a changed registration), parking
+  # between checks so the supervisor can run. Consumes and ignores observer
+  # notifications while polling (start notifications are asserted by pid
+  # freshness here, not by arrival order — stray-driven restarts may batch).
+  fn wait_fresh(name :: Atom, old_pid :: u64, tries :: i64) -> Bool {
+    current = Process.whereis(name)
+    case current != 0 and current != old_pid {
+      true -> true
+      false ->
+        case tries <= 0 {
+          true -> false
+          _ ->
+            {
+              _park = receive Atom { _ -> :message after 10 -> :timeout }
+              TestConcurrency.SupervisorTest.wait_fresh(name, old_pid, tries - 1)
+            }
+        }
+    }
   }
 
   # Poll `whereis(name)` for the name to become free, PARKING (yielding to the

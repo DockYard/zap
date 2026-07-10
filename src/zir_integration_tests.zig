@@ -663,6 +663,110 @@ fn compileAndRunCustomProject(
     };
 }
 
+/// Compile a Zap source string under a gate-ON (`runtime_concurrency: true`)
+/// manifest and run the resulting binary — the concurrency twin of
+/// `compileAndRun`. Gated compiles resolve the concurrency kernel unit
+/// relative to the stdlib root, so the build is pinned to the repo's `lib/`
+/// via `--zap-lib-dir` (the exe-relative stdlib copy under `zig-out/` has no
+/// sibling `src/runtime/concurrency`).
+fn compileAndRunGatedConcurrency(source: []const u8) TestError!TestResult {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    tmp_dir.dir.createDirPath(getTestIo(), "lib") catch return error.Unexpected;
+
+    const build_source =
+        \\pub struct TestProg.Builder {
+        \\  pub fn manifest(env :: Zap.Env) -> Zap.Manifest {
+        \\    case env.target {
+        \\      :test_prog ->
+        \\        %Zap.Manifest{
+        \\          name: "test_prog",
+        \\          version: "0.1.0",
+        \\          kind: :bin,
+        \\          root: &TestProg.main/0,
+        \\          paths: ["lib/**/*.zap"],
+        \\          runtime_concurrency: true
+        \\        }
+        \\      _ ->
+        \\        panic("Unknown target")
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "build.zap", .data = build_source }) catch
+        return error.Unexpected;
+    tmp_dir.dir.writeFile(getTestIo(), .{ .sub_path = "lib/test_prog.zap", .data = source }) catch
+        return error.Unexpected;
+
+    const tmp_dir_path = tmp_dir.dir.realPathFileAlloc(getTestIo(), ".", allocator) catch
+        return error.Unexpected;
+    defer allocator.free(tmp_dir_path);
+
+    const zap_binary = try resolveZapBinary(allocator);
+    defer allocator.free(zap_binary);
+
+    var repo_lib_dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const canonical_len = std.Io.Dir.cwd().realPathFile(getTestIo(), "lib", &repo_lib_dir_buffer) catch
+        return error.Unexpected;
+    const repo_lib_dir = repo_lib_dir_buffer[0..canonical_len];
+
+    const compile_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{ zap_binary, "build", "test_prog", "--zap-lib-dir", repo_lib_dir },
+        .cwd = .{ .path = tmp_dir_path },
+        .stdout_limit = .limited(COMPILE_OUTPUT_LIMIT),
+        .stderr_limit = .limited(COMPILE_OUTPUT_LIMIT),
+    }) catch return error.CompilationFailed;
+    defer allocator.free(compile_result.stdout);
+    defer allocator.free(compile_result.stderr);
+
+    const compile_exit = switch (compile_result.term) {
+        .exited => |code| code,
+        else => {
+            printUnexpectedCompileFailure(255, compile_result.stdout, compile_result.stderr);
+            return error.CompilationFailed;
+        },
+    };
+    if (compile_exit != 0) {
+        printUnexpectedCompileFailure(compile_exit, compile_result.stdout, compile_result.stderr);
+        return error.CompilationFailed;
+    }
+
+    const compiled_binary = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out/bin/test_prog", allocator) catch {
+        std.debug.print("\n=== COMPILED BINARY NOT FOUND ===\n", .{});
+        return error.CompilationFailed;
+    };
+    defer allocator.free(compiled_binary);
+
+    const run_result = std.process.run(allocator, getTestIo(), .{
+        .argv = &.{compiled_binary},
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
+    }) catch return error.RunFailed;
+
+    const run_exit = switch (run_result.term) {
+        .exited => |code| code,
+        else => {
+            allocator.free(run_result.stdout);
+            allocator.free(run_result.stderr);
+            return error.RunFailed;
+        },
+    };
+
+    const output_dir = tmp_dir.dir.realPathFileAlloc(getTestIo(), "zap-out", allocator) catch null;
+
+    return .{
+        .stdout = run_result.stdout,
+        .stderr = run_result.stderr,
+        .exit_code = run_exit,
+        .allocator = allocator,
+        .output_dir = output_dir,
+    };
+}
+
 test "ZIR memory manager: project-local third-party adapter builds and runs" {
     const build_source =
         \\pub struct TestProg.Builder {
@@ -5962,6 +6066,44 @@ test "ZIR concurrency: Process.pid rejects an unsendable message-type token" {
     ,
         "no macro clause of `pid/2` matches the arguments",
     );
+}
+
+test "ZIR concurrency: a first-op spawn_monitor DOWN carries :normal, not the unregistered term (P5-R1 S5)" {
+    // A FRESH gate-ON program whose FIRST signal operation is
+    // `Process.spawn_monitor`: the immediately-returning worker's `DOWN`
+    // must carry the real `:normal` reason atom. Before P5-R1 S5 only
+    // `link`/`monitor`/`exit_signal`/`kill`/`exit_with` registered the
+    // kernel reason atoms, so a first-op spawn_monitor delivered the
+    // unregistered term (0) instead. This ordering is only observable in a
+    // fresh binary — inside the Zest suite an earlier test has always
+    // registered the atoms — hence the harness-level compile-and-run.
+    var result = try compileAndRunGatedConcurrency(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    _pair = Process.spawn_monitor(&TestProg.worker/0)
+        \\    reason = Process.await_signal()
+        \\    case reason == :normal {
+        \\      true ->
+        \\        {
+        \\          IO.puts("first-op DOWN reason: normal")
+        \\          0
+        \\        }
+        \\      false ->
+        \\        {
+        \\          IO.puts("first-op DOWN reason: WRONG")
+        \\          1
+        \\        }
+        \\    }
+        \\  }
+        \\
+        \\  pub fn worker() -> Nil {
+        \\    nil
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqualStrings("first-op DOWN reason: normal\n", result.stdout);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
 test "ZIR concurrency: Process.* is a compile error when the runtime_concurrency gate is OFF" {

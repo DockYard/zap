@@ -634,11 +634,32 @@ cross-scheduler budget explicitly re-derived from the loaded numbers.
 - **5.1** Links (bidirectional, one-per-pair), monitors (unidirectional, stackable, `DOWN`
   with `noproc`), `trap_exit`, exit-signal ordering merged with pairwise FIFO; `kill`
   untrappable → `killed`. Exit signals as a distinct Select arm.
+  **DONE (P5-J1, 2026-07-09, `538adbb`)** — the kernel signal runtime (`signal.zig`:
+  link/monitor sets, reason categories, `trap_exit`, teardown propagation) + the
+  `zap_proc_link/monitor/exit_signal/kill/set_trap_exit/await_signal` intrinsics
+  (`abi.zig`) + the `lib/process.zap` wrappers with the reason-atom identities
+  registered FROM Zap (`register_reason_atoms` — never hardcoded in the compiler);
+  exit-signal ordering merged with pairwise FIFO; `kill` untrappable → `killed`
+  (`test_concurrency/signal_test.zap`). "Distinct Select arm" was reframed: there
+  is no Select surface — signals ride the one mailbox as signal-kind envelopes.
 - **5.2** Runtime local registry (atomic register/lookup, register-then-crash race handled).
+  **DONE (P5-J2, 2026-07-09, `308e1b0`)** — `registry.zig` (atomic name→pid table,
+  generation-validated liveness so a dead registrant is a lookup MISS) +
+  `Process.register/unregister/whereis`, send-by-name, and atomic
+  `spawn_link`/`spawn_monitor` (`test_concurrency/registry_test.zap`).
 - **5.3** Pure-Zap stdlib: `lib/supervisor.zap` (strategies, defaults, shutdown protocols,
   start left→right/terminate right→left), `lib/task.zap` (`Task.async` → `Future(T)`,
   `call` with internal correlation-token skip — the ref-trick receive mark lands here),
   dead-letter sink + telemetry.
+  **DONE (P5-J3, 2026-07-09, `b0e3306`)** — `lib/supervisor.zap` in PURE ZAP over the
+  J1/J2 intrinsics: all four strategies, restart types, restart-intensity breaker,
+  left→right start / right→left terminate, the three shutdown protocols, nested
+  supervision trees; inverted-control loop (library owns policy as data transforms,
+  user module owns the tiny start loop) so no function value crosses a struct
+  boundary (`test_concurrency/supervisor_test.zap`). The `lib/task.zap` half landed
+  in P5-J4 (below); the keep-alive dead-letter SINK remains open — today's
+  dead-letter path is the non-crashing per-process termination + pid-table
+  telemetry, not a sink process.
 - **5.4** `spawn_link`/`spawn_monitor`; `Process` module completed; `@doc` everywhere.
 
   **P5-J4 (2026-07-09):** `Task.async`/`Task.await` (`lib/task.zap`) + the typed synchronous
@@ -670,11 +691,105 @@ cross-scheduler budget explicitly re-derived from the loaded numbers.
   Task + 6 call); kernel tests 209/209 both modes; `-fsanitize-thread` clean (204 pass / 5
   skip / 0 fail).
 
+  **P5-R1 (2026-07-09):** the Phase-5 gap-resolution batch — every finding of the P5
+  review resolved or formally deferred with a numbered owner.
+  - **S1 (BLOCKING — the supervisor stray-signal hang).** `reap_exit`/`wait_exit`
+    popped signals destructively and DISCARDED any not from the awaited pid, so a
+    sibling crashing during a shutdown sweep produced (a) a FOREVER-blocked reap
+    when the sweep later reached the already-dead sibling (one_for_all: kill C, A
+    crashes inside B's `:timeout` window → hang), and (b) a silently-lost permanent
+    child under `rest_for_one` (an out-of-scope crash discarded → stale `live_pids`
+    slot, never restarted). Fixed in PURE ZAP (`lib/supervisor.zap`): every signal a
+    wait pops that is not the awaited exit is COLLECTED (`SupervisorStrays` — bounded
+    by child count + the parent's one order) and folded back into supervisor state
+    after the sweep: a collected child death is handled as a fresh exit (restart
+    type, intensity charge, strategy scope whose own sweep is SEEDED with the
+    unresolved strays so an already-collected pid is never re-reaped, and whose
+    restart queue MERGES in spec order), a zeroed-slot stray is ignored (OTP's
+    exit-from-unknown-pid rule — no double intensity charge), and a non-child stray
+    (the parent terminating the supervisor mid-sweep) is honored as a shutdown
+    order. **D4 rode along**: `wait_exit` now waits on an ABSOLUTE
+    `monotonic_millis` deadline — strays consumed while waiting never restart the
+    child's grace period. Both review-specified acceptance tests are seeded in
+    `supervisor_test.zap` ("stray signals during teardown"): the one_for_all
+    stray-during-`:timeout`-shutdown case (no hang, all three restarted) and the
+    rest_for_one out-of-scope crash (the permanent child IS restarted).
+  - **S2 (signals × the typed receive — SAFE SUBSET landed, tuple-decode deferred
+    as item 5.5).** The abort semantics are GONE from every user-reachable path:
+    `await_signal` no longer panics on a user-message head — it extracts the OLDEST
+    signal envelope and leaves user messages queued in order (`mailbox.zig` gains
+    ref-less class-match kinds `signal_any`/`user_any` on the P5-J4 scan-extract
+    machinery); the steady-state typed `receive` (`zap_proc_receive_park`) is the
+    mirror image — it takes the oldest USER envelope and leaves signal envelopes
+    queued for `await_signal`, so a trapped `{'EXIT', …}` reaching a `receive Atom`
+    is never mis-decoded as the message type (Erlang: an unmatched trapped exit
+    sits in the mailbox); and the `receive … after` wait (`receiveWaitTimeout`) is
+    signal-aware via a non-consuming `scanForMatch` probe + the correlated-receive
+    any-push-wake park protocol, so a signal-only mailbox times out instead of
+    parking the receive past its deadline. New kernel intrinsic
+    `zap_proc_await_signal_timeout` (the timed signal wait `wait_exit` stands on).
+    Gate-ON proofs in `signal_test.zap` ("typed receive and signals") and
+    `supervisor_test.zap` (a registered supervisor sent a stray user message skips
+    it — S2×S1). The R8 visit counter now counts REF-correlated scans only, so the
+    class scans cannot pollute the O(1)-from-mark telemetry.
+  - **S3/S4/S5 + N3 (Erlang `exit/2` fidelity, `lib/process.zap`).**
+    `exit_signal(pid, :kill)` routes to the UNTRAPPABLE kill path — a trapping
+    target dies `:killed` (only exit/2's literal `:kill`; a link-cascaded `:kill`
+    from `exit_with(:kill)` stays trappable, correct Erlang). `exit_signal(self(),
+    :normal)` from a NON-trapping process terminates the caller `:normal`
+    (erlang.org exit/2's self-normal special case). `spawn_link`/`spawn_monitor`
+    call `ensure_reason_atoms_registered` BEFORE the link/monitor exists, so a
+    first-op `spawn_monitor` `DOWN` carries `:normal` — proven in a FRESH gate-ON
+    binary by the `zir_integration_tests.zig` first-op test (in-suite it is
+    unobservable: an earlier test always registers the atoms). N3's missing direct
+    test added: a trapping process linked to a KILLED process receives
+    `{'EXIT', _, :killed}` as a message.
+  - Gate-ON `:test_concurrency` **121/0** (278 assertions; 112 baseline + 6 signal
+    + 3 supervisor), order-robust across shuffle seeds; kernel tests green both
+    modes (+5 mailbox class-scan/probe unit tests).
+- **5.5** Typed signal-decode in `receive` (the S2 deferral, formally owned here).
+  Today a trapping process OBSERVES signals only through the `await_signal` surface;
+  the typed `receive` skips signal envelopes entirely (they stay queued). This item
+  wires the receive lowering to decode a signal envelope — via the existing
+  `zap_proc_envelope_signal_*` accessors — into `{'EXIT', from, reason}` /
+  `{'DOWN', ref, pid, reason}` tuples and match them against the arms, so a receive
+  whose message union includes the exit-tuple type handles signals in stream order
+  with user messages (research §6.7 "a trapping process sees exits as ordinary
+  messages", fully). Depends on the message-union work (item 2.2): the scrutinee
+  must be a union of the message type and the signal-tuple shapes, and
+  exhaustiveness must reason over both. Until then the contract is the S2 safe
+  subset documented on `Process.await_signal`.
+- **5.6** `simple_one_for_one` DYNAMIC child management (the D2 deferral):
+  `start_child`/`terminate_child` at runtime over ONE template spec — today the
+  strategy is implemented as one-for-one restart scope over a STATIC homogeneous
+  child list (each instance pre-declared). Needs a supervisor-state API for
+  appending/removing instances and pid-keyed (not spec-index) accounting.
+- **5.7** Named `Process.call` (the D5 deferral): `Process.call(name :: Atom,
+  request)` resolving through `whereis` with the dead-name `:noproc` exit surface
+  (Elixir `GenServer.call(name, …)` parity). Today `call` requires a typed pid;
+  send-by-name exists but the correlated call surface does not.
+- **5.8** Gate-ON Zest suite under `ZAP_SCHED_SEED` (the D8 owner): under the
+  seeded deterministic scheduler exactly the two `SafepointTest` preemption-ORDERING
+  tests fail (verified 2026-07-09: `ZAP_SCHED_SEED=7` → 121 tests, 2 failures — the
+  "quick process replies before the CPU-bound one" P2 assertions), because the
+  simulator's seeded schedule is under no obligation to interleave the co-runnable
+  quick process before the slow one finishes; preemption CORRECTNESS is asserted,
+  ordering is not guaranteed. Fix the two tests' ordering assumption under the
+  simulator (assert progress/preemption without demanding arrival order — e.g.
+  reply-set equality or a reduction-count bound instead of arrival order). Until
+  then the Phase-5 seeded-determinism exit gate is SCOPED to kernel-level
+  determinism (below); everything else in the gate-ON suite — including the whole
+  supervision suite and the P5-R1 stray tests — is verified seed-clean.
+
 Exit gate: supervision-tree Zest suite (restart intensity, rest_for_one ordering, brutal_kill
 timing) under seeded determinism; R8 selective-receive benchmark (10⁶-deep mailbox, O(1)
 correlated replies). *[R8 discharged at 10⁴ depth by the P5-J4 operation-count proof above —
 visits are independent of backlog depth by construction (the scan starts at the mark), so the
-10⁶ variant is a constant-factor rerun if ever wanted.]*
+10⁶ variant is a constant-factor rerun if ever wanted.]* *[Seeded-determinism scope (P5-R1,
+D8): the gate holds at KERNEL level (the `deterministic_mn.zig` seeded suites) and for the
+supervision tests, which pass under `ZAP_SCHED_SEED`; the full gate-ON Zest suite is
+seed-clean except the two pre-existing `SafepointTest` ordering assertions, owned by item
+5.8 — not a Phase-5 signals/supervision regression.]*
 
 ### Phase 6 — Performance tier (L)
 
@@ -729,6 +844,17 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   (never crash on unknown dynamic message); latency bound documentation incl. the one
   unbounded case.
 - **7.4** README/CHANGELOG; benchmark suite results published in-repo.
+- **7.5** Signal-delivery OOM posture (the P5-R1 D1 hook). `pushSignalMessage`
+  DROPS a signal when the payload/envelope allocation fails ("best-effort under
+  memory pressure"), while the runtime's general OOM posture is panic — and a
+  dropped `{'EXIT', …}` is not merely lossy telemetry: a supervisor's
+  `reap_exit`/`await_signal` then waits FOREVER for an exit that was never
+  enqueued (the same hang class S1 fixed for discarded strays, resurrected by
+  OOM), and `demonitorFlush`'s in-flight-`DOWN` wait is likewise unbounded.
+  Resolve toward CONSISTENCY: panic on signal-delivery OOM (matching the
+  allocator posture everywhere else — a kernel that cannot deliver exit signals
+  has lost supervision soundness), or, if best-effort survives, every unbounded
+  signal wait needs an OOM-aware bound. Preference recorded: panic-on-OOM.
 
 ## 6. Experiment gates → phases
 

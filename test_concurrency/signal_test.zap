@@ -200,6 +200,62 @@ pub struct TestConcurrency.SignalTest {
       assert(Process.last_signal_from() == target)
     }
 
+    test("exit_signal with reason kill routes to the untrappable kill — a trapping target dies killed") {
+      # Erlang `exit(Pid, kill)`: reason `:kill` through exit/2 is the
+      # UNTRAPPABLE kill, not a trappable `:kill` message — the trapping
+      # target dies with reason `:killed` (P5-R1 S3).
+      target = Process.spawn(&TestConcurrency.SignalTest.trap_blocker_entry/0)
+      _self_to_child = Process.send(Process.pid(u64, target), Process.self())
+      _ready = receive Atom { :ready -> :ready }
+
+      _ref = Process.monitor(target)
+      _killed = Process.exit_signal(target, :kill)
+
+      reason = Process.await_signal()
+      assert(reason == :killed)
+      assert(Process.last_signal_kind() == 2)   # down — the target died despite trapping
+      assert(Process.last_signal_from() == target)
+    }
+
+    test("a kill cascades to a trapping linked peer as a trappable EXIT killed message") {
+      # The killed process dies with reason `:killed` (not `:kill`), so its
+      # LINKED peers receive the ordinary trappable `:killed` — a trapping
+      # peer observes `{'EXIT', target, :killed}` and survives (P5-R1 N3).
+      target = Process.spawn(&TestConcurrency.SignalTest.blocker_entry/0)
+      _self_to_child = Process.send(Process.pid(u64, target), Process.self())
+      _ready = receive Atom { :ready -> :ready }
+
+      _trap = Process.trap_exit(true)
+      _linked = Process.link(target)
+      _killed = Process.kill(target)
+
+      reason = Process.await_signal()
+      assert(reason == :killed)
+      assert(Process.last_signal_kind() == 1)   # exit — the killed cascade is trappable
+      assert(Process.last_signal_from() == target)
+      _untrap = Process.trap_exit(false)
+    }
+
+    test("exit_signal to self with reason normal exits a non-trapping caller") {
+      # erlang.org exit/2: `exit(self(), normal)` from a NON-trapping process
+      # terminates the caller with reason `:normal` — the one self-normal
+      # special case (P5-R1 S4). The entry exits at the `exit_signal` call;
+      # were the signal dropped (the pre-fix bug), it would fall through to
+      # the abnormal `exit_with(:fell_through)` and the DOWN reason would
+      # betray it.
+      target = Process.spawn(&TestConcurrency.SignalTest.self_normal_exit_entry/0)
+      _self_to_child = Process.send(Process.pid(u64, target), Process.self())
+      _ready = receive Atom { :ready -> :ready }
+
+      _ref = Process.monitor(target)
+      _go = Process.send(Process.pid(Atom, target), :go)
+
+      reason = Process.await_signal()
+      assert(reason == :normal)
+      assert(Process.last_signal_kind() == 2)
+      assert(Process.last_signal_from() == target)
+    }
+
     test("exit_with self-terminates abnormally, delivering the reason to a monitor") {
       target = Process.spawn(&TestConcurrency.SignalTest.self_exit_after_go_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
@@ -211,6 +267,55 @@ pub struct TestConcurrency.SignalTest {
       reason = Process.await_signal()
       assert(reason == :mycrash)
       assert(Process.last_signal_from() == target)
+    }
+  }
+
+  describe("typed receive and signals (P5-R1 S2)") {
+    test("a typed receive skips a trapped EXIT, leaving it queued for await_signal") {
+      # A trapping process whose mailbox head is a trapped `{'EXIT', …}` must
+      # still serve a typed `receive` for a LATER user message: the signal is
+      # skipped (left queued, Erlang selective-receive semantics), never
+      # mis-decoded as the message type and never an abort. Sending the exit
+      # signal to SELF makes the head deterministic — a trapping self-signal
+      # is pushed synchronously into our own mailbox.
+      _trap = Process.trap_exit(true)
+      _exit = Process.exit_signal(Process.self(), :skip_boom)
+      _hello = Process.send(Process.pid(Atom, Process.self()), :hello)
+      got = receive Atom { :hello -> :hello }
+      assert(got == :hello)
+      # The skipped EXIT stayed queued, in order, for the signal surface.
+      reason = Process.await_signal()
+      assert(reason == :skip_boom)
+      assert(Process.last_signal_kind() == 1)
+      assert(Process.last_signal_from() == Process.self())
+      _untrap = Process.trap_exit(false)
+    }
+
+    test("await_signal skips a user message at the mailbox head, leaving it queued") {
+      # The dual: `await_signal` over a mailbox whose head is an ordinary
+      # user message must skip it (left queued for the typed receive) and
+      # consume the next SIGNAL — never abort on the user-message head.
+      _trap = Process.trap_exit(true)
+      _first = Process.send(Process.pid(Atom, Process.self()), :first_message)
+      _exit = Process.exit_signal(Process.self(), :sig_after)
+      reason = Process.await_signal()
+      assert(reason == :sig_after)
+      got = receive Atom { :first_message -> :first_message }
+      assert(got == :first_message)
+      _untrap = Process.trap_exit(false)
+    }
+
+    test("receive after times out when only a trapped EXIT is queued") {
+      # A queued signal is NOT a user message: the `after` wait must not
+      # report it available (the receive would then skip it and park past
+      # the deadline). With only an EXIT queued, `after 50` fires.
+      _trap = Process.trap_exit(true)
+      _exit = Process.exit_signal(Process.self(), :only_signal)
+      timed_out = receive Atom { _ -> false after 50 -> true }
+      assert(timed_out)
+      reason = Process.await_signal()
+      assert(reason == :only_signal)
+      _untrap = Process.trap_exit(false)
     }
   }
 
@@ -292,6 +397,18 @@ pub struct TestConcurrency.SignalTest {
     _ready = Process.send(parent, :ready)
     _go = receive Atom { :go -> :go }
     Process.exit_with(:mycrash)
+  }
+
+  # Acks, waits for :go, then sends ITSELF a `:normal` exit signal while NOT
+  # trapping — the erlang exit/2 self-normal special case must terminate it
+  # right there with reason `:normal`. The abnormal `exit_with` below is the
+  # tripwire: reached only if the self-normal signal failed to terminate.
+  pub fn self_normal_exit_entry() -> Nil {
+    parent = Process.pid(Atom, Process.receive_raw(u64))
+    _ready = Process.send(parent, :ready)
+    _go = receive Atom { :go -> :go }
+    _exit = Process.exit_signal(Process.self(), :normal)
+    Process.exit_with(:fell_through)
   }
 
   # Receives the parent pid, sends 100 then 200, and returns normally — the exit

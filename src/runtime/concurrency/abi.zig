@@ -1198,20 +1198,23 @@ export fn zap_proc_envelope_take_moved(envelope_handle: *anyopaque) callconv(.c)
     return root;
 }
 
-/// Park the calling process until its mailbox is nonempty, then return
-/// the oldest deliverable envelope as an opaque reference, with the
-/// payload view written through the out-parameters (`null`/`0` for
-/// payload-less messages). The payload view BORROWS from the envelope:
-/// it is valid until `zap_proc_envelope_free`, which the caller MUST
-/// eventually invoke on the returned reference. If the process is
-/// killed while parked, the call never returns.
+/// Park the calling process until a USER message is queued, then return
+/// the oldest user envelope as an opaque reference, with the payload
+/// view written through the out-parameters (`null`/`0` for payload-less
+/// messages). Signal envelopes (trapped exits / `DOWN`s) are SKIPPED and
+/// stay queued, in order, for `zap_proc_await_signal` (P5-R1) — the
+/// typed receive never decodes a `SignalPayload` as the message type.
+/// The payload view BORROWS from the envelope: it is valid until
+/// `zap_proc_envelope_free`, which the caller MUST eventually invoke on
+/// the returned reference. If the process is killed while parked, the
+/// call never returns.
 export fn zap_proc_receive_park(
     process: *anyopaque,
     out_payload_pointer: *?[*]const u8,
     out_payload_len: *usize,
 ) callconv(.c) *anyopaque {
     const context = contextFromHandle(process);
-    const envelope = context.receive();
+    const envelope = context.receiveUser();
     out_payload_pointer.* = envelope.fragment.payload_pointer;
     out_payload_len.* = envelope.fragment.payload_byte_length;
     return @ptrCast(envelope);
@@ -1312,12 +1315,14 @@ pub const ZapProcWaitOutcome = struct {
     pub const timed_out: i32 = 1;
 };
 
-/// Park the calling process until a message is at its mailbox head or
+/// Park the calling process until a USER message is queued or
 /// `timeout_nanoseconds` elapses — the `receive … after` timeout
-/// mechanism (plan item 2.3, P2-J3). Returns
+/// mechanism (plan item 2.3, P2-J3). Queued signal envelopes do NOT
+/// satisfy the wait (P5-R1): the receive would skip them, so reporting
+/// one available would park the receive past its deadline. Returns
 /// `ZapProcWaitOutcome.message_available` (a following
-/// `zap_proc_receive_park` then pops it WITHOUT blocking) or `.timed_out`.
-/// `timeout_nanoseconds == 0` polls once WITHOUT parking (`after 0`). The
+/// `zap_proc_receive_park` then takes it WITHOUT blocking) or `.timed_out`.
+/// `timeout_nanoseconds == 0` probes once WITHOUT parking (`after 0`). The
 /// wait is NON-consuming; a message that races the deadline wins. If the
 /// process is killed while parked, the call never returns.
 export fn zap_proc_receive_wait_timeout(
@@ -1430,12 +1435,38 @@ export fn zap_proc_exit_reason(process: *anyopaque, reason_kind: u8, reason_term
     unreachable;
 }
 
-/// Blocking receive of the next SIGNAL message (raw J1 surface): pops the
-/// mailbox head (which MUST be an exit/`DOWN` signal), caches its fields, frees
-/// it, and returns the reason term. `zap_proc_last_signal_*` read the other
-/// fields. Aborts if the head is an ordinary user message.
+/// Blocking receive of the next SIGNAL message (raw J1 surface): extracts the
+/// oldest exit/`DOWN` envelope — ordinary user messages are SKIPPED and stay
+/// queued, in order, for the steady-state receive (P5-R1) — caches its fields,
+/// frees it, and returns the reason term. `zap_proc_last_signal_*` read the
+/// other fields.
 export fn zap_proc_await_signal(process: *anyopaque) callconv(.c) u64 {
     return contextFromHandle(process).awaitSignal();
+}
+
+/// C-ABI outcomes of `zap_proc_await_signal_timeout`.
+pub const ZapProcSignalWaitOutcome = struct {
+    /// A signal was consumed and cached (read via `zap_proc_last_signal_*`).
+    pub const signal_consumed: i32 = 0;
+    /// The deadline elapsed with no signal.
+    pub const timed_out: i32 = 1;
+};
+
+/// `zap_proc_await_signal` bounded by a deadline — the timed signal wait the
+/// supervisor `:timeout` shutdown protocol stands on (P5-R1). Blocks until a
+/// signal envelope is queued (user messages skipped, left queued) or
+/// `timeout_nanoseconds` elapses; `0` probes once without parking. On
+/// `signal_consumed` the fields are cached exactly like `zap_proc_await_signal`
+/// (read the reason via `zap_proc_last_signal_reason`). If the process is
+/// killed while waiting, the call never returns.
+export fn zap_proc_await_signal_timeout(
+    process: *anyopaque,
+    timeout_nanoseconds: u64,
+) callconv(.c) i32 {
+    if (contextFromHandle(process).awaitSignalTimeout(timeout_nanoseconds)) |_| {
+        return ZapProcSignalWaitOutcome.signal_consumed;
+    }
+    return ZapProcSignalWaitOutcome.timed_out;
 }
 
 /// The `from` pid bits of the most recently `zap_proc_await_signal`-consumed

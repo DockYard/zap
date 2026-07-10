@@ -286,7 +286,8 @@ pub const ReceiveMark = union(enum) {
     after: *Envelope,
 };
 
-/// Which envelopes a correlated scan matches (P5-J4).
+/// Which envelopes a correlated scan matches (P5-J4; the `_any` kinds are
+/// P5-R1's signal-aware receive split).
 pub const CorrelatedMatchKind = enum {
     /// A correlated USER reply (`Fragment.correlation_ref == ref`) OR the
     /// monitor `DOWN` carrying `ref` — the `call`/`Task.await` wait.
@@ -296,6 +297,16 @@ pub const CorrelatedMatchKind = enum {
     /// steady-state receive's dead-letter accounting, never be silently
     /// eaten by a flush).
     down_only,
+    /// ANY signal envelope (a trapped exit or a `DOWN`), `ref` ignored
+    /// (pass 0) — the `await_signal` scan: user messages are skipped and
+    /// stay queued, in order, for the steady-state receive.
+    signal_any,
+    /// ANY ordinary user envelope (`signal_kind == .none`), `ref` ignored
+    /// (pass 0) — the steady-state receive's scan: signal envelopes are
+    /// skipped and stay queued, in order, for `await_signal` (Erlang: an
+    /// unmatched trapped exit sits in the mailbox; it is never decoded as
+    /// a user message).
+    user_any,
 };
 
 /// One `takeCorrelated` attempt (consumer-only).
@@ -321,6 +332,24 @@ pub const CorrelatedScanOutcome = union(enum) {
     /// matched envelope REMAINS QUEUED; yield and rescan (the same
     /// deterministic match is found again). Mirrors `PopOutcome.transient_gap`.
     extraction_pending,
+};
+
+/// One non-consuming `scanForMatch` probe (consumer-only) — the
+/// signal-aware `receive … after` wait (P5-R1): "is a matching envelope
+/// queued?" without extracting it.
+pub const ScanProbeOutcome = union(enum) {
+    /// A matching envelope is queued; a following consuming scan
+    /// (`takeCorrelated`) finds it.
+    found,
+    /// No match anywhere in the reachable queue; the payload is the LAST
+    /// queued envelope the probe examined (the embedded stub when empty).
+    /// Hand it to `armCorrelatedWake` and back as `resume_after` so the
+    /// re-probe only walks NEW arrivals.
+    exhausted: *Envelope,
+    /// A producer is mid-publish past the last reachable envelope: more
+    /// input is arriving — yield and re-probe from the payload envelope.
+    /// Mirrors `PopOutcome.transient_gap`.
+    publish_pending: *Envelope,
 };
 
 /// Result of a non-consuming `Mailbox.peek` (the `receive … after`
@@ -594,9 +623,16 @@ pub const Mailbox = struct {
 
     /// Whether `envelope` is correlated with `ref` under `match_kind`:
     /// a user reply stamped `correlation_ref == ref`, or the monitor
-    /// `DOWN` whose signal payload carries `ref`. Header/payload-struct
-    /// compares only — the kernel never interprets user payload bytes.
+    /// `DOWN` whose signal payload carries `ref` — or, for the `_any`
+    /// kinds, a class match on the envelope's `signal_kind` alone.
+    /// Header/payload-struct compares only — the kernel never interprets
+    /// user payload bytes.
     fn envelopeMatchesCorrelation(envelope: *const Envelope, ref: u64, match_kind: CorrelatedMatchKind) bool {
+        switch (match_kind) {
+            .signal_any => return envelope.fragment.signal_kind != .none,
+            .user_any => return envelope.fragment.signal_kind == .none,
+            .user_or_down, .down_only => {},
+        }
         switch (envelope.fragment.signal_kind) {
             .none => {
                 if (match_kind == .down_only) return false;
@@ -625,18 +661,22 @@ pub const Mailbox = struct {
         resume_after: ?*Envelope,
     ) CorrelatedScanOutcome {
         // Ref 0 is the "uncorrelated" stamp every ordinary send carries; a
-        // scan for it would match arbitrary user messages.
-        std.debug.assert(ref != 0);
+        // ref-keyed scan for it would match arbitrary user messages. The
+        // class-match `_any` kinds ignore the ref and pass 0.
+        std.debug.assert(ref != 0 or match_kind == .signal_any or match_kind == .user_any);
         const stub_envelope = &mailbox.stub;
 
         // The anchor: the queued envelope whose successor opens the
         // unscanned region — or null, meaning the region starts AT
-        // `consumer_head` itself (a head scan with a real head).
+        // `consumer_head` itself (a head scan with a real head). The mark
+        // is consulted only for a nonzero ref: `receive_mark_ref == 0`
+        // means "prepared but unbound", which a ref-0 class scan must
+        // never mistake for its own mark.
         var anchor: ?*Envelope = null;
         var start_at_head = false;
         if (resume_after) |resumed| {
             anchor = resumed;
-        } else if (mailbox.receive_mark == .after and mailbox.receive_mark_ref == ref) {
+        } else if (ref != 0 and mailbox.receive_mark == .after and mailbox.receive_mark_ref == ref) {
             anchor = mailbox.receive_mark.after;
         } else {
             start_at_head = true;
@@ -671,7 +711,13 @@ pub const Mailbox = struct {
         }
 
         while (true) {
-            mailbox.correlated_scan_visit_total += 1;
+            // The R8 telemetry counts REF-CORRELATED scan work only (the
+            // `call`/`Task.await` O(1)-from-mark proof); the `_any` class
+            // scans of the steady-state receive / `await_signal` would
+            // drown it.
+            if (match_kind == .user_or_down or match_kind == .down_only) {
+                mailbox.correlated_scan_visit_total += 1;
+            }
             if (envelopeMatchesCorrelation(current, ref, match_kind)) {
                 const extracted = mailbox.extractCorrelated(previous, current) orelse
                     return .extraction_pending;
@@ -688,6 +734,62 @@ pub const Mailbox = struct {
                 continue;
             };
             previous = current;
+            current = successor;
+        }
+    }
+
+    /// Non-consuming twin of `takeCorrelated` for the class-match kinds:
+    /// walk the reachable queue for an envelope matching `match_kind` and
+    /// report WHETHER one is queued, leaving everything in place — the
+    /// signal-aware `receive … after` wait probes for `.user_any` with
+    /// this (a queued signal alone must not satisfy the wait; the message
+    /// it reports stays queued for the following consuming receive).
+    /// Scans from `resume_after` when non-null (every envelope at-or-
+    /// before it was already examined and unmatched), else from the head.
+    /// Never consults the receive-mark (class scans are ref-less).
+    pub fn scanForMatch(
+        mailbox: *Mailbox,
+        ref: u64,
+        match_kind: CorrelatedMatchKind,
+        resume_after: ?*Envelope,
+    ) ScanProbeOutcome {
+        std.debug.assert(ref != 0 or match_kind == .signal_any or match_kind == .user_any);
+        const stub_envelope = &mailbox.stub;
+
+        // The anchor: the queued envelope whose successor opens the
+        // unexamined region — `resume_after`, or the embedded stub for a
+        // head probe of an empty-headed queue; null means the region
+        // starts AT `consumer_head` itself (a head probe with a real head).
+        const anchor: ?*Envelope = resume_after orelse
+            (if (mailbox.consumer_head == stub_envelope) stub_envelope else null);
+
+        var current: *Envelope = undefined;
+        if (anchor) |anchored| {
+            current = anchored.next.load(.acquire) orelse first: {
+                if (mailbox.producer_tail.load(.acquire) == anchored) {
+                    return .{ .exhausted = anchored };
+                }
+                // The tail moved past the anchor but the link is not
+                // visible: a producer is mid-publish at the probe
+                // boundary. Grant it the pop-path spin grace.
+                break :first spinForNextLink(anchored) orelse
+                    return .{ .publish_pending = anchored };
+            };
+        } else {
+            current = mailbox.consumer_head;
+        }
+
+        while (true) {
+            if (envelopeMatchesCorrelation(current, ref, match_kind)) return .found;
+            const successor = current.next.load(.acquire) orelse {
+                if (mailbox.producer_tail.load(.acquire) == current) {
+                    return .{ .exhausted = current };
+                }
+                const linked = spinForNextLink(current) orelse
+                    return .{ .publish_pending = current };
+                current = linked;
+                continue;
+            };
             current = successor;
         }
     }
@@ -1215,6 +1317,171 @@ test "Mailbox: user_or_down takes the earlier of reply and DOWN in queue order" 
         .matched => |envelope| try testing.expectEqual(&down, envelope),
         else => return error.TestExpectedMatch,
     }
+}
+
+// -- signal-aware receive split (P5-R1): signal_any / user_any / scanForMatch --
+
+fn exitSignalEnvelope(payload: *const signal_module.SignalPayload) Envelope {
+    return .{
+        .next = .init(null),
+        .origin_page = null,
+        .fragment = .{
+            .payload_pointer = @ptrCast(payload),
+            .payload_byte_length = @sizeOf(signal_module.SignalPayload),
+            .signal_kind = .exit,
+        },
+    };
+}
+
+test "Mailbox: signal_any extracts the oldest signal, leaving user messages queued in order" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var exit_payload = signal_module.SignalPayload{ .from_bits = 7, .reason_term = 2 };
+    var down_payload = signal_module.SignalPayload{ .from_bits = 8, .ref = 55, .reason_term = 3 };
+    var first_user = standaloneEnvelope(1);
+    var exit_envelope = exitSignalEnvelope(&exit_payload);
+    var second_user = standaloneEnvelope(2);
+    var down_envelope = downSignalEnvelope(&down_payload);
+    _ = mailbox.push(&first_user);
+    _ = mailbox.push(&exit_envelope);
+    _ = mailbox.push(&second_user);
+    _ = mailbox.push(&down_envelope);
+
+    // The oldest SIGNAL (the exit) is taken first — the user head is
+    // skipped, never a match, never disturbed.
+    switch (mailbox.takeCorrelated(0, .signal_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&exit_envelope, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    // Then the DOWN; signal kinds are indistinguishable to the class scan.
+    switch (mailbox.takeCorrelated(0, .signal_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&down_envelope, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    // The skipped user messages remain queued, in order.
+    try expectPopped(&mailbox, &first_user);
+    try expectPopped(&mailbox, &second_user);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: user_any extracts the oldest user message, leaving signals queued in order" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    var exit_payload = signal_module.SignalPayload{ .from_bits = 7, .reason_term = 2 };
+    var exit_envelope = exitSignalEnvelope(&exit_payload);
+    var first_user = standaloneEnvelope(1);
+    var second_user = standaloneEnvelope(2);
+    _ = mailbox.push(&exit_envelope);
+    _ = mailbox.push(&first_user);
+    _ = mailbox.push(&second_user);
+
+    // The signal head is skipped; the oldest USER message is taken —
+    // FIFO among user messages is preserved.
+    switch (mailbox.takeCorrelated(0, .user_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&first_user, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    switch (mailbox.takeCorrelated(0, .user_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&second_user, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    // No user message left: exhausted, with the signal still queued for
+    // the signal surface.
+    switch (mailbox.takeCorrelated(0, .user_any, null)) {
+        .exhausted => {},
+        else => return error.TestExpectedExhausted,
+    }
+    switch (mailbox.takeCorrelated(0, .signal_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&exit_envelope, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: a correlated-stamped reply is a user message to the class scans" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    // A late correlated reply (its awaiter timed out) must surface through
+    // the steady-state user receive — user_any matches it.
+    var late_reply = correlatedEnvelope(99);
+    _ = mailbox.push(&late_reply);
+    switch (mailbox.takeCorrelated(0, .user_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&late_reply, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: scanForMatch probes without consuming and honors the class kinds" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    // Empty queue: exhausted at the stub.
+    switch (mailbox.scanForMatch(0, .user_any, null)) {
+        .exhausted => |last| try testing.expectEqual(&mailbox.stub, last),
+        else => return error.TestExpectedExhausted,
+    }
+
+    // Only a signal queued: a user_any probe reports exhausted (the
+    // signal-aware `after` wait must NOT count it) — and consumes nothing.
+    var exit_payload = signal_module.SignalPayload{ .from_bits = 7, .reason_term = 2 };
+    var exit_envelope = exitSignalEnvelope(&exit_payload);
+    _ = mailbox.push(&exit_envelope);
+    switch (mailbox.scanForMatch(0, .user_any, null)) {
+        .exhausted => |last| try testing.expectEqual(&exit_envelope, last),
+        else => return error.TestExpectedExhausted,
+    }
+    try testing.expectEqual(@as(usize, 1), mailbox.depth());
+
+    // A user message behind the signal: found — still nothing consumed,
+    // and a resumed probe from the exhausted tail sees only new arrivals.
+    var user_envelope = standaloneEnvelope(1);
+    _ = mailbox.push(&user_envelope);
+    switch (mailbox.scanForMatch(0, .user_any, &exit_envelope)) {
+        .found => {},
+        else => return error.TestExpectedFound,
+    }
+    try testing.expectEqual(@as(usize, 2), mailbox.depth());
+
+    // The probe left everything in place for the consuming scans.
+    switch (mailbox.takeCorrelated(0, .user_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&user_envelope, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    switch (mailbox.takeCorrelated(0, .signal_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&exit_envelope, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
+}
+
+test "Mailbox: class scans never consult the receive-mark and never bump the R8 counter" {
+    var mailbox: Mailbox = undefined;
+    mailbox.init();
+
+    // Arm a mark past an older user message (the call-protocol shape).
+    var older_user = standaloneEnvelope(1);
+    _ = mailbox.push(&older_user);
+    mailbox.prepareReceiveMark();
+    mailbox.bindReceiveMark(42);
+    var newer_user = standaloneEnvelope(2);
+    _ = mailbox.push(&newer_user);
+
+    // A ref-0 class scan must start at the HEAD (an armed-but-foreign mark
+    // never applies): the OLDER user message is taken first.
+    const visits_before = mailbox.correlatedScanVisits();
+    switch (mailbox.takeCorrelated(0, .user_any, null)) {
+        .matched => |envelope| try testing.expectEqual(&older_user, envelope),
+        else => return error.TestExpectedMatch,
+    }
+    // And the class scan does not pollute the R8 correlated-visit counter.
+    try testing.expectEqual(visits_before, mailbox.correlatedScanVisits());
+
+    try expectPopped(&mailbox, &newer_user);
+    try testing.expectEqual(PopOutcome.empty, mailbox.pop());
 }
 
 test "Mailbox: armCorrelatedWake makes every push fire the wake seam until disarmed" {

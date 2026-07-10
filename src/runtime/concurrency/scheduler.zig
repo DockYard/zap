@@ -882,32 +882,55 @@ pub const ProcessContext = struct {
         }
     }
 
+    /// Blocking receive of the oldest USER message (P5-R1): like `receive`,
+    /// but signal envelopes (trapped exits / `DOWN`s) are SKIPPED and stay
+    /// queued, in order, for `await_signal` — the steady-state typed receive
+    /// must never decode a `SignalPayload` as the message type (Erlang: an
+    /// unmatched trapped exit sits in the mailbox until a wait that matches
+    /// it). The head-is-a-user-message common case extracts the head exactly
+    /// as `pop` delivers it. If the process is killed while waiting, the
+    /// suspension never returns.
+    pub fn receiveUser(context: *ProcessContext) *mailbox_module.Envelope {
+        switch (context.receiveCorrelated(0, .user_any, null)) {
+            .matched => |envelope| return envelope,
+            .timed_out => unreachable, // no deadline was armed
+        }
+    }
+
     /// Blocking receive with a timeout — the `receive … after` mechanism
-    /// (plan item 2.3, P2-J3). Parks (non-consuming) until a message is at
-    /// the mailbox head or `timeout_nanoseconds` elapses, returning which
+    /// (plan item 2.3, P2-J3). Parks (non-consuming) until a USER message
+    /// is queued or `timeout_nanoseconds` elapses, returning which
     /// happened WITHOUT consuming the message (a following `receive`
-    /// pops it). `timeout_nanoseconds == 0` polls once without parking
-    /// (`after 0`). A message that races the deadline wins. If the process
-    /// is killed while waiting, the suspension never returns.
+    /// takes it). Signal envelopes (trapped exits / `DOWN`s) are NOT user
+    /// messages (P5-R1): they never satisfy the wait — they stay queued
+    /// for `await_signal` while the wait probes past them — so a `receive
+    /// … after` whose mailbox holds only signals still times out instead
+    /// of parking forever behind a message the receive would then skip.
+    /// `timeout_nanoseconds == 0` probes once without parking (`after 0`).
+    /// A message that races the deadline wins. If the process is killed
+    /// while waiting, the suspension never returns.
     pub fn receiveWaitTimeout(context: *ProcessContext, timeout_nanoseconds: u64) ReceiveWaitOutcome {
         const record = context.record;
+        const mailbox = &record.pcb.mailbox;
 
-        // `after 0`: poll once without parking. A bounded spin resolves a
-        // producer mid-publish (a materializing message the poll must see).
+        // `after 0`: probe once without parking. A bounded spin resolves a
+        // producer mid-publish (a materializing message the probe must see).
         if (timeout_nanoseconds == 0) {
             var gap_spins: u32 = 0;
+            var resume_after: ?*mailbox_module.Envelope = null;
             while (true) {
                 if (record.pending_kill.load(.acquire)) {
                     record.yield_reason = .reenqueue;
                     context.execution.yield();
                     continue;
                 }
-                switch (record.pcb.mailbox.peek()) {
-                    .available => return .message_available,
-                    .empty => return .timed_out,
-                    .transient_gap => {
+                switch (mailbox.scanForMatch(0, .user_any, resume_after)) {
+                    .found => return .message_available,
+                    .exhausted => return .timed_out,
+                    .publish_pending => |last_examined| {
                         gap_spins += 1;
                         if (gap_spins >= poll_transient_gap_spin_limit) return .timed_out;
+                        resume_after = last_examined;
                         std.atomic.spinLoopHint();
                     },
                 }
@@ -915,37 +938,52 @@ pub const ProcessContext = struct {
         }
 
         const deadline_nanoseconds = context.scheduler.options.clock.read() +| timeout_nanoseconds;
+        var resume_after: ?*mailbox_module.Envelope = null;
         while (true) {
             if (record.pending_kill.load(.acquire)) {
                 record.yield_reason = .reenqueue;
                 context.execution.yield();
                 continue;
             }
-            switch (record.pcb.mailbox.peek()) {
-                .available => return .message_available,
-                .transient_gap => {
+            switch (mailbox.scanForMatch(0, .user_any, resume_after)) {
+                .found => return .message_available,
+                .publish_pending => |last_examined| {
                     // A producer is mid-publish — a message is arriving.
                     // Retry next quantum rather than parking on it.
+                    resume_after = last_examined;
                     record.yield_reason = .reenqueue;
                     context.execution.yield();
                 },
-                .empty => {
+                .exhausted => |last_examined| {
                     if (context.scheduler.options.clock.read() >= deadline_nanoseconds) return .timed_out;
-                    // Park with the deadline: the scheduler re-runs this
-                    // process on a message wake OR when the deadline
-                    // elapses (setting `receive_timed_out`).
+                    // Park with the deadline AND the any-push wake armed
+                    // (the mailbox may be nonempty — signals we probed
+                    // past — so the empty→nonempty wake alone would miss
+                    // a new push; the correlated receive's protocol
+                    // covers exactly this parked-on-nonempty shape).
+                    if (!mailbox.armCorrelatedWake(last_examined)) {
+                        // A message landed after the probe — re-probe the
+                        // new arrivals instead of parking.
+                        resume_after = last_examined;
+                        continue;
+                    }
                     record.receive_timed_out = false;
                     record.wake_deadline_nanoseconds = deadline_nanoseconds;
                     record.yield_reason = .waiting_for_message_deadline;
                     context.execution.yield();
+                    mailbox.disarmCorrelatedWake();
+                    resume_after = last_examined;
                     if (record.receive_timed_out) {
                         record.receive_timed_out = false;
-                        // A message that raced the timeout wins.
-                        if (record.pcb.mailbox.peek() == .available) return .message_available;
-                        return .timed_out;
+                        // A message that raced the timeout wins: one final
+                        // probe of the arrivals before conceding.
+                        switch (mailbox.scanForMatch(0, .user_any, resume_after)) {
+                            .found => return .message_available,
+                            else => return .timed_out,
+                        }
                     }
-                    // Message wake or spurious resume: loop re-checks the
-                    // mailbox and the deadline.
+                    // Push wake or spurious resume: loop re-probes the new
+                    // arrivals and re-checks the deadline.
                 },
             }
         }
@@ -1223,11 +1261,18 @@ pub const ProcessContext = struct {
         return context.record.pcb.signal_state.trapsExits();
     }
 
-    /// Blocking receive of the next signal message; caches it and returns the
-    /// reason term (`lastSignal*` read the other fields). See
-    /// `Scheduler.awaitSignal`.
+    /// Blocking receive of the next signal message (user messages skipped,
+    /// left queued); caches it and returns the reason term (`lastSignal*`
+    /// read the other fields). See `Scheduler.awaitSignal`.
     pub fn awaitSignal(context: *ProcessContext) u64 {
         return context.scheduler.awaitSignal(context);
+    }
+
+    /// `awaitSignal` bounded by a deadline: the consumed signal's reason term,
+    /// or null when `timeout_nanoseconds` elapsed with no signal. See
+    /// `Scheduler.awaitSignalTimeout`.
+    pub fn awaitSignalTimeout(context: *ProcessContext, timeout_nanoseconds: u64) ?u64 {
+        return context.scheduler.awaitSignalTimeout(context, timeout_nanoseconds);
     }
 
     /// The `from` pid bits of the most recently `awaitSignal`-consumed signal.
@@ -3414,17 +3459,42 @@ pub const Scheduler = struct {
 
     /// Blocking receive of the next SIGNAL message (an exit/`DOWN`) — the raw J1
     /// observation surface a trapping/monitoring process uses to inspect a
-    /// signal. Pops the mailbox head, caches its fields in `record.last_signal`,
-    /// frees the payload + envelope, and returns the reason term. Aborts if the
-    /// head is an ordinary user message (the raw contract, mirroring
-    /// `receive_raw`); J2/J3's `receive` construct decodes signals through the
-    /// per-envelope `signal_kind` accessors instead.
+    /// signal. Extracts the OLDEST signal envelope from the mailbox — ordinary
+    /// user messages are SKIPPED and stay queued, in order, for the
+    /// steady-state receive (P5-R1: Erlang's selective receive leaves what a
+    /// wait does not match; a supervisor sent a stray user message must not
+    /// abort) — caches its fields in `record.last_signal`, frees the payload +
+    /// envelope, and returns the reason term.
     fn awaitSignal(scheduler: *Scheduler, context: *ProcessContext) u64 {
-        const sr = scheduler.signalRuntimePtr().?;
-        const envelope = context.receive();
-        if (envelope.fragment.signal_kind == .none) {
-            @panic("awaitSignal: mailbox head is an ordinary message, not a signal");
+        switch (context.receiveCorrelated(0, .signal_any, null)) {
+            .matched => |envelope| return scheduler.consumeSignalEnvelope(context, envelope),
+            .timed_out => unreachable, // no deadline was armed
         }
+    }
+
+    /// `awaitSignal` bounded by a deadline — the timed signal wait a
+    /// supervisor's `:timeout` shutdown protocol needs (`lib/supervisor.zap`
+    /// `wait_exit`). Returns the consumed signal's reason term (fields cached
+    /// exactly like `awaitSignal`), or null when `timeout_nanoseconds`
+    /// elapsed with no signal. User messages are skipped and stay queued.
+    fn awaitSignalTimeout(scheduler: *Scheduler, context: *ProcessContext, timeout_nanoseconds: u64) ?u64 {
+        switch (context.receiveCorrelated(0, .signal_any, timeout_nanoseconds)) {
+            .matched => |envelope| return scheduler.consumeSignalEnvelope(context, envelope),
+            .timed_out => return null,
+        }
+    }
+
+    /// Consume one extracted SIGNAL envelope: cache its fields in
+    /// `record.last_signal` (the `zap_proc_last_signal_*` read surface), free
+    /// the payload + envelope, and return the reason term — the shared tail of
+    /// `awaitSignal`/`awaitSignalTimeout`.
+    fn consumeSignalEnvelope(
+        scheduler: *Scheduler,
+        context: *ProcessContext,
+        envelope: *mailbox_module.Envelope,
+    ) u64 {
+        const sr = scheduler.signalRuntimePtr().?;
+        std.debug.assert(envelope.fragment.signal_kind != .none);
         const payload: *const signal_module.SignalPayload = @ptrCast(@alignCast(envelope.fragment.payload_pointer.?));
         context.record.last_signal = payload.*;
         context.record.last_signal_kind = envelope.fragment.signal_kind;

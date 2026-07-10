@@ -93,10 +93,22 @@
   - **Child order**: children START left→right and TERMINATE right→left.
   - **Shutdown protocol** (per child): `:brutal_kill` (immediate untrappable
     `exit(kill)`), `:timeout` (`exit(shutdown)`, then `kill` after
-    `shutdown_timeout_ms` if still alive), `:infinity` (`exit(shutdown)`, wait
-    indefinitely — the default for supervisor children).
+    `shutdown_timeout_ms` if still alive — an ABSOLUTE deadline; stray signals
+    consumed while waiting never restart the clock), `:infinity`
+    (`exit(shutdown)`, wait indefinitely — the default for supervisor children).
   - **Defaults**: intensity 1, period 5000 ms, strategy `:one_for_one`, restart
     `:permanent`.
+  - **Stray signals during teardown**: while a shutdown protocol waits for ONE
+    child's exit, another child can crash spontaneously — or the supervisor's
+    own parent can order it down. `Process.await_signal` is destructive (it
+    cannot leave a non-matching signal queued the way OTP's selective receive
+    does), so every such signal is COLLECTED (`SupervisorStrays`) and folded
+    back into supervisor state after the sweep: a collected child death is
+    handled as a fresh exit (restart policy + intensity charge, its own sweep
+    skipping already-collected pids — never a blocked re-reap), and a parent
+    signal collected mid-sweep is honored as a shutdown order. Ordinary USER
+    messages sent to the supervisor are skipped by the signal waits and stay
+    queued — they are never decoded as signals and never abort the supervisor.
 
   ## Supervision trees
 
@@ -184,6 +196,64 @@ pub struct SupervisorStep {
   child_id :: Atom
   reason :: Atom
   state :: SupervisorState
+}
+
+@doc = """
+  The stray signals a supervisor's blocking waits collected while waiting for
+  a SPECIFIC child's exit (`reap_exit`/`wait_exit` during a shutdown
+  protocol). `Process.await_signal` is DESTRUCTIVE — unlike OTP's selective
+  receive it cannot leave a non-matching signal queued — so every signal
+  popped while awaiting a particular pid is RECORDED here (never discarded)
+  and folded back into supervisor state once the wait completes: a collected
+  child death is handled as if its exit had arrived at the loop (restart
+  policy, intensity charge), and a collected non-child signal (the
+  supervisor's own parent terminating it) is honored as a shutdown order.
+  Two index-aligned lists: `froms` holds each signal's sender pid bits,
+  `reasons` its reason atom. Bounded by the child count plus the parent's one
+  shutdown signal — never unbounded. Internal to the supervisor machinery.
+  """
+
+pub struct SupervisorStrays {
+  froms :: List(u64)
+  reasons :: List(Atom)
+}
+
+@doc = """
+  Outcome of a timed wait for one child's exit (`wait_exit`): whether the
+  child's exit was consumed before the deadline (`exited`), plus every stray
+  signal collected while waiting. Internal.
+  """
+
+pub struct SupervisorReap {
+  exited :: Bool
+  strays :: SupervisorStrays
+}
+
+@doc = """
+  Outcome of a termination sweep over a child-index range
+  (`terminate_scope`): the live-pid list with the swept children zeroed, plus
+  every stray signal collected during the sweep. Internal.
+  """
+
+pub struct SupervisorSweep {
+  live_pids :: List(u64)
+  strays :: SupervisorStrays
+}
+
+@doc = """
+  Outcome of applying ONE child death to supervisor state
+  (`apply_child_death`): either the supervisor must stop (`stopped` with
+  `stop_reason` — the restart-intensity breaker tripped and the survivors
+  were already terminated), or the updated `state` (slots zeroed, restarts
+  queued, intensity recorded) plus the strays still awaiting resolution
+  (`resolve_strays` folds them in). Internal.
+  """
+
+pub struct SupervisorDeathOutcome {
+  stopped :: Bool
+  stop_reason :: Atom
+  state :: SupervisorState
+  strays :: SupervisorStrays
 }
 
 @doc = """
@@ -343,8 +413,10 @@ pub struct Supervisor {
               {
                 # A signal from a NON-child (the supervisor's own parent/linker
                 # terminating it): tear the subtree down right→left and tell the
-                # loop to exit with the received reason.
-                _down = Supervisor.terminate_all(state.specs, state.live_pids, List.length(state.specs) - 1)
+                # loop to exit with the received reason. Strays collected during
+                # the teardown steer its own reaps (an already-dead child is
+                # never re-reaped) and are then moot — everything is stopping.
+                _swept = Supervisor.terminate_all(state.specs, state.live_pids, List.length(state.specs) - 1, Supervisor.strays_empty())
                 %SupervisorStep{action: :stop, child_id: :none, reason: reason, state: state}
               }
             false -> Supervisor.handle_child_death(state, crashed_index, reason)
@@ -364,12 +436,98 @@ pub struct Supervisor {
   }
 
   @doc = """
-    Decide and act on one child's exit: honor its restart type, enforce the
-    intensity window, and apply the strategy — returning the next `Step`.
-    Internal to `step`.
+    Decide and act on one child's exit: apply the death (restart type,
+    intensity window, strategy — `apply_child_death`), then RESOLVE every
+    stray signal the termination sweep collected (`resolve_strays`) before
+    handing the next `Step` to the loop. Internal to `step`.
     """
 
   fn handle_child_death(state :: SupervisorState, crashed_index :: i64, reason :: Atom) -> SupervisorStep {
+    # Snapshot of the live pids as of THIS event: the classifier for strays.
+    # A stray from a snapshot pid is a child of this turn (fresh if its slot
+    # is still set, already-handled if zeroed); anything else is an outside
+    # signal (the supervisor's own parent). No new child pid can appear
+    # mid-turn (starts happen in the loop, after `step` returns).
+    snapshot = state.live_pids
+    outcome = Supervisor.apply_child_death(state, crashed_index, reason, Supervisor.strays_empty())
+    Supervisor.settle(outcome, snapshot)
+  }
+
+  @doc = """
+    Turn one `apply_child_death` outcome into the loop's next move: a
+    `:stop` step when the intensity breaker tripped, else fold the collected
+    strays into state (`resolve_strays`). Internal.
+    """
+
+  fn settle(outcome :: SupervisorDeathOutcome, snapshot :: List(u64)) -> SupervisorStep {
+    case outcome.stopped {
+      true -> %SupervisorStep{action: :stop, child_id: :none, reason: outcome.stop_reason, state: outcome.state}
+      false -> Supervisor.resolve_strays(outcome.state, snapshot, outcome.strays, 0)
+    }
+  }
+
+  @doc = """
+    Fold the collected stray signals into supervisor state, oldest first
+    (queue order). Each stray `{from, reason}` is classified against the
+    turn's `snapshot`:
+
+    - `from` matches a LIVE child slot — a child died spontaneously while a
+      sweep was waiting on someone else: handle it as a fresh child death
+      (restart type, intensity charge, strategy scope — whose own sweep is
+      seeded with the still-unresolved strays so it never re-reaps a
+      collected pid, and whose restart queue MERGES with the pending one).
+    - `from` was a child this turn but its slot is zeroed — the sweep already
+      terminated (or skip-zeroed) it and its restart, if due, is already
+      queued: ignore, exactly OTP's exit-from-unknown-pid rule and with no
+      double intensity charge.
+    - `from` was never a child — the supervisor's own parent terminated it
+      mid-sweep: honor the order (terminate everything still live, skipping
+      already-collected deaths) and stop with the stray's reason.
+
+    Once every stray is resolved, re-enter `step` to emit the queued
+    restarts. Internal.
+    """
+
+  fn resolve_strays(state :: SupervisorState, snapshot :: List(u64), strays :: SupervisorStrays, index :: i64) -> SupervisorStep {
+    case index < List.length(strays.froms) {
+      false -> Supervisor.step(state)
+      true ->
+        {
+          stray_from = List.at(strays.froms, index)
+          stray_reason = List.at(strays.reasons, index)
+          child_index = Supervisor.index_of_pid(state.live_pids, stray_from, 0, List.length(state.live_pids))
+          case child_index >= 0 {
+            true ->
+              {
+                remaining = Supervisor.strays_after(strays, index + 1)
+                outcome = Supervisor.apply_child_death(state, child_index, stray_reason, remaining)
+                Supervisor.settle(outcome, snapshot)
+              }
+            false ->
+              case Supervisor.index_of_pid(snapshot, stray_from, 0, List.length(snapshot)) >= 0 {
+                true -> Supervisor.resolve_strays(state, snapshot, strays, index + 1)
+                false ->
+                  {
+                    remaining = Supervisor.strays_after(strays, index + 1)
+                    _swept = Supervisor.terminate_all(state.specs, state.live_pids, List.length(state.specs) - 1, remaining)
+                    %SupervisorStep{action: :stop, child_id: :none, reason: stray_reason, state: state}
+                  }
+              }
+          }
+        }
+    }
+  }
+
+  @doc = """
+    Apply ONE child death to supervisor state: honor its restart type,
+    enforce the intensity window (terminating the survivors and reporting
+    `stopped` when the breaker trips), and apply the restart strategy. The
+    incoming `strays` seed every sweep (collected deaths are never
+    re-reaped) and accumulate what the sweeps pop; the caller resolves the
+    result. Internal.
+    """
+
+  fn apply_child_death(state :: SupervisorState, crashed_index :: i64, reason :: Atom, strays :: SupervisorStrays) -> SupervisorDeathOutcome {
     spec = List.at(state.specs, crashed_index)
     case Supervisor.triggers_restart?(spec.restart, reason) {
       false ->
@@ -378,7 +536,7 @@ pub struct Supervisor {
           # cleanly: drop it from the live set with no sibling effect and no
           # intensity charge — no restart happened.
           dropped = Supervisor.with_live_pids(state, List.set(state.live_pids, crashed_index, (0 :: u64)))
-          %SupervisorStep{action: :continue, child_id: :none, reason: :normal, state: dropped}
+          %SupervisorDeathOutcome{stopped: false, stop_reason: :normal, state: dropped, strays: strays}
         }
       true ->
         {
@@ -389,17 +547,13 @@ pub struct Supervisor {
               {
                 # Restart-intensity exceeded: the crash-loop breaker. The crashed
                 # child is already dead, so drop it before terminating the
-                # SURVIVORS right→left, then tell the loop to give up and exit
-                # `:shutdown`.
+                # SURVIVORS right→left (already-collected deaths skipped), then
+                # tell the loop to give up and exit `:shutdown`.
                 survivors = List.set(state.live_pids, crashed_index, (0 :: u64))
-                _down = Supervisor.terminate_all(state.specs, survivors, List.length(state.specs) - 1)
-                %SupervisorStep{action: :stop, child_id: :none, reason: :shutdown, state: Supervisor.with_live_pids(state, survivors)}
+                _swept = Supervisor.terminate_all(state.specs, survivors, List.length(state.specs) - 1, strays)
+                %SupervisorDeathOutcome{stopped: true, stop_reason: :shutdown, state: Supervisor.with_live_pids(state, survivors), strays: strays}
               }
-            false ->
-              {
-                planned = Supervisor.plan_restart(state, updated_history, crashed_index)
-                Supervisor.step(planned)
-              }
+            false -> Supervisor.plan_restart(state, updated_history, crashed_index, strays)
           }
         }
     }
@@ -408,37 +562,41 @@ pub struct Supervisor {
   @doc = """
     Build the restart plan for the crashed child under the state's strategy:
     terminate the affected still-live siblings (right→left, per their shutdown
-    protocol), and queue the children to (re)start (left→right, skipping
-    `:temporary` ones). Returns the state carrying the updated live pids, the new
-    intensity history, and the `pending_starts` queue. Internal.
+    protocol, skipping already-collected deaths), and queue the children to
+    (re)start (left→right, skipping `:temporary` ones, MERGED with any
+    already-pending starts in spec order). Returns the outcome carrying the
+    updated live pids, the new intensity history, the merged `pending_starts`
+    queue, and the accumulated strays. Internal.
     """
 
-  fn plan_restart(state :: SupervisorState, updated_history :: List(i64), crashed_index :: i64) -> SupervisorState {
+  fn plan_restart(state :: SupervisorState, updated_history :: List(i64), crashed_index :: i64, strays :: SupervisorStrays) -> SupervisorDeathOutcome {
     last_index = List.length(state.specs) - 1
-    scoped = case state.options.strategy {
-      :one_for_one -> Supervisor.plan_scope(state, crashed_index, crashed_index, crashed_index)
-      :simple_one_for_one -> Supervisor.plan_scope(state, crashed_index, crashed_index, crashed_index)
-      :rest_for_one -> Supervisor.plan_scope(state, crashed_index, last_index, crashed_index)
-      :one_for_all -> Supervisor.plan_scope(state, 0, last_index, crashed_index)
-      _ -> Supervisor.plan_scope(state, crashed_index, crashed_index, crashed_index)
+    planned = case state.options.strategy {
+      :one_for_one -> Supervisor.plan_scope(state, crashed_index, crashed_index, crashed_index, strays)
+      :simple_one_for_one -> Supervisor.plan_scope(state, crashed_index, crashed_index, crashed_index, strays)
+      :rest_for_one -> Supervisor.plan_scope(state, crashed_index, last_index, crashed_index, strays)
+      :one_for_all -> Supervisor.plan_scope(state, 0, last_index, crashed_index, strays)
+      _ -> Supervisor.plan_scope(state, crashed_index, crashed_index, crashed_index, strays)
     }
-    Supervisor.with_history(scoped, updated_history)
+    %SupervisorDeathOutcome{stopped: false, stop_reason: :normal, state: Supervisor.with_history(planned.state, updated_history), strays: planned.strays}
   }
 
   @doc = """
     Terminate the still-live children in `[low_index, high_index]` (right→left,
-    skipping the already-dead crashed child), then return the state with those
-    pids zeroed and `pending_starts` set to the children of the scope to restart
-    (left→right, skipping `:temporary`). Backs `:one_for_one` (scope = the crashed
-    child alone), `:rest_for_one` (crashed..last), and `:one_for_all` (0..last).
-    Internal.
+    skipping the already-dead crashed child and any child whose death was
+    already collected as a stray), then return the outcome with those pids
+    zeroed and `pending_starts` MERGED (spec order) with the scope's restart
+    ids (left→right, skipping `:temporary`). Backs `:one_for_one` (scope = the
+    crashed child alone), `:rest_for_one` (crashed..last), and `:one_for_all`
+    (0..last). Internal.
     """
 
-  fn plan_scope(state :: SupervisorState, low_index :: i64, high_index :: i64, crashed_index :: i64) -> SupervisorState {
+  fn plan_scope(state :: SupervisorState, low_index :: i64, high_index :: i64, crashed_index :: i64, strays :: SupervisorStrays) -> SupervisorDeathOutcome {
     after_crash = List.set(state.live_pids, crashed_index, (0 :: u64))
-    after_terminate = Supervisor.terminate_scope(state.specs, after_crash, high_index, low_index)
+    sweep = Supervisor.terminate_scope(state.specs, after_crash, high_index, low_index, strays)
     restart_ids = Supervisor.scope_restart_ids(state.specs, low_index, high_index, (List.new_empty(high_index - low_index + 1) :: List(Atom)))
-    Supervisor.with_live_and_pending(state, after_terminate, restart_ids)
+    merged = Supervisor.merge_pending(state.specs, state.pending_starts, restart_ids)
+    %SupervisorDeathOutcome{stopped: false, stop_reason: :normal, state: Supervisor.with_live_and_pending(state, sweep.live_pids, merged), strays: sweep.strays}
   }
 
   @doc = """
@@ -522,122 +680,244 @@ pub struct Supervisor {
   @doc = """
     Terminate the still-live children in `[low_index, high_index]` in reverse
     (right→left) order, each through its shutdown protocol, returning the
-    live-pid list with those children zeroed. Skips children already dead (pid
-    `0`). Internal.
+    live-pid list with those children zeroed plus the strays collected along
+    the way. Skips children already dead (pid `0`) and children whose death
+    was already COLLECTED as a stray (their exit is consumed — reaping again
+    would block forever on a signal that can never arrive; the collected
+    death is resolved by the caller). Internal.
     """
 
-  fn terminate_scope(specs :: List(SupervisorChildSpec), live_pids :: List(u64), index :: i64, low_index :: i64) -> List(u64) {
+  fn terminate_scope(specs :: List(SupervisorChildSpec), live_pids :: List(u64), index :: i64, low_index :: i64, strays :: SupervisorStrays) -> SupervisorSweep {
     case index >= low_index {
       true ->
         {
           pid = List.at(live_pids, index)
-          next_live = case pid == 0 {
-            true -> live_pids
+          case pid == 0 {
+            true -> Supervisor.terminate_scope(specs, live_pids, index - 1, low_index, strays)
             false ->
-              {
-                _stopped = Supervisor.terminate_child(List.at(specs, index), pid)
-                List.set(live_pids, index, (0 :: u64))
+              case Supervisor.strays_contain(strays, pid) {
+                true ->
+                  # Died on its own mid-sweep; its exit is already collected.
+                  # Zero the slot without a reap — the stray fold accounts it.
+                  Supervisor.terminate_scope(specs, List.set(live_pids, index, (0 :: u64)), index - 1, low_index, strays)
+                false ->
+                  {
+                    swept = Supervisor.terminate_child(List.at(specs, index), pid, strays)
+                    Supervisor.terminate_scope(specs, List.set(live_pids, index, (0 :: u64)), index - 1, low_index, swept)
+                  }
               }
           }
-          Supervisor.terminate_scope(specs, next_live, index - 1, low_index)
         }
-      false -> live_pids
+      false -> %SupervisorSweep{live_pids: live_pids, strays: strays}
     }
   }
 
   @doc = """
     Terminate every live child right→left (index `high_index` downto 0), each
     through its shutdown protocol — the whole-subtree teardown used when the
-    supervisor is shutting down or giving up. Internal.
+    supervisor is shutting down or giving up. Children whose deaths were
+    already collected as strays are skipped (never re-reaped). Returns the
+    accumulated strays, which the stopping caller then drops — every child is
+    dead or terminated at that point. Internal.
     """
 
-  fn terminate_all(specs :: List(SupervisorChildSpec), live_pids :: List(u64), index :: i64) -> Bool {
+  fn terminate_all(specs :: List(SupervisorChildSpec), live_pids :: List(u64), index :: i64, strays :: SupervisorStrays) -> SupervisorStrays {
     case index >= 0 {
       true ->
         {
           pid = List.at(live_pids, index)
-          _stopped = case pid == 0 {
-            true -> true
-            false -> Supervisor.terminate_child(List.at(specs, index), pid)
+          swept = case pid == 0 {
+            true -> strays
+            false ->
+              case Supervisor.strays_contain(strays, pid) {
+                true -> strays
+                false -> Supervisor.terminate_child(List.at(specs, index), pid, strays)
+              }
           }
-          Supervisor.terminate_all(specs, live_pids, index - 1)
+          Supervisor.terminate_all(specs, live_pids, index - 1, swept)
         }
-      false -> true
+      false -> strays
     }
   }
 
   @doc = """
     Terminate one child through its shutdown protocol and reap its exit:
     `:brutal_kill` — untrappable `kill`, then reap; `:infinity` — `exit(shutdown)`
-    then reap, waiting indefinitely; `:timeout` — `exit(shutdown)`, wait up to
-    `shutdown_timeout_ms` for it to die, and `kill` it if the deadline passes.
-    Because the supervisor traps exits and is linked to the child, the child's
-    death always arrives as a reap-able exit signal. Internal.
+    then reap, waiting indefinitely; `:timeout` — `exit(shutdown)`, wait until an
+    ABSOLUTE deadline (`monotonic_millis` now + `shutdown_timeout_ms` — strays
+    consumed while waiting never restart the clock) for it to die, and `kill` it
+    if the deadline passes. Because the supervisor traps exits and is linked to
+    the child, the child's death always arrives as a reap-able exit signal.
+    Every signal from another sender popped along the way is COLLECTED into the
+    returned strays (never discarded). Internal.
     """
 
-  fn terminate_child(spec :: SupervisorChildSpec, pid :: u64) -> Bool {
+  fn terminate_child(spec :: SupervisorChildSpec, pid :: u64, strays :: SupervisorStrays) -> SupervisorStrays {
     case spec.shutdown_kind {
       :brutal_kill ->
         {
           _killed = Process.kill(pid)
-          Supervisor.reap_exit(pid)
+          Supervisor.reap_exit(pid, strays)
         }
       :infinity ->
         {
           _asked = Process.exit_signal(pid, :shutdown)
-          Supervisor.reap_exit(pid)
+          Supervisor.reap_exit(pid, strays)
         }
       :timeout ->
         {
           _asked = Process.exit_signal(pid, :shutdown)
-          case Supervisor.wait_exit(pid, spec.shutdown_timeout_ms) {
-            true -> true
+          deadline = Process.monotonic_millis() + spec.shutdown_timeout_ms
+          reaped = Supervisor.wait_exit(pid, deadline, strays)
+          case reaped.exited {
+            true -> reaped.strays
             false ->
               {
                 _killed = Process.kill(pid)
-                Supervisor.reap_exit(pid)
+                Supervisor.reap_exit(pid, reaped.strays)
               }
           }
         }
       _ ->
         {
           _asked = Process.exit_signal(pid, :shutdown)
-          Supervisor.reap_exit(pid)
+          Supervisor.reap_exit(pid, strays)
         }
     }
   }
 
   @doc = """
     Block (via `await_signal`) until the exit of the process `pid` has been
-    consumed, discarding any other signal that arrives first (another child's
-    stray death during teardown). Internal to `terminate_child`.
+    consumed, COLLECTING every other signal that arrives first (another
+    child's spontaneous death, or the supervisor's own parent terminating it
+    mid-sweep) into the returned strays — the caller folds them into
+    supervisor state; nothing is discarded. Internal to `terminate_child`.
     """
 
-  fn reap_exit(pid :: u64) -> Bool {
-    _reason = Process.await_signal()
-    case Process.last_signal_from() == pid {
-      true -> true
-      false -> Supervisor.reap_exit(pid)
+  fn reap_exit(pid :: u64, strays :: SupervisorStrays) -> SupervisorStrays {
+    reason = Process.await_signal()
+    from = Process.last_signal_from()
+    case from == pid {
+      true -> strays
+      false -> Supervisor.reap_exit(pid, Supervisor.strays_push(strays, from, reason))
     }
   }
 
   @doc = """
-    Wait up to `timeout_ms` for the exit of `pid`, consuming it if it arrives
-    (returning `true`) or reporting the deadline elapsed (`false`). Composed from
-    the non-consuming `wait_for_message` peek (which reports ANY head envelope,
-    signals included) plus `await_signal` to consume the signal once present —
-    the timed-signal-wait the `:timeout` shutdown protocol needs. Internal.
+    Wait until `deadline_ms` (an ABSOLUTE `Process.monotonic_millis` instant)
+    for the exit of `pid`, consuming it if it arrives (`exited: true`) or
+    reporting the deadline elapsed (`exited: false`). Built on the timed
+    signal wait (`await_signal_timeout` — user messages are skipped and stay
+    queued); every signal from another sender is COLLECTED into the returned
+    strays and the remaining time recomputed, so a burst of strays can never
+    extend the child's grace period. Internal.
     """
 
-  fn wait_exit(pid :: u64, timeout_ms :: i64) -> Bool {
-    case :zig.ProcessRuntime.wait_for_message(timeout_ms) {
+  fn wait_exit(pid :: u64, deadline_ms :: i64, strays :: SupervisorStrays) -> SupervisorReap {
+    remaining = deadline_ms - Process.monotonic_millis()
+    case remaining <= 0 {
+      true -> %SupervisorReap{exited: false, strays: strays}
+      false ->
+        case :zig.ProcessRuntime.await_signal_timeout(remaining) {
+          false -> %SupervisorReap{exited: false, strays: strays}
+          true ->
+            {
+              from = Process.last_signal_from()
+              reason = Process.last_signal_reason()
+              case from == pid {
+                true -> %SupervisorReap{exited: true, strays: strays}
+                false -> Supervisor.wait_exit(pid, deadline_ms, Supervisor.strays_push(strays, from, reason))
+              }
+            }
+        }
+    }
+  }
+
+  @doc = """
+    An empty stray-signal collection. Internal.
+    """
+
+  fn strays_empty() -> SupervisorStrays {
+    %SupervisorStrays{froms: (List.new_empty(4) :: List(u64)), reasons: (List.new_empty(4) :: List(Atom))}
+  }
+
+  @doc = """
+    Append one collected signal to the strays. Internal.
+    """
+
+  fn strays_push(strays :: SupervisorStrays, from :: u64, reason :: Atom) -> SupervisorStrays {
+    %SupervisorStrays{froms: List.push(strays.froms, from), reasons: List.push(strays.reasons, reason)}
+  }
+
+  @doc = """
+    Whether a signal from `pid` was already collected. Internal.
+    """
+
+  fn strays_contain(strays :: SupervisorStrays, pid :: u64) -> Bool {
+    Supervisor.index_of_pid(strays.froms, pid, 0, List.length(strays.froms)) >= 0
+  }
+
+  @doc = """
+    The strays from index `start` on — the still-unresolved tail handed to a
+    nested sweep as its seed. Internal.
+    """
+
+  fn strays_after(strays :: SupervisorStrays, start :: i64) -> SupervisorStrays {
+    Supervisor.strays_copy_from(strays, start, List.length(strays.froms), Supervisor.strays_empty())
+  }
+
+  @doc = """
+    Copy the strays in `[index, total)` into `collected`. Internal.
+    """
+
+  fn strays_copy_from(strays :: SupervisorStrays, index :: i64, total :: i64, collected :: SupervisorStrays) -> SupervisorStrays {
+    case index < total {
+      true -> Supervisor.strays_copy_from(strays, index + 1, total, Supervisor.strays_push(collected, List.at(strays.froms, index), List.at(strays.reasons, index)))
+      false -> collected
+    }
+  }
+
+  @doc = """
+    Merge two restart queues into one, in SPEC (start) order, deduplicated —
+    a stray-driven restart plan joining an already-pending one must keep
+    every queued child exactly once, left→right. Internal.
+    """
+
+  fn merge_pending(specs :: List(SupervisorChildSpec), current :: List(Atom), additions :: List(Atom)) -> List(Atom) {
+    Supervisor.merge_pending_walk(specs, current, additions, 0, List.length(specs), (List.new_empty(List.length(specs)) :: List(Atom)))
+  }
+
+  @doc = """
+    The spec-order walk behind `merge_pending`: keep each spec's `child_id`
+    when it appears in either queue. Internal.
+    """
+
+  fn merge_pending_walk(specs :: List(SupervisorChildSpec), current :: List(Atom), additions :: List(Atom), index :: i64, total :: i64, collected :: List(Atom)) -> List(Atom) {
+    case index < total {
       true ->
         {
-          _reason = Process.await_signal()
-          case Process.last_signal_from() == pid {
-            true -> true
-            false -> Supervisor.wait_exit(pid, timeout_ms)
+          id = List.at(specs, index).child_id
+          queued = Supervisor.contains_atom(current, id, 0, List.length(current)) or Supervisor.contains_atom(additions, id, 0, List.length(additions))
+          next_collected = case queued {
+            true -> List.push(collected, id)
+            false -> collected
           }
+          Supervisor.merge_pending_walk(specs, current, additions, index + 1, total, next_collected)
+        }
+      false -> collected
+    }
+  }
+
+  @doc = """
+    Whether `target` appears in `atoms`. Internal.
+    """
+
+  fn contains_atom(atoms :: List(Atom), target :: Atom, index :: i64, total :: i64) -> Bool {
+    case index < total {
+      true ->
+        case List.at(atoms, index) == target {
+          true -> true
+          false -> Supervisor.contains_atom(atoms, target, index + 1, total)
         }
       false -> false
     }
