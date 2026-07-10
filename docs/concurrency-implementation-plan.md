@@ -768,6 +768,18 @@ cross-scheduler budget explicitly re-derived from the loaded numbers.
   request)` resolving through `whereis` with the dead-name `:noproc` exit surface
   (Elixir `GenServer.call(name, …)` parity). Today `call` requires a typed pid;
   send-by-name exists but the correlated call surface does not.
+- **5.9** Supervisor parent-vs-unknown-pid signal policy (round-2 finding; the
+  round-1 D3 fidelity nuance): today ANY trapped signal from a non-child pid is
+  treated as the parent's shutdown order and tears the tree down; OTP terminates
+  only on the REAL parent's exit and IGNORES unknown-pid EXITs. Corollary: a live
+  child explicitly `exit_signal`-ing its trapping supervisor is misclassified as
+  that child's death. Fix: record the actual parent pid at supervisor start and
+  classify strays three ways (child / parent / unknown-ignore). Behavior is
+  documented in `lib/supervisor.zap`; requires user code signaling the supervisor
+  directly to trigger. Related note folded into 5.5's scope: a supervisor never
+  CONSUMES skipped user messages (they stay queued indefinitely — OTP
+  logs-and-drops unknown messages); the drain/dead-letter behavior should land
+  with 5.5's typed signal-decode so both unknown-message classes get one policy.
 - **5.8** Gate-ON Zest suite under `ZAP_SCHED_SEED` (the D8 owner): under the
   seeded deterministic scheduler exactly the two `SafepointTest` preemption-ORDERING
   tests fail (verified 2026-07-09: `ZAP_SCHED_SEED=7` → 121 tests, 2 failures — the

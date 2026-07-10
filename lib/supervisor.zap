@@ -209,8 +209,12 @@ pub struct SupervisorStep {
   policy, intensity charge), and a collected non-child signal (the
   supervisor's own parent terminating it) is honored as a shutdown order.
   Two index-aligned lists: `froms` holds each signal's sender pid bits,
-  `reasons` its reason atom. Bounded by the child count plus the parent's one
-  shutdown signal — never unbounded. Internal to the supervisor machinery.
+  `reasons` its reason atom. Practically bounded by the supervisor's
+  link/monitor fan-in (its children plus the parent's one shutdown signal);
+  an adversarial `exit_signal` spammed at the supervisor during a sweep
+  window folds to a stop order on the first such stray (plan item 5.9
+  tracks the parent-vs-unknown classification refinement), so the list
+  cannot grow past that turn. Internal to the supervisor machinery.
   """
 
 pub struct SupervisorStrays {
