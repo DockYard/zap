@@ -1460,6 +1460,9 @@ O(1) is the one-call-site follow-up of migrating `Map.bufferAlloc`/
 `List` already carries), after which `movableFlatListCell` extends to
 `movableFlatMapCell`. Nested graphs (a `List`/`Map` of `String`/`List`/`Map`)
 have interior ARC children in separate cells and also copy.
+*[RESOLVED — P6-J1 (2026-07-10, plan item 6.1a): the migration and
+`movableFlatMapCell` landed; a large uniquely-owned flat `Map` now moves O(1)
+(§ E6, "P6-J1 Map-move re-run"). Nested graphs still copy, as designed.]*
 
 ### Measurement
 
@@ -1742,6 +1745,125 @@ Net: **an early crossover for maps pulls the R4 bulk-adopt/move path forward
 for structured containers; a late crossover for flat scalars lets it be
 deferred there.** Re-run E6 in Phase 6 with the move path on and compare the
 `Map` row against the 2.19 ms/MB serialize-to-blob baseline recorded here.
+
+### P6-J1 Map-move re-run (2026-07-10) — the map catastrophe is FIXED
+
+**VERDICT: with the plan-6.1a migration landed (`Map.bufferAlloc`/
+`bufferFreeShallow` on the `containerBufferAlloc` gate-branch +
+`movableFlatMapCell`), a large uniquely-owned flat `Map` send is an O(1)
+region move: a FULL round trip (two sends + two receives) costs ~0.24–0.29 µs
+in the paired run (~0.11 µs in a second, move-only run — run-to-run
+core-placement variance at this scale), SIZE-INDEPENDENT from 16 KB to 1 MB —
+replacing a 5.2 ms 1 MB copy round trip measured in the SAME paired run
+(≈20,500×) and the 2.19 ms/MB single-direction reconstruct this section's
+baseline recorded.** The phase exit gate ("E6 re-run — crossover documented;
+ping-pong within target with move path on") is met; the crossover for flat
+containers is now "**everything large enough to be page-backed moves;
+everything smaller stays on the (cheap-at-that-size) copy path**" — the
+catastrophic arm of the 2026-07-07 crossover is gone.
+
+- **Harness:** `bench/concurrency-copy/move-bench.zig` (built + run by
+  `run-move-bench.sh`) — an END-TO-END kernel measurement, not a walker
+  microbench: a root process and an echo process ping-pong ONE value through
+  the REAL `Process.send_move`/`send` + `receive` paths (real spawned
+  processes, real mailboxes, real per-process ARC heaps; gate-ON, stats-ON,
+  source-bound-ARC runtime via the compiler's own marker rewrites applied to
+  a build-local `runtime.zig`; fork compiler, `-OReleaseFast`;
+  `ZAP_SCHED_CORES=1` — the same-scheduler ledger discipline). Timing: one
+  `CLOCK_UPTIME_RAW` pair per repetition batch (E1 kernel-bench convention),
+  median/min of 5 reps.
+- **Move-vs-copy PROOF per run, not assumption:** every move round trip
+  asserts pointer IDENTITY (the SAME cell address returns — a copy fallback
+  would mint a fresh cell) and the run asserts the `region_move_sends_total`/
+  `region_move_adopts_total` counters equal EXACTLY two per round trip; copy
+  runs assert the counters stay zero. Element counts are sized so the
+  serialized blob matches this section's byte targets (map blob = 4 + 16n).
+- **Load + variance:** primary table = ONE paired `all`-mode invocation
+  (move and copy rows back-to-back in the same session — the item-2.9
+  paired-run discipline), 1-min load 2.5–3.1, per-rep medians/minima within
+  ~1–4 % per row. A separate move-only run at load 3.9–4.3 measured the SAME
+  rows at 105–119 ns RTT — 2.2× faster in absolute terms (core placement /
+  frequency at the sub-µs scale), IDENTICALLY flat across sizes. The
+  load-robust claims are the ones both runs agree on: size-independence and
+  the orders-of-magnitude move-vs-copy gap; treat absolute sub-µs RTTs with
+  the standing min-floor caveat.
+
+Full round trip (2 sends + 2 receives), median / min over 5 reps, paired run:
+
+| Shape | Blob-equivalent | MOVE rtt (ns) | COPY rtt (ns) | move speedup |
+|---|---:|---:|---:|---:|
+| `Map(i64,i64)` 1 023 entries | 16 KB | **288 / 279** | 87 223 / 86 784 | ~303× |
+| `Map(i64,i64)` 4 095 entries | 64 KB | **242 / 241** | 316 192 / 315 472 | ~1 307× |
+| `Map(i64,i64)` 16 383 entries | 256 KB | **244 / 242** | 1 257 969 / 1 248 333 | ~5 155× |
+| `Map(i64,i64)` 65 535 entries | 1 MB | **255 / 250** | 5 236 423 / 5 214 636 | **~20 535×** |
+| `List(i64)` 2 047 elems | 16 KB | **222 / 210** | 11 202 / 10 928 | ~50× |
+| `List(i64)` 131 071 elems | 1 MB | **217 / 211** | 341 028 / 337 122 | ~1 572× |
+| `Map` 15 entries (slab-backed) | 244 B | 3 809 (degrades to copy, counters 0) | — | honest fallback |
+
+(The move-only run: map rows 115/112/119/112 ns, list rows 105/103 ns —
+same flatness, faster absolute floor.)
+
+Readings:
+
+- **The move is FLAT across three orders of magnitude** (242–288 ns RTT for
+  16 KB → 1 MB maps in the paired run; 112–119 ns in the second run; per
+  direction ≈ the ~44 ns E1 mailbox floor + the E5 detach/adopt pair +
+  envelope bookkeeping) — the E5 manager-level O(1) claim now holds
+  END-TO-END for `Map`.
+- **The receiver's map needs NO rebuild**: the cell layout is
+  position-independent (buckets reference entries BY INDEX; the per-instance
+  hash seed travels inside the cell; section addresses are recomputed from
+  the cell pointer), so adoption is pure ownership relink — pointer identity
+  preserved, every lookup correct (asserted exhaustively in
+  `test_concurrency/move_send_test.zap` and per-op in the bench's
+  anti-elision probe).
+- **The copy baseline reconciles with the 2026-07-07 table**: a 1 MB map
+  copy round trip here is two full copy sends ≈ 2 × (22.8 µs serialize +
+  ~14 µs transport + ~2.2 ms reconstruct + envelope) ≈ 5.2–6.4 ms across the
+  two runs — the same reconstruct-dominated cost, measured end-to-end.
+- **Small maps still copy** (slab-backed cells are not relocatable): the
+  244 B row degrades transparently (move counters zero) at 3.8 µs RTT —
+  the cheap side of the crossover, exactly as designed.
+- **ORC processes participate**: ORC's v1.2 relocate slots are wired through
+  its production SlabHeap large path (with a collector-state guard: a
+  buffered/non-black cell declines; a flat move-eligible cell is provably
+  never buffered since `noteDecrement` skips `possibleRoot` for
+  `deep_walk == null`/unregistered types), and cross-manager moves ride the
+  byte-identical mirrored `LargeHeader` ABI — ORC→ARC, ARC→ORC and ORC→ORC
+  moves proven at the language surface
+  (`test_concurrency/orc_move_test.zap`).
+- **Ping-pong within target with the move path on** (the exit-gate
+  sentence): `bench/concurrency-kernel` `pingpong-pool` re-run at this HEAD
+  (2026-07-10, rebuilt from source; 100k RTTs × 5 reps, 2-core pool, load
+  2.4–3.1): **median 135.6 ns / min 98.1 ns per RTT, 6 parks over 500k
+  RTTs** — squarely inside the E1 target envelope (kill criterion ≥ 2–3 µs;
+  the P4-J1 reading of this bench — a collocated communicating pair, not a
+  sustained cross-core RTT — stands; the spread vs P4-J1's 88/73 ns is
+  session-load drift, rep medians fell 192 → 98 ns as load fell within the
+  run). The kernel itself is untouched by P6-J1 (all changes are
+  runtime/manager-side). And the container move itself IS a ping-pong: a
+  1 MB `Map` round trip at 0.11–0.29 µs is within the same order as the
+  scalar floor while transporting a megabyte of live hash table.
+- **Leak-exactness on every path**: delivered+adopted, dead-lettered
+  (caller re-owns), and receiver-teardown-drain are pinned at the kernel
+  level with a counting reclaim hook (`src/runtime/concurrency/abi.zig`, the
+  three "moved envelope" tests), at the manager level for both ARC and ORC
+  (detach/adopt/free-detached unit tests), and the Map-cell-shaped
+  cross-thread move is ThreadSanitizer-clean
+  (`src/memory/arc/cross_thread_stress.zig`, `runMapMoveSendArcStress`).
+
+Gate-OFF is untouched, PROVEN at the byte level: a full gate-OFF
+`-OReleaseFast` binary (real runtime + real ARC manager, the copy-bench
+harness exercising the Map/List/String paths) built from the pre-P6-J1
+runtime and from the migrated runtime has a byte-identical `__text` section
+(SHA-256 `fd9cc4c5…` both) — `Map.bufferAlloc` gate-OFF is the same
+`c_allocator` path as before, per the gate-branch pattern. Behaviorally
+confirmed by re-running the original P2-J9 walker harness (`bench.zig` `map`
+mode, 5 reps, load 2.0; its manager binding was refreshed to the
+source-module path after P3-J3's `.Obj`-gated symbol export orphaned the
+weak-extern recipe): the 1 MB map walker round trip measures **2.194 ms
+(reconstruct 2.176 ms)** vs the 2026-07-07 baseline's 2.190 ms/2.166 ms —
+unchanged within noise, every row within ~1–2 % of the baseline table.
 
 ## E8 — conservative fiber-stack scan (P3-J6, 2026-07-08) — GATE: PASS (mark-sweep ships as TRACED)
 

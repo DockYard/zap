@@ -79,12 +79,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zap = @import("zapruntime");
 
-// Force the ARC manager's `zap_memory_section` linker symbol to be emitted so
-// the runtime's weak `@extern("zap_memory_section")` binds the REAL production
-// ARC manager vtable (not the test-only fallback — this is a non-test exe).
-comptime {
-    _ = @import("zaparcmanager");
-}
+// The REAL production ARC manager is bound as the `zap_active_manager` source
+// module with `RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT` rewritten to true (see
+// `run-copy-bench.sh`) — the exact binding every compiler-driven user binary
+// uses. This replaced the original weak-linker-symbol binding when the
+// manager's `zap_memory_section` export became `.Obj`-gated (P3-J3 per-spawn
+// managers; docs in `src/memory/arc/manager.zig`): an `.Exe` build like this
+// bench no longer emits the symbol, so the source-module DECL binding is the
+// one production path.
 
 // -- harness clock (CLOCK_UPTIME_RAW, never through the walker) ------------------------------
 

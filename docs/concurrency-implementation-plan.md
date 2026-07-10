@@ -563,7 +563,9 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     `containerBufferAlloc`/`Free` (the exact gate-branch `List` already carries);
     the O(1) map-send fix is that one-call-site migration + extending
     `movableFlatListCell` to maps. Nested graphs (interior ARC children in separate
-    cells) also copy.
+    cells) also copy. *[RESOLVED by item 6.1a (P6-J1, 2026-07-10): the migration and
+    `movableFlatMapCell` landed; a large uniquely-owned flat `Map` now moves O(1) —
+    see 6.1a's DONE record and the E6 re-run. Nested graphs still copy, as designed.]*
 - **3.4** ORC manager: `src/memory/orc/manager.zig` + stdlib adapter; verify the
   shares-REFCOUNTED-specialization hypothesis (cycle-root buffering entirely inside `release`);
   cycle-collection at yield points only. **DONE (P3-J6, 2026-07-08)** — `Memory.ORC`
@@ -594,7 +596,16 @@ Goal: `spawn(f, .{ .manager = … })` with comptime-resolved manager binding (De
     VALUE is **DORMANT-UNTIL-MUTATION** — it unlocks with opportunistic-mutation / mutable-closure
     primitives (future work). This item is manager-level-proven + dispatch-wired, NOT
     "surface end-to-end proven." Follow-ons: (i) wire `CYCL` `register_cell_type` auto-registration
-    to the runtime container types; (ii) the `Map` O(1)-move migration (item 6.1a); (iii) mutation
+    to the runtime container types; (ii) the `Map` O(1)-move migration (item 6.1a) *[DONE —
+    P6-J1, 2026-07-10: ORC's v1.2 relocate slots are also now REAL — detach/adopt wired through
+    the production SlabHeap `large_head` (mirroring ARC), `free_detached_region` context-free via
+    the shared `LargeHeader` ABI, guarded by `collectorStateBlocksMove` (a buffered/non-black cell
+    declines the move; a flat move-eligible cell is provably never buffered — `noteDecrement`
+    skips `possibleRoot` for `deep_walk == null` and unregistered types). Cross-manager moves
+    (ARC↔ORC, both `.refcounted`) ride the byte-identical mirrored `LargeHeader` contract, proven
+    end-to-end in `test_concurrency/orc_move_test.zap` (ORC→ARC, ARC→ORC, ORC→ORC). Test builds
+    (DebugAllocator heap) decline detach, honestly — the SlabHeap path is unit-proven +
+    gate-ON-proven.]*; (iii) mutation
     primitives that make reference cycles constructible at the surface.
 - **3.5** Capability matrix (comptime table + runtime spawn error); wasm32 and Windows entries;
   compile-time warnings for statically-known-impossible combos.
@@ -824,6 +835,28 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
   ARC children in separate cells) still copy. Exit: an E6 `Map`-crossover re-run
   shows the move path replacing the 2.19 ms/MB rebuild for large uniquely-owned
   maps. `docs/concurrency-bench-results.md` § E6.
+  **DONE (P6-J1, 2026-07-10)** — the one-call-site migration landed:
+  `Map.bufferAlloc`/`bufferFreeShallow` carry the exact gate-branch `List` uses
+  (gate-ON → `containerBufferAlloc`/`containerBufferFree`, the running process's
+  private manager heap — a killed process's map cells now also reclaim wholesale;
+  gate-OFF → `c_allocator` byte-identical to before, plus the previously-missing
+  layer-1 `procReductionTick` alloc piggyback, comptime-elided gate-OFF), and
+  `movableFlatMapCell` extends the move predicate to flat `Map(scalar, scalar)`.
+  The layout-survival argument is documented at the predicate: the cell is one
+  contiguous `[Self | buckets | entries]` block with NO interior pointers —
+  buckets reference entries BY INDEX, the hash seed travels inside the cell, and
+  section addresses are recomputed from the cell pointer per access — so the
+  adopted map is usable IMMEDIATELY (no rebuild, no fix-up; pointer identity
+  preserved, E5 mechanism). Alongside: the v1.2 relocate slots now dispatch
+  per-process under `multi_manager_active` (`currentRefcountCapability`, closing
+  the same type-confusion hazard P3-R1a closed for retain/release), and ORC's
+  relocate slots are wired through its production SlabHeap large path with a
+  collector-state guard (see 3.4 follow-on (ii) — done). Exit met: the E6
+  re-run shows the flat-`Map` move RTT flat at ~0.24–0.29 µs (0.11 µs on a
+  second run — sub-µs core-placement variance), SIZE-INDEPENDENT 16 KB→1 MB,
+  vs the paired-run 5.2 ms 1 MB copy round trip (≈20,500×) — § E6 "P6-J1
+  Map-move re-run". Nested graphs (interior ARC children) still copy,
+  documented.
 - **6.2** `Blob` (atomically-refcounted immutable byte buffer; naming folds into the pending
   V8→dense rename sweep): the one sanctioned share tier; global immutable registry
   (`persistent_term` analogue).

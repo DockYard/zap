@@ -1023,6 +1023,17 @@ fn slabFreeSlot(pool: *SlabPool, slab: *SlabHeader, slot_index: u32) void {
 // a minimum of 16 bytes, the size of the header struct) so the user
 // pointer remains aligned. `release_sized` finds the header by walking
 // backward from the user pointer.
+//
+// CROSS-MANAGER REGION-MOVE ABI (P6-J1): this header — field layout,
+// `LARGE_MAGIC` value, and the `largeLeadingFor` placement rule — is
+// deliberately BYTE-IDENTICAL between the ARC and ORC managers
+// (`src/memory/arc/manager.zig` / `src/memory/orc/manager.zig`; each manager
+// compiles standalone, so the definition is mirrored, not shared). The
+// same-model O(1) region-move send re-parents a detached large block between
+// ANY two refcounted-model processes — ARC->ARC, ORC->ORC, ARC->ORC, or
+// ORC->ARC — so the adopting manager reads the header the detaching manager
+// wrote, and `free_detached_region` on either manager reclaims either's
+// orphan. Any change here MUST be made to both definitions in lockstep.
 // ---------------------------------------------------------------------------
 
 const LargeHeader = extern struct {

@@ -67,19 +67,43 @@ uses **no fibers**, so the fork's x30-clobber fix (E9) is not itself required
 here — but the fork is what the whole series pins.
 
 The runtime links the real ARC manager for a production-representative
-reconstruct substrate; the manager's `zap_memory_section` is force-referenced
-from `bench.zig` so its linker symbol is emitted and the runtime's weak extern
-binds it.
+reconstruct substrate, bound the PRODUCTION way: the manager is registered as
+the `zap_active_manager` SOURCE MODULE and the runtime's
+`RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT` marker is rewritten to `true` on a
+build-local copy of `runtime.zig` — the same marker rewrite the compiler
+performs for every user binary. (The original weak-linker-symbol binding died
+when the manager's `zap_memory_section` export became `.Obj`-gated with
+P3-J3's per-spawn managers; an `.Exe` build like this bench no longer emits
+the symbol.) `run-copy-bench.sh` performs the rewrite; by hand:
 
 ```sh
+sed 's/const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = false;/const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = true;/' \
+  ../../src/runtime.zig > .copy-bench-build/runtime_bound.zig
 ~/projects/zig/zig-out/bin/zig build-exe -OReleaseFast --name bench \
-  --dep zapruntime --dep zaparcmanager \
+  --dep zapruntime \
   -Mmain=bench.zig \
   --dep zap_active_manager \
-  -Mzapruntime=../../src/runtime.zig \
-  --dep zap_active_manager \
-  -Mzaparcmanager=../../src/memory/arc/manager.zig \
-  -Mzap_active_manager=../../src/zap_active_manager_stub.zig
+  -Mzapruntime=.copy-bench-build/runtime_bound.zig \
+  -Mzap_active_manager=../../src/memory/arc/manager.zig
+```
+
+## The P6-J1 move bench (`move-bench.zig`)
+
+The E6 **re-run** harness (plan item 6.1a): the O(1) region-move send vs the
+two-copy send, measured END-TO-END through the REAL kernel — spawned
+processes, real mailboxes, `Process.send_move`/`receive` — on real
+`Map(i64, i64)`/`List(i64)` cells, with per-run PROOF of which path ran
+(pointer identity across every round trip + exact `region_move_*` counter
+accounting). Built by `run-move-bench.sh` against a gate-ON, stats-ON,
+source-bound-ARC runtime (the compiler's marker rewrites applied to a
+build-local `runtime.zig` copy) plus the real kernel unit (`zapkernel`,
+rooted at `abi.zig` exactly as `concurrency_driver.zig` roots the production
+kernel object). Runs under `ZAP_SCHED_CORES=1` (the same-scheduler ledger
+discipline). Results: `docs/concurrency-bench-results.md` § E6, "P6-J1
+Map-move re-run".
+
+```sh
+./run-move-bench.sh [move|copy|small|all] [reps]
 ```
 
 ## Run

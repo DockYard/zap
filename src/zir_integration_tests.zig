@@ -6035,6 +6035,28 @@ test "ZIR concurrency: Process.send_move consumes its message — a use after th
     );
 }
 
+test "ZIR concurrency: Process.send_move of a Map consumes it too — use-after-move is a compile error (P6-J1)" {
+    // The Map counterpart of the P3-J5 List pin above: `send_move`'s consuming
+    // convention is type-agnostic (the `unique message_type` parameter), so a
+    // flat Map message is moved out of the sender identically — the compile-time
+    // TOOTH that makes the P6-J1 O(1) Map region-move sound (the receiver owns
+    // the cell after the move; a sender reuse would read a re-parented cell).
+    // WRITTEN, not run here (`zig build zir-test` is driven separately).
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    table = %{1 => 10, 2 => 20}
+        \\    echo = (Pid.of(Process.self()) :: Pid(%{i64 => i64}))
+        \\    _sent = Process.send_move(echo, table)
+        \\    _reuse = table
+        \\    0
+        \\  }
+        \\}
+    ,
+        "already moved",
+    );
+}
+
 test "ZIR concurrency: Process.receive_raw rejects an unsendable payload type token" {
     // `String` is outside the Phase-2 sendable set (fixed-size scalars);
     // the raw-receive token macro has no clause for it, so an unsendable

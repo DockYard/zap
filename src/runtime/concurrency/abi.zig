@@ -2459,6 +2459,178 @@ test "abi: send to a dead pid dead-letters and reclaims the payload block" {
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
 }
 
+// ---------------------------------------------------------------------------
+// Moved-envelope reclaim discipline (plan items 6.1/6.1a, P3-J5/P6-J1).
+//
+// The kernel is payload-agnostic — a moved fragment is an opaque root pointer
+// plus the caller's `moved_reclaim` hook — so ONE invocation contract covers
+// every moved shape (flat `List` and, since P6-J1, flat `Map`). These tests
+// pin the contract's three legs at the kernel level with a counting hook:
+//
+//   * dead-letter  → the graph was never enqueued; the kernel must NOT invoke
+//                    the reclaim (the CALLER re-owns the orphan — the runtime
+//                    re-adopts and releases it);
+//   * teardown-drain → a delivered-but-never-received moved envelope drained
+//                    by the receiver's teardown must reclaim EXACTLY ONCE;
+//   * delivered+adopted → `zap_proc_envelope_take_moved` transfers ownership
+//                    and clears the fragment, so the following envelope free
+//                    must NOT reclaim.
+// ---------------------------------------------------------------------------
+
+/// Counting stand-in for the runtime's `movedOrphanReclaim`: the kernel only
+/// ever INVOKES the hook (never interprets the payload), so the invocation
+/// count is the whole contract under test. The payload is a static buffer —
+/// nothing to free.
+var moved_reclaim_invocations: usize = 0;
+var moved_payload_storage: [64]u8 = [_]u8{0xAB} ** 64;
+
+fn countingMovedReclaim(payload_pointer: [*]const u8) callconv(.c) void {
+    _ = payload_pointer;
+    moved_reclaim_invocations += 1;
+}
+
+fn movedDeadLetterSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const status_out: *i32 = @ptrCast(@alignCast(argument.?));
+    const forged = concurrency.Pid{
+        .slot = 7,
+        .generation = 999,
+        .model = .refcounted,
+        .node = 0,
+    };
+    status_out.* = zap_proc_send_moved(
+        process,
+        forged.toBits(),
+        &moved_payload_storage,
+        moved_payload_storage.len,
+        countingMovedReclaim,
+    );
+}
+
+test "abi: send_moved to a dead pid dead-letters WITHOUT invoking moved_reclaim (the caller re-owns the orphan)" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+    moved_reclaim_invocations = 0;
+
+    var observed_status: i32 = std.math.minInt(i32);
+    const pid_bits = zap_proc_spawn(movedDeadLetterSenderEntry, &observed_status);
+    try testing.expect(pid_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // Nothing was enqueued and nothing was consumed: the kernel must leave
+    // the orphan to the caller (the runtime re-adopts + releases it), so the
+    // reclaim hook fires ZERO times.
+    try testing.expectEqual(ZapProcStatus.dead_lettered, observed_status);
+    try testing.expectEqual(@as(usize, 0), moved_reclaim_invocations);
+}
+
+/// Probe threading the receive-once receiver's pid to the moved-payload
+/// sender.
+const MovedTeardownProbe = struct {
+    receiver_pid_bits: u64 = 0,
+    send_status: i32 = std.math.minInt(i32),
+};
+
+/// Receives exactly ONE message (the plain marker), then exits — leaving
+/// whatever else is in its mailbox for the exit-teardown drain.
+fn movedTeardownReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    _ = argument;
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    zap_proc_envelope_free(envelope);
+}
+
+fn movedTeardownSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *MovedTeardownProbe = @ptrCast(@alignCast(argument.?));
+    // Pairwise FIFO: the plain marker is received first; the moved envelope
+    // is still queued when the receiver exits after its single receive.
+    _ = zap_proc_send(process, probe.receiver_pid_bits, "m", 1);
+    probe.send_status = zap_proc_send_moved(
+        process,
+        probe.receiver_pid_bits,
+        &moved_payload_storage,
+        moved_payload_storage.len,
+        countingMovedReclaim,
+    );
+}
+
+test "abi: a moved envelope drained at receiver teardown runs moved_reclaim exactly once" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+    moved_reclaim_invocations = 0;
+
+    // The receiver receives ONE plain marker then exits, so the moved
+    // envelope (sent after the marker — pairwise FIFO) is still in its
+    // mailbox at exit: the receiver dies before adopting, and the teardown
+    // drain (`reclaimUndeliveredEnvelope`) must run the moved reclaim
+    // exactly once.
+    var probe = MovedTeardownProbe{};
+    const receiver_bits = zap_proc_spawn(movedTeardownReceiverEntry, null);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.receiver_pid_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(movedTeardownSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // Delivered, receiver exited without adopting → drained exactly once.
+    try testing.expectEqual(ZapProcStatus.ok, probe.send_status);
+    try testing.expectEqual(@as(usize, 1), moved_reclaim_invocations);
+}
+
+/// Probe for the delivered+adopted leg: the receiver records the moved root
+/// it took ownership of.
+const MovedAdoptProbe = struct {
+    receiver_pid_bits: u64 = 0,
+    send_status: i32 = std.math.minInt(i32),
+    taken_root: ?[*]const u8 = null,
+};
+
+fn movedAdoptReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *MovedAdoptProbe = @ptrCast(@alignCast(argument.?));
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    // Take ownership of the moved graph (clears the fragment), then free the
+    // envelope header — which must NOT invoke the reclaim.
+    probe.taken_root = zap_proc_envelope_take_moved(envelope);
+    zap_proc_envelope_free(envelope);
+}
+
+fn movedAdoptSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *MovedAdoptProbe = @ptrCast(@alignCast(argument.?));
+    probe.send_status = zap_proc_send_moved(
+        process,
+        probe.receiver_pid_bits,
+        &moved_payload_storage,
+        moved_payload_storage.len,
+        countingMovedReclaim,
+    );
+}
+
+test "abi: a delivered moved envelope whose graph is TAKEN is never reclaimed by envelope_free" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+    moved_reclaim_invocations = 0;
+
+    var probe = MovedAdoptProbe{};
+    const receiver_bits = zap_proc_spawn(movedAdoptReceiverEntry, &probe);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.receiver_pid_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(movedAdoptSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // Ownership transferred BY POINTER (zero copy — the exact root crossed),
+    // and the ordinary envelope free ran with a cleared fragment: no reclaim.
+    try testing.expectEqual(ZapProcStatus.ok, probe.send_status);
+    try testing.expect(probe.taken_root != null);
+    try testing.expectEqual(@intFromPtr(&moved_payload_storage), @intFromPtr(probe.taken_root.?));
+    try testing.expectEqual(@as(usize, 0), moved_reclaim_invocations);
+}
+
 /// Probe for the cross-model stale-pid dead-letter test (P3-J4 §2.4): a sender
 /// records the `zap_proc_send` status of a message aimed at a STALE pid whose
 /// pid-table slot has been recycled by a DIFFERENT-model process.

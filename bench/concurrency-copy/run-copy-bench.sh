@@ -22,14 +22,30 @@ cd "$HERE"
 
 echo "# fork compiler: $FORK_ZIG ($("$FORK_ZIG" version))"
 echo "# building bench (ReleaseFast, real runtime + real ARC manager)..."
+
+# Bind the REAL ARC manager as the `zap_active_manager` SOURCE MODULE with
+# `RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT` rewritten to true on a build-local
+# runtime copy — the production binding every compiler-driven user binary
+# uses. (The original weak-linker-symbol binding died when the manager's
+# `zap_memory_section` export became `.Obj`-gated with P3-J3's per-spawn
+# managers; an `.Exe` build like this bench no longer emits the symbol.)
+BUILD_DIR=".copy-bench-build"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+grep -q 'const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = false;' ../../src/runtime.zig || {
+  echo "error: RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT marker not found in src/runtime.zig" >&2
+  exit 1
+}
+sed -e 's/const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = false;/const RUNTIME_ACTIVE_MANAGER_SOURCE_DEFAULT: bool = true;/' \
+  ../../src/runtime.zig > "$BUILD_DIR/runtime_bound.zig"
+
 "$FORK_ZIG" build-exe -OReleaseFast --name bench \
-  --dep zapruntime --dep zaparcmanager \
+  --dep zapruntime \
   -Mmain=bench.zig \
   --dep zap_active_manager \
-  -Mzapruntime=../../src/runtime.zig \
-  --dep zap_active_manager \
-  -Mzaparcmanager=../../src/memory/arc/manager.zig \
-  -Mzap_active_manager=../../src/zap_active_manager_stub.zig
+  "-Mzapruntime=$BUILD_DIR/runtime_bound.zig" \
+  -Mzap_active_manager=../../src/memory/arc/manager.zig \
+  --cache-dir "$BUILD_DIR/zig-cache"
 
 for mode in clock list map string; do
   echo

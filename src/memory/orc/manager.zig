@@ -993,6 +993,17 @@ fn slabFreeSlot(pool: *SlabPool, slab: *SlabHeader, slot_index: u32) void {
 // a minimum of 16 bytes, the size of the header struct) so the user
 // pointer remains aligned. `release_sized` finds the header by walking
 // backward from the user pointer.
+//
+// CROSS-MANAGER REGION-MOVE ABI (P6-J1): this header — field layout,
+// `LARGE_MAGIC` value, and the `largeLeadingFor` placement rule — is
+// deliberately BYTE-IDENTICAL between the ARC and ORC managers
+// (`src/memory/arc/manager.zig` / `src/memory/orc/manager.zig`; each manager
+// compiles standalone, so the definition is mirrored, not shared). The
+// same-model O(1) region-move send re-parents a detached large block between
+// ANY two refcounted-model processes — ARC->ARC, ORC->ORC, ARC->ORC, or
+// ORC->ARC — so the adopting manager reads the header the detaching manager
+// wrote, and `free_detached_region` on either manager reclaims either's
+// orphan. Any change here MUST be made to both definitions in lockstep.
 // ---------------------------------------------------------------------------
 
 const LargeHeader = extern struct {
@@ -1168,6 +1179,64 @@ const SlabHeap = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Region relocation on the SlabHeap — the same-model O(1) region-move send
+// (plan items 6.1/6.1a, P6-J1). Mirrors ARC's `arcDetachRegion` /
+// `arcAdoptRegion` discipline verbatim, but on the `SlabHeap`'s `large_head`
+// (ORC's per-context heap wraps the list one level deeper than `ArcContext`).
+// Only the LARGE (`page_allocator`-backed) discipline is relocatable: the
+// block is tracked solely by intrusive membership in the owning heap's
+// `large_head`, and `munmap` is process-global, so re-parenting is a pure
+// O(1) unlink + relink with the payload untouched. Slab-backed blocks are
+// interleaved with unrelated co-tenants and decline. Both operations run
+// exclusively within the owning process's quantum (no atomics — the
+// scheduler-local invariant, same single-owner discipline as alloc/free).
+// ---------------------------------------------------------------------------
+
+/// Detach a large block from `self`'s ownership so a same-model receiver can
+/// adopt it without copying (the sender side). Returns `true` when the block
+/// is LARGE (now an orphan owned by NO heap, safe to transport by pointer)
+/// and `false` when it is slab-backed (the honest R4 degradation — the caller
+/// must copy instead).
+fn slabHeapDetachRegion(self: *SlabHeap, object: *anyopaque, size: usize, alignment: u32) bool {
+    // Mirror `rawAlloc`'s EXACT slab-vs-large decision: a request that maps
+    // to a slab class is slab-backed and not relocatable per-cell.
+    if (lookupClass(size, alignment) != null) return false;
+    const header_ptr = largeHeader(object);
+    // Corruption is fatal — the pointer is not a large allocation of this
+    // heap (mismatched size, double-detach, or memory corruption).
+    if (header_ptr.magic != LARGE_MAGIC) @panic("zap.orc: detachRegion: corrupt LargeHeader magic (pointer not a large allocation of this manager)");
+    // Unlink from this heap's large list so the owner's teardown (`deinit`)
+    // no longer reclaims it — the receiver owns it after the adopt.
+    if (header_ptr.prev) |prev| {
+        prev.next = header_ptr.next;
+    } else {
+        self.large_head = header_ptr.next;
+    }
+    if (header_ptr.next) |next| next.prev = header_ptr.prev;
+    // Mark orphaned (in-flight, owned by neither heap).
+    header_ptr.prev = null;
+    header_ptr.next = null;
+    return true;
+}
+
+/// Adopt a detached LARGE block into `self`'s ownership (the receiver side),
+/// so `self`'s prompt individual free (`rawFree`) and wholesale teardown
+/// (`deinit`) reclaim it correctly. The block's refcount is untouched (it
+/// remains the sole reference the mover proved unique). `size`/`alignment`
+/// must match the original request (asserts large-path).
+fn slabHeapAdoptRegion(self: *SlabHeap, object: *anyopaque, size: usize, alignment: u32) void {
+    // Adopt is large-path only — the caller only detaches large blocks.
+    std.debug.assert(lookupClass(size, alignment) == null);
+    const header_ptr = largeHeader(object);
+    if (header_ptr.magic != LARGE_MAGIC) @panic("zap.orc: adoptRegion: corrupt LargeHeader magic (pointer not a detached large allocation)");
+    // Link at the head of the adopting heap's large list.
+    header_ptr.prev = null;
+    header_ptr.next = self.large_head;
+    if (self.large_head) |old_head| old_head.prev = header_ptr;
+    self.large_head = header_ptr;
+}
 
 // ---------------------------------------------------------------------------
 // Per-process ORC context
@@ -1532,43 +1601,96 @@ fn orcRefcountSized(ctx_opaque: *anyopaque, object: *anyopaque, size: usize, ali
 // REFCOUNT_V1 capability — region relocation (v1.2 detach/adopt/free-detached)
 // ---------------------------------------------------------------------------
 
-/// Detach a uniquely-owned cell for a same-model O(1) region-move send (plan
-/// item 6.1). ORC **declines** the move (always returns false), so the runtime
-/// falls back to the always-sound copy send.
+/// Whether the cycle collector's per-context state still references `cell` —
+/// the move-soundness guard for `orcDetachRegion` (P6-J1, the roots-buffer
+/// invariant, reasoned through):
 ///
-/// The reason is a deliberate correctness choice, not an oversight: ORC backs
-/// each process's heap with a per-instance general-purpose allocator, so a cell
-/// is owned by ITS process's allocator and cannot be soundly re-parented into a
-/// different process's allocator (nor freed by one) — unlike ARC's large cells,
-/// which are `page_allocator`-backed and globally free-able. The O(1) region
-/// move for ORC therefore needs a page-backed large-cell path mirroring ARC's
-/// (a documented Phase-6 follow-up); until then, declining is correct and
-/// leak-free (copy send serialises + reconstructs into the receiver's own heap).
-fn orcDetachRegion(ctx_opaque: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool {
-    _ = ctx_opaque;
-    _ = object;
-    _ = size;
-    _ = alignment;
+///   * **Buffered root**: `possibleRoot` buffers a cell on a decrement to
+///     NON-zero — but ONLY a cell released with a `deep_walk` whose type is
+///     REGISTERED with the collector (`noteDecrement` skips leaves and
+///     unregistered types). A MOVE-ELIGIBLE cell is a FLAT container (scalar
+///     elements — `movableFlatListCell`/`movableFlatMapCell` in the runtime),
+///     and no runtime container type registers with `CYCL` today, so a
+///     move-eligible cell is NEVER buffered. If it were, a detach would leave
+///     a dangling roots entry the sender's next collection trial-decrements —
+///     on a cell the RECEIVER now owns (a cross-process mutation, corruption).
+///   * **Non-black colour**: colours are assigned only during a collection
+///     (which runs to completion within the owner's quantum, never concurrent
+///     with a send) and every surviving cell ends black (`ScanBlack` /
+///     `MarkRoots` unbuffer-and-blacken); "absent ⇒ black". A non-black entry
+///     therefore means the cell is still entangled with candidate state.
+///
+/// Both checks are O(1) hash lookups; answering `true` DECLINES the move (the
+/// send degrades to the always-sound copy) — the honest posture until
+/// container types register with the collector and a detach-time unbuffer
+/// discipline is designed. (The side table is not consulted: only container
+/// buffers — `allocate`, inline-header — are ever detached; side-table cells
+/// come from the disjoint `allocate_refcounted` path.)
+fn collectorStateBlocksMove(ctx: *OrcContext, cell: *anyopaque) bool {
+    if (isBuffered(ctx, cell)) return true;
+    if (getColor(ctx, cell) != .black) return true;
     return false;
 }
 
-/// Adopt a detached region. Unreachable in practice: `orcDetachRegion` declines
-/// every move (same-model moves only ever originate from another ORC process's
-/// detach), so no ORC block is ever detached to adopt. Present for ABI
-/// completeness; the `put` keeps it sound should the runtime ever call it.
-fn orcAdoptRegion(ctx_opaque: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void {
+/// Detach a uniquely-owned cell for the same-model O(1) region-move send (plan
+/// items 6.1/6.1a, P6-J1). Mirrors ARC's `arcDetachRegion` on the production
+/// `SlabHeap`: a LARGE (`page_allocator`-backed) block unlinks from THIS
+/// context's `large_head` in O(1) and becomes a relocatable orphan; a
+/// slab-backed block declines (interleaved with co-tenants — the R4
+/// degradation, copy fallback). Two ORC-specific guards precede the heap work:
+///
+///   * `collectorStateBlocksMove` — the cycle collector must hold NO reference
+///     to the departing cell (see its doc for the invariant trace);
+///   * the test-build `BackingHeap` (DebugAllocator leak oracle) has no
+///     page-backed large path, so test builds decline every move — the
+///     production SlabHeap branch is proven by the SlabHeap-level tests below
+///     and end-to-end by the gate-ON `:test_concurrency` ORC move tests.
+///
+/// Cross-manager contract: the detached block's `LargeHeader` (layout +
+/// `LARGE_MAGIC`) is byte-identical to ARC's, so an ORC-detached block may be
+/// adopted by an ARC receiver and vice versa — both managers' large paths
+/// speak the ONE region-move ABI (`page_allocator` block behind the shared
+/// header). Keep the two definitions in lockstep.
+fn orcDetachRegion(ctx_opaque: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) bool {
     const ctx: *OrcContext = @ptrCast(@alignCast(ctx_opaque));
-    ctx.side_table.put(ctx.meta, @intFromPtr(object), .{
-        .refcount = 1,
-        .size = size,
-        .alignment = alignment,
-    }) catch {};
+    if (collectorStateBlocksMove(ctx, object)) return false;
+    if (comptime builtin.is_test) return false;
+    return slabHeapDetachRegion(&ctx.gpa, object, size, alignment);
 }
 
-/// Free a detached-but-never-adopted region. Unreachable in practice (ORC never
-/// detaches — see `orcDetachRegion`); a safe no-op for ABI completeness.
+/// Adopt a detached LARGE block (from a same-model sender's `detach_region` —
+/// ARC's or ORC's; the shared `LargeHeader` ABI) into THIS context's ownership:
+/// link it into the production SlabHeap's `large_head` so the receiver's
+/// prompt individual free (`rawFree` at the refcount zero-transition) and
+/// wholesale teardown (`deinit`) both reclaim it. O(1), scheduler-local, the
+/// refcount untouched (the mover proved rc == 1). The freshly-adopted cell has
+/// NO collector state in this context (no buffered/colour/side-table entries) —
+/// it arrives exactly as clean as a fresh allocation.
+///
+/// Test builds panic: the DebugAllocator heap cannot own a foreign page-backed
+/// block, and no move is ever initiated under a test build (`orcDetachRegion`
+/// declines and the same-model gate means moves only originate from refcounted
+/// detaches) — reaching this is a dispatcher bug, mirroring the runtime's
+/// `v1_0_trap_adopt_region` posture.
+fn orcAdoptRegion(ctx_opaque: *anyopaque, object: *anyopaque, size: usize, alignment: u32) callconv(.c) void {
+    if (comptime builtin.is_test) {
+        @panic("zap.orc: adoptRegion under the test-build DebugAllocator heap (no move can originate here — dispatcher bug)");
+    }
+    const ctx: *OrcContext = @ptrCast(@alignCast(ctx_opaque));
+    slabHeapAdoptRegion(&ctx.gpa, object, size, alignment);
+}
+
+/// Free a DETACHED block that was never adopted — the leak-exactness cleanup
+/// for an undelivered move (dead-lettered, or a mailbox drained at receiver
+/// teardown). Context-free by specification (§8.6): a detached block is in NO
+/// context's list, so this reads the size/alignment from the block's own
+/// `LargeHeader` and returns the standalone page to the OS — no list surgery,
+/// safe from any thread. Works on any same-ABI detached block (ARC- or
+/// ORC-origin; the shared `LargeHeader` contract).
 fn orcFreeDetachedRegion(object: *anyopaque) callconv(.c) void {
-    _ = object;
+    const header_ptr = largeHeader(object);
+    if (header_ptr.magic != LARGE_MAGIC) @panic("zap.orc: freeDetachedRegion: corrupt LargeHeader magic (not a detached large allocation)");
+    largeFreePage(header_ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -2425,4 +2547,134 @@ test "orc: production SlabHeap serves slab + large allocs and wholesale teardown
     try testing.expectEqual(test_large_alloc_total - large_alloc_before, test_large_free_total - large_free_before);
     try testing.expect(test_slab_mmap_total > mmap_before);
     try testing.expect(test_large_alloc_total > large_alloc_before);
+}
+
+// ---------------------------------------------------------------------------
+// Region-move (detach / adopt) tests — the same-model O(1) region-move send
+// wired through ORC's production SlabHeap (plan item 6.1a follow-on, P6-J1).
+// The SlabHeap-level mechanics are exercised directly (the G7 pattern: the
+// manager's own `is_test` build backs `OrcContext` with the DebugAllocator
+// oracle, so the production heap must be instantiated explicitly); the
+// vtable-level `orcDetachRegion` guards are exercised on a real `OrcContext`.
+// ---------------------------------------------------------------------------
+
+test "orc region-move: a large SlabHeap block detaches from the sender heap and adopts into the receiver heap (P6-J1)" {
+    const large_alloc_before = test_large_alloc_total;
+    const large_free_before = test_large_free_total;
+
+    var sender: SlabHeap = .init;
+    var receiver: SlabHeap = .init;
+
+    // Above the slab ceiling → the page-backed large path (the only
+    // relocatable discipline). Fill with a recognizable pattern so the adopt
+    // provably preserves the payload bytes (the move relocates OWNERSHIP, not
+    // bytes — pointer identity is the O(1) proof).
+    const size: usize = 64 * 1024;
+    const block = sender.rawAlloc(size, 16) orelse return error.OutOfMemory;
+    for (0..size) |index| block[index] = @truncate(index *% 31);
+    const address_before = @intFromPtr(block);
+
+    try testing.expect(slabHeapDetachRegion(&sender, block, size, 16));
+    slabHeapAdoptRegion(&receiver, block, size, 16);
+    try testing.expectEqual(address_before, @intFromPtr(block));
+    for (0..size) |index| try testing.expectEqual(@as(u8, @truncate(index *% 31)), block[index]);
+
+    // The sender's teardown must NOT reclaim the moved block (it left the
+    // sender's large list at detach); the receiver's teardown must.
+    sender.deinit();
+    try testing.expectEqual(large_free_before, test_large_free_total);
+    receiver.deinit();
+    try testing.expectEqual(test_large_alloc_total - large_alloc_before, test_large_free_total - large_free_before);
+}
+
+test "orc region-move: a slab-backed block is NOT relocatable (detach declines, copy fallback)" {
+    var heap: SlabHeap = .init;
+    defer heap.deinit();
+    // Slab-class sized → interleaved with co-tenants in a shared slab; the
+    // detach must decline so the send degrades to the always-sound copy.
+    const block = heap.rawAlloc(1024, 8) orelse return error.OutOfMemory;
+    try testing.expect(!slabHeapDetachRegion(&heap, block, 1024, 8));
+    heap.rawFree(block, 1024, 8);
+}
+
+test "orc region-move: the receiver can individually free an adopted block (the ARC fast path)" {
+    const large_alloc_before = test_large_alloc_total;
+    const large_free_before = test_large_free_total;
+
+    var sender: SlabHeap = .init;
+    var receiver: SlabHeap = .init;
+    const size: usize = 16 * 1024;
+    const block = sender.rawAlloc(size, 16) orelse return error.OutOfMemory;
+    try testing.expect(slabHeapDetachRegion(&sender, block, size, 16));
+    slabHeapAdoptRegion(&receiver, block, size, 16);
+
+    // The adopted block is now an ordinary member of the receiver's large
+    // list: a prompt individual free (refcount zero-transition) reclaims it.
+    receiver.rawFree(block, size, 16);
+    try testing.expectEqual(test_large_alloc_total - large_alloc_before, test_large_free_total - large_free_before);
+    sender.deinit();
+    receiver.deinit();
+}
+
+test "orc region-move: an un-adopted detached block is reclaimed leak-exactly (undelivered move)" {
+    const large_alloc_before = test_large_alloc_total;
+    const large_free_before = test_large_free_total;
+
+    var sender: SlabHeap = .init;
+    const size: usize = 32 * 1024;
+    const block = sender.rawAlloc(size, 16) orelse return error.OutOfMemory;
+    try testing.expect(slabHeapDetachRegion(&sender, block, size, 16));
+
+    // Dead-letter / teardown-drain path: the detached orphan is in NO heap's
+    // list, so the context-free reclaim returns it straight to the OS.
+    orcFreeDetachedRegion(block);
+    try testing.expectEqual(test_large_alloc_total - large_alloc_before, test_large_free_total - large_free_before);
+    sender.deinit();
+}
+
+test "orc region-move: collector-entangled cells decline the move (the roots-buffer invariant guard)" {
+    // The soundness crux (P6-J1): a detached cell leaves this context
+    // entirely, so it must not remain referenced by the cycle collector's
+    // per-context state — a buffered root would be trial-decremented by a
+    // later collection on the SENDER while the RECEIVER owns (and mutates)
+    // the cell. A move-eligible cell (flat: released with `deep_walk == null`,
+    // or of an unregistered type) can never be buffered — `noteDecrement`
+    // skips `possibleRoot` for it — so the guard is unreachable today; it is
+    // the structural defense for the day container types register with the
+    // CYCL collector.
+    const ctx_opaque = orcInit(null) orelse return error.OutOfMemory;
+    defer testDeinitAssertClean(ctx_opaque);
+    const ctx: *OrcContext = @ptrCast(@alignCast(ctx_opaque));
+
+    var fake_cell: u64 = 0;
+    const cell_ptr: *anyopaque = @ptrCast(&fake_cell);
+
+    // Clean cell (absent from every collector map): the move is allowed.
+    try testing.expect(!collectorStateBlocksMove(ctx, cell_ptr));
+
+    // A buffered root candidate: blocked.
+    try ctx.buffered.put(ctx.meta, @intFromPtr(cell_ptr), {});
+    try testing.expect(collectorStateBlocksMove(ctx, cell_ptr));
+    _ = ctx.buffered.remove(@intFromPtr(cell_ptr));
+
+    // A non-black (mid-collection / stale-candidate) colour: blocked.
+    try ctx.color.put(ctx.meta, @intFromPtr(cell_ptr), .purple);
+    try testing.expect(collectorStateBlocksMove(ctx, cell_ptr));
+    _ = ctx.color.remove(@intFromPtr(cell_ptr));
+
+    // Back to clean: allowed again (the guards are pure lookups).
+    try testing.expect(!collectorStateBlocksMove(ctx, cell_ptr));
+}
+
+test "orc region-move: the test-build vtable detach declines (DebugAllocator heaps are not relocatable)" {
+    // Under `builtin.is_test` the OrcContext heap is the DebugAllocator leak
+    // oracle, whose blocks belong to that allocator instance and cannot be
+    // re-parented; the vtable detach must answer false (copy fallback) rather
+    // than corrupt. Production (`!is_test`) builds take the SlabHeap branch
+    // proven above.
+    const ctx_opaque = orcInit(null) orelse return error.OutOfMemory;
+    defer testDeinitAssertClean(ctx_opaque);
+    const block = orcAllocate(ctx_opaque, 64 * 1024, 16) orelse return error.OutOfMemory;
+    try testing.expect(!orcDetachRegion(ctx_opaque, block, 64 * 1024, 16));
+    orcDeallocate(ctx_opaque, block, 64 * 1024, 16);
 }

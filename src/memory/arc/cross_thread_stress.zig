@@ -564,6 +564,219 @@ pub fn runMoveSendArcStress(rounds_per_producer: usize) !void {
     try std.testing.expectEqual(large_alloc_total - large_alloc_baseline, large_free_total - large_free_baseline);
 }
 
+// ---------------------------------------------------------------------------
+// Map-cell-shaped move stress (P6-J1, plan item 6.1a)
+//
+// The `runMoveSendArcStress` harness above hands a flat stamped buffer across;
+// this variant moves a MAP-CELL-SHAPED image — structurally the dense-Map cell
+// discipline `Map.bufferAlloc` lays out (`src/runtime.zig`): ONE contiguous
+// container buffer `[ prefix (refcount, len, capacity, entry_cap, hash_seed) |
+// buckets[capacity] | entries[entry_cap] ]`, allocated through the manager's
+// plain `allocate` (the container-buffer path, `init_refcount = 0` — the
+// refcount lives INLINE in the payload prefix, exactly like a runtime
+// inline-header cell), with buckets referring to entries BY INDEX and the hash
+// seed travelling inside the prefix. The consumer ADOPTS the cell and then
+// reads it the way a receiver reads a moved map — the full bucket walk plus
+// every entry — verifying EVERY section byte-for-byte, so a copy, a torn
+// write, or a raced value in ANY of the three sections fails loudly. (The
+// REAL-cell semantics — actual `Map.get` lookups on a moved runtime cell —
+// are proven by the gate-ON `:test_concurrency` Map move tests and the E6
+// move bench, which assert pointer identity + lookup correctness on genuine
+// `Map(i64, i64)` cells; this harness is the ThreadSanitizer half.)
+// ---------------------------------------------------------------------------
+
+/// Structural mirror of the dense-Map cell prefix: the inline refcount word at
+/// offset 0 (the ArcHeader discipline), then the map geometry + per-instance
+/// hash seed. A structural IMAGE for the race proof — not an import of the
+/// runtime type (this file sits below the runtime layer).
+const MapImagePrefix = extern struct {
+    refcount: u32,
+    len: u32,
+    capacity: u32,
+    entry_cap: u32,
+    hash_seed: u64,
+};
+
+/// Mirror of the runtime's 8-byte `DenseMapBucket`.
+const MapImageBucket = extern struct {
+    dist_and_fingerprint: u32,
+    entry_idx: u32,
+};
+
+/// Mirror of the runtime's `Map(i64, i64).MapEntry` shape.
+const MapImageEntry = extern struct {
+    hash: u64,
+    key: i64,
+    value: i64,
+};
+
+const map_image_capacity: u32 = 1024; // power of two, like the real table
+const map_image_len: u32 = 896; // 7/8 load factor, like the real resize policy
+const map_image_alignment: u32 = 16;
+
+const map_image_buckets_offset: usize = std.mem.alignForward(usize, @sizeOf(MapImagePrefix), @alignOf(MapImageBucket));
+const map_image_entries_offset: usize = std.mem.alignForward(
+    usize,
+    map_image_buckets_offset + @as(usize, map_image_capacity) * @sizeOf(MapImageBucket),
+    @alignOf(MapImageEntry),
+);
+const map_image_bytes: usize = map_image_entries_offset + @as(usize, map_image_capacity) * @sizeOf(MapImageEntry);
+
+comptime {
+    // The image must land on the manager's LARGE path (the only relocatable
+    // discipline) — ~33 KB, far above the 4 KiB slab ceiling.
+    std.debug.assert(map_image_bytes > 16 * 1024);
+}
+
+fn mapImageBuckets(cell: [*]u8) [*]MapImageBucket {
+    return @ptrCast(@alignCast(cell + map_image_buckets_offset));
+}
+
+fn mapImageEntries(cell: [*]u8) [*]MapImageEntry {
+    return @ptrCast(@alignCast(cell + map_image_entries_offset));
+}
+
+/// Deterministic per-(seed, slot) stamp functions shared by both sides, so
+/// the consumer recomputes every expected value independently.
+fn mapImageFingerprintFor(seed: u64, bucket_index: u32) u32 {
+    return @truncate(checksumFor(seed +% bucket_index));
+}
+
+fn mapImageHashFor(seed: u64, entry_index: u32) u64 {
+    return checksumFor(seed ^ (@as(u64, entry_index) << 17));
+}
+
+/// Stamp a full map-cell image into a freshly-allocated container buffer.
+fn stampMapImage(cell: [*]u8, seq: u64) void {
+    const prefix: *MapImagePrefix = @ptrCast(@alignCast(cell));
+    prefix.* = .{
+        .refcount = 1,
+        .len = map_image_len,
+        .capacity = map_image_capacity,
+        .entry_cap = map_image_capacity,
+        .hash_seed = seq,
+    };
+    const buckets = mapImageBuckets(cell);
+    for (0..map_image_capacity) |bucket_index| {
+        const index: u32 = @intCast(bucket_index);
+        buckets[bucket_index] = .{
+            .dist_and_fingerprint = mapImageFingerprintFor(seq, index),
+            .entry_idx = index % map_image_len,
+        };
+    }
+    const entries = mapImageEntries(cell);
+    for (0..map_image_len) |entry_index| {
+        const index: u32 = @intCast(entry_index);
+        entries[entry_index] = .{
+            .hash = mapImageHashFor(seq, index),
+            .key = @intCast(index),
+            .value = @bitCast(seq ^ index),
+        };
+    }
+}
+
+/// Verify a moved map-cell image the receiver's way: prefix geometry first,
+/// then the full bucket walk (each bucket's fingerprint AND its entry INDEX —
+/// the position-independence the real cell relies on), then every entry.
+fn verifyMapImage(cell: [*]u8, seq: u64) bool {
+    const prefix: *const MapImagePrefix = @ptrCast(@alignCast(cell));
+    if (prefix.refcount != 1 or prefix.len != map_image_len or
+        prefix.capacity != map_image_capacity or prefix.entry_cap != map_image_capacity or
+        prefix.hash_seed != seq) return false;
+    const buckets = mapImageBuckets(cell);
+    for (0..map_image_capacity) |bucket_index| {
+        const index: u32 = @intCast(bucket_index);
+        const bucket = buckets[bucket_index];
+        if (bucket.dist_and_fingerprint != mapImageFingerprintFor(seq, index)) return false;
+        if (bucket.entry_idx != index % map_image_len) return false;
+    }
+    const entries = mapImageEntries(cell);
+    for (0..map_image_len) |entry_index| {
+        const index: u32 = @intCast(entry_index);
+        const entry = entries[entry_index];
+        if (entry.hash != mapImageHashFor(seq, index)) return false;
+        if (entry.key != @as(i64, @intCast(index))) return false;
+        if (entry.value != @as(i64, @bitCast(seq ^ index))) return false;
+    }
+    return true;
+}
+
+/// One MAP-move producer thread: private ARC context; per round allocates a
+/// LARGE container buffer through `allocate` (the `Map.bufferAlloc` path),
+/// stamps a full map-cell image, detaches, and hands the pointer across.
+fn mapMoveProducerMain(config: MoveProducerConfig) void {
+    const context = arc.init(null) orelse @panic("arc-xthread-mapmove: producer manager init failed");
+
+    var round: usize = 0;
+    while (round < config.rounds) : (round += 1) {
+        const seq = config.base_seq + round;
+        const cell = arc.allocate(context, map_image_bytes, map_image_alignment) orelse
+            @panic("arc-xthread-mapmove: producer map-cell alloc failed");
+        stampMapImage(cell, seq);
+        if (!arc.detachRegion(context, cell, map_image_bytes, map_image_alignment))
+            @panic("arc-xthread-mapmove: a large map cell must be region-move eligible");
+        config.queue.push(.{ .cell_address = @intFromPtr(cell), .seq = seq });
+    }
+
+    arc.deinit(context);
+    config.queue.producerFinished();
+}
+
+/// Run the P6-J1 Map-cell move stress: N producer threads move map-cell-shaped
+/// container buffers to one consumer that adopts each into its OWN context,
+/// verifies the WHOLE image (prefix + buckets + entries) intact, and frees it
+/// through the container path (`deallocate` — the `Map.bufferFreeShallow`
+/// route). TSan-clean + leak-exact, mirroring `runMoveSendArcStress`.
+pub fn runMapMoveSendArcStress(rounds_per_producer: usize) !void {
+    const large_alloc_baseline = @atomicLoad(usize, &arc.test_large_alloc_total, .monotonic);
+    const large_free_baseline = @atomicLoad(usize, &arc.test_large_free_total, .monotonic);
+
+    var queue = MoveQueue{ .live_producers = producer_count };
+
+    var threads: [producer_count]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        var index: usize = 0;
+        while (index < spawned) : (index += 1) threads[index].join();
+    }
+    while (spawned < producer_count) : (spawned += 1) {
+        threads[spawned] = try std.Thread.spawn(.{}, mapMoveProducerMain, .{MoveProducerConfig{
+            .queue = &queue,
+            .rounds = rounds_per_producer,
+            .base_seq = @as(u64, spawned) *% 0x1_0000_0000,
+        }});
+    }
+
+    const consumer_context = arc.init(null) orelse @panic("arc-xthread-mapmove: consumer manager init failed");
+    var adopted: usize = 0;
+    while (queue.pop()) |message| {
+        const cell: [*]u8 = @ptrFromInt(message.cell_address);
+        arc.adoptRegion(consumer_context, cell, map_image_bytes, map_image_alignment);
+
+        if (!verifyMapImage(cell, message.seq)) {
+            arc.deallocate(consumer_context, cell, map_image_bytes, map_image_alignment);
+            arc.deinit(consumer_context);
+            for (&threads) |*thread| thread.join();
+            return error.MapMoveDataCorruption;
+        }
+
+        // The consumer solely owns it: the container free unlinks it from the
+        // consumer's `large_head` (where adopt linked it) and `munmap`s it.
+        arc.deallocate(consumer_context, cell, map_image_bytes, map_image_alignment);
+        adopted += 1;
+    }
+    arc.deinit(consumer_context);
+
+    for (&threads) |*thread| thread.join();
+
+    try std.testing.expectEqual(producer_count * rounds_per_producer, adopted);
+
+    const large_alloc_total = @atomicLoad(usize, &arc.test_large_alloc_total, .monotonic);
+    const large_free_total = @atomicLoad(usize, &arc.test_large_free_total, .monotonic);
+    try std.testing.expectEqual(producer_count * rounds_per_producer, large_alloc_total - large_alloc_baseline);
+    try std.testing.expectEqual(large_alloc_total - large_alloc_baseline, large_free_total - large_free_baseline);
+}
+
 fn roundsFromEnvironment() usize {
     // Fork-convention env read (libc `std.c.getenv`; macOS always links
     // libSystem), mirroring `adversarial_stress.zig`/`teardown_stress.zig`.
@@ -582,4 +795,8 @@ test "ArcCrossThreadStress: cross-model send/receive (ARC senders → Arena rece
 
 test "ArcCrossThreadStress: O(1) region-move send (detach → cross-thread pointer hand-off → adopt) holds the scheduler-local-refcount invariant" {
     try runMoveSendArcStress(roundsFromEnvironment());
+}
+
+test "ArcCrossThreadStress: Map-cell O(1) region-move (P6-J1) crosses threads intact — full image verified, leak-exact" {
+    try runMapMoveSendArcStress(roundsFromEnvironment());
 }

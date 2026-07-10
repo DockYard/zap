@@ -4238,12 +4238,56 @@ fn walkerListCell(comptime T: type) ?type {
 /// (P3-J5) can transfer soundly: a single contiguous large-backed buffer with
 /// no interior pointers, so re-parenting the one cell moves the WHOLE value. A
 /// `List` of `String`/`List`/`Map` (interior ARC children living in separate
-/// cells), a `Map` (its backing is a non-relocatable `c_allocator` block), a
-/// `String` slice, or a struct all fall back to the copy send.
+/// cells), a `String` slice, or a struct all fall back to the copy send; a
+/// FLAT `Map` has its own predicate (`movableFlatMapCell`, P6-J1).
 fn movableFlatListCell(comptime T: type) ?type {
     const Cell = walkerListCell(T) orelse return null;
     if (!isWalkerScalar(Cell.Element)) return null;
     return Cell;
+}
+
+/// If `T` is a FLAT `Map(Scalar, Scalar)` value — `?*const Map(K, V)` whose key
+/// AND value are walker scalars (no interior ARC children) — return its `Map`
+/// cell type, else null. The `Map` counterpart of `movableFlatListCell` (plan
+/// item 6.1a, P6-J1 — THE fix for the E6 map catastrophe: the 2.19 ms/MB
+/// hash-table rebuild the copy send's reconstruct pays).
+///
+/// Why the move is sound for exactly this shape — the layout-survival
+/// argument: a `Map` cell is ONE contiguous allocation
+/// `[Self | buckets[capacity] | entries[entry_cap]]` with NO interior
+/// pointers anywhere —
+///
+///   * `bucketsPtr`/`entriesPtr` recompute the section addresses from the
+///     cell pointer + comptime offsets + the in-cell `capacity` field on
+///     every access (never stored),
+///   * each bucket refers to its entry by INDEX (`DenseMapBucket.entry_idx`),
+///     never by address,
+///   * each entry is `{ hash: u64, key: K, value: V }` with `K`/`V` scalar
+///     (this predicate's flat gate), and
+///   * the per-instance `hash_seed` travels INSIDE the cell, so the
+///     receiver's lookups recompute every key hash with the SAME seed and
+///     probe the SAME bucket sequence.
+///
+/// The move itself relocates OWNERSHIP, not bytes (detach/adopt re-links the
+/// backing page's `LargeHeader` between per-process heaps; pointer identity is
+/// preserved — E5), so the received map is usable IMMEDIATELY: no rebuild, no
+/// fix-up, zero bytes touched. A `Map` with `String`/`List`/`Map` keys or
+/// values owns interior cells a root re-parent would strand — those fall back
+/// to the copy send, as do slab-backed (small) and aliased (rc > 1) maps at
+/// the runtime checks in `send_message_moved`.
+fn movableFlatMapCell(comptime T: type) ?type {
+    const Cell = walkerMapCell(T) orelse return null;
+    if (!isWalkerScalar(Cell.KeyType) or !isWalkerScalar(Cell.ValueType)) return null;
+    return Cell;
+}
+
+/// The union of the two move-eligible shapes: `T`'s flat `List` cell, else
+/// `T`'s flat `Map` cell, else null. The receive side dispatches on this (a
+/// moved envelope's root is always one of the two — `send_message_moved` only
+/// ever detaches shapes these predicates accepted).
+fn movableContainerCell(comptime T: type) ?type {
+    if (movableFlatListCell(T)) |Cell| return Cell;
+    return movableFlatMapCell(T);
 }
 
 /// If `T` is the runtime representation of a Zap map value —
@@ -4963,6 +5007,40 @@ test "message walker: isWalkerSendable vocabulary is locked (N10 send/receive mi
     try std.testing.expect(!isWalkerSendable(UnsendableStruct));
 }
 
+test "message walker: move-eligibility predicates accept exactly the flat container shapes (P6-J1)" {
+    // The comptime SHAPE half of the same-model O(1) region-move send (plan
+    // items 6.1/6.1a): `movableFlatListCell` / `movableFlatMapCell` must accept
+    // exactly the value shapes whose ENTIRE graph is one contiguous cell — a
+    // flat `List(scalar)` / `Map(scalar, scalar)` — and reject every shape with
+    // interior ARC children (whose re-parent would strand the children in the
+    // sender's heap) or a non-container shape. The runtime rc==1/large-backed/
+    // same-model checks are the RUNTIME half; this locks the comptime half.
+
+    // MOVE-ELIGIBLE: flat scalar containers.
+    try std.testing.expect(movableFlatListCell(?*const List(i64)) == List(i64));
+    try std.testing.expect(movableFlatListCell(?*const List(f64)) == List(f64));
+    try std.testing.expect(movableFlatMapCell(?*const Map(i64, i64)) == Map(i64, i64));
+    try std.testing.expect(movableFlatMapCell(?*const Map(u32, f64)) == Map(u32, f64));
+    try std.testing.expect(movableFlatMapCell(?*const Map(bool, u64)) == Map(bool, u64));
+
+    // NOT move-eligible: interior ARC children (String bytes / nested cells)
+    // live in SEPARATE cells, so re-parenting the root would not move them.
+    try std.testing.expect(movableFlatListCell(?*const List([]const u8)) == null);
+    try std.testing.expect(movableFlatListCell(?*const List(?*const List(i64))) == null);
+    try std.testing.expect(movableFlatMapCell(?*const Map(i64, []const u8)) == null);
+    try std.testing.expect(movableFlatMapCell(?*const Map(i64, ?*const List(i64))) == null);
+    try std.testing.expect(movableFlatMapCell(?*const Map(i64, ?*const Map(i64, i64))) == null);
+
+    // NOT move-eligible: the predicates are shape-exact — a list is never a
+    // movable map and vice versa, and scalars/structs are not container cells.
+    try std.testing.expect(movableFlatMapCell(?*const List(i64)) == null);
+    try std.testing.expect(movableFlatListCell(?*const Map(i64, i64)) == null);
+    try std.testing.expect(movableFlatMapCell(i64) == null);
+    const FlatStruct = struct { count: i64 };
+    try std.testing.expect(movableFlatMapCell(FlatStruct) == null);
+    try std.testing.expect(movableFlatListCell(FlatStruct) == null);
+}
+
 test "message walker: a struct of scalar+String+List+Map deep-copies by value, independently" {
     ensureMemoryStartup();
     // The task's "a struct containing these" case: a by-value struct whose
@@ -5282,32 +5360,32 @@ pub const ProcessRuntime = struct {
 
         const typed_message: MessageType = message;
 
-        // Move-eligible shape: a flat List(scalar) whose backing is relocatable,
-        // sent to a same-model receiver, uniquely owned. Only reached when the
-        // sender itself is refcounted (`refcount_v1_active`).
+        // Move-eligible shapes: a flat List(scalar) (P3-J5) or a flat
+        // Map(scalar, scalar) (P6-J1, plan item 6.1a) whose backing is
+        // relocatable, sent to a same-model receiver, uniquely owned. Only
+        // reached when the sender itself is refcounted (`refcount_v1_active`).
+        // An iteration-cursor cell aliased as its container type is a SMALL
+        // fixed struct that BORROWS its source cell — structurally excluded
+        // from the move (its slab-backed size would decline the detach anyway;
+        // the explicit guard keeps the invariant visible and keeps the Map
+        // branch from mis-reading MapIter fields through the Map layout).
         if (comptime refcount_v1_active) {
             if (comptime movableFlatListCell(MessageType)) |Cell| {
                 if (typed_message) |cell| {
-                    const same_model = ZapConcurrencyKernel.zap_proc_pid_is_refcounted(target_pid_bits);
-                    if (same_model and cell.header.count() == 1) {
+                    if (!cell.isIterCell()) {
                         const byte_length = Cell.bufferSize(cell.cap);
-                        const alignment = comptime Cell.bufferAlign();
-                        const cell_bytes: [*]u8 = @ptrCast(@constCast(cell));
-                        if (ArcRuntime.detachRegion(cell_bytes, byte_length, alignment)) {
-                            const status = ZapConcurrencyKernel.zap_proc_send_moved(
-                                requireCurrentProcessHandle(),
-                                target_pid_bits,
-                                cell_bytes,
-                                byte_length,
-                                movedOrphanReclaim,
-                            );
-                            if (status == 0) return true; // delivered — receiver owns the graph
-                            // Not delivered (dead-letter / OOM): nothing consumed the
-                            // detached graph. Re-home it into our own heap and release
-                            // our +1 (send_move consumes its argument).
-                            ArcRuntime.adoptRegion(cell_bytes, byte_length, alignment);
-                            Cell.release(typed_message);
-                            return interpretSendStatus(status);
+                        if (attemptRegionMoveSend(Cell, cell, target_pid_bits, byte_length)) |delivered| {
+                            return delivered;
+                        }
+                    }
+                }
+            }
+            if (comptime movableFlatMapCell(MessageType)) |Cell| {
+                if (typed_message) |cell| {
+                    if (!cell.isIterCell()) {
+                        const byte_length = Cell.bufferSize(cell.capacity, cell.entry_cap);
+                        if (attemptRegionMoveSend(Cell, cell, target_pid_bits, byte_length)) |delivered| {
+                            return delivered;
                         }
                     }
                 }
@@ -5319,6 +5397,48 @@ pub const ProcessRuntime = struct {
         const delivered = send_message(target_pid_bits, typed_message);
         releaseWalkerValue(MessageType, typed_message);
         return delivered;
+    }
+
+    /// Attempt the same-model O(1) region-move for one move-eligible container
+    /// cell (a flat `List`/`Map` — see `movableFlatListCell` /
+    /// `movableFlatMapCell`; the shared tail of `send_message_moved`'s two
+    /// shape branches). Returns the delivery result when the move path ran to
+    /// completion — delivered (`true`, the receiver owns the graph) or
+    /// dead-lettered (the sender re-owned and released the orphan; the message
+    /// is CONSUMED either way) — or null when the move does not apply here
+    /// (cross-model receiver, aliased cell, or slab-backed/non-relocatable
+    /// backing) and the caller must fall back to the copy send.
+    fn attemptRegionMoveSend(
+        comptime Cell: type,
+        cell: *const Cell,
+        target_pid_bits: u64,
+        byte_length: usize,
+    ) ?bool {
+        const same_model = ZapConcurrencyKernel.zap_proc_pid_is_refcounted(target_pid_bits);
+        if (!same_model or cell.header.count() != 1) return null;
+        const alignment = comptime Cell.bufferAlign();
+        const cell_bytes: [*]u8 = @ptrCast(@constCast(cell));
+        if (!ArcRuntime.detachRegion(cell_bytes, byte_length, alignment)) return null;
+        const status = ZapConcurrencyKernel.zap_proc_send_moved(
+            requireCurrentProcessHandle(),
+            target_pid_bits,
+            cell_bytes,
+            byte_length,
+            movedOrphanReclaim,
+        );
+        if (status == 0) {
+            // Delivered — the receiver owns the graph, zero payload bytes
+            // copied. Observable via the `region_move_sends_total` counter
+            // (stats builds), the move-vs-copy assertion hook.
+            incrementRuntimeStatCounter(&region_move_sends_total);
+            return true;
+        }
+        // Not delivered (dead-letter / OOM): nothing consumed the detached
+        // graph. Re-home it into our own heap and release our +1 (send_move
+        // consumes its argument).
+        ArcRuntime.adoptRegion(cell_bytes, byte_length, alignment);
+        Cell.release(cell);
+        return interpretSendStatus(status);
     }
 
     /// Blocking typed receive: park until the mailbox is nonempty and
@@ -5379,13 +5499,16 @@ pub const ProcessRuntime = struct {
     /// caller owns the envelope and frees it after this returns (the
     /// payload view borrows from it until then).
     ///
-    /// Same-model O(1) region-move receive (P3-J5): if the envelope carries a
-    /// MOVED value graph (not a copied byte blob), take ownership of it,
-    /// ADOPT its backing into THIS process's heap, and return it IN PLACE —
-    /// no reconstruction, no copy. The sender only ever moves a flat
-    /// `List(scalar)` cell (see `send_message_moved`), so the moved root IS a
-    /// `MessageType` value; a moved payload for any other receive type is a
-    /// protocol violation.
+    /// Same-model O(1) region-move receive (P3-J5; Map: P6-J1): if the
+    /// envelope carries a MOVED value graph (not a copied byte blob), take
+    /// ownership of it, ADOPT its backing into THIS process's heap, and return
+    /// it IN PLACE — no reconstruction, no copy, and for a `Map` NO hash-table
+    /// rebuild (the cell layout is position-independent — see
+    /// `movableFlatMapCell`'s layout-survival argument — so every lookup works
+    /// immediately). The sender only ever moves a flat `List(scalar)` or flat
+    /// `Map(scalar, scalar)` cell (see `send_message_moved`), so the moved root
+    /// IS a `MessageType` value; a moved payload for any other receive type is
+    /// a protocol violation.
     fn decodeReceivedEnvelope(
         comptime MessageType: type,
         envelope: *anyopaque,
@@ -5393,9 +5516,10 @@ pub const ProcessRuntime = struct {
         payload_len: usize,
     ) MessageType {
         if (ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope)) |moved_root| {
-            if (comptime movableFlatListCell(MessageType)) |Cell| {
+            if (comptime movableContainerCell(MessageType)) |Cell| {
                 const alignment = comptime Cell.bufferAlign();
                 ArcRuntime.adoptRegion(@constCast(moved_root), payload_len, alignment);
+                incrementRuntimeStatCounter(&region_move_adopts_total);
                 return @as(MessageType, @ptrCast(@alignCast(moved_root)));
             } else {
                 @panic("zap: Process.receive got a MOVED payload for a non-movable receive type (protocol violation — the sender and receiver message types disagree)");
@@ -6099,6 +6223,16 @@ pub var arc_retains_total: u64 = 0;
 pub var arc_releases_total: u64 = 0;
 pub var arc_consumes_total: u64 = 0;
 pub var arc_return_elisions_total: u64 = 0;
+/// Same-model O(1) region-move sends DELIVERED (plan items 6.1/6.1a): the
+/// sender detached the cell's backing and the kernel enqueued it by pointer —
+/// zero payload bytes copied. Together with `region_move_adopts_total` this is
+/// the observable move-vs-copy discriminator the move bench and stats builds
+/// assert on (a copy-fallback send bumps NEITHER counter).
+pub var region_move_sends_total: u64 = 0;
+/// Moved value graphs ADOPTED by a receiver: `decodeReceivedEnvelope` took a
+/// moved payload and re-parented its backing in place — no reconstruct, no
+/// hash-table rebuild.
+pub var region_move_adopts_total: u64 = 0;
 /// Number of dense-Map mutating calls (put/delete) that took the
 /// rc-1 fast path (mutated the receiver in place).
 pub var dense_map_rc1_fast_path_total: u64 = 0;
@@ -7189,10 +7323,23 @@ pub const ArcRuntime = struct {
     /// Resolve a process binding's REFCOUNT_V1 capability, or `null` for a
     /// non-refcounted manager. Checks `declared_caps` first so a non-refcounted
     /// core is answered without even calling `get_capability_desc`.
+    ///
+    /// The returned pointer is typed as the FULL v1.2 vtable (all nine slots,
+    /// including the relocate extension `detach_region`/`adopt_region`/
+    /// `free_detached_region` — the O(1) region-move slots), so the descriptor
+    /// MUST advertise the v1.2 image size; a shorter image would let a
+    /// dispatcher read a function pointer past the manager's real vtable. Every
+    /// first-party per-spawn manager is v1.2; the panic turns a future
+    /// undersized registration into a loud startup-adjacent failure instead of
+    /// an arbitrary-memory call (the same posture as the trap-stub composition
+    /// in `bindRefcountCapability`).
     fn resolveRefcountCapability(binding: *const ProcessManagerBinding) ?*const AbiV1.ZapRefcountCapabilityV1 {
         if ((binding.core.declared_caps & AbiV1.REFCOUNT_V1_BIT) == 0) return null;
         const desc = binding.core.get_capability_desc(binding.context, AbiV1.REFC_TAG) orelse
             @panic("zap runtime: per-process manager declares REFCOUNT_V1 but get_capability_desc(REFC) returned null");
+        if (desc.size < AbiV1.REFCOUNT_V1_SIZE_V1_2) {
+            @panic("zap runtime: per-process REFCOUNT_V1 manager advertises a pre-v1.2 vtable image (per-process dispatch requires the full nine-slot capability)");
+        }
         return @ptrCast(@alignCast(desc.vtable));
     }
 
@@ -7302,6 +7449,18 @@ pub const ArcRuntime = struct {
         if (active_manager_state.shutdown_complete) return false;
         const ctx = currentManagerContext() orelse return false;
         const alignment_bytes: u32 = @intCast(alignment.toByteUnits());
+        // Multi-manager: the detach must reach the RUNNING (sender) process's
+        // OWN manager with ITS OWN context — an ORC sender's detach runs ORC's
+        // collector-state checks on ORC's context, never the manifest manager
+        // on a foreign context (the type-confusion hazard P3-R1a closed for
+        // retain/release, applied to the relocate slots — P6-J1). A
+        // non-refcounted process answers null → the send falls back to copy.
+        // The per-process capability is v1.2-complete by construction
+        // (`resolveRefcountCapability` panics on a shorter image).
+        if (comptime multi_manager_active) {
+            const cap = currentRefcountCapability() orelse return false;
+            return cap.detach_region(ctx, memory, byte_length, alignment_bytes);
+        }
         if (comptime active_manager_source_available and refcount_v1_active) {
             return active_manager.detachRegion(ctx, memory, byte_length, alignment_bytes);
         }
@@ -7320,6 +7479,18 @@ pub const ArcRuntime = struct {
         const ctx = currentManagerContext() orelse
             @panic("zap runtime: region adopt with no active manager context");
         const alignment_bytes: u32 = @intCast(alignment.toByteUnits());
+        // Multi-manager: the adopt links the block into the RUNNING (receiver)
+        // process's OWN heap through ITS OWN manager — an ORC receiver's adopt
+        // links into ORC's large list on ORC's context (P6-J1; see
+        // `detachRegion`). A moved payload only ever reaches a refcounted
+        // receiver (`send_message_moved`'s same-model gate), so a null
+        // capability here is a dispatcher bug, not a fallback.
+        if (comptime multi_manager_active) {
+            const cap = currentRefcountCapability() orelse
+                @panic("zap runtime: region adopt on a non-refcounted process (the same-model move gate should have declined)");
+            cap.adopt_region(ctx, memory, byte_length, alignment_bytes);
+            return;
+        }
         if (comptime active_manager_source_available and refcount_v1_active) {
             active_manager.adoptRegion(ctx, memory, byte_length, alignment_bytes);
             return;
@@ -7336,6 +7507,18 @@ pub const ArcRuntime = struct {
     /// heap's tracking list (a detached block is in none). Reads the size/align
     /// from the block itself, so it is safe to call from any thread with no
     /// current process quantum.
+    ///
+    /// Multi-manager note (P6-J1): this deliberately dispatches through the
+    /// MANIFEST capability even when per-spawn managers exist, because the
+    /// reclaim may run outside any quantum (driver-thread envelope free) or
+    /// during an unrelated process's quantum. That is sound because every
+    /// refcounted manager's detached blocks share ONE binary contract: a
+    /// standalone `page_allocator` block behind the byte-identical
+    /// `LargeHeader` (same layout, same `LARGE_MAGIC` — the cross-manager
+    /// region-move ABI documented in `src/memory/arc/manager.zig` and
+    /// `src/memory/orc/manager.zig`), and `free_detached_region` is
+    /// context-free by specification (§8.6) — ARC's and ORC's implementations
+    /// are interchangeable on any detached block.
     pub inline fn freeDetachedRegion(memory: [*]u8) void {
         if (comptime active_manager_source_available and refcount_v1_active) {
             active_manager.freeDetachedRegion(memory);
@@ -18667,12 +18850,33 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Allocate a freshly-zeroed buffer with the given capacity.
         /// Refcount=1, all buckets EMPTY, `len=0`.
         fn bufferAlloc(capacity_arg: u32, seed: u64, creation_callsite: u64) ?*Self {
+            // P2-J6 layer-1 alloc piggyback (plan item 2.5): one reduction per
+            // Map cell allocation — the same safepoint `List.bufferAlloc`
+            // carries, so a map-allocating loop the layer-2 classifier excludes
+            // from the back-edge poll still reaches the safepoint here.
+            // Comptime-elided with the concurrency gate OFF (zero cost).
+            Kernel.procReductionTick();
             std.debug.assert(std.math.isPowerOfTwo(capacity_arg));
             const total = bufferSize(capacity_arg, capacity_arg);
-            const allocator = std.heap.c_allocator;
             const align_v = comptime bufferAlign();
-            const raw = allocator.alignedAlloc(u8, align_v, total) catch return null;
-            const self_ptr: *Self = @ptrCast(@alignCast(raw.ptr));
+            // P6-J1 (plan item 6.1a): under the concurrency gate the cell
+            // buffer comes from the CURRENT PROCESS'S private manager heap —
+            // the exact gate-branch `List.bufferAlloc` carries (P3-J1) — so it
+            // is wholesale-freed with the process at teardown (leak-exact,
+            // crash-safe) AND a large map lands on the manager's page-backed
+            // large path, making it O(1)-relocatable for the same-model
+            // region-move send (the E6 map-catastrophe fix: the move replaces
+            // the 2.19 ms/MB hash-table rebuild). Gate OFF: `c_allocator`
+            // exactly as today (the zero-cost guarantee — E6/host baselines
+            // unchanged).
+            const raw_ptr: [*]u8 = if (comptime runtime_concurrency_active)
+                (ArcRuntime.containerBufferAlloc(total, align_v) orelse return null)
+            else raw: {
+                const allocator = std.heap.c_allocator;
+                const raw = allocator.alignedAlloc(u8, align_v, total) catch return null;
+                break :raw raw.ptr;
+            };
+            const self_ptr: *Self = @ptrCast(@alignCast(raw_ptr));
             self_ptr.* = .{
                 .header = ArcHeader.init(),
                 .len = 0,
@@ -18693,12 +18897,20 @@ pub fn Map(comptime K: type, comptime V: type) type {
         /// Free the buffer without deep-releasing K/V children. Used on
         /// the unique-owner resize path where children have been moved.
         fn bufferFreeShallow(self: *Self) void {
-            const allocator = std.heap.c_allocator;
             const total = bufferSize(self.capacity, self.entry_cap);
             const align_v = comptime bufferAlign();
             const raw_ptr: [*]u8 = @ptrCast(self);
-            const raw_slice = @as([*]align(align_v.toByteUnits()) u8, @alignCast(raw_ptr))[0..total];
-            allocator.free(raw_slice);
+            // P6-J1: mirror `bufferAlloc` — under the gate return the buffer to
+            // the current process's private heap (the same size/alignment the
+            // alloc used, so the manager's slab-vs-large routing matches);
+            // gate OFF free to `c_allocator` exactly as today.
+            if (comptime runtime_concurrency_active) {
+                ArcRuntime.containerBufferFree(raw_ptr, total, align_v);
+            } else {
+                const allocator = std.heap.c_allocator;
+                const raw_slice = @as([*]align(align_v.toByteUnits()) u8, @alignCast(raw_ptr))[0..total];
+                allocator.free(raw_slice);
+            }
         }
 
         fn bufferFreeDeep(self: *Self) void {
