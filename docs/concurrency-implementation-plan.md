@@ -900,18 +900,46 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
   Blob correlated replies (`Task`) and blob-inside-containers are documented v1
   exclusions; 6.3's String work builds on the header-recoverable payload layout
   (`BlobHeader.fromPayloadPointer`).
-  **Follow-on — PRE-EXISTING compiler defect discovered by this job (needs its own
-  fix):** instantiating `Option(<user struct>)` (an applied union over a struct — e.g.
-  `Option(Blob)` or `Option(%Marker{value :: i64})`) in ANY `runtime_concurrency: true`
-  binary mis-compiles: warm builds fail with the whole binary spuriously treated as
-  gate-OFF (86× "Process operations require the concurrency runtime" across the suite),
-  cold builds ICE inside the fork's LLVM bitcode emitter (`Builder.zig getConstantIndex`
-  null-global panic). Bisected minimally to `never = Option(BlobProbeMarker).None` in a
-  gate-ON test (`Option(i64)` is fine; the same code is fine gate-OFF — the `test/`
-  suite uses Option(struct) freely). Unrelated to Blob. Consequence here:
-  `Blob.get_global` ships the Elixir-canonical `:persistent_term.get(key, default)`
-  shape plus `Blob.has_global?` instead of the intended `-> Option(Blob)`, which is the
-  documented eventual surface once this defect is fixed.
+  **Follow-on — FIXED (zap 9a36e6f, fork 6ba5c3e632): the `Option(<user
+  struct>)` gate-ON miscompile/ICE discovered and bisected by P6-J2.** Three stacked
+  root causes, none specific to the concurrency gate (the gate only changed which
+  module set exposed them):
+  1. **Wrong code (Zap `src/ir.zig`):** a parametric-union specialization's synthetic
+     Zig module (Step 3.6, e.g. `Option_Marker.zig`) rendered a user-struct payload as
+     a BARE identifier (`Some: Marker,`) with no import — unresolvable in the file-IS-
+     struct module layout, so the file fails AstGen ("use of undeclared identifier").
+     Nominal payloads are now rendered as `@import` expressions
+     (`zigTypeToImportableStr`: struct `@import("Marker")`, union/enum
+     `@import("Color").Color`, dotted `@import("Owner").Leaf`), which resolve in any
+     synthetic module via the fork's bidirectional module-dep wiring. Also applied to
+     concrete-union payloads and the union-dispatch `_Union` synthesis.
+  2. **Error swallowing → the cold ICE (fork `src/zir_builder.zig`):** Zap-injected ZIR
+     published an EMPTY `Zir.ExtraIndex.imports` table, so `computeAliveFiles` never
+     crawled past the injected roots — the failed synthetic file was never "alive",
+     its AstGen error was dropped from reporting, `anyErrors()` stayed false, and
+     flush proceeded to LLVM emission where the failed decl's unpopulated `lowerNavRef`
+     placeholder global panicked `Builder.toBitcode getConstantIndex` (".?" on a
+     null `getIndex`). The fork's ZIR builder now scans emitted `.import` instructions
+     at `finalize()` and publishes the deduplicated imports table, restoring the
+     upstream invariant: reachable-file AstGen failures gate analysis
+     (`skip_analysis_this_update`) and surface as ordinary compile errors.
+  3. **Warm spurious gate-OFF (fork `src/zir_api.zig`):** every compilation context
+     wrote its struct sources to ONE shared path
+     (`.zap-cache/zap_structs/<name>.zig`) — a sibling gate-OFF target (e.g. `zap run
+     doc`, the gate-OFF `test` target) clobbers the gate-ON daemon's rewritten
+     `zap_runtime.zig` (`RUNTIME_CONCURRENCY_DEFAULT` flips to false on disk;
+     demonstrated live), and the persistent daemon re-AstGens the foreign content at
+     its next update — the whole suite then fails with 86× "Process operations
+     require the concurrency runtime". Struct sources now live under a per-context
+     scope directory (`zap_structs/<scope>/<name>.zig`), preserving in-place update
+     semantics within one context while making cross-context clobbering impossible.
+  Regression tests: `test_concurrency/option_struct_test.zap` (Option(user-struct)
+  construction, Some round-trip, predicates — gate-ON), IR unit tests
+  (`zigTypeToImportableStr`, importable-payload rendering), fork unit tests (imports
+  table population + dedup, per-context struct-source scoping). Consequence resolved:
+  `Blob.fetch_global/1 -> Option(Blob)` now ships alongside the Elixir-canonical
+  `Blob.get_global(key, default)` (which stays the primary), with a gate-ON
+  leak-exact registry test.
 - **6.3** Blob-backed String per rev 2 §5.4: copy-out slices, SSO, 64 B promotion (tuned by
   measurement), rc==1 in-place append via the uniqueness prover, opt-in aliasing view.
 - **6.4** Arena auto-reset at the receive back-edge for solver-proven loop-closed processes;
