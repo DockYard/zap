@@ -65,6 +65,19 @@ pub const KERNEL_UNIT_RELATIVE_DIR = "src/runtime/concurrency";
 /// bridge, which `@import`s the rest of the kernel tree.
 pub const KERNEL_ROOT_BASENAME = "abi.zig";
 
+/// The cpu architectures the concurrency kernel can exist on at all —
+/// the driver-level mirror of the fork's stackful-fiber support set
+/// (`~/projects/zig/lib/std/Io/fiber.zig`, `pub const supported`) and of
+/// the kernel's own comptime guard (`src/runtime/concurrency/
+/// fiber_context.zig`: "the Zap concurrency kernel requires stackful
+/// fiber support"). `validateKernelTargetSupport` checks this set BEFORE
+/// any kernel work so a gate-ON build for an unsupported target fails
+/// with ONE actionable diagnostic at the earliest point that knows both
+/// the gate and the target (plan 7.1's capability-matrix posture),
+/// instead of a screen of fiber/thread/atomic errors from deep inside
+/// the kernel-object compile.
+pub const FIBER_SUPPORTED_ARCHITECTURES = [_]std.Target.Cpu.Arch{ .aarch64, .riscv64, .x86_64 };
+
 /// The intrinsic export the compiled object is asserted to carry. One
 /// symbol suffices as the build-time link-surface tripwire: all
 /// `zap_proc_*` exports live in the same root file, so a root-file
@@ -75,6 +88,10 @@ pub const KERNEL_SENTINEL_SYMBOL = "zap_proc_runtime_init";
 /// Driver-level errors, mirroring the memory driver's error/diagnostic
 /// discipline (each variant is paired with a populated diagnostic).
 pub const KernelResolveError = error{
+    /// The build target's cpu architecture cannot host the kernel at all
+    /// (no stackful-fiber support — see `FIBER_SUPPORTED_ARCHITECTURES`).
+    /// Raised BEFORE any kernel work with an actionable diagnostic.
+    KernelTargetUnsupported,
     /// The kernel source directory or its root file could not be read.
     KernelSourceNotFound,
     /// The fork primitive rejected the compile; the diagnostic carries
@@ -157,6 +174,13 @@ pub fn kernelCacheKeyHex(
     options: KernelResolveOptions,
     diag: *memory_driver.DriverDiagnostic,
 ) KernelResolveError![64]u8 {
+    // Capability gate first: no cache key exists for a target the kernel
+    // cannot exist on. Every build path reaches the driver through this
+    // function (the manifest compile tail and script-mode key computation
+    // call it directly; `resolveKernelObject` calls it before compiling),
+    // so this is the single earliest enforcement point.
+    try validateKernelTargetSupport(options.target, diag);
+
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hashLenPrefixed(&hasher, KERNEL_CACHE_SCHEMA);
     hashLenPrefixed(&hasher, options.kernel_root_basename);
@@ -302,9 +326,67 @@ pub fn resolveKernelObject(
     return .{ .object_path = object_path, .cache_key_hex = cache_key_hex };
 }
 
+/// Reject a build target whose cpu architecture cannot host the
+/// concurrency kernel (plan 7.1 — the capability-matrix compile-time
+/// check). The kernel is fiber-based: `FIBER_SUPPORTED_ARCHITECTURES`
+/// mirrors the fork's `std.Io.fiber.supported` set, and wasm is excluded
+/// architecturally — the wasm call stack is inaccessible, so no fiber
+/// substrate exists (Asyncify is ruled out by decision 9 of
+/// `zap-concurrency-research.md` §6; revisit when the wasm
+/// stack-switching proposal ships in major runtimes).
+///
+/// A `null` target validates the native host architecture. A triple that
+/// does not parse is NOT rejected here: the compile path owns the
+/// malformed-triple diagnostic (`compileKernelUnit`), and this check must
+/// never mask it.
+pub fn validateKernelTargetSupport(
+    target_triple: ?[]const u8,
+    diag: *memory_driver.DriverDiagnostic,
+) KernelResolveError!void {
+    const target_architecture: std.Target.Cpu.Arch = blk: {
+        const triple = target_triple orelse break :blk builtin.cpu.arch;
+        const parsed = memory_driver.parseTargetTriple(triple) orelse return;
+        break :blk architectureFromForkTag(parsed.arch_tag) orelse return;
+    };
+    for (FIBER_SUPPORTED_ARCHITECTURES) |supported_architecture| {
+        if (target_architecture == supported_architecture) return;
+    }
+    const triple_text = target_triple orelse "native";
+    switch (target_architecture) {
+        .wasm32, .wasm64 => diag.write(
+            "runtime_concurrency is not supported on {s} (target '{s}'): the concurrency " ++
+                "kernel requires stackful fibers, and the wasm call stack is architecturally " ++
+                "inaccessible — no wasm fiber substrate exists (Asyncify is ruled out; revisit " ++
+                "when the wasm stack-switching proposal ships). Build without " ++
+                "-Druntime-concurrency=on (or set `runtime_concurrency: false` in the " ++
+                "Zap.Manifest), or target a fiber-capable platform (aarch64/x86_64/riscv64).",
+            .{ @tagName(target_architecture), triple_text },
+        ),
+        else => diag.write(
+            "runtime_concurrency is not supported on {s} (target '{s}'): the concurrency " ++
+                "kernel requires stackful fiber support, which exists for " ++
+                "aarch64/x86_64/riscv64 only. Build without -Druntime-concurrency=on (or set " ++
+                "`runtime_concurrency: false` in the Zap.Manifest), or target a fiber-capable " ++
+                "architecture.",
+            .{ @tagName(target_architecture), triple_text },
+        ),
+    }
+    return KernelResolveError.KernelTargetUnsupported;
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
+
+/// Resolve a `ZapForkTarget.arch_tag` back to the `std.Target.Cpu.Arch`
+/// it encodes (the inverse of `memory_driver.parseTargetTriple`'s
+/// `@intFromEnum`). Null for a tag no architecture carries — the caller
+/// defers such targets to the compile path's own diagnostics.
+fn architectureFromForkTag(arch_tag: u16) ?std.Target.Cpu.Arch {
+    return inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |field| {
+        if (field.value == arch_tag) break @field(std.Target.Cpu.Arch, field.name);
+    } else null;
+}
 
 fn requiredIdentity(
     digest: ?[32]u8,
@@ -978,6 +1060,115 @@ test "concurrency driver: cache key separates optimize, target, and cpu" {
     base_options.cpu = "baseline";
     const cpu_key = try kernelCacheKeyHex(allocator, base_options, &diag);
     try testing.expect(!std.mem.eql(u8, &base_key, &cpu_key));
+}
+
+test "concurrency driver: gate-ON wasm32 target fails early with one actionable diagnostic" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    mock_kernel_compile_count = 0;
+    var options = unit.options(mockForkCompileKernel);
+    options.target = "wasm32-wasi";
+
+    try testing.expectError(
+        KernelResolveError.KernelTargetUnsupported,
+        resolveKernelObject(allocator, options, &diag),
+    );
+    // The rejection happens BEFORE any kernel work: the fork primitive is
+    // never invoked, so no screen of fiber/atomic stdlib compile errors.
+    try testing.expectEqual(@as(usize, 0), mock_kernel_compile_count);
+    // The diagnostic is the actionable capability message.
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "runtime_concurrency is not supported on wasm32") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "wasm call stack") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "-Druntime-concurrency") != null);
+}
+
+test "concurrency driver: the wasm rejection covers the cache-key path and explicit-abi triples" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var options = unit.options(mockForkCompileKernel);
+    options.target = "wasm32-wasi-musl";
+
+    // `kernelCacheKeyHex` is the FIRST driver entry point every build path
+    // hits (the manifest compile tail, script-mode key computation, and
+    // `resolveKernelObject` itself), so the capability check must fire there.
+    try testing.expectError(
+        KernelResolveError.KernelTargetUnsupported,
+        kernelCacheKeyHex(allocator, options, &diag),
+    );
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "runtime_concurrency is not supported on wasm32") != null);
+}
+
+test "concurrency driver: a fiber-incapable non-wasm architecture is rejected with the fiber diagnostic" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    mock_kernel_compile_count = 0;
+    var options = unit.options(mockForkCompileKernel);
+    options.target = "arm-linux-gnueabihf";
+
+    try testing.expectError(
+        KernelResolveError.KernelTargetUnsupported,
+        resolveKernelObject(allocator, options, &diag),
+    );
+    try testing.expectEqual(@as(usize, 0), mock_kernel_compile_count);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "runtime_concurrency is not supported on arm") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "aarch64/x86_64/riscv64") != null);
+}
+
+test "concurrency driver: fiber-capable cross targets pass the capability check" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var options = unit.options(mockForkCompileKernel);
+    const fiber_capable_triples = [_][]const u8{
+        "x86_64-linux-gnu",
+        "aarch64-macos",
+        "riscv64-linux-gnu",
+    };
+    for (fiber_capable_triples) |triple| {
+        options.target = triple;
+        // Key computation succeeds: the capability check lets the build
+        // proceed to the kernel compile for every fiber-capable target.
+        _ = try kernelCacheKeyHex(allocator, options, &diag);
+    }
+}
+
+test "concurrency driver: a malformed triple defers to the compile-path diagnostic" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var options = unit.options(mockForkCompileKernel);
+    options.target = "bogus-not-a-target";
+
+    // The capability check must never mask the existing malformed-triple
+    // diagnostic owned by the compile path.
+    try testing.expectError(
+        KernelResolveError.KernelCompileFailed,
+        resolveKernelObject(allocator, options, &diag),
+    );
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "unrecognised triple") != null);
 }
 
 test "concurrency driver: object missing the sentinel intrinsic fails validation" {

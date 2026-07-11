@@ -6,7 +6,7 @@
 performance tier) completed 2026-07-11. Every phase exit gate adjudicated MET; the
 experiment ledger (E1–E10 + OQ1) fully recorded in `docs/concurrency-bench-results.md`;
 zero-cost-OFF byte-identity holds at HEAD. Remaining post-construction items carry
-numbered owners (2.2a, 5.5–5.9, 6.2a, 6.3a/6.3b, 6.4a, 6.6a, 7.1–7.6). **One
+numbered owners (2.2a, 5.5–5.9, 6.2a, 6.3a/6.3b, 6.4a, 6.6a, 7.1–7.6, 7.1a). **One
 deliberately user-run step remains: `zig build zir-test`** — the compile-fail fixtures
 written across the campaign (send type-mismatch, non-sendable receive, use-after-move,
 gate-off Process rejection, the Option(struct) regression, spawn-entry contracts, and
@@ -1263,6 +1263,88 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
 
 - **7.1** Wasm: capability-matrix entries verified (spawn error clean, Threaded fallback where
   host threads exist); cross-compile smoke per the existing `runtime_os` gate.
+  **DONE (P7-J2, 2026-07-11)** — verified at HEAD; one fix landed (the clean gate-ON
+  diagnostic); one distinct pre-existing defect split out to 7.1a. **Verification
+  matrix** (zap CLI, script mode, hello fixture; real exit codes): (i) gate-OFF
+  `-Dtarget=wasm32-wasi` cross-compiles clean (exit 0; artifact is `WebAssembly (wasm)
+  binary module version 0x1 (MVP)`) and RUNS under wasmtime (exit 0, correct stdout) —
+  the pre-campaign runtime_os posture holds at HEAD after seven phases of concurrency
+  changes. (ii) gate-ON `-Dtarget=wasm32-wasi` BEFORE the fix died at the kernel-object
+  compile with 60+ stdlib errors deep in the noise (`std/Io/fiber.zig:23: unimplemented
+  architecture: wasm32`; `std/Thread.zig:346: Cannot spawn thread when building in
+  single-threaded mode`; a page of `std/atomic.zig` 64-bit-atomics rejections against
+  the kernel's blob/pid_table/scheduler_pool/signal counters) — exactly the failure
+  mode this item forbids. AFTER the fix it fails before ANY kernel work, exit 1, with
+  ONE actionable diagnostic: "runtime_concurrency is not supported on wasm32 (target
+  'wasm32-wasi'): the concurrency kernel requires stackful fibers, and the wasm call
+  stack is architecturally inaccessible — no wasm fiber substrate exists (Asyncify is
+  ruled out; revisit when the wasm stack-switching proposal ships). Build without
+  -Druntime-concurrency=on (or set `runtime_concurrency: false` in the Zap.Manifest),
+  or target a fiber-capable platform (aarch64/x86_64/riscv64)." (iii) gate-ON native
+  (aarch64-macos) and gate-ON EXPLICIT `-Dtarget=aarch64-macos` both still build and
+  run (exit 0) — the check admits every fiber-capable triple. (iv) gate-ON
+  `-Dtarget=x86_64-linux-gnu` control: the capability check correctly ADMITS x86_64,
+  then the kernel-object compile fails on a DISTINCT pre-existing libc-gating defect →
+  7.1a. **The fix** (`src/concurrency_driver.zig`): `FIBER_SUPPORTED_ARCHITECTURES`
+  (aarch64/riscv64/x86_64 — the driver-level mirror of the fork's
+  `std.Io.fiber.supported` set and of the kernel's own `fiber_context.zig` comptime
+  guard) + `validateKernelTargetSupport(target, diag)` raising the new
+  `KernelResolveError.KernelTargetUnsupported`, enforced at the top of
+  `kernelCacheKeyHex` — the single earliest driver entry point every gate-ON build path
+  hits (the manifest compile tail, script-mode key computation, and the watch/daemon
+  `resolveKernelObject`). wasm32/wasm64 get the call-stack-inaccessible wording; other
+  fiber-incapable arches the generic fiber wording; malformed triples still defer to
+  the compile path's `unrecognised triple` diagnostic (never masked). Five driver unit
+  tests red→green (wasm rejection with fork-primitive-never-invoked; explicit-abi
+  triple on the cache-key path; arm-linux rejection; fiber-capable triples pass;
+  malformed-triple deferral). **Threaded-fallback adjudication: DEFERRED — the honest
+  v1 posture is "gate-ON unsupported on wasm, full stop", cleanly diagnosed and
+  documented.** "Threaded where host threads exist" is not implementable for wasm
+  today; the kernel structurally depends on primitives wasm32-wasi lacks: real OS
+  threads for scheduler cores and the blocking pool (`scheduler_pool.zig:378`,
+  `blocking_pool.zig:213/312` — Zig's wasm32-wasi target is single-threaded;
+  wasi-threads is experimental and absent from `std.Thread`); futex park/unpark
+  (`futex.zig` maps Darwin `__ulock`/`os_sync` and Linux `futex(2)`, "other OSes are a
+  compile error" — wasm needs `memory.atomic.wait/notify`, valid only on shared memory
+  under the threads feature); mmap+`PROT_NONE` guard-paged, lazily-committed fiber
+  stacks (`stack_pool.zig` — wasm linear memory has no mprotect or guard pages);
+  `threadlocal` scheduler state (`process.zig:187/199/242` exported TLS
+  budget/context, `scheduler.zig:1888` — wasm TLS requires the threads feature);
+  pervasive 64-bit atomics (`std.atomic.Value(u64)` across
+  blob/pid_table/scheduler_pool/signal, rejected on wasm32); and above all stackful
+  fibers (the fork's `fiber.supported` excludes wasm because the call stack is
+  architecturally inaccessible). §5.5's "optional Threaded fallback" therefore stays
+  UNEXERCISED for wasm in v1 — A.2 item 6's "wasm-with-host-threads" reading is design
+  intent, not shipped capability; revisit alongside the wasm stack-switching proposal
+  (fibers) or a mature wasi-threads `std.Thread` port (1:1 Threaded); no Asyncify,
+  ever (decision 9). **Cross-compile smoke per the runtime_os gate**: `zig build test`
+  carries the standing wasm32-wasi compile-check of `src/runtime_os/wasi.zig` plus the
+  P4-R2 portability grep-gate (green at close); the gate-OFF wasmtime run above is the
+  end-to-end smoke. Kernel-tree `std.c` usage is capability-adjudicated: the env/clock
+  reads (`abi.zig` env knobs, `blocking_pool.zig:512`) are documented libc-leg reads
+  that are never reached on wasm — the capability gate rejects wasm before the kernel
+  is ever compiled for it (their Linux story is 7.1a). Gates: `zig build test` 0; `zig
+  build test-kernel` (fork compiler, Debug + ReleaseFast) 0; gate-ON
+  `:test_concurrency` 177/0 (478 assertions); `zig fmt` clean.
+- **7.1a (FOLLOW-ON — gate-ON Linux: kernel-object compile vs libc).** Split out of the
+  P7-J2 verification matrix (pre-existing; NOT wasm-related). Gate-ON
+  `-Dtarget=x86_64-linux-gnu` fails the kernel-object compile with `std/c.zig:
+  dependency on libc must be explicitly specified in the build command` (×2, exit 1).
+  Root cause: the fork's `zap_fork_compile_zig_to_object` decides libc INTERNALLY
+  (`~/projects/zig/src/zir_api.zig` `compileToObjectImpl`: `requiresLibC()` — Darwin et
+  al. — plus the Windows carve-out), so Linux objects compile `link_libc = false`,
+  while the kernel deliberately reads `std.c.getenv`/`std.c.clock_gettime` ("the Linux
+  CI leg links libc" — `abi.zig` env knobs, `blocking_pool.zig`) and the FINAL Zap
+  binary links libc by default on every hosted target (`src/zir_backend.zig`
+  `link_libc: bool = true`). The object's libc state must agree with the final link it
+  feeds: the correct fix is to thread the caller's resolved libc decision through the
+  fork primitive's C ABI (a `link_libc` parameter on `zap_fork_compile_zig_to_object`,
+  passed by both build drivers), NOT to strip the kernel's documented libc reads. Fork
+  ABI change + fork rebuild — deliberately not smuggled into the P7-J2 wasm job. The
+  same `requiresLibC() == false` path almost certainly breaks gate-ON builds run
+  NATIVELY on a Linux host (unverified here — no Linux host in the P7-J2 environment);
+  verify both legs when this lands. Until then, gate-ON is validated on macOS
+  (native + explicit-triple) only; Windows end-to-end is 7.2's open item.
 - **7.2** Windows: Threaded-backend 1:1 fallback validated end-to-end; IOCP+fiber fork work
   scoped as a follow-on (stretch).
 - **7.3** Docs: user-facing concurrency guide; FFI safety contract; message-versioning posture
