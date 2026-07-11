@@ -2302,6 +2302,11 @@ documented price of `runtime_tracing: true`; the ring itself is 4096 × 40 B
   path-sensitivity of the toolchain, isolated by a 2×2
   compiler×stdlib swap (the stdlib and every P6-J6 source change are
   text-neutral); same-path builds are deterministic and identical.
+  **RESOLVED (P7-J4, 2026-07-11, § P7-J4 below): not a path leak into
+  emitted text — a silent dependency-resolution divergence in the
+  different-path build; emitted user text is proven bit-exact across
+  every path axis when the toolchain inputs are pinned, and the one
+  silent location-dependent input is now a hard build error.**
 
 ### Detector posture (documented decisions)
 
@@ -2321,6 +2326,87 @@ documented price of `runtime_tracing: true`; the ring itself is 4096 × 40 B
   — it VERIFIES the P4-R2 fairness rather than assuming it, and fires with
   a naming diagnostic under a genuinely unfair pick policy (the synthetic
   never-pick-the-head `Decisions` test).
+
+## P7-J4 — toolchain build-path sensitivity root-cause (2026-07-11): plan item 7.7 — no path leak; silent stdlib fallback removed
+
+Root-cause of the P6-J6 environmental footnote. Method: single workload
+(mandelbrot, `zap run` script mode — the script pipeline pins its optimize
+mode — fresh isolated `XDG_CACHE_HOME` per compile), compare the produced
+binary's `__TEXT,__text` SHA-256 + full `nm` symbol table across one axis
+at a time, everything else pinned (zap HEAD `98798eb`, fork `df4a90ae04`,
+`ZAP_ZIG_LIB_DIR`/`ZAP_LIB_DIR` env-pinned, same cwd).
+
+### Result: emitted user text is BIT-EXACT across every path axis
+
+All of the following produced the IDENTICAL `__text` SHA-256
+(`85419cd4…9894a`, 1,262,316 bytes) and identical symbol tables:
+
+1. **Zig-stdlib dir path** — canonical 35-char `~/projects/zig/lib` vs a
+   byte-identical copy at a 110-char absolute path (`ZAP_ZIG_LIB_DIR`).
+2. **Compiler run path** — the same `zap` binary copied to a much longer
+   absolute path.
+3. **Cache path** — different `XDG_CACHE_HOME` names AND lengths.
+4. **Zap-stdlib + manager-backend path** — `ZAP_LIB_DIR` copy at a longer
+   path (this also moves the `src/memory/arc/manager.zig` absolute path
+   that is handed to `zir_compilation_add_struct` as `zap_active_manager`).
+5. **cwd** — project root vs `/private/tmp`.
+6. **Script source path** — `mandelbrot.zap` copied to a much longer path.
+7. **`zap` rebuilt from IDENTICAL source in a /tmp git worktree** — same
+   pinned `-Dzap-compiler-lib`/`-Dllvm-lib-path`/`-Dzig-fork-root` flags,
+   same building Zig; only the project root differs.
+8. **LLVM static-lib swap** — `zap` relinked against the zap-deps LLVM
+   set instead of the zig-bootstrap host set (different LLVM builds:
+   `libLLVMCore.a` 6,408,752 vs 5,890,232 B).
+9. **`libzap_compiler.a` rebuilt from IDENTICAL fork source in a /tmp
+   fork worktree** (canonical build command), `zap` relinked against it.
+
+Determinism control: two same-path compiles differ ONLY in `LC_UUID` +
+LINKEDIT stabs (`N_OSO` cache paths/mtimes); no absolute path string
+appears in any user-binary content section (`strings` sweep: only
+`/dev/null`, `/usr/lib/dyld`, the default `PATH` literal).
+
+Artifact-level (non-code) build-path effects DO exist and are benign: the
+fork archive built at /tmp differs by 61,664 bytes and the /tmp-built
+`zap` exe by 16 bytes — the compiler's own debug/path metadata — with
+ZERO symbol-table drift (both `zap` builds: 308,824 symbols, 642
+`__MergedGlobals`) and zero effect on emitted user text.
+
+### The one real, silent location-dependent input (found + fixed)
+
+`build.zig` resolved the embedded/exe-compile stdlib as: `-Dzig-lib-dir`
+→ fork sibling `{zig-fork-root}/lib` → **silent fallback to the BUILDING
+Zig's own lib dir** (`detectBuildZigLibDir`). Building zap from a
+checkout with no `../zig` sibling — exactly the P6-J6 /tmp-worktree
+situation — silently embedded the building Zig's UPSTREAM stdlib and
+compiled the `zap` exe against it. A compiler built that way emits
+materially different user binaries wherever that stdlib is used:
+measured −22,560 B of `__text` on the same workload with the fork's
+entire `std.debug.MachOFile` machinery absent (the fork-only crash
+reporter/symbolization stdlib changes). The other dependency-default
+divergences fail LOUDLY (missing archive → hard configure error; the
+stale zap-deps release archive → 33 link errors against current zap, a
+requirement dating to 2026-05-16, before P6-J6).
+
+**Fix (this job):** the silent fallback is deleted; a missing fork stdlib
+is now a hard configure error naming the expected path and the two
+explicit outs (`-Dzig-fork-root=…`, or `-Dzig-lib-dir=…` for
+prebuilt-archive builds, which then owns matching the archive).
+`zig build setup` on a fresh checkout is unaffected (the archive check
+already early-returns before stdlib resolution).
+
+### Verdict on the P6-J6 footnote
+
+The "path sensitivity" does not reproduce from identical pinned inputs —
+the controlled different-path rebuilds of both compiler artifacts are
+text-neutral. The observed 3-symbol/`__MergedGlobals` drift is therefore
+attributed to the /tmp build's dependency RESOLUTION diverging (the
+silent stdlib fallback and/or a different dep set passed to the worktree
+build), not to path bytes reaching codegen. Same-path determinism — the
+basis of every campaign byte-identity gate — was never in question;
+path-independent reproducibility now holds as well, and the one silent
+divergence channel is closed. Validation: `zig build test` green
+(includes the kernel tests) after the `build.zig` change; failure mode +
+`-Dzig-lib-dir` escape hatch exercised directly.
 
 ## Baseline comparison yardstick
 

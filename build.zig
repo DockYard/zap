@@ -432,14 +432,60 @@ pub fn build(b: *std.Build) void {
     // The fork root is already resolved above (from `-Dzig-fork-root`, the
     // `-Dzap-compiler-lib` tree, or the `../zig` default), so its sibling
     // `lib/` is the authoritative stdlib that matches `libzap_compiler.a`.
-    // Fall back to the building Zig's lib only when the fork tree is absent
-    // (e.g. a CI job handed a prebuilt archive without the fork checkout).
+    //
+    // Absence of the fork stdlib is a HARD ERROR, never a silent fallback to
+    // the building Zig's own lib. The P7-J4 root-cause of the "toolchain
+    // build-path sensitivity" footnote (concurrency plan item 7.7) proved
+    // that emitted user-binary text is bit-exact across build locations when
+    // every toolchain input is pinned — the one silent location-dependent
+    // input was THIS fallback: building Zap from a checkout without a `../zig`
+    // sibling (e.g. a /tmp worktree) silently embedded the building Zig's
+    // upstream stdlib, and a compiler built that way emits materially
+    // different user binaries (measured: -22,560 bytes of `__TEXT,__text` on
+    // mandelbrot ReleaseFast; the entire fork `std.debug.MachOFile`
+    // machinery absent). A caller that genuinely wants a non-sibling stdlib
+    // (e.g. a prebuilt-archive build without a fork checkout) must say so
+    // explicitly with `-Dzig-lib-dir`, and owns the responsibility that the
+    // named tree matches `libzap_compiler.a`.
     const fork_zig_lib_dir = b.fmt("{s}/lib", .{zig_fork_root});
-    const zig_lib_dir = b.option([]const u8, "zig-lib-dir", "Path to Zig lib directory (contains std/)") orelse
+    const maybe_zig_lib_dir: ?[]const u8 = b.option([]const u8, "zig-lib-dir", "Path to Zig lib directory (contains std/)") orelse
         (if (pathExists(b, b.pathJoin(&.{ fork_zig_lib_dir, "std", "std.zig" })))
             fork_zig_lib_dir
         else
-            detectBuildZigLibDir(b));
+            null);
+    const zig_lib_dir = maybe_zig_lib_dir orelse {
+        const fail = b.addSystemCommand(&.{
+            "sh", "-c",
+            b.fmt(
+                "printf '\\n" ++
+                    "Error: the Zap fork Zig stdlib was not found.\\n" ++
+                    "\\n" ++
+                    "Expected:\\n" ++
+                    "  {s}/std/std.zig\\n" ++
+                    "\\n" ++
+                    "Zap embeds this stdlib into the `zap` binary and compiles both the\\n" ++
+                    "`zap` executable and every user binary against it; it must be the\\n" ++
+                    "fork lib/ that matches libzap_compiler.a. Building against the Zig\\n" ++
+                    "that happens to be running this build would silently produce a\\n" ++
+                    "compiler that emits different user binaries.\\n" ++
+                    "\\n" ++
+                    "Point the build at the fork checkout:\\n" ++
+                    "  zig build -Dzig-fork-root=/path/to/zap-zig-fork\\n" ++
+                    "\\n" ++
+                    "Or name a stdlib tree explicitly (it must match libzap_compiler.a):\\n" ++
+                    "  zig build -Dzig-lib-dir=/path/to/zap-zig-fork/lib\\n" ++
+                    "\\n' >&2 && exit 1",
+                .{fork_zig_lib_dir},
+            ),
+        });
+        b.getInstallStep().dependOn(&fail.step);
+        test_step.dependOn(&fail.step);
+        const run_step = b.step("run", "Run the app");
+        run_step.dependOn(&fail.step);
+        const zir_test_step = b.step("zir-test", "Run ZIR integration tests");
+        zir_test_step.dependOn(&fail.step);
+        return;
+    };
 
     // Phase 2.f GP3 — the `zap` exe (and the CLI/addr2line test binaries that
     // exercise the same code) MUST be COMPILED against the fork's `std`, not
@@ -1015,11 +1061,3 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
-fn detectBuildZigLibDir(b: *std.Build) []const u8 {
-    return b.graph.zig_lib_directory.path orelse {
-        const zig_exe = b.graph.zig_exe;
-        const bin_dir = std.fs.path.dirname(zig_exe) orelse ".";
-        const parent_dir = std.fs.path.dirname(bin_dir) orelse ".";
-        return b.fmt("{s}/lib", .{parent_dir});
-    };
-}

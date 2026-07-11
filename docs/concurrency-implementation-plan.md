@@ -1531,6 +1531,25 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   unaffected — but path-independent reproducibility is the durable posture:
   root-cause the absolute-path leak into emitted text on the fork-hygiene
   track.
+  - **DONE (P7-J4, 2026-07-11).** Root cause: there is NO absolute-path leak
+    into emitted text. Under controlled reproduction (ledger § P7-J4), user
+    `__TEXT,__text` is BIT-EXACT across every path axis — nine
+    runtime-supplied path axes (zig-stdlib dir, compiler run path, cache
+    path incl. length, Zap-stdlib + manager-backend source path, cwd,
+    script path) AND full rebuilds from identical source at a /tmp worktree
+    of BOTH the `zap` binary and `libzap_compiler.a` (pinned dep flags),
+    AND an LLVM static-lib set swap. The compiler ARTIFACTS legitimately
+    differ across build paths (own debug/path metadata: 61,664 B archive
+    delta, 16 B exe delta; ZERO symbol-table drift) without affecting
+    emitted code. The one SILENT location-dependent input was
+    `build.zig`'s stdlib fallback: absent a `../zig` sibling (exactly the
+    /tmp-worktree situation) it silently embedded the BUILDING Zig's
+    upstream stdlib — a compiler built that way emits materially different
+    user text (measured −22,560 B `__text`, fork `std.debug.MachOFile`
+    machinery absent). FIXED: the fallback is now a hard configure error
+    with an explicit `-Dzig-lib-dir` escape hatch
+    (`detectBuildZigLibDir` deleted). Path-independent reproducibility of
+    emitted user binaries now HOLDS and is loudly protected.
 
 ## 6. Experiment gates → phases
 
