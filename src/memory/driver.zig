@@ -68,6 +68,30 @@ pub const ZapForkResult = enum(c_int) {
     InternalError = 99,
 };
 
+/// Caller's libc decision for the fork compile primitive (spec section
+/// 10.1.2). The compiled object is a partial input to the FINAL link,
+/// and `link_libc` must agree between the object compile and that final
+/// link — only the caller knows the final link's posture, so the caller
+/// decides. Values mirror the fork's `ZapForkLinkLibc` exactly.
+pub const ZapForkLinkLibc = enum(c_int) {
+    /// The fork decides: `std.Target.requiresLibC()` targets and all
+    /// Windows targets compile with libc, everything else without —
+    /// the historical pre-parameter behavior. Manager validation
+    /// objects pass this (their `.o` is build-time evidence only and
+    /// never linked, so the historical decision remains correct).
+    default = 0,
+    /// Compile the object with `link_libc = false`.
+    off = 1,
+    /// Compile the object with `link_libc = true`. The concurrency
+    /// kernel object passes this: the kernel deliberately reads
+    /// `std.c.getenv`/`std.c.clock_gettime` (the documented production
+    /// seams) and the final binary always links libc
+    /// (`src/zir_backend.zig` `link_libc: bool = true`), so the kernel
+    /// `.o` must agree — on Linux the fork's internal default would
+    /// otherwise compile it without libc and fail on the `std.c` seams.
+    on = 2,
+};
+
 /// Function-pointer type matching the Zig fork primitive's C-ABI signature.
 /// The driver invokes this indirectly so unit tests that do not link
 /// `libzap_compiler.a` can substitute a mock.
@@ -85,6 +109,8 @@ pub const ForkCompileFn = *const fn (
     /// Null/"" ⇒ the resolved triple's default CPU. The manager `.o`
     /// is built for the SAME CPU as the user binary.
     cpu_features_opt: ?[*:0]const u8,
+    /// The caller's libc decision — see `ZapForkLinkLibc`.
+    link_libc: ZapForkLinkLibc,
 ) callconv(.c) ZapForkResult;
 
 /// The real Zig fork primitive, provided by `libzap_compiler.a` in the
@@ -108,6 +134,7 @@ extern "c" fn zap_fork_compile_zig_to_object(
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
     cpu_features_opt: ?[*:0]const u8,
+    link_libc: ZapForkLinkLibc,
 ) callconv(.c) ZapForkResult;
 
 /// Thin shim that the driver invokes through `default_fork_fn_or_null`.
@@ -125,6 +152,7 @@ fn zapForkCompileShim(
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
     cpu_features_opt: ?[*:0]const u8,
+    link_libc: ZapForkLinkLibc,
 ) callconv(.c) ZapForkResult {
     return zap_fork_compile_zig_to_object(
         source_path,
@@ -137,6 +165,7 @@ fn zapForkCompileShim(
         local_cache_dir_opt,
         global_cache_dir_opt,
         cpu_features_opt,
+        link_libc,
     );
 }
 
@@ -1241,6 +1270,12 @@ fn compileManagerSource(
         cache_dir_z.ptr,
         cache_dir_z.ptr,
         if (cpu_z) |p| p.ptr else null,
+        // Manager validation objects keep the fork's internal libc
+        // decision (`requiresLibC()` targets and Windows link libc):
+        // the `.o` is build-time evidence only — never linked into the
+        // final binary — so the historical decision remains correct and
+        // this call site's behavior is unchanged by the libc parameter.
+        .default,
     );
 
     switch (result) {
@@ -3016,6 +3051,10 @@ fn synthesizeNoOpCoff(buffer: []u8) usize {
 /// Mock `ForkCompileFn` used by the ELF integration test. Writes a
 /// NoOp-style ELF object to the requested output path and returns `.Ok`.
 var mock_noop_compile_count: usize = 0;
+/// Records the libc decision the driver threaded into the most recent
+/// mock compile, so tests can assert manager validation objects keep
+/// passing `.default` (unchanged behavior under the libc parameter).
+var mock_noop_last_link_libc: ?ZapForkLinkLibc = null;
 
 fn mockForkCompileNoOp(
     source_path: [*:0]const u8,
@@ -3028,6 +3067,7 @@ fn mockForkCompileNoOp(
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
     cpu_features_opt: ?[*:0]const u8,
+    link_libc: ZapForkLinkLibc,
 ) callconv(.c) ZapForkResult {
     _ = source_path;
     _ = target;
@@ -3040,6 +3080,7 @@ fn mockForkCompileNoOp(
     _ = cpu_features_opt;
 
     mock_noop_compile_count += 1;
+    mock_noop_last_link_libc = link_libc;
 
     var buffer: [4096]u8 = undefined;
     const written = synthesizeNoOpElf(&buffer);
@@ -3252,6 +3293,7 @@ fn mockForkCompileNoOpMacho(
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
     cpu_features_opt: ?[*:0]const u8,
+    link_libc: ZapForkLinkLibc,
 ) callconv(.c) ZapForkResult {
     _ = source_path;
     _ = target;
@@ -3262,6 +3304,7 @@ fn mockForkCompileNoOpMacho(
     _ = local_cache_dir_opt;
     _ = global_cache_dir_opt;
     _ = cpu_features_opt;
+    _ = link_libc;
 
     var buffer: [4096]u8 = undefined;
     const written = synthesizeNoOpMacho(&buffer);
@@ -4002,6 +4045,10 @@ var captured_target_state: struct {
     local_cache_len: usize = 0,
     global_cache_buf: [256]u8 = undefined,
     global_cache_len: usize = 0,
+    /// The libc decision the driver threaded through — manager
+    /// validation compiles must always pass `.default` (the fork's
+    /// internal heuristic; unchanged behavior).
+    link_libc: ?ZapForkLinkLibc = null,
     invoked: bool = false,
 } = .{};
 
@@ -4020,6 +4067,7 @@ fn mockForkCompileCaptureTarget(
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
     cpu_features_opt: ?[*:0]const u8,
+    link_libc: ZapForkLinkLibc,
 ) callconv(.c) ZapForkResult {
     _ = source_path;
     _ = optimize;
@@ -4028,6 +4076,7 @@ fn mockForkCompileCaptureTarget(
     _ = zig_lib_dir_opt;
 
     captured_target_state.target = target.*;
+    captured_target_state.link_libc = link_libc;
     captured_target_state.invoked = true;
     if (cpu_features_opt) |c| {
         const slice = std.mem.span(c);
@@ -4147,6 +4196,15 @@ test "resolve threads compile_target through to fork_compile_fn" {
     try std.testing.expectEqual(
         @as(u16, @intCast(@intFromEnum(std.Target.Abi.gnu))),
         captured_target_state.target.abi_tag,
+    );
+    // Manager validation objects must keep the fork's INTERNAL libc
+    // decision (`.default`) — the libc parameter exists for callers
+    // whose object is linked into the final binary (the concurrency
+    // kernel); the validation `.o` is never linked, so its behavior is
+    // unchanged (7.1a call-site audit).
+    try std.testing.expectEqual(
+        @as(?ZapForkLinkLibc, .default),
+        captured_target_state.link_libc,
     );
 }
 

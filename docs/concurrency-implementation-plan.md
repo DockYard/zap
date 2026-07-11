@@ -1348,11 +1348,32 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   feeds: the correct fix is to thread the caller's resolved libc decision through the
   fork primitive's C ABI (a `link_libc` parameter on `zap_fork_compile_zig_to_object`,
   passed by both build drivers), NOT to strip the kernel's documented libc reads. Fork
-  ABI change + fork rebuild — deliberately not smuggled into the P7-J2 wasm job. The
-  same `requiresLibC() == false` path almost certainly breaks gate-ON builds run
-  NATIVELY on a Linux host (unverified here — no Linux host in the P7-J2 environment);
-  verify both legs when this lands. Until then, gate-ON is validated on macOS
-  (native + explicit-triple) only; Windows end-to-end is 7.2's open item.
+  ABI change + fork rebuild — deliberately not smuggled into the P7-J2 wasm job.
+  **DONE (P7-J4a, 2026-07-11) — the caller's libc decision is threaded through the
+  primitive's C ABI and gate-ON Linux compiles+links.** Fork (`df4a90ae04`):
+  `zap_fork_compile_zig_to_object` gained a trailing `ZapForkLinkLibc` enum parameter
+  (`default = 0` keeps the internal heuristic incl. the Windows always-libc carve-out
+  — the exact pre-parameter behavior; `.on`/`.off` are honored exactly on every
+  target), the v1.x append-with-zero-default flat-signature extension already
+  practiced for `cpu_features_opt` (memory-manager-abi.md §10.1.2/§11.1.1 updated);
+  the decision is extracted into `objectLinkLibcDecision` and unit-tested (default
+  across linux/windows-gnu/windows-msvc/macos/wasi + explicit overrides). Zap: the
+  memory driver's manager validation compiles pass `.default` (unchanged behavior —
+  asserted in the target-plumbing test); the concurrency driver pins
+  `KERNEL_OBJECT_LINK_LIBC = .on` (one constant feeds BOTH the compile and the cache
+  key; kernel cache schema bumped to v3 so pre-7.1a no-libc objects can never
+  cache-hit). Verified: gate-ON `-Dtarget=x86_64-linux-gnu` kernel object is an
+  x86-64 ELF relocatable importing `getenv`/`clock_gettime`, and the final
+  `zap_test_concurrency` links clean (dynamic glibc ELF executable, 122 `zap_proc_*`
+  symbols, exit 0); the P7-J2 wasm/arm rejections and the P7-J3 Windows rejection
+  still fire (exit 1 each); native gate-ON runs 177/0 (478 assertions); `zig build
+  test` 42/42 steps, 3271/3271; `zig build test-kernel` Debug+ReleaseFast 533 pass /
+  3 skip; E9 floors reproduce with the rebuilt fork (3.31 ns median one-way, 8.40 ns
+  spawn min). Gate-ON EXECUTION on a Linux host remains Linux-CI territory (this
+  environment is macOS-only — compile-level acceptance here); the native-Linux-host
+  leg conjectured by P7-J2 is fixed by the same change (the kernel compile passes
+  `.on` for native builds too) but should be confirmed when the Linux CI leg lands.
+  Windows end-to-end is 7.2's open item.
 - **7.2** Windows: Threaded-backend 1:1 fallback validated end-to-end; IOCP+fiber fork work
   scoped as a follow-on (stretch).
   **DONE (P7-J3, 2026-07-11) — adjudicated to the honest posture: Windows gate-ON is

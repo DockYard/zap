@@ -160,8 +160,12 @@
 //!
 //! Portability tracking (Phase 4 Linux CI leg): the kernel test/stress env
 //! knobs (`adversarial_stress.zig`, `teardown_stress.zig`, `panic_guards.zig`)
-//! read their configuration via libc `std.c.getenv`, so the Linux leg must
-//! either link libc for kernel tests or migrate the knobs to
+//! read their configuration via libc `std.c.getenv`. The PRODUCTION kernel
+//! object is covered since 7.1a — the concurrency driver compiles it with
+//! `link_libc = true` on every target, matching the final binary's link —
+//! so this item now tracks only the standalone TEST builds (`zig build
+//! test-kernel` via `build.zig`, which does not set `link_libc`): the Linux
+//! leg must either link libc for kernel tests or migrate the knobs to
 //! `std.posix.getenv`. Failure mode today is a loud link error, not silent
 //! misbehavior.
 //!

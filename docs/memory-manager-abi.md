@@ -1386,6 +1386,27 @@ pub const ZapForkResult = enum(c_int) {
     InternalError = 99,
 };
 
+/// The caller's libc decision for the object compile. The object is a
+/// partial input to the caller's FINAL link, and `link_libc` must agree
+/// between the object compile and that final link; only the caller
+/// knows the final link's posture, so the caller decides. `default`
+/// (the zero value) preserves the primitive's internal heuristic.
+pub const ZapForkLinkLibc = enum(c_int) {
+    /// The primitive decides: `std.Target.requiresLibC()` targets and
+    /// all Windows targets compile with libc (the Windows carve-out —
+    /// Zig's std resolves C-runtime externs against libc-named import
+    /// libraries there), everything else without. This is the
+    /// pre-parameter behavior; callers with no libc opinion pass this.
+    default = 0,
+    /// Compile the object with `link_libc = false`.
+    off = 1,
+    /// Compile the object with `link_libc = true`. Pass this when the
+    /// final binary links libc and the object deliberately uses
+    /// `std.c` bindings so both sides of the link agree (e.g. Zap's
+    /// concurrency kernel object).
+    on = 2,
+};
+
 pub extern fn zap_fork_compile_zig_to_object(
     source_path: [*:0]const u8,
     target: *const ZapForkTarget,
@@ -1396,6 +1417,8 @@ pub extern fn zap_fork_compile_zig_to_object(
     zig_lib_dir_opt: ?[*:0]const u8,
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
+    cpu_features_opt: ?[*:0]const u8,
+    link_libc: ZapForkLinkLibc,
 ) callconv(.c) ZapForkResult;
 ```
 
@@ -1432,10 +1455,36 @@ On `CompilationFailed`, the diagnostic buffer is populated with the formatted co
     artifacts (e.g., libcxx, compiler_rt) to live alongside the rest
     of its tooling cache.
 
-All three pointers are `?[*:0]const u8` and follow C-string conventions:
-NUL-terminated UTF-8 paths or `null` to request the default. The
-primitive never takes ownership of the buffers; the caller may free
-them as soon as the call returns.
+`cpu_features_opt`
+    Optional CPU model/feature set (mirrors `zig build`'s `-Dcpu=`,
+    e.g. `"baseline"`, `"apple_m1"`, `"x86_64_v3"`,
+    `"<model>+feat-feat"`). Pass null or `""` for the resolved
+    triple's default CPU. When set, the object is built for the SAME
+    CPU as the caller's final binary so every object in the final link
+    agrees on the target machine.
+
+`link_libc`
+    The caller's libc decision (`ZapForkLinkLibc`, not optional — the
+    zero value `default` is the no-opinion spelling). `default`
+    preserves the primitive's internal heuristic: targets where the
+    platform stdlib requires libc (`std.Target.requiresLibC()`) and
+    all Windows targets compile with `link_libc = true`, everything
+    else with `link_libc = false`. `on`/`off` pin the object's
+    `link_libc` exactly — explicit decisions are honored on every
+    target, because only the caller knows its final link's libc
+    posture and the object must agree with that link. Zap's manager
+    validation objects pass `default` (the `.o` is build-time evidence
+    only, never linked); Zap's concurrency kernel object passes `on`
+    (the kernel reads `std.c` seams and the final binary always links
+    libc, so an internal-default Linux compile would fail on `std.c`
+    resolution). Note that `off` on a `requiresLibC()`/Windows target
+    will fail to compile any source that touches `std` OS facilities —
+    that contract belongs to the caller, exactly like the final link.
+
+The four optional pointers are `?[*:0]const u8` and follow C-string
+conventions: NUL-terminated UTF-8 paths/strings or `null` to request
+the default. The primitive never takes ownership of the buffers; the
+caller may free them as soon as the call returns.
 
 The primitive does not currently accept package dependencies (`build.zig.zon` deps arrays); see section 11.1.1 for the implication.
 
@@ -1688,9 +1737,11 @@ codegen.
 
 #### 11.1.1 Third-party manager dependencies
 
-v1.0 third-party managers may not declare Zig-package dependencies. The manager source must be self-contained: `@import("std")`, `@import("builtin")`, and the manager's own files (no `build.zig.zon` `dependencies` table). The `zap_fork_compile_zig_to_object` primitive is a flat C-ABI function whose signature is fixed for the lifetime of ABI v1.x; it carries no deps-array field and no size-extensible options struct, so dep support cannot be added under the `size`-field forward-extension convention used elsewhere in this spec (section 2.3 applies to extern structs, not flat C-ABI signatures).
+v1.0 third-party managers may not declare Zig-package dependencies. The manager source must be self-contained: `@import("std")`, `@import("builtin")`, and the manager's own files (no `build.zig.zon` `dependencies` table). The `zap_fork_compile_zig_to_object` primitive is a flat C-ABI function; it carries no deps-array field and no size-extensible options struct, so dep support cannot be added under the `size`-field forward-extension convention used elsewhere in this spec (section 2.3 applies to extern structs, not flat C-ABI signatures).
 
-Future ABI versions may add dep support by introducing a new C-ABI entry point (e.g., `zap_fork_compile_zig_to_object_v2`) that accepts a deps graph. The v1.0 primitive `zap_fork_compile_zig_to_object` will remain stable and continue to work for self-contained managers.
+Within v1.x the flat signature evolves ONLY by appending trailing parameters whose zero value (`null` pointer or `0`-valued enum) preserves the prior behavior exactly — the flat-signature analogue of the section 2.3 forward-extension discipline. `cpu_features_opt` (null ⇒ the triple's default CPU) and `link_libc` (`ZapForkLinkLibc.default = 0` ⇒ the internal libc heuristic) were both added this way. The fork archive (`libzap_compiler.a`) and its callers are always rebuilt in lockstep, so an appended parameter is a source-level extension, never a binary-compatibility hazard; a caller that passes the zero value for every appended parameter observes the original v1.0 semantics.
+
+A deps graph is not expressible as an append-with-default scalar, so future ABI versions may add dep support by introducing a new C-ABI entry point (e.g., `zap_fork_compile_zig_to_object_v2`) that accepts a deps graph. The v1.x primitive `zap_fork_compile_zig_to_object` will remain stable under the append-only rule and continue to work for self-contained managers.
 
 ### 11.2 Versioning the third-party manager
 

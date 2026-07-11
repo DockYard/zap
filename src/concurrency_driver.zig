@@ -46,8 +46,24 @@ const progress_mod = @import("progress.zig");
 
 /// Schema tag folded into the cache key so a future change to what the
 /// key covers self-invalidates every older entry. v2: the P6-J6
-/// `runtime_tracing` gate joined the key.
-const KERNEL_CACHE_SCHEMA = "zap.concurrency.kernel.object.cache.v2";
+/// `runtime_tracing` gate joined the key. v3: the kernel object's libc
+/// posture (`KERNEL_OBJECT_LINK_LIBC`) joined the key (7.1a) — objects
+/// cached by older schemas were compiled under the fork's internal libc
+/// decision (no libc on Linux) and must never cache-hit a build whose
+/// kernel object now links libc.
+const KERNEL_CACHE_SCHEMA = "zap.concurrency.kernel.object.cache.v3";
+
+/// The kernel object's libc posture (7.1a): ALWAYS compiled with
+/// `link_libc = true`, matching the final binary's link
+/// (`src/zir_backend.zig` `link_libc: bool = true`). The kernel
+/// deliberately reads `std.c.getenv` / `std.c.clock_gettime` — the
+/// documented production seams — so on targets where the fork's
+/// internal default would skip libc (Linux) the object would otherwise
+/// fail to compile with `std.c` resolution errors. A single constant
+/// feeds BOTH the cache key (`kernelCacheKeyHex`) and the fork compile
+/// (`compileKernelUnit`) so the key can never drift from the object it
+/// addresses.
+const KERNEL_OBJECT_LINK_LIBC: memory_driver.ZapForkLinkLibc = .on;
 
 /// The trace-gate marker line the staging rewrite flips (P6-J6 — the
 /// P2-J1 `RUNTIME_CONCURRENCY_DEFAULT` marker-rewrite pattern applied to
@@ -215,6 +231,13 @@ pub fn kernelCacheKeyHex(
     // marker rewrite), so it is part of the object's identity.
     const tracing_byte: u8 = if (options.runtime_tracing) 1 else 0;
     hasher.update(std.mem.asBytes(&tracing_byte));
+
+    // 7.1a: the libc posture changes the compiled object (which `std.c`
+    // externs resolve, and the object/final-link agreement), so it is
+    // part of the object's identity — a change to
+    // `KERNEL_OBJECT_LINK_LIBC` must miss the cache.
+    const link_libc_byte: u8 = @intCast(@intFromEnum(KERNEL_OBJECT_LINK_LIBC));
+    hasher.update(std.mem.asBytes(&link_libc_byte));
 
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
@@ -724,6 +747,9 @@ fn compileKernelUnit(
         cache_dir_z.ptr,
         cache_dir_z.ptr,
         if (cpu_z) |p| p.ptr else null,
+        // The kernel object always links libc, matching the final
+        // binary's posture — see `KERNEL_OBJECT_LINK_LIBC` (7.1a).
+        KERNEL_OBJECT_LINK_LIBC,
     );
 
     switch (result) {
@@ -895,6 +921,10 @@ const TestUnit = struct {
 };
 
 var mock_kernel_compile_count: usize = 0;
+/// The libc decision the driver threaded into the most recent mock
+/// kernel compile — kernel objects must always receive
+/// `KERNEL_OBJECT_LINK_LIBC` (`.on`, the final binary's posture).
+var mock_kernel_last_link_libc: ?memory_driver.ZapForkLinkLibc = null;
 
 fn mockForkCompileKernel(
     source_path: [*:0]const u8,
@@ -907,6 +937,7 @@ fn mockForkCompileKernel(
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
     cpu_features_opt: ?[*:0]const u8,
+    link_libc: memory_driver.ZapForkLinkLibc,
 ) callconv(.c) memory_driver.ZapForkResult {
     _ = source_path;
     _ = target;
@@ -918,6 +949,7 @@ fn mockForkCompileKernel(
     _ = global_cache_dir_opt;
     _ = cpu_features_opt;
     mock_kernel_compile_count += 1;
+    mock_kernel_last_link_libc = link_libc;
     var buffer: [4096]u8 = undefined;
     const written = synthesizeKernelElf(&buffer);
     const object_path = std.mem.sliceTo(out_object_path, 0);
@@ -939,6 +971,7 @@ fn mockForkCompileGarbage(
     local_cache_dir_opt: ?[*:0]const u8,
     global_cache_dir_opt: ?[*:0]const u8,
     cpu_features_opt: ?[*:0]const u8,
+    link_libc: memory_driver.ZapForkLinkLibc,
 ) callconv(.c) memory_driver.ZapForkResult {
     _ = source_path;
     _ = target;
@@ -949,6 +982,7 @@ fn mockForkCompileGarbage(
     _ = local_cache_dir_opt;
     _ = global_cache_dir_opt;
     _ = cpu_features_opt;
+    _ = link_libc;
     const object_path = std.mem.sliceTo(out_object_path, 0);
     std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{
         .sub_path = object_path,
@@ -1076,6 +1110,32 @@ test "concurrency driver: resolve compiles once and content-addressed reuse skip
     try testing.expectEqual(@as(usize, 1), mock_kernel_compile_count);
     try testing.expectEqualStrings(first.object_path, second.object_path);
     try testing.expectEqualSlices(u8, &first.cache_key_hex, &second.cache_key_hex);
+}
+
+test "concurrency driver: kernel objects compile with link_libc=on, matching the final binary's posture" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    mock_kernel_compile_count = 0;
+    mock_kernel_last_link_libc = null;
+    var resolved = try resolveKernelObject(allocator, unit.options(mockForkCompileKernel), &diag);
+    defer freeResolvedKernel(allocator, &resolved);
+
+    // 7.1a: the kernel deliberately reads `std.c.getenv` /
+    // `std.c.clock_gettime` and the final binary always links libc, so
+    // the kernel-object compile must pin `link_libc = true` instead of
+    // inheriting the fork's internal per-target default (which would be
+    // `false` on Linux and fail the gate-ON x86_64-linux-gnu compile).
+    try testing.expectEqual(@as(usize, 1), mock_kernel_compile_count);
+    try testing.expectEqual(
+        @as(?memory_driver.ZapForkLinkLibc, KERNEL_OBJECT_LINK_LIBC),
+        mock_kernel_last_link_libc,
+    );
+    try testing.expectEqual(memory_driver.ZapForkLinkLibc.on, KERNEL_OBJECT_LINK_LIBC);
 }
 
 test "concurrency driver: editing any kernel source changes the cache key and recompiles" {

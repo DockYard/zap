@@ -175,10 +175,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Backing allocator for segments, payload allocations, registry slots,
-/// and ledger storage. The page allocator is the one std allocator with
-/// no libc dependency, which the kernel object needs because
-/// `zap_fork_compile_zig_to_object` compiles it with `link_libc = false`
-/// on targets that do not require libc (the `abi.zig` convention).
+/// and ledger storage. The page allocator is deliberate — OS-direct
+/// (mmap), no C-runtime init-order dependency, kernel memory kept apart
+/// from user-code allocators (the `abi.zig` convention; since 7.1a the
+/// kernel object compiles with `link_libc = true`, so this is a design
+/// choice, not a libc constraint).
 const backing_allocator = std.heap.page_allocator;
 
 // ---------------------------------------------------------------------------

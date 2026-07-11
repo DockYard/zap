@@ -112,10 +112,13 @@ const trace_module = @import("trace.zig");
 /// Backing allocator for every runtime-owned structure this bridge
 /// creates (pid table, envelope-pool pages, scheduler records, payload
 /// ledger blocks, spawn closures, bootstrap manager states). The page
-/// allocator is the one std allocator with no libc dependency, which the
-/// kernel object needs because `zap_fork_compile_zig_to_object` compiles
-/// it with `link_libc = false` on targets that do not require libc
-/// (`~/projects/zig/src/zir_api.zig`, `compileToObjectImpl`). Page
+/// allocator is deliberate: it allocates straight from the OS (mmap),
+/// carries no C-runtime init-order dependency, and keeps kernel memory
+/// visibly separate from whatever allocator user code links. (Since
+/// 7.1a the kernel object always compiles with `link_libc = true` —
+/// matching the final binary, so the `std.c` seams the kernel reads
+/// resolve on every target — but the page allocator remains the right
+/// choice on its own merits, not as a libc workaround.) Page
 /// granularity per small block is acceptable at Phase 2 volumes; the
 /// P2-J5 fragment walker and the plan-2.4 manager binding replace the
 /// two per-message/per-spawn consumers of this allocator.

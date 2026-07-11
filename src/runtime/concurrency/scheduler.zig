@@ -1844,14 +1844,16 @@ pub const AwaitCorrelatedOutcome = enum(i32) {
 /// correctly reports the mailbox empty at that instant.
 const poll_transient_gap_spin_limit: u32 = 4096;
 
-/// Libc-free monotonic nanoseconds for `receive … after` deadlines. The
-/// kernel object is compiled `link_libc = false` on targets that do not
-/// require libc (`abi.zig` module doc), so this cannot use `std.c`; it
-/// mirrors how the futex parking layer reaches the OS directly. Darwin:
+/// OS-direct monotonic nanoseconds for `receive … after` deadlines,
+/// mirroring how the futex parking layer reaches the OS directly. (The
+/// kernel object compiles with `link_libc = true` since 7.1a — matching
+/// the final binary — so `std.c` is available; the direct paths here
+/// remain deliberate, keeping the deadline clock on the exact clock the
+/// futex timeout APIs measure against.) Darwin:
 /// `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` from libSystem (always linked,
 /// exactly like the `os_sync_*` futex calls). Linux: the raw
-/// `clock_gettime` syscall (no libc). Other OSes are Phase 4/7 ports —
-/// the same posture as the futex layer.
+/// `clock_gettime` syscall. Other OSes are Phase 4/7 ports — the same
+/// posture as the futex layer.
 fn monotonicNowNanoseconds() u64 {
     switch (comptime builtin.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => {
