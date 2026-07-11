@@ -107,6 +107,7 @@ const process_module = @import("process.zig");
 const envelope_pool_module = @import("envelope_pool.zig");
 const mailbox_module = @import("mailbox.zig");
 const pid_table = @import("pid_table.zig");
+const trace_module = @import("trace.zig");
 
 /// Backing allocator for every runtime-owned structure this bridge
 /// creates (pid table, envelope-pool pages, scheduler records, payload
@@ -815,6 +816,21 @@ fn readSeededSchedulerCoreCount() usize {
     return @max(parsed, 1);
 }
 
+/// Read `ZAP_DEADLOCK_ACTION` — what the pool does after DETECTING a
+/// system deadlock (P6-J6, plan item 6.5): `continue` (the default —
+/// report once to stderr and stay parked, BEAM-compatible-plus-diagnostic),
+/// `stop` (stop the pool; the run returns and stragglers are reaped at
+/// deinit), or `panic` (fail fast, non-zero exit — legitimate because a
+/// detected deadlock is permanent: no external wake source exists).
+/// Unknown values keep the default.
+fn readDeadlockAction() concurrency.DeadlockAction {
+    const raw = std.c.getenv("ZAP_DEADLOCK_ACTION") orelse return .report_and_continue;
+    const text = std.mem.sliceTo(raw, 0);
+    if (std.mem.eql(u8, text, "stop")) return .report_and_stop;
+    if (std.mem.eql(u8, text, "panic")) return .report_and_panic;
+    return .report_and_continue;
+}
+
 var runtime_state_storage: RuntimeState = undefined;
 var runtime_initialized: bool = false;
 
@@ -942,11 +958,16 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
             backing_allocator,
             &runtime_state.pid_table,
             &runtime_state.envelope_pool,
-            .{ .core_options = .{
-                .signal_runtime = &runtime_state.signal_runtime,
-                .registry = &runtime_state.registry,
-                .blob_domain = &runtime_state.blob_domain,
-            } },
+            .{
+                .core_options = .{
+                    .signal_runtime = &runtime_state.signal_runtime,
+                    .registry = &runtime_state.registry,
+                    .blob_domain = &runtime_state.blob_domain,
+                    // P6-J6: the deadlock detector's post-report action
+                    // (default: report to stderr once, keep parking).
+                    .deadlock_action = readDeadlockAction(),
+                },
+            },
         ) catch {
             runtime_state.blob_domain.deinit();
             runtime_state.registry.deinit();
@@ -1080,6 +1101,10 @@ export fn zap_proc_runtime_deinit() callconv(.c) void {
     // `deinit` releases those and asserts ZERO live blobs (the share tier's
     // leak-exactness oracle), then frees the domain.
     runtime_state.blob_domain.deinit();
+    // P6-J6: release the observability capture storage (grown lazily by
+    // `zap_introspect_capture`).
+    introspect_snapshot_storage.deinit(backing_allocator);
+    introspect_snapshot_storage = .empty;
     runtime_initialized = false;
 }
 
@@ -1475,6 +1500,262 @@ export fn zap_proc_heap_byte_count(process: *anyopaque) callconv(.c) usize {
 /// hibernated, the call never returns.
 export fn zap_proc_hibernate(process: *anyopaque) callconv(.c) void {
     contextFromHandle(process).hibernate();
+}
+
+// ---------------------------------------------------------------------------
+// Intrinsics — observability (P6-J6, plan item 6.5)
+//
+// The runtime-wide introspection surface behind `lib/runtime_info.zap`
+// (`:zig.RuntimeInfo.*`): process listing, per-core scheduler utilization and
+// run-queue depth, and the trace-ring read API. Read-side only — the trace
+// EMIT sites live in the kernel and are comptime-gated (`trace.zig`); these
+// exports exist in BOTH trace modes so the runtime's externs always resolve
+// (they report disabled/empty when tracing is compiled OFF).
+//
+// Snapshot protocol (capture + indexed getters): a `*_capture` intrinsic
+// copies a consistent point-in-time snapshot into runtime-owned storage and
+// returns the entry count; the indexed getters then read that snapshot.
+// Captures serialize on a spinlock; the getters read the captured arrays
+// without it, so they are meaningful between ONE process's capture and its
+// next (the Zap surface documents the single-capturer discipline). The
+// listing inherits `introspection.zig`'s consistency contract: per-process
+// point-in-time, never globally atomic; mailbox depth approximate; exact at
+// quiescence.
+// ---------------------------------------------------------------------------
+
+/// Serializes `zap_introspect_capture` / `zap_trace_capture` (and reset)
+/// against each other. Kernel spinlock convention (`std.atomic.Mutex`).
+var observability_lock: std.atomic.Mutex = .unlocked;
+
+inline fn lockObservability() void {
+    while (!observability_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
+inline fn unlockObservability() void {
+    observability_lock.unlock();
+}
+
+/// The captured process listing (grown as needed; freed at runtime deinit).
+var introspect_snapshot_storage: std.ArrayListUnmanaged(concurrency.introspection.ProcessSnapshot) = .empty;
+
+/// Stable ABI encoding of a `ProcessState` (independent of the kernel
+/// enum's ordinal layout; `lib/runtime_info.zap` maps these to atoms).
+fn processStateCode(state: process_module.ProcessState) i64 {
+    return switch (state) {
+        .embryo => 0,
+        .runnable => 1,
+        .running => 2,
+        .waiting => 3,
+        .blocking => 4,
+        .exiting => 5,
+    };
+}
+
+/// Snapshot the live process set (pid, state, mailbox depth, heap bytes per
+/// process) into runtime-owned storage and return how many were captured.
+/// Callable from any process; captures serialize. Returns 0 when the
+/// runtime is not initialized or memory is exhausted.
+export fn zap_introspect_capture() callconv(.c) u64 {
+    if (!runtime_initialized) return 0;
+    lockObservability();
+    defer unlockObservability();
+    introspect_snapshot_storage.clearRetainingCapacity();
+    var listing = concurrency.introspection.listProcesses(&runtime_state.pid_table);
+    while (listing.next()) |snapshot| {
+        introspect_snapshot_storage.append(backing_allocator, snapshot) catch return 0;
+    }
+    return introspect_snapshot_storage.items.len;
+}
+
+/// The captured process at `index`, or null past the captured count.
+fn capturedProcessAt(index: u64) ?*const concurrency.introspection.ProcessSnapshot {
+    if (index >= introspect_snapshot_storage.items.len) return null;
+    return &introspect_snapshot_storage.items[@intCast(index)];
+}
+
+/// Raw pid bits of captured process `index` (0 past the captured count).
+export fn zap_introspect_pid(index: u64) callconv(.c) u64 {
+    const snapshot = capturedProcessAt(index) orelse return 0;
+    return snapshot.pid.toBits();
+}
+
+/// State code of captured process `index` (see `processStateCode`; −1 past
+/// the captured count).
+export fn zap_introspect_state(index: u64) callconv(.c) i64 {
+    const snapshot = capturedProcessAt(index) orelse return -1;
+    return processStateCode(snapshot.state);
+}
+
+/// Mailbox depth of captured process `index` (0 past the captured count).
+export fn zap_introspect_mailbox_depth(index: u64) callconv(.c) u64 {
+    const snapshot = capturedProcessAt(index) orelse return 0;
+    return snapshot.mailbox_depth;
+}
+
+/// Heap bytes of captured process `index` per its manager's accounting
+/// (the P6-J4 `STAT` capability; 0 without one, and 0 past the count).
+export fn zap_introspect_heap_bytes(index: u64) callconv(.c) u64 {
+    const snapshot = capturedProcessAt(index) orelse return 0;
+    return snapshot.heap_byte_count;
+}
+
+/// The scheduler core at `core_index` for the active backend, or null out
+/// of range / uninitialized.
+fn backendCoreAt(core_index: u64) ?*concurrency.Scheduler {
+    if (!runtime_initialized) return null;
+    return switch (runtime_state.backend) {
+        .production_pool => |*pool| if (core_index < pool.coreCount())
+            &pool.cores[@intCast(core_index)]
+        else
+            null,
+        .seeded_simulator => |simulator| if (core_index < simulator.coreCount())
+            &simulator.cores[@intCast(core_index)]
+        else
+            null,
+    };
+}
+
+/// Number of scheduler cores in the active backend (0 when the runtime is
+/// not initialized).
+export fn zap_sched_core_count() callconv(.c) u64 {
+    if (!runtime_initialized) return 0;
+    return switch (runtime_state.backend) {
+        .production_pool => |*pool| pool.coreCount(),
+        .seeded_simulator => |simulator| simulator.coreCount(),
+    };
+}
+
+/// Run-queue depth of core `core_index` (local FIFO + LIFO slot;
+/// `Scheduler.runQueueDepth`). 0 out of range.
+export fn zap_sched_run_queue_depth(core_index: u64) callconv(.c) u64 {
+    const core = backendCoreAt(core_index) orelse return 0;
+    return core.runQueueDepth();
+}
+
+/// Depth of the shared global overflow run queue (approximate under
+/// concurrency; exact at quiescence).
+export fn zap_sched_global_queue_depth() callconv(.c) u64 {
+    if (!runtime_initialized) return 0;
+    return switch (runtime_state.backend) {
+        .production_pool => |*pool| pool.globalRunQueueDepth(),
+        .seeded_simulator => |simulator| simulator.global_queue.count.load(.monotonic),
+    };
+}
+
+/// Wall nanoseconds core `core_index`'s run episodes have spanned so far
+/// (`Scheduler.utilizationSnapshot`). 0 out of range.
+export fn zap_sched_window_nanos(core_index: u64) callconv(.c) u64 {
+    const core = backendCoreAt(core_index) orelse return 0;
+    return core.utilizationSnapshot().window_nanoseconds;
+}
+
+/// Nanoseconds of core `core_index`'s window spent parked (idle).
+export fn zap_sched_parked_nanos(core_index: u64) callconv(.c) u64 {
+    const core = backendCoreAt(core_index) orelse return 0;
+    return core.utilizationSnapshot().parked_nanoseconds;
+}
+
+/// Nanoseconds of core `core_index`'s window spent busy (window − parked).
+export fn zap_sched_busy_nanos(core_index: u64) callconv(.c) u64 {
+    const core = backendCoreAt(core_index) orelse return 0;
+    return core.utilizationSnapshot().busy_nanoseconds;
+}
+
+/// Futex parks core `core_index` has entered (thread-safe counter).
+export fn zap_sched_park_count(core_index: u64) callconv(.c) u64 {
+    const core = backendCoreAt(core_index) orelse return 0;
+    return core.parkCount();
+}
+
+/// The captured trace events (storage comptime-gated away when tracing is
+/// compiled OFF — see `trace.zig`).
+var trace_snapshot_storage: if (trace_module.runtime_trace_active)
+    [trace_module.ring_capacity]trace_module.TraceEventRecord
+else
+    void = undefined;
+
+/// Number of valid entries in `trace_snapshot_storage`.
+var trace_snapshot_count: usize = 0;
+
+/// Whether this binary's kernel was compiled with the message-flow trace
+/// instrumentation (`runtime_tracing` — manifest field or
+/// `-Druntime-tracing=on`).
+export fn zap_trace_enabled() callconv(.c) bool {
+    return trace_module.runtime_trace_active;
+}
+
+/// Snapshot the trace ring (oldest first) into runtime-owned storage and
+/// return how many events were captured. 0 when tracing is compiled OFF.
+/// Exact at quiescence; a capture racing active emitters may skip the
+/// entries being overwritten in that instant (`trace.zig` module doc).
+export fn zap_trace_capture() callconv(.c) u64 {
+    if (comptime !trace_module.runtime_trace_active) return 0;
+    lockObservability();
+    defer unlockObservability();
+    trace_snapshot_count = trace_module.captureGlobal(&trace_snapshot_storage);
+    return trace_snapshot_count;
+}
+
+/// The captured trace event at `index`, or null past the captured count
+/// (always null when tracing is compiled OFF).
+fn capturedTraceEventAt(index: u64) ?*const trace_module.TraceEventRecord {
+    if (comptime !trace_module.runtime_trace_active) return null;
+    if (index >= trace_snapshot_count) return null;
+    return &trace_snapshot_storage[@intCast(index)];
+}
+
+/// Global emission sequence of captured event `index` (strictly increasing
+/// across the capture; 0 past the count).
+export fn zap_trace_sequence(index: u64) callconv(.c) u64 {
+    const event = capturedTraceEventAt(index) orelse return 0;
+    return event.sequence;
+}
+
+/// Monotonic-nanosecond timestamp of captured event `index` (0 past the
+/// count).
+export fn zap_trace_timestamp_nanos(index: u64) callconv(.c) u64 {
+    const event = capturedTraceEventAt(index) orelse return 0;
+    return event.timestamp_nanoseconds;
+}
+
+/// Kind of captured event `index` (`trace.TraceEventKind` raw value:
+/// 1 = spawn, 2 = exit, 3 = send, 4 = receive, 5 = signal; 0 past the
+/// count).
+export fn zap_trace_kind(index: u64) callconv(.c) i64 {
+    const event = capturedTraceEventAt(index) orelse return 0;
+    return @intFromEnum(event.kind);
+}
+
+/// Acting process's raw pid bits of captured event `index` (0 past the
+/// count).
+export fn zap_trace_pid(index: u64) callconv(.c) u64 {
+    const event = capturedTraceEventAt(index) orelse return 0;
+    return event.pid_bits;
+}
+
+/// Counterparty raw pid bits of captured event `index` (send target /
+/// signal target; 0 when the event has none or past the count).
+export fn zap_trace_peer(index: u64) callconv(.c) u64 {
+    const event = capturedTraceEventAt(index) orelse return 0;
+    return event.peer_pid_bits;
+}
+
+/// Kind-specific detail byte of captured event `index` (see
+/// `trace.TraceEventKind`; 0 past the count).
+export fn zap_trace_detail(index: u64) callconv(.c) u64 {
+    const event = capturedTraceEventAt(index) orelse return 0;
+    return event.detail;
+}
+
+/// Discard the retained trace events and restart sequence numbering — a
+/// test/diagnostic aid; call at quiescence (`trace.TraceRing.reset`).
+/// No-op when tracing is compiled OFF.
+export fn zap_trace_reset() callconv(.c) void {
+    if (comptime !trace_module.runtime_trace_active) return;
+    lockObservability();
+    defer unlockObservability();
+    trace_snapshot_count = 0;
+    trace_module.resetGlobal();
 }
 
 // ---------------------------------------------------------------------------
@@ -3018,6 +3299,76 @@ test "abi: zap_proc_run_until_exit joins the target and leaves stragglers for de
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(root_pid_bits));
 
     // Program-shutdown semantics: deinit tears the straggler down.
+    zap_proc_runtime_deinit();
+    try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
+}
+
+test "abi: observability — process listing, scheduler surfaces, and the trace-OFF read API (P6-J6)" {
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    bindTestManager();
+
+    // Uninitialized-index and empty-capture behavior is total (no traps).
+    try testing.expectEqual(@as(u64, 0), zap_introspect_pid(0));
+    try testing.expectEqual(@as(i64, -1), zap_introspect_state(0));
+
+    // Two parked stragglers to list, and a root whose exit stops the run.
+    const first_pid_bits = zap_proc_spawn(parkForeverEntry, null);
+    const second_pid_bits = zap_proc_spawn(parkForeverEntry, null);
+    const root_pid_bits = zap_proc_spawn(immediateExitEntry, null);
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(root_pid_bits));
+
+    // Process listing: exactly the two live stragglers, both named. Each is
+    // `.waiting` (parked) or — if the root exited before a core gave it a
+    // quantum — still `.runnable`; the listing is point-in-time, never a
+    // stop-the-world (introspection.zig's consistency contract).
+    const captured = zap_introspect_capture();
+    try testing.expectEqual(@as(u64, 2), captured);
+    var found_first = false;
+    var found_second = false;
+    var index: u64 = 0;
+    while (index < captured) : (index += 1) {
+        const pid_bits = zap_introspect_pid(index);
+        if (pid_bits == first_pid_bits) found_first = true;
+        if (pid_bits == second_pid_bits) found_second = true;
+        const state_code = zap_introspect_state(index);
+        try testing.expect(state_code == 1 or state_code == 3); // runnable | waiting
+        try testing.expectEqual(@as(u64, 0), zap_introspect_mailbox_depth(index));
+    }
+    try testing.expect(found_first);
+    try testing.expect(found_second);
+    // Past-the-count getters are total.
+    try testing.expectEqual(@as(u64, 0), zap_introspect_pid(captured));
+    try testing.expectEqual(@as(i64, -1), zap_introspect_state(captured));
+
+    // Scheduler surfaces. The run has returned (workers joined), so every
+    // utilization window is CLOSED and the busy/parked split is frozen and
+    // exact: busy + parked == window, per core.
+    const core_count = zap_sched_core_count();
+    try testing.expect(core_count >= 1);
+    var core_index: u64 = 0;
+    while (core_index < core_count) : (core_index += 1) {
+        const window = zap_sched_window_nanos(core_index);
+        const parked = zap_sched_parked_nanos(core_index);
+        const busy = zap_sched_busy_nanos(core_index);
+        try testing.expectEqual(window, busy + parked);
+    }
+    // Core 0 is the driver — it provably ran a window.
+    try testing.expect(zap_sched_window_nanos(0) > 0);
+    try testing.expectEqual(@as(u64, 0), zap_sched_global_queue_depth());
+    // Out-of-range core indexes are total.
+    try testing.expectEqual(@as(u64, 0), zap_sched_run_queue_depth(core_count + 7));
+    try testing.expectEqual(@as(u64, 0), zap_sched_window_nanos(core_count + 7));
+
+    // The trace read surface in a trace-OFF kernel build (this test binary):
+    // disabled, empty, and total — the Zap-level API never traps.
+    try testing.expect(!zap_trace_enabled());
+    try testing.expectEqual(@as(u64, 0), zap_trace_capture());
+    try testing.expectEqual(@as(i64, 0), zap_trace_kind(0));
+    try testing.expectEqual(@as(u64, 0), zap_trace_pid(0));
+    try testing.expectEqual(@as(u64, 0), zap_trace_sequence(0));
+    zap_trace_reset();
+
+    // Deinit reaps the stragglers and releases the capture storage.
     zap_proc_runtime_deinit();
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
 }

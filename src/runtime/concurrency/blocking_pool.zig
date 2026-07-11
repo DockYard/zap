@@ -370,6 +370,18 @@ pub const BlockingPool = struct {
         pool.* = undefined;
     }
 
+    /// Whether the pool holds NO queued and NO in-flight work (P6-J6 —
+    /// the deadlock detector's blocking leg). Read under `state_lock`, so
+    /// a true result is ordered after every completed op's re-attach push
+    /// (`inflight_count` decrements after `execute` returns, and `execute`
+    /// performs the push). "Approx" because the value may change the
+    /// instant the lock is released — the detector's bracket handles that.
+    pub fn isIdleApprox(pool: *BlockingPool) bool {
+        pool.lockState();
+        defer pool.unlockState();
+        return pool.queue_len == 0 and pool.inflight_count == 0;
+    }
+
     /// Statistics snapshot (thread-safe reads; `peak_thread_count` under lock).
     pub const Statistics = struct {
         submit_total: u64,

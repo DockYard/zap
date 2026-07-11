@@ -61,6 +61,17 @@ pub const BuildConfig = struct {
     /// `true` links the per-target kernel object resolved by
     /// `src/concurrency_driver.zig` and enables the runtime bootstrap.
     runtime_concurrency: bool = false,
+    /// P6-J6 comptime message-flow trace gate
+    /// (`Zap.Manifest.runtime_tracing`, overridable by
+    /// `-Druntime-tracing=on|off`). `false` — the default — compiles the
+    /// kernel with ZERO trace instructions on the send/receive/spawn/
+    /// exit/signal paths (the zero-cost posture); `true` compiles the
+    /// kernel object from a staged copy with the trace marker rewritten
+    /// (`src/concurrency_driver.zig`), enabling the bounded in-memory
+    /// trace ring read via `RuntimeInfo.trace_*`. Requires
+    /// `runtime_concurrency` — enabling it on a gate-off build is a
+    /// build error.
+    runtime_tracing: bool = false,
     /// Test timeout in milliseconds (0 = no timeout). Zig 0.16 supports
     /// native unit test timeouts in the build system.
     test_timeout: i64 = 0,
@@ -218,6 +229,7 @@ pub fn scriptManifest(
         // `applyBuildOverrides` overlays `-Druntime-concurrency=` when
         // present, matching the manifest path's field resolution.
         .runtime_concurrency = false,
+        .runtime_tracing = false,
         .test_timeout = 0,
         .error_style = null,
         .multiline_errors = false,
@@ -1713,6 +1725,11 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                 } else if (std.mem.eql(u8, field.name, "runtime_concurrency")) {
                     config.runtime_concurrency = switch (field.value) {
                         .bool_val => |gate_enabled| gate_enabled,
+                        else => false,
+                    };
+                } else if (std.mem.eql(u8, field.name, "runtime_tracing")) {
+                    config.runtime_tracing = switch (field.value) {
+                        .bool_val => |trace_enabled| trace_enabled,
                         else => false,
                     };
                 } else if (std.mem.eql(u8, field.name, "pipeline")) {
@@ -3426,6 +3443,36 @@ test "ctfe manifest evaluates minimal valid manifest with real stdlib" {
     try testing.expectEqualStrings("lib/**/*.zap", manifest_eval.config.paths[0]);
     try testing.expect(manifest_eval.config.memory_manager != null);
     try testing.expectEqualStrings("Memory.ARC", manifest_eval.config.memory_manager.?.type_name);
+}
+
+test "constValueToBuildConfig parses the runtime_tracing gate (P6-J6)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const tracing_on = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "trace_probe" } },
+            .{ .name = "version", .value = .{ .string = "0.0.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "runtime_concurrency", .value = .{ .bool_val = true } },
+            .{ .name = "runtime_tracing", .value = .{ .bool_val = true } },
+        },
+    } };
+    const tracing_on_config = try constValueToBuildConfig(alloc, tracing_on);
+    try testing.expect(tracing_on_config.runtime_tracing);
+
+    const tracing_absent = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "trace_probe" } },
+            .{ .name = "version", .value = .{ .string = "0.0.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+        },
+    } };
+    const tracing_absent_config = try constValueToBuildConfig(alloc, tracing_absent);
+    try testing.expect(!tracing_absent_config.runtime_tracing);
 }
 
 test "constValueToBuildConfig parses the runtime_concurrency gate (P2-J1)" {

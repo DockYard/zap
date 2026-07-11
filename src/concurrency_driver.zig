@@ -45,8 +45,16 @@ const memory_driver = @import("memory/driver.zig");
 const progress_mod = @import("progress.zig");
 
 /// Schema tag folded into the cache key so a future change to what the
-/// key covers self-invalidates every older entry.
-const KERNEL_CACHE_SCHEMA = "zap.concurrency.kernel.object.cache.v1";
+/// key covers self-invalidates every older entry. v2: the P6-J6
+/// `runtime_tracing` gate joined the key.
+const KERNEL_CACHE_SCHEMA = "zap.concurrency.kernel.object.cache.v2";
+
+/// The trace-gate marker line the staging rewrite flips (P6-J6 — the
+/// P2-J1 `RUNTIME_CONCURRENCY_DEFAULT` marker-rewrite pattern applied to
+/// the kernel unit). Lives in `src/runtime/concurrency/trace.zig`.
+const TRACE_MARKER_FILE_BASENAME = "trace.zig";
+const TRACE_MARKER_OFF = "pub const RUNTIME_TRACE_DEFAULT: bool = false;";
+const TRACE_MARKER_ON = "pub const RUNTIME_TRACE_DEFAULT: bool = true;";
 
 /// Path of the kernel source unit relative to the Zap source tree root
 /// (the parent of the resolved stdlib `lib/` directory — the same root
@@ -114,6 +122,13 @@ pub const KernelResolveOptions = struct {
     fork_compile_fn: ?memory_driver.ForkCompileFn = null,
     /// Optional CLI progress reporter owned by the build command.
     progress: ?*progress_mod.Reporter = null,
+    /// P6-J6: the resolved `runtime_tracing` gate. OFF (default) compiles
+    /// the kernel unit from the source tree unchanged — byte-identical to
+    /// a pre-tracing build. ON compiles from a STAGED COPY of the unit
+    /// with `trace.zig`'s `RUNTIME_TRACE_DEFAULT` marker rewritten to
+    /// `true` (the source tree is never modified), enabling the
+    /// comptime-gated trace instrumentation. Folded into the cache key.
+    runtime_tracing: bool = false,
 };
 
 /// A resolved (content-addressed, validated) kernel object.
@@ -169,6 +184,11 @@ pub fn kernelCacheKeyHex(
     hashLenPrefixed(&hasher, options.cpu orelse "");
     hashLenPrefixed(&hasher, options.zig_lib_dir orelse "");
 
+    // P6-J6: the trace gate changes the compiled object (the staged
+    // marker rewrite), so it is part of the object's identity.
+    const tracing_byte: u8 = if (options.runtime_tracing) 1 else 0;
+    hasher.update(std.mem.asBytes(&tracing_byte));
+
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return digestHex(digest);
@@ -216,6 +236,35 @@ pub fn resolveKernelObject(
     ) catch return KernelResolveError.OutOfMemory;
     defer allocator.free(root_source_path);
 
+    // P6-J6: with `runtime_tracing` ON, compile from a STAGED COPY of the
+    // kernel unit whose `trace.zig` marker is rewritten to `true` — the
+    // P2-J1 marker-rewrite pattern applied to the kernel; the source tree
+    // is never modified. OFF compiles from the tree unchanged (the
+    // zero-cost posture: the OFF object is byte-for-byte the object a
+    // build with no tracing support would produce). The staging directory
+    // is process-unique and removed after the compile (the OBJECT is what
+    // the cache keeps).
+    var staging_dir_path: ?[]const u8 = null;
+    defer if (staging_dir_path) |staged_dir| {
+        std.Io.Dir.cwd().deleteTree(std.Options.debug_io, staged_dir) catch {};
+        allocator.free(staged_dir);
+    };
+    var staged_root_path: ?[]const u8 = null;
+    defer if (staged_root_path) |staged_root| allocator.free(staged_root);
+    if (options.runtime_tracing) {
+        const staged_dir = std.fmt.allocPrint(
+            allocator,
+            "{s}/traced-src.tmp-{d}",
+            .{ options.cache_dir, interimPathDiscriminator() },
+        ) catch return KernelResolveError.OutOfMemory;
+        staging_dir_path = staged_dir;
+        try stageTracedKernelUnit(allocator, options, staged_dir, diag);
+        staged_root_path = std.fs.path.join(
+            allocator,
+            &.{ staged_dir, options.kernel_root_basename },
+        ) catch return KernelResolveError.OutOfMemory;
+    }
+
     // Compile to a process-unique temporary sibling, then rename into
     // the keyed path. A crash mid-compile leaves only a stale `.tmp-*`
     // file that can never satisfy the reuse check above.
@@ -226,7 +275,13 @@ pub fn resolveKernelObject(
     ) catch return KernelResolveError.OutOfMemory;
     defer allocator.free(temporary_object_path);
 
-    try compileKernelUnit(allocator, root_source_path, temporary_object_path, options, diag);
+    try compileKernelUnit(
+        allocator,
+        staged_root_path orelse root_source_path,
+        temporary_object_path,
+        options,
+        diag,
+    );
     errdefer std.Io.Dir.cwd().deleteFile(std.Options.debug_io, temporary_object_path) catch {};
 
     try assertKernelObjectExports(allocator, temporary_object_path, diag);
@@ -345,6 +400,115 @@ fn hashKernelSources(
             .{ options.kernel_root_basename, options.kernel_source_dir },
         );
         return KernelResolveError.KernelSourceNotFound;
+    }
+}
+
+/// P6-J6: copy every `.zig` file of the kernel unit into `staging_dir`
+/// (flat — the unit has no subdirectories; asserted), rewriting
+/// `trace.zig`'s `RUNTIME_TRACE_DEFAULT` marker from `false` to `true`.
+/// A missing or already-rewritten marker is a hard error: the marker is
+/// the trace gate's single source of truth, and drifting silently would
+/// ship a "traced" binary with no instrumentation.
+fn stageTracedKernelUnit(
+    allocator: std.mem.Allocator,
+    options: KernelResolveOptions,
+    staging_dir: []const u8,
+    diag: *memory_driver.DriverDiagnostic,
+) KernelResolveError!void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    std.Io.Dir.cwd().createDirPath(std.Options.debug_io, staging_dir) catch {
+        diag.write(
+            "concurrency kernel tracing: could not create the staging directory '{s}'",
+            .{staging_dir},
+        );
+        return KernelResolveError.InternalError;
+    };
+
+    var source_dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, options.kernel_source_dir, .{ .iterate = true }) catch {
+        diag.write(
+            "concurrency kernel source unit not found at '{s}'",
+            .{options.kernel_source_dir},
+        );
+        return KernelResolveError.KernelSourceNotFound;
+    };
+    defer source_dir.close(std.Options.debug_io);
+
+    var marker_rewritten = false;
+    var walker = source_dir.walk(arena) catch return KernelResolveError.OutOfMemory;
+    defer walker.deinit();
+    while (walker.next(std.Options.debug_io) catch {
+        diag.write(
+            "concurrency kernel source unit at '{s}' could not be walked",
+            .{options.kernel_source_dir},
+        );
+        return KernelResolveError.KernelSourceNotFound;
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        // The unit is flat by construction (`abi.zig` imports siblings);
+        // a nested source would silently escape the copy below.
+        if (std.mem.findScalar(u8, entry.path, std.fs.path.sep) != null) {
+            diag.write(
+                "concurrency kernel tracing: unexpected nested source '{s}' (the staging copy assumes a flat unit)",
+                .{entry.path},
+            );
+            return KernelResolveError.InternalError;
+        }
+        const contents = source_dir.readFileAlloc(
+            std.Options.debug_io,
+            entry.path,
+            arena,
+            .limited(64 * 1024 * 1024),
+        ) catch {
+            diag.write(
+                "concurrency kernel source '{s}/{s}' could not be read",
+                .{ options.kernel_source_dir, entry.path },
+            );
+            return KernelResolveError.KernelSourceNotFound;
+        };
+        var staged_contents: []const u8 = contents;
+        if (std.mem.eql(u8, entry.path, TRACE_MARKER_FILE_BASENAME)) {
+            const marker_index = std.mem.find(u8, contents, TRACE_MARKER_OFF) orelse {
+                diag.write(
+                    "concurrency kernel tracing: '{s}' is missing the marker line `{s}` — the trace-gate rewrite cannot proceed",
+                    .{ TRACE_MARKER_FILE_BASENAME, TRACE_MARKER_OFF },
+                );
+                return KernelResolveError.KernelCompileFailed;
+            };
+            const rewritten = arena.alloc(u8, contents.len - TRACE_MARKER_OFF.len + TRACE_MARKER_ON.len) catch
+                return KernelResolveError.OutOfMemory;
+            @memcpy(rewritten[0..marker_index], contents[0..marker_index]);
+            @memcpy(rewritten[marker_index..][0..TRACE_MARKER_ON.len], TRACE_MARKER_ON);
+            @memcpy(
+                rewritten[marker_index + TRACE_MARKER_ON.len ..],
+                contents[marker_index + TRACE_MARKER_OFF.len ..],
+            );
+            staged_contents = rewritten;
+            marker_rewritten = true;
+        }
+        const staged_path = std.fs.path.join(arena, &.{ staging_dir, entry.path }) catch
+            return KernelResolveError.OutOfMemory;
+        std.Io.Dir.cwd().writeFile(std.Options.debug_io, .{
+            .sub_path = staged_path,
+            .data = staged_contents,
+        }) catch {
+            diag.write(
+                "concurrency kernel tracing: could not write staged source '{s}'",
+                .{staged_path},
+            );
+            return KernelResolveError.InternalError;
+        };
+    }
+
+    if (!marker_rewritten) {
+        diag.write(
+            "concurrency kernel tracing: '{s}' not found in the kernel unit — the trace-gate rewrite cannot proceed",
+            .{TRACE_MARKER_FILE_BASENAME},
+        );
+        return KernelResolveError.KernelCompileFailed;
     }
 }
 

@@ -49,6 +49,10 @@ pub const OverrideIdentity = struct {
     /// line, so the manifest-snapshot fast path must MISS on it rather
     /// than reinstalling an artifact built under the other gate value.
     runtime_concurrency: ?bool = null,
+    /// P6-J6: `-Druntime-tracing=` tri-state (null = manifest decides).
+    /// A trace-gate flip changes the linked kernel object (the staged
+    /// marker rewrite), so the snapshot fast path must MISS on it.
+    runtime_tracing: ?bool = null,
     /// P2-R1 (D6): `-Ddebug-info=<full|split|none>` override, stored as
     /// the `main.BuildOverrides.DebugInfoOverride` enum tag (null = the
     /// per-optimize-mode default). It changes the emitted in-binary DWARF
@@ -524,6 +528,11 @@ pub fn hashInvocationIdentity(allocator: std.mem.Allocator, inputs: InvocationIn
     // P2-J1: tri-state gate override (0 = unset, 1 = off, 2 = on).
     hashOptionalByte(&hasher, if (inputs.overrides.runtime_concurrency) |gate|
         @as(u8, if (gate) 2 else 1)
+    else
+        null);
+    // P6-J6: tri-state trace-gate override (same encoding).
+    hashOptionalByte(&hasher, if (inputs.overrides.runtime_tracing) |trace_gate|
+        @as(u8, if (trace_gate) 2 else 1)
     else
         null);
     // P2-R1 (D6): fold the `-Ddebug-info=` tag and the `-Dframe-pointers=`

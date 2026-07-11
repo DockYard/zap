@@ -232,6 +232,11 @@ fn printUsage() void {
         \\                    Comptime concurrency-runtime gate (default off:
         \\                    zero cost — no kernel linked, no zap_proc_*
         \\                    symbols; overrides Zap.Manifest.runtime_concurrency)
+        \\  -Druntime-tracing=<on|off>
+        \\                    Comptime message-flow trace gate (default off:
+        \\                    zero trace instructions in the kernel; requires
+        \\                    runtime-concurrency on; overrides
+        \\                    Zap.Manifest.runtime_tracing)
         \\  -D<key>=<value>   Custom build option (read via System.get_build_opt)
         \\
         \\Options:
@@ -802,6 +807,14 @@ const BuildOverrides = struct {
     /// bootstrap; `off` forces the zero-cost posture. Null defers to the
     /// manifest field (default `false`).
     runtime_concurrency: ?bool = null,
+    /// P6-J6 — `-Druntime-tracing=on|off`: per-build override of the
+    /// manifest's `runtime_tracing` comptime trace gate. `on` compiles the
+    /// concurrency kernel with the message-flow trace points and the
+    /// bounded in-memory trace ring; `off` forces the zero-cost posture
+    /// (no trace instruction on any send/receive/spawn/exit/signal path).
+    /// Requires the concurrency gate ON. Null defers to the manifest
+    /// field (default `false`).
+    runtime_tracing: ?bool = null,
 };
 
 /// Phase 0 — DWARF foundation: parsed `-Ddebug-info` flag value.
@@ -1012,6 +1025,7 @@ const BUILD_FLAG_KEYS = [_][]const u8{
     "error-format",
     "leaks-fatal",
     "runtime-concurrency",
+    "runtime-tracing",
 };
 
 /// Format the supported-keys list for diagnostics straight from
@@ -1193,6 +1207,19 @@ fn parseBuildOverrides(
                     "unknown -Druntime-concurrency value '{s}' (valid: on, off)",
                     .{value},
                 ) };
+        } else if (std.mem.eql(u8, key, "runtime-tracing")) {
+            // P6-J6: per-build override of the manifest's comptime
+            // message-flow trace gate.
+            overrides.runtime_tracing = if (std.mem.eql(u8, value, "on") or std.mem.eql(u8, value, "true"))
+                true
+            else if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "false"))
+                false
+            else
+                return .{ .err = try std.fmt.allocPrint(
+                    alloc,
+                    "unknown -Druntime-tracing value '{s}' (valid: on, off)",
+                    .{value},
+                ) };
         } else {
             return .{ .err = try std.fmt.allocPrint(
                 alloc,
@@ -1241,6 +1268,11 @@ fn applyBuildOverrides(config: *zap.builder.BuildConfig, overrides: BuildOverrid
     // P2-J1: `-Druntime-concurrency=` overrides the manifest's comptime
     // concurrency gate per-field, exactly like every other `-D` flag.
     if (overrides.runtime_concurrency) |gate| config.runtime_concurrency = gate;
+    // P6-J6: `-Druntime-tracing=` overrides the manifest's comptime
+    // trace gate per-field. Its "requires concurrency" validation runs
+    // after ALL overrides land (`validateRuntimeTracingGate`), so the
+    // check sees the final resolved pair.
+    if (overrides.runtime_tracing) |trace_gate| config.runtime_tracing = trace_gate;
 
     // Phase 4.a — unified diagnostics: install the process-wide
     // diagnostic-output policy as a single source of truth read by the
@@ -4439,6 +4471,9 @@ fn buildOverrideIdentity(overrides: BuildOverrides) build_cache.OverrideIdentity
         .target = overrides.target,
         .cpu = overrides.cpu,
         .runtime_concurrency = overrides.runtime_concurrency,
+        // P6-J6: the trace-gate override joins the identity for the same
+        // reason (it selects a different kernel object).
+        .runtime_tracing = overrides.runtime_tracing,
         // P2-R1 (D6): thread the `-Ddebug-info=`/`-Dframe-pointers=`
         // overrides into the manifest invocation identity so two builds
         // differing only in those flags do not false-hit the snapshot.
@@ -7796,6 +7831,7 @@ fn compileAndLink(
     // mirroring the manager's source-selection/object split.
     // ------------------------------------------------------------------
     const runtime_concurrency_enabled = config.runtime_concurrency;
+    validateRuntimeTracingGate(config);
     const concurrency_kernel_source_dir = try std.fs.path.join(
         alloc,
         &.{ zap_source_tree_root, zap.concurrency_driver.KERNEL_UNIT_RELATIVE_DIR },
@@ -7811,6 +7847,7 @@ fn compileAndLink(
         .target = compile_target,
         .cpu = compile_cpu,
         .progress = progress,
+        .runtime_tracing = config.runtime_tracing,
     };
     var concurrency_kernel_key_storage: [64]u8 = undefined;
     const concurrency_kernel_key: []const u8 = if (runtime_concurrency_enabled) blk: {
@@ -9109,6 +9146,24 @@ const ScriptContentKeyControls = struct {
     concurrency_kernel_key: []const u8 = "",
 };
 
+/// P6-J6: `runtime_tracing` instruments the concurrency kernel, so it is
+/// meaningless — and a likely misconfiguration — without the concurrency
+/// runtime. Fail the build with an actionable diagnostic rather than
+/// silently ignoring the flag. Runs after ALL overrides land, so it sees
+/// the final resolved (manifest + `-D`) pair on every build path
+/// (manifest, script, and watch).
+fn validateRuntimeTracingGate(config: zap.builder.BuildConfig) void {
+    if (config.runtime_tracing and !config.runtime_concurrency) {
+        std.debug.print(
+            "Error: runtime_tracing requires the concurrency runtime. " ++
+                "Set `runtime_concurrency: true` in the Zap.Manifest (or -Druntime-concurrency=on) " ++
+                "alongside `runtime_tracing: true` (or -Druntime-tracing=on).\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
+}
+
 /// P2-J1: resolve the concurrency-kernel content key for a script-mode
 /// content key: "" when the gate is OFF; otherwise the same
 /// `kernelCacheKeyHex` the compile tail folds into the manifest cache
@@ -9124,6 +9179,7 @@ fn scriptConcurrencyKernelKey(
     zig_lib_identity_digest: BuildCacheDigest,
     driver_optimize: zap.memory_driver.ZapForkOptimize,
 ) []const u8 {
+    validateRuntimeTracingGate(config);
     if (!config.runtime_concurrency) return "";
     const zap_source_root = std.fs.path.dirname(zap_lib) orelse ".";
     const kernel_source_dir = std.fs.path.join(
@@ -9146,6 +9202,7 @@ fn scriptConcurrencyKernelKey(
         .optimize = driver_optimize,
         .target = config.target,
         .cpu = config.cpu,
+        .runtime_tracing = config.runtime_tracing,
     }, &kernel_diag) catch |err| {
         std.debug.print("Error: concurrency kernel resolution failed: {s}\n", .{@errorName(err)});
         if (kernel_diag.text().len > 0) {
@@ -10368,6 +10425,7 @@ const IncrementalWatchState = struct {
         // the watch session (the object path is baked into the
         // persistent Zig context's link inputs below).
         const runtime_concurrency_enabled = config.runtime_concurrency;
+        validateRuntimeTracingGate(config);
         var resolved_concurrency_kernel: ?zap.concurrency_driver.ResolvedKernel = null;
         defer if (resolved_concurrency_kernel) |*resolved_kernel|
             zap.concurrency_driver.freeResolvedKernel(alloc, resolved_kernel);
@@ -10390,6 +10448,7 @@ const IncrementalWatchState = struct {
                     .target = compile_target,
                     .cpu = compile_cpu,
                     .progress = progress,
+                    .runtime_tracing = config.runtime_tracing,
                 },
                 &kernel_diag,
             ) catch |err| {

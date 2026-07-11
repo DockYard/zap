@@ -3953,6 +3953,34 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_proc_hibernate(process: *anyopaque) callconv(.c) void;
     extern fn zap_proc_heap_byte_count(process: *anyopaque) callconv(.c) usize;
 
+    // P6-J6 (plan item 6.5): the observability read surface behind
+    // `lib/runtime_info.zap` (`:zig.RuntimeInfo.*`) — process listing
+    // (capture + indexed getters), per-core scheduler utilization and
+    // run-queue depth, and the trace-ring read API. Present in BOTH trace
+    // modes (the kernel exports report disabled/empty when the
+    // `runtime_tracing` gate is OFF, so these externs always resolve).
+    extern fn zap_introspect_capture() callconv(.c) u64;
+    extern fn zap_introspect_pid(index: u64) callconv(.c) u64;
+    extern fn zap_introspect_state(index: u64) callconv(.c) i64;
+    extern fn zap_introspect_mailbox_depth(index: u64) callconv(.c) u64;
+    extern fn zap_introspect_heap_bytes(index: u64) callconv(.c) u64;
+    extern fn zap_sched_core_count() callconv(.c) u64;
+    extern fn zap_sched_run_queue_depth(core_index: u64) callconv(.c) u64;
+    extern fn zap_sched_global_queue_depth() callconv(.c) u64;
+    extern fn zap_sched_window_nanos(core_index: u64) callconv(.c) u64;
+    extern fn zap_sched_parked_nanos(core_index: u64) callconv(.c) u64;
+    extern fn zap_sched_busy_nanos(core_index: u64) callconv(.c) u64;
+    extern fn zap_sched_park_count(core_index: u64) callconv(.c) u64;
+    extern fn zap_trace_enabled() callconv(.c) bool;
+    extern fn zap_trace_capture() callconv(.c) u64;
+    extern fn zap_trace_sequence(index: u64) callconv(.c) u64;
+    extern fn zap_trace_timestamp_nanos(index: u64) callconv(.c) u64;
+    extern fn zap_trace_kind(index: u64) callconv(.c) i64;
+    extern fn zap_trace_pid(index: u64) callconv(.c) u64;
+    extern fn zap_trace_peer(index: u64) callconv(.c) u64;
+    extern fn zap_trace_detail(index: u64) callconv(.c) u64;
+    extern fn zap_trace_reset() callconv(.c) void;
+
     // Kernel signal primitives (P5-J1, `src/runtime/concurrency/abi.zig`): links,
     // monitors, exit signals, trap_exit — the mechanism J2/J3 build supervision
     // on in pure Zap. Reason terms are atom ids (binary-global `u32`, widened to
@@ -5323,6 +5351,168 @@ fn movedOrphanReclaim(payload_pointer: [*]const u8) callconv(.c) void {
 fn blobFlightReclaim(payload_pointer: [*]const u8) callconv(.c) void {
     ZapConcurrencyKernel.zap_blob_flight_release(payload_pointer);
 }
+
+/// `:zig.RuntimeInfo.*` — the observability intrinsic bridge behind
+/// `lib/runtime_info.zap` (P6-J6, plan item 6.5): process listing,
+/// per-core scheduler utilization + run-queue depth, and the trace-ring
+/// read API. Thin, total wrappers over the kernel's `zap_introspect_*` /
+/// `zap_sched_*` / `zap_trace_*` exports; every function is gate-checked
+/// so a gate-OFF binary gets the actionable compile error instead of a
+/// link failure. The trace READ surface works in both trace modes —
+/// `trace_enabled()` reports whether the emit instrumentation was
+/// compiled in (`runtime_tracing`).
+///
+/// Signature convention: counts, indexes, depths, and nanosecond spans
+/// are `i64` (the Zap stdlib's integer idiom — `Blob.size` etc.; every
+/// value fits with orders of magnitude to spare); raw pid bits are the
+/// full `u64` kernel encoding. A negative index is simply out of range
+/// (the getters stay total).
+pub const RuntimeInfo = struct {
+    /// Clamp a Zap-side `i64` index for the total kernel getters: a
+    /// negative index maps to an always-out-of-range sentinel.
+    inline fn kernelIndex(index: i64) u64 {
+        return if (index < 0) std.math.maxInt(u64) else @intCast(index);
+    }
+
+    /// Snapshot the live process set into runtime-owned storage; returns
+    /// the captured count. The indexed `process_*` getters read this
+    /// snapshot until the next capture (single-capturer discipline —
+    /// captures serialize, getters don't).
+    pub fn capture_processes() i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_introspect_capture());
+    }
+
+    /// Raw pid bits of captured process `index` (0 past the count).
+    pub fn process_pid_bits(index: i64) u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_introspect_pid(kernelIndex(index));
+    }
+
+    /// State code of captured process `index`: 0 embryo, 1 runnable,
+    /// 2 running, 3 waiting, 4 blocking, 5 exiting; −1 past the count.
+    pub fn process_state_code(index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_introspect_state(kernelIndex(index));
+    }
+
+    /// Mailbox depth of captured process `index` (approximate under
+    /// concurrency; exact at quiescence).
+    pub fn process_mailbox_depth(index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_introspect_mailbox_depth(kernelIndex(index)));
+    }
+
+    /// Heap bytes of captured process `index` per its manager's `STAT`
+    /// accounting (0 for a manager without one).
+    pub fn process_heap_bytes(index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_introspect_heap_bytes(kernelIndex(index)));
+    }
+
+    /// Number of scheduler cores in the running backend.
+    pub fn scheduler_count() i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_sched_core_count());
+    }
+
+    /// Run-queue depth of core `core_index` (local FIFO + LIFO slot).
+    pub fn run_queue_depth(core_index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_sched_run_queue_depth(kernelIndex(core_index)));
+    }
+
+    /// Depth of the shared global overflow run queue.
+    pub fn global_run_queue_depth() i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_sched_global_queue_depth());
+    }
+
+    /// Wall nanoseconds core `core_index`'s run episodes have spanned.
+    pub fn scheduler_window_nanos(core_index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_sched_window_nanos(kernelIndex(core_index)));
+    }
+
+    /// Nanoseconds of core `core_index`'s window spent parked (idle).
+    pub fn scheduler_parked_nanos(core_index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_sched_parked_nanos(kernelIndex(core_index)));
+    }
+
+    /// Nanoseconds of core `core_index`'s window spent busy.
+    pub fn scheduler_busy_nanos(core_index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_sched_busy_nanos(kernelIndex(core_index)));
+    }
+
+    /// Futex parks core `core_index` has entered.
+    pub fn scheduler_park_count(core_index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_sched_park_count(kernelIndex(core_index)));
+    }
+
+    /// Whether the message-flow trace instrumentation was compiled in.
+    pub fn trace_enabled() bool {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_trace_enabled();
+    }
+
+    /// Snapshot the trace ring (oldest first); returns the captured count
+    /// (0 when tracing is compiled OFF).
+    pub fn trace_capture() i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_trace_capture());
+    }
+
+    /// Global emission sequence of captured trace event `index`.
+    pub fn trace_sequence(index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_trace_sequence(kernelIndex(index)));
+    }
+
+    /// Monotonic-nanosecond timestamp of captured trace event `index`.
+    pub fn trace_timestamp_nanos(index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_trace_timestamp_nanos(kernelIndex(index)));
+    }
+
+    /// Kind code of captured trace event `index`: 1 spawn, 2 exit,
+    /// 3 send, 4 receive, 5 signal; 0 past the count.
+    pub fn trace_kind_code(index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_trace_kind(kernelIndex(index));
+    }
+
+    /// Acting process's raw pid bits of captured trace event `index`.
+    pub fn trace_pid_bits(index: i64) u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_trace_pid(kernelIndex(index));
+    }
+
+    /// Counterparty raw pid bits of captured trace event `index` (send /
+    /// signal target; 0 when the event has none).
+    pub fn trace_peer_bits(index: i64) u64 {
+        requireConcurrencyRuntimeGate();
+        return ZapConcurrencyKernel.zap_trace_peer(kernelIndex(index));
+    }
+
+    /// Kind-specific detail of captured trace event `index` (exit:
+    /// 0 normal / 1 killed; send: 0 delivered / 1 dead-lettered; signal:
+    /// the kernel signal kind).
+    pub fn trace_detail(index: i64) i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(ZapConcurrencyKernel.zap_trace_detail(kernelIndex(index)));
+    }
+
+    /// Discard retained trace events and restart sequencing (call at
+    /// quiescence — a test/diagnostic aid).
+    pub fn trace_reset() bool {
+        requireConcurrencyRuntimeGate();
+        ZapConcurrencyKernel.zap_trace_reset();
+        return true;
+    }
+};
 
 pub const ProcessRuntime = struct {
     /// The calling process's pid as its raw `u64` kernel encoding

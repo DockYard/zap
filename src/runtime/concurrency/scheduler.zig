@@ -321,6 +321,7 @@ const timing_wheel_module = @import("timing_wheel.zig");
 const signal_module = @import("signal.zig");
 const registry_module = @import("registry.zig");
 const blob_module = @import("blob.zig");
+const trace_module = @import("trace.zig");
 
 const Pid = pid_table_module.Pid;
 const PidTable = pid_table_module.PidTable;
@@ -387,6 +388,121 @@ pub const TraceEvent = struct {
 /// installs its recorder here, and the Phase 1.6 observability skeleton
 /// grows from the same seam.
 pub const TraceHook = *const fn (trace_context: ?*anyopaque, event: TraceEvent) void;
+
+/// What the kernel does after DETECTING a system deadlock (P6-J6, plan
+/// item 6.5 — research.md §6.9 "all processes waiting, none runnable").
+/// The v1 decision, documented: detection is exact (the detectors only
+/// fire on a consistent observation — see `SchedulerPool.maybeDetectDeadlock`
+/// and `Scheduler.standaloneDeadlockDetected`), and the DEFAULT posture is
+/// BEAM-compatible-plus-diagnostic: report once, keep the schedulers
+/// parked (BEAM just sits there silently; Zap sits there loudly). The
+/// stop/panic variants exist because a detected deadlock is PERMANENT
+/// under the current runtime (no external wake source exists: every
+/// producer is a scheduler core or a blocking-pool thread, and both are
+/// provably idle at detection), so failing fast is a legitimate
+/// production choice — `ZAP_DEADLOCK_ACTION=stop|panic` selects it at the
+/// binary level (`abi.zig`).
+pub const DeadlockAction = enum {
+    /// Report once (hook or stderr), then keep parking — the system stays
+    /// exactly as BEAM would leave it, plus the diagnostic. Default.
+    report_and_continue,
+    /// Report, then stop the scheduler(s): a pool sets its stop flag (the
+    /// run returns; stragglers are reaped by `shutdownAllProcesses`); a
+    /// standalone run loop returns `error.AllProcessesWaiting`.
+    report_and_stop,
+    /// Report, then `@panic` — fail fast with a non-zero exit.
+    report_and_panic,
+};
+
+/// A detected system deadlock, borrowed for the duration of the hook call
+/// (like `crash_report.ReportHook`). The per-process detail — who is
+/// waiting, on what — is read through `pid_table` (every live process is
+/// `.waiting` at detection; its mailbox depth, heap bytes, and last
+/// suspend point are the diagnostic body — the default stderr renderer
+/// shows exactly that).
+pub const DeadlockReport = struct {
+    /// Live (all waiting) processes at detection.
+    live_process_count: u64,
+    /// Scheduler cores observed idle (1 for a standalone scheduler).
+    scheduler_count: usize,
+    /// The shared pid table — iterate `iterateLiveProcesses` for the
+    /// waiting set. Borrowed; valid only during the hook call.
+    pid_table: *PidTable,
+};
+
+/// Deadlock sink seam: invoked once per detection, synchronously, on the
+/// detecting scheduler thread, before the configured `DeadlockAction`
+/// takes effect. Null (production default) renders the report to stderr.
+pub const DeadlockHook = *const fn (deadlock_context: ?*anyopaque, report: *const DeadlockReport) void;
+
+/// A starved-process observation (P6-J6, plan item 6.5 — research.md
+/// §6.9 "process starved N ticks"): the oldest FIFO entry of one core has
+/// been at the queue HEAD — next in line — for `head_tenure_quanta`
+/// consecutive picks without being chosen. Head tenure (not total queue
+/// wait) is the metric precisely so a long-but-moving queue never false
+/// positives: production FIFO always picks the head, the LIFO `runnext`
+/// bypass is fairness-bounded to `runnext_fairness_interval` picks, and
+/// work stealing takes from the head — so any large tenure means the pick
+/// policy itself is unfair (a seeded `Decisions` policy, or a scheduler
+/// bug). The detector VERIFIES the P4-R2 fairness machinery in
+/// production rather than assuming it.
+pub const StarvationReport = struct {
+    /// The starved (still-waiting) process's raw pid bits.
+    pid_bits: u64,
+    /// Consecutive picks it has been passed over while at the head.
+    head_tenure_quanta: u64,
+    /// The core's FIFO depth at detection.
+    ready_queue_depth: usize,
+    /// The core's quantum counter at detection.
+    quantum_total: u64,
+};
+
+/// Starvation sink seam: invoked at most once per head-episode (the flag
+/// re-arms when the process finally runs or moves), synchronously, on the
+/// detecting core. Null (production default) renders to stderr.
+pub const StarvationHook = *const fn (starvation_context: ?*anyopaque, report: *const StarvationReport) void;
+
+/// Dispatch a deadlock report to `hook`, or render it to stderr when no
+/// hook is installed (suppressed under `zig test`, like the seed banner —
+/// the kernel test suites install hooks). Shared by the standalone
+/// detector (`Scheduler.reportStandaloneDeadlock`) and the pool detector
+/// (`scheduler_pool.zig`).
+pub fn fireDeadlockReport(
+    hook: ?DeadlockHook,
+    deadlock_context: ?*anyopaque,
+    report: *const DeadlockReport,
+    action: DeadlockAction,
+) void {
+    if (hook) |installed_hook| {
+        installed_hook(deadlock_context, report);
+        return;
+    }
+    if (builtin.is_test) return;
+    std.debug.print(
+        "[zap] DEADLOCK DETECTED: all {d} live processes are waiting across {d} scheduler core(s); " ++
+            "none is runnable, no receive-after timer is armed, and no blocking-pool work is in flight — " ++
+            "no source of progress exists. Waiting processes:\n",
+        .{ report.live_process_count, report.scheduler_count },
+    );
+    var live_iterator = report.pid_table.iterateLiveProcesses();
+    while (live_iterator.next()) |live| {
+        const suspend_point = fiber_context.savedRegisters(&live.pcb.fiber);
+        std.debug.print(
+            "[zap]   pid=0x{x} state={s} mailbox_depth={d} heap_bytes={d} suspend_pc=0x{x}\n",
+            .{
+                live.pid.toBits(),
+                @tagName(live.pcb.currentState()),
+                live.pcb.mailbox.depth(),
+                live.pcb.manager.heapByteCount(),
+                if (suspend_point) |saved| saved.program_counter else 0,
+            },
+        );
+    }
+    std.debug.print(
+        "[zap]   deadlock_action={s} (configure via ZAP_DEADLOCK_ACTION=continue|stop|panic)\n",
+        .{@tagName(action)},
+    );
+}
 
 /// The seam that owns ALL scheduler nondeterminism (plan 1.5, research.md
 /// §6.11: FoundationDB-style — every decision a run makes must be a
@@ -843,6 +959,25 @@ pub const ProcessContext = struct {
         context.record.pcb.registerDropResource(node);
     }
 
+    /// P6-J6 flow-trace point (plan item 6.5): record the consumption of a
+    /// USER envelope by this process. Signal envelopes are excluded — their
+    /// delivery is traced at the push side (`Scheduler.pushSignalMessage`)
+    /// as `.signal` events. Comptime-gated: a trace-OFF kernel compiles this
+    /// to nothing (no clock read, no branch).
+    inline fn emitReceiveTracePoint(context: *ProcessContext, envelope: *const mailbox_module.Envelope) void {
+        if (comptime trace_module.runtime_trace_active) {
+            if (envelope.fragment.signal_kind == .none) {
+                trace_module.emitGlobal(
+                    context.scheduler.options.clock.read(),
+                    .receive,
+                    0,
+                    context.record.pcb.pid.toBits(),
+                    0,
+                );
+            }
+        }
+    }
+
     /// This process's blob-ownership ledger (P6-J2 — owner-only, like
     /// every PCB field; the blob intrinsics append/verify/remove through
     /// it and teardown drains it).
@@ -932,7 +1067,10 @@ pub const ProcessContext = struct {
                 continue;
             }
             switch (record.pcb.mailbox.pop()) {
-                .envelope => |envelope| return envelope,
+                .envelope => |envelope| {
+                    context.emitReceiveTracePoint(envelope);
+                    return envelope;
+                },
                 .empty => {
                     record.yield_reason = .waiting_for_message;
                     context.execution.yield();
@@ -1176,7 +1314,10 @@ pub const ProcessContext = struct {
                 continue;
             }
             switch (mailbox.takeCorrelated(ref, match_kind, resume_after)) {
-                .matched => |envelope| return .{ .matched = envelope },
+                .matched => |envelope| {
+                    context.emitReceiveTracePoint(envelope);
+                    return .{ .matched = envelope };
+                },
                 .publish_pending => |last_examined| {
                     // A producer is mid-publish: input is arriving. Retry
                     // next quantum (pop's transient-gap discipline) from
@@ -1219,7 +1360,10 @@ pub const ProcessContext = struct {
                         // A message that raced the deadline wins: one final
                         // scan before conceding the timeout.
                         switch (mailbox.takeCorrelated(ref, match_kind, resume_after)) {
-                            .matched => |envelope| return .{ .matched = envelope },
+                            .matched => |envelope| {
+                                context.emitReceiveTracePoint(envelope);
+                                return .{ .matched = envelope };
+                            },
                             else => return .timed_out,
                         }
                     }
@@ -1296,6 +1440,31 @@ pub const ProcessContext = struct {
     /// dead/stale pid dead-letters (drops) instead of erroring, matching
     /// Erlang send semantics; the outcome is returned for observability.
     pub fn send(
+        context: *ProcessContext,
+        target: Pid,
+        fragment: mailbox_module.Fragment,
+    ) error{OutOfMemory}!SendOutcome {
+        const outcome = try context.sendEnvelope(target, fragment);
+        // P6-J6 flow-trace point (plan item 6.5): comptime-gated — a
+        // trace-OFF kernel emits nothing and reads no clock here.
+        if (comptime trace_module.runtime_trace_active) {
+            trace_module.emitGlobal(
+                context.scheduler.options.clock.read(),
+                .send,
+                switch (outcome) {
+                    .delivered => 0,
+                    .dead_lettered => 1,
+                },
+                context.record.pcb.pid.toBits(),
+                target.toBits(),
+            );
+        }
+        return outcome;
+    }
+
+    /// The untraced body of `send` (the P6-J6 trace point wraps it so the
+    /// outcome is known at one emit site).
+    fn sendEnvelope(
         context: *ProcessContext,
         target: Pid,
         fragment: mailbox_module.Fragment,
@@ -1545,6 +1714,14 @@ pub const ProcessContext = struct {
 /// (spin ~1–2 µs — a few hundred `spinLoopHint`s on M4 — before paying
 /// the ~900 ns parked-wake cost; plan A.2.3).
 pub const default_spin_iterations_before_park: u32 = 512;
+
+/// Default starvation watermark (P6-J6): consecutive passed-over picks at
+/// the FIFO head before a `StarvationReport` fires. Production FIFO's
+/// head tenure is structurally ≤ 1 pick and the `runnext` fairness bypass
+/// bounds a hot LIFO pair's bypassing to `runnext_fairness_interval`, so
+/// 4096 is orders of magnitude above any fair schedule — a report means a
+/// genuinely unfair pick policy or a scheduler bug, never load.
+pub const default_starvation_quantum_threshold: u32 = 4096;
 
 /// Default local-FIFO length past which a work-stealing core spills half its
 /// backlog to the global overflow queue (P4-J1). Sized so a core keeps a
@@ -1839,8 +2016,11 @@ pub const Scheduler = struct {
     /// and unused when `work_stealing` is false. Consumed first on 60 of every
     /// 61 picks; the 61st pick BYPASSES it for fairness (see `schedule_tick` /
     /// `runnext_fairness_interval`), so a hot mutual-wake pair cannot starve the
-    /// FIFO / global queue.
-    runnext: ?*ProcessRecord,
+    /// FIFO / global queue. An ATOMIC cell (P6-J6) purely so cross-thread
+    /// observability readers (`runQueueDepth`) see whole words race-free;
+    /// ownership is unchanged — only this scheduler's own thread writes it,
+    /// with `.monotonic` ops that compile to plain loads/stores.
+    runnext: std.atomic.Value(?*ProcessRecord),
     /// Per-core quantum counter driving the runnext-fairness poll (P4-R2
     /// finding #3). `dequeueNextRunnable` bumps it once per pick under work
     /// stealing; every `runnext_fairness_interval`-th pick bypasses `runnext`
@@ -1938,6 +2118,44 @@ pub const Scheduler = struct {
     /// observability surface for the plan item 6.4 idle-footprint shrink.
     hibernate_stack_bytes_released: u64,
 
+    // -- deadlock + starvation detection (P6-J6, plan item 6.5) ----------------
+    /// One standalone deadlock report per run episode (reset at run-loop
+    /// entry). The POOL detector keeps its own flag. Owner-thread only.
+    deadlock_reported: bool,
+    /// The FIFO head record last observed by the starvation watermark
+    /// (`noteHeadTenureLocked`); COMPARED only, never dereferenced unless
+    /// it is still the live head under the run-queue lock. Owner-thread
+    /// only (the watermark runs on the owner's pick path exclusively, so
+    /// no cross-thread `quantum_total` read exists).
+    observed_head_record: ?*ProcessRecord,
+    /// `quantum_total` when `observed_head_record` was first seen at the
+    /// head. Owner-thread only.
+    observed_head_since_quantum: u64,
+    /// Whether the current head episode was already reported (re-arms on
+    /// head change). Owner-thread only.
+    observed_head_reported: bool,
+
+    // -- utilization accounting (P6-J6, plan item 6.5) -------------------------
+    // Busy/idle wall-time split, computed from monotonic timestamps at the
+    // park/unpark boundaries (research.md §6.9 "scheduler utilization"): a
+    // scheduler's run-episode window divides into PARKED time (inside the
+    // futex wait) and BUSY time (everything else — quanta, queue service,
+    // steal scans, and the bounded pre-park spin; the same "active" notion
+    // BEAM's scheduler-utilization reports). All four cells are atomics so a
+    // foreign observability reader composes a race-free snapshot
+    // (`utilizationSnapshot`); only this scheduler's own thread writes them.
+    // Timestamps come from the `Clock` seam, so a seeded simulator run reads
+    // virtual time (it never parks, so its parked share is structurally 0).
+    /// Stamp when the live run episode began (`beginRunThread` /
+    /// `runUntilQuiescent` entry); 0 when no episode is live.
+    run_started_nanos: std.atomic.Value(u64),
+    /// Accumulated wall window of COMPLETED run episodes.
+    run_window_nanos_total: std.atomic.Value(u64),
+    /// Accumulated nanoseconds inside COMPLETED futex parks.
+    parked_nanos_total: std.atomic.Value(u64),
+    /// Stamp when the in-flight park began; 0 when not parked.
+    park_entered_nanos: std.atomic.Value(u64),
+
     /// Construction options.
     pub const Options = struct {
         /// Preemption budget granted per quantum, in reductions
@@ -1991,6 +2209,26 @@ pub const Scheduler = struct {
         crash_report_hook: ?crash_report_module.ReportHook = null,
         /// Opaque context for `crash_report_hook`.
         crash_report_context: ?*anyopaque = null,
+        /// Deadlock sink seam (P6-J6; see `DeadlockHook`). Null = the
+        /// default stderr renderer. Honored by both the standalone
+        /// detector (this scheduler's own run loops) and the pool detector
+        /// (`SchedulerPool`, which reads its cores' shared options).
+        deadlock_hook: ?DeadlockHook = null,
+        /// Opaque context for `deadlock_hook`.
+        deadlock_context: ?*anyopaque = null,
+        /// What happens after a deadlock is reported (see `DeadlockAction`).
+        deadlock_action: DeadlockAction = .report_and_continue,
+        /// Starvation watermark in quanta (P6-J6; see `StarvationReport`):
+        /// report when one core's FIFO head has been passed over this many
+        /// consecutive picks. 0 disables the detector. Production FIFO
+        /// picks the head every time, so the detector is silent unless the
+        /// pick policy is genuinely unfair.
+        starvation_quantum_threshold: u32 = default_starvation_quantum_threshold,
+        /// Starvation sink seam (see `StarvationHook`). Null = the default
+        /// stderr renderer.
+        starvation_hook: ?StarvationHook = null,
+        /// Opaque context for `starvation_hook`.
+        starvation_context: ?*anyopaque = null,
         /// Usable bytes per fiber stack (forwarded to this scheduler's
         /// stack pool).
         stack_usable_size: usize = stack_pool_module.default_usable_size,
@@ -2118,7 +2356,7 @@ pub const Scheduler = struct {
             .current_process = null,
             .receive_timer_wheel = timing_wheel_module.TimingWheel.init(backing_allocator),
             .work_stealing = options.work_stealing,
-            .runnext = null,
+            .runnext = .init(null),
             .schedule_tick = 0,
             .ready_head = null,
             .ready_tail = null,
@@ -2144,6 +2382,14 @@ pub const Scheduler = struct {
             .blocking_reattach_total = 0,
             .hibernate_park_total = 0,
             .hibernate_stack_bytes_released = 0,
+            .deadlock_reported = false,
+            .observed_head_record = null,
+            .observed_head_since_quantum = 0,
+            .observed_head_reported = false,
+            .run_started_nanos = .init(0),
+            .run_window_nanos_total = .init(0),
+            .parked_nanos_total = .init(0),
+            .park_entered_nanos = .init(0),
         };
     }
 
@@ -2153,7 +2399,7 @@ pub const Scheduler = struct {
     pub fn deinit(scheduler: *Scheduler) void {
         std.debug.assert(scheduler.live_record_count == 0);
         std.debug.assert(scheduler.ready_count == 0);
-        std.debug.assert(scheduler.runnext == null);
+        std.debug.assert(scheduler.runnext.load(.monotonic) == null);
         std.debug.assert(scheduler.wake_stack_head.load(.acquire) == null);
         std.debug.assert(scheduler.reattach_stack_head.load(.acquire) == null);
         while (scheduler.free_records) |record| {
@@ -2303,6 +2549,10 @@ pub const Scheduler = struct {
         scheduler.readyEnqueue(record);
         scheduler.spawn_total += 1;
         scheduler.emitTrace(.spawn, pid);
+        // P6-J6 flow-trace point (plan item 6.5): comptime-gated.
+        if (comptime trace_module.runtime_trace_active) {
+            trace_module.emitGlobal(scheduler.options.clock.read(), .spawn, 0, pid.toBits(), 0);
+        }
         // Exercise the admission wake edge from day one (no-op syscall-
         // wise while un-parked; Phase 4's cross-scheduler admission rides
         // exactly this seam).
@@ -2515,6 +2765,9 @@ pub const Scheduler = struct {
         const previous_scheduler = current_scheduler;
         current_scheduler = scheduler;
         defer current_scheduler = previous_scheduler;
+        scheduler.beginRunEpisode();
+        defer scheduler.endRunEpisode();
+        scheduler.deadlock_reported = false;
         while (true) {
             scheduler.drainWakeStack();
             scheduler.drainReattachStack();
@@ -2533,7 +2786,16 @@ pub const Scheduler = struct {
             switch (scheduler.options.idle_strategy) {
                 // Park bounded by the earliest `receive … after` deadline
                 // (parkUntilWakeSignal reads it) so a timeout fires on time.
-                .futex_park => scheduler.parkUntilWakeSignal(),
+                .futex_park => {
+                    // P6-J6: idle with live processes — exact standalone
+                    // deadlock predicate (single-threaded observation).
+                    if (scheduler.standaloneDeadlockDetected()) {
+                        if (scheduler.reportStandaloneDeadlock()) {
+                            return error.AllProcessesWaiting;
+                        }
+                    }
+                    scheduler.parkUntilWakeSignal();
+                },
                 .forbid_parking => {
                     // Deterministic run: fire the earliest `receive … after`
                     // waiter (virtual time) before declaring deadlock.
@@ -2565,6 +2827,9 @@ pub const Scheduler = struct {
         const previous_scheduler = current_scheduler;
         current_scheduler = scheduler;
         defer current_scheduler = previous_scheduler;
+        scheduler.beginRunEpisode();
+        defer scheduler.endRunEpisode();
+        scheduler.deadlock_reported = false;
         while (true) {
             // Silent probe — the target's death is this loop's expected
             // terminal condition, not a dead-lettered message (the
@@ -2587,7 +2852,16 @@ pub const Scheduler = struct {
             switch (scheduler.options.idle_strategy) {
                 // Park bounded by the earliest `receive … after` deadline
                 // (parkUntilWakeSignal reads it) so a timeout fires on time.
-                .futex_park => scheduler.parkUntilWakeSignal(),
+                .futex_park => {
+                    // P6-J6: idle with live processes — exact standalone
+                    // deadlock predicate (single-threaded observation).
+                    if (scheduler.standaloneDeadlockDetected()) {
+                        if (scheduler.reportStandaloneDeadlock()) {
+                            return error.AllProcessesWaiting;
+                        }
+                    }
+                    scheduler.parkUntilWakeSignal();
+                },
                 .forbid_parking => {
                     // Deterministic run: fire the earliest `receive … after`
                     // waiter (virtual time) before declaring deadlock.
@@ -2615,12 +2889,134 @@ pub const Scheduler = struct {
     /// Called once when a pool worker thread enters, paired with `endRunThread`.
     pub fn beginRunThread(scheduler: *Scheduler) void {
         current_scheduler = scheduler;
+        scheduler.beginRunEpisode();
     }
 
     /// Clear the current-thread scheduler on worker exit.
     pub fn endRunThread(scheduler: *Scheduler) void {
         std.debug.assert(current_scheduler == scheduler);
         current_scheduler = null;
+        scheduler.endRunEpisode();
+    }
+
+    /// Open a utilization window (P6-J6): stamp the episode start. Paired
+    /// with `endRunEpisode`; the pool worker loop and the standalone run
+    /// loops bracket themselves with the pair.
+    fn beginRunEpisode(scheduler: *Scheduler) void {
+        scheduler.run_started_nanos.store(scheduler.options.clock.read(), .monotonic);
+    }
+
+    /// Close the live utilization window: fold its span into the completed
+    /// total. Idempotent (a second close is a no-op).
+    fn endRunEpisode(scheduler: *Scheduler) void {
+        const started = scheduler.run_started_nanos.swap(0, .monotonic);
+        if (started == 0) return;
+        const now = scheduler.options.clock.read();
+        _ = scheduler.run_window_nanos_total.fetchAdd(now -| started, .monotonic);
+    }
+
+    /// Busy/idle wall-time split for this scheduler (P6-J6, plan item 6.5).
+    /// Thread-safe: composed from the atomic utilization cells, including
+    /// the in-flight episode and any in-flight park, so a reader on another
+    /// thread sees a live view. APPROXIMATE under concurrency (the
+    /// composition is not one atomic snapshot; `parked` is clamped to
+    /// `window` so the split is always well-formed); exact when this
+    /// scheduler is idle or stopped.
+    pub const UtilizationSnapshot = struct {
+        /// Wall nanoseconds this scheduler's run episodes have spanned so
+        /// far (completed episodes + the live one).
+        window_nanoseconds: u64,
+        /// Nanoseconds of that window spent parked (the idle futex wait).
+        parked_nanoseconds: u64,
+        /// `window − parked`: quanta, queue service, steal scans, and the
+        /// bounded pre-park spin (the BEAM "active" notion).
+        busy_nanoseconds: u64,
+    };
+
+    /// The STANDALONE deadlock predicate (P6-J6, plan item 6.5): called by
+    /// this scheduler's own run loops when idle under `.futex_park`, AFTER
+    /// `dequeueNextRunnable` returned null (so the local queues are empty
+    /// by the owner's own exact observation). True iff live processes
+    /// exist, no revival is pending (wake/reattach stacks), and no
+    /// `receive … after` timer is armed — under the Phase-1 standalone
+    /// contract (one scheduler thread, no foreign producer threads) this
+    /// observation is EXACT, because the observer is the only thread that
+    /// could create work. A pool core never runs this (the pool owns the
+    /// M:N-consistent detector — `SchedulerPool.maybeDetectDeadlock`), and
+    /// a standalone scheduler wired to a blocking pool skips it (an
+    /// off-core op may still re-attach).
+    fn standaloneDeadlockDetected(scheduler: *Scheduler) bool {
+        if (scheduler.pool_hooks != null) return false;
+        if (scheduler.options.blocking_handoff != null) return false;
+        if (scheduler.deadlock_reported) return false;
+        if (scheduler.live_record_count == 0) return false;
+        if (scheduler.hasPendingCrossThreadWork()) return false;
+        if (scheduler.receive_timer_wheel.armedCountApprox() != 0) return false;
+        return true;
+    }
+
+    /// Report a detected standalone deadlock and apply the configured
+    /// action. Returns true when the caller (a run loop) must surface
+    /// `error.AllProcessesWaiting` (`.report_and_stop`).
+    fn reportStandaloneDeadlock(scheduler: *Scheduler) bool {
+        scheduler.deadlock_reported = true;
+        const report = DeadlockReport{
+            .live_process_count = scheduler.live_record_count,
+            .scheduler_count = 1,
+            .pid_table = scheduler.pid_table,
+        };
+        fireDeadlockReport(
+            scheduler.options.deadlock_hook,
+            scheduler.options.deadlock_context,
+            &report,
+            scheduler.options.deadlock_action,
+        );
+        switch (scheduler.options.deadlock_action) {
+            .report_and_continue => return false,
+            .report_and_stop => return true,
+            .report_and_panic => @panic(
+                "zap: system deadlock detected — every process is waiting and nothing can wake one " ++
+                    "(deadlock_action = report_and_panic)",
+            ),
+        }
+    }
+
+    /// Compose a `UtilizationSnapshot` at "now" (the scheduler's clock seam).
+    pub fn utilizationSnapshot(scheduler: *const Scheduler) UtilizationSnapshot {
+        const now = scheduler.options.clock.read();
+        var window = scheduler.run_window_nanos_total.load(.monotonic);
+        const started = scheduler.run_started_nanos.load(.monotonic);
+        if (started != 0 and now > started) window += now - started;
+        var parked = scheduler.parked_nanos_total.load(.monotonic);
+        const park_entered = scheduler.park_entered_nanos.load(.monotonic);
+        if (park_entered != 0 and now > park_entered) parked += now - park_entered;
+        if (parked > window) parked = window;
+        return .{
+            .window_nanoseconds = window,
+            .parked_nanoseconds = parked,
+            .busy_nanoseconds = window - parked,
+        };
+    }
+
+    /// Thread-safe run-queue depth for this core (P6-J6, plan item 6.5):
+    /// the local FIFO length (under the run-queue lock) plus the LIFO
+    /// `runnext` occupant. A point-in-time observability read — the value
+    /// may change the instant the lock is released.
+    pub fn runQueueDepth(scheduler: *Scheduler) usize {
+        scheduler.lockRunQueue();
+        const fifo_depth = scheduler.ready_count;
+        scheduler.unlockRunQueue();
+        const lifo_occupied: usize = @intFromBool(scheduler.runnext.load(.monotonic) != null);
+        return fifo_depth + lifo_occupied;
+    }
+
+    /// Thread-safe count of timers armed in this core's timing wheel
+    /// (P6-J6): live `receive … after` deadlines, PLUS any stale
+    /// cross-core-cancelled entries awaiting their lazy reap (`timing_wheel.zig`
+    /// — a stale entry expires and is reaped within its original deadline,
+    /// so the count is an upper bound that converges to the live count).
+    pub fn armedTimerCount(scheduler: *const Scheduler) usize {
+        return scheduler.receive_timer_wheel.armedCountApprox();
     }
 
     /// The scheduler driving the calling thread, or null on a non-scheduler
@@ -2694,7 +3090,7 @@ pub const Scheduler = struct {
     /// FIFO). Approximate under concurrency (a thief may empty the FIFO); the
     /// worker loop's park path re-checks authoritatively. Owner-biased read.
     pub fn hasLocalWork(scheduler: *Scheduler) bool {
-        if (scheduler.runnext != null) return true;
+        if (scheduler.runnext.load(.monotonic) != null) return true;
         scheduler.lockRunQueue();
         defer scheduler.unlockRunQueue();
         return scheduler.ready_count != 0;
@@ -3251,6 +3647,18 @@ pub const Scheduler = struct {
             .signal_kind = kind,
         };
         _ = target_pcb.mailbox.push(envelope);
+        // P6-J6 flow-trace point (plan item 6.5): a trapped-exit / `DOWN`
+        // envelope was delivered. pid = the signal's origin, peer = the
+        // target, detail = the signal kind. Comptime-gated.
+        if (comptime trace_module.runtime_trace_active) {
+            trace_module.emitGlobal(
+                scheduler.options.clock.read(),
+                .signal,
+                @intFromEnum(kind),
+                payload.from_bits,
+                target_pcb.pid.toBits(),
+            );
+        }
     }
 
     /// Doom `target_record` with `status`: record the reason (`pending_exit`,
@@ -3894,6 +4302,19 @@ pub const Scheduler = struct {
             .normal => .exit,
             .killed => .kill,
         }, exit_pid);
+        // P6-J6 flow-trace point (plan item 6.5): comptime-gated.
+        if (comptime trace_module.runtime_trace_active) {
+            trace_module.emitGlobal(
+                scheduler.options.clock.read(),
+                .exit,
+                switch (reason) {
+                    .normal => 0,
+                    .killed => 1,
+                },
+                exit_pid.toBits(),
+                0,
+            );
+        }
         switch (reason) {
             .normal => scheduler.normal_exit_total += 1,
             .killed => scheduler.kill_total += 1,
@@ -4065,8 +4486,8 @@ pub const Scheduler = struct {
             return;
         }
         record.ready_next = null;
-        const displaced = scheduler.runnext;
-        scheduler.runnext = record;
+        const displaced = scheduler.runnext.load(.monotonic);
+        scheduler.runnext.store(record, .monotonic);
         if (displaced) |previous| scheduler.readyEnqueue(previous);
     }
 
@@ -4096,8 +4517,8 @@ pub const Scheduler = struct {
                 }
                 if (scheduler.dequeueLocalFifo()) |record| return record;
             }
-            if (scheduler.runnext) |record| {
-                scheduler.runnext = null;
+            if (scheduler.runnext.load(.monotonic)) |record| {
+                scheduler.runnext.store(null, .monotonic);
                 return record;
             }
         }
@@ -4110,14 +4531,74 @@ pub const Scheduler = struct {
     /// the Decisions policy identically. Owner-thread only.
     fn dequeueLocalFifo(scheduler: *Scheduler) ?*ProcessRecord {
         scheduler.lockRunQueue();
-        defer scheduler.unlockRunQueue();
-        if (scheduler.ready_count == 0) return null;
+        if (scheduler.ready_count == 0) {
+            scheduler.observed_head_record = null;
+            scheduler.unlockRunQueue();
+            return null;
+        }
+        // Starvation watermark (P6-J6): copy any due report OUT under the
+        // lock, fire it after the unlock (never run a user hook under the
+        // run-queue lock).
+        const starvation_report = scheduler.noteHeadTenureLocked();
         const chosen_index = scheduler.options.decisions.vtable.chooseNextReadyIndex(
             scheduler.options.decisions.decision_context,
             scheduler.ready_count,
         );
         std.debug.assert(chosen_index < scheduler.ready_count);
-        return scheduler.dequeueReadyAtLocked(chosen_index);
+        const chosen = scheduler.dequeueReadyAtLocked(chosen_index);
+        // Head-episode ABA guard: if the pick took the watched head (the
+        // FIFO production case, every pick), forget it so a later
+        // re-enqueue of the same recycled record starts a fresh episode.
+        if (chosen == scheduler.observed_head_record) scheduler.observed_head_record = null;
+        scheduler.unlockRunQueue();
+        if (starvation_report) |report| scheduler.fireStarvationReport(report);
+        return chosen;
+    }
+
+    /// The starvation watermark body (P6-J6, plan item 6.5; see
+    /// `StarvationReport` for why HEAD TENURE is the false-positive-free
+    /// metric). Runs on the owner's pick path with the run-queue lock
+    /// held; O(1) — one pointer compare and a subtraction. Returns a
+    /// report to fire (after unlock) when the current head has been
+    /// passed over `starvation_quantum_threshold` consecutive picks.
+    fn noteHeadTenureLocked(scheduler: *Scheduler) ?StarvationReport {
+        const threshold = scheduler.options.starvation_quantum_threshold;
+        if (threshold == 0) return null;
+        const head = scheduler.ready_head orelse {
+            scheduler.observed_head_record = null;
+            return null;
+        };
+        if (head != scheduler.observed_head_record) {
+            // A new head episode begins.
+            scheduler.observed_head_record = head;
+            scheduler.observed_head_since_quantum = scheduler.quantum_total;
+            scheduler.observed_head_reported = false;
+            return null;
+        }
+        const tenure = scheduler.quantum_total - scheduler.observed_head_since_quantum;
+        if (tenure < threshold or scheduler.observed_head_reported) return null;
+        scheduler.observed_head_reported = true;
+        return .{
+            .pid_bits = head.pcb.pid.toBits(),
+            .head_tenure_quanta = tenure,
+            .ready_queue_depth = scheduler.ready_count,
+            .quantum_total = scheduler.quantum_total,
+        };
+    }
+
+    /// Dispatch a starvation report to the configured sink (default:
+    /// stderr, suppressed in `zig test` builds like the seed banner).
+    fn fireStarvationReport(scheduler: *Scheduler, report: StarvationReport) void {
+        if (scheduler.options.starvation_hook) |hook| {
+            hook(scheduler.options.starvation_context, &report);
+            return;
+        }
+        if (!builtin.is_test) std.debug.print(
+            "[zap] STARVATION: process 0x{x} has been runnable at a run-queue head for {d} consecutive picks " ++
+                "without being scheduled (core quantum_total={d}, ready_queue_depth={d}) — " ++
+                "the scheduler pick policy is not serving it\n",
+            .{ report.pid_bits, report.head_tenure_quanta, report.quantum_total, report.ready_queue_depth },
+        );
     }
 
     /// Unlink and return the `index`-th queued record (0 = oldest), taking the
@@ -4392,11 +4873,19 @@ pub const Scheduler = struct {
         if (scheduler.hasPendingCrossThreadWork()) return;
         scheduler.parked_hint.store(true, .seq_cst);
         _ = scheduler.park_count.fetchAdd(1, .monotonic);
+        // Utilization accounting (P6-J6): the park/unpark boundaries are
+        // the busy/idle split points (module fields doc). The pre-park spin
+        // above deliberately counts as BUSY.
+        const park_started_nanos = scheduler.options.clock.read();
+        scheduler.park_entered_nanos.store(park_started_nanos, .monotonic);
         parking_futex.waitBounded(
             &scheduler.wake_epoch,
             observed_epoch,
             scheduler.idleParkTimeoutNanoseconds(),
         );
+        scheduler.park_entered_nanos.store(0, .monotonic);
+        const park_ended_nanos = scheduler.options.clock.read();
+        _ = scheduler.parked_nanos_total.fetchAdd(park_ended_nanos -| park_started_nanos, .monotonic);
         scheduler.parked_hint.store(false, .seq_cst);
     }
 
@@ -4764,7 +5253,7 @@ test "Scheduler: the runnext fairness poll serves stranded global/FIFO work past
     const total_picks = runnext_fairness_interval * 2;
     var pick: u64 = 0;
     while (pick < total_picks) : (pick += 1) {
-        kernel.scheduler.runnext = hot_record; // the ever-refilled LIFO slot
+        kernel.scheduler.runnext.store(hot_record, .monotonic); // the ever-refilled LIFO slot
         const chosen = kernel.scheduler.dequeueNextRunnable().?;
         if (chosen == hot_record) {
             runnext_picks += 1;
@@ -6167,5 +6656,326 @@ test "Scheduler: a process can spawn a child mid-quantum" {
     try testing.expect(probe.child_probe.entered);
     try testing.expectEqual(probe.child_pid_bits, probe.child_probe.observed_self_pid_bits);
     try testing.expectEqual(@as(usize, 2), manager.teardown_count);
+    try kernel.expectExactAccounting();
+}
+
+// -- P6-J6 observability: deadlock detection, starvation watermark, utilization,
+// -- and queue depth (plan item 6.5)
+
+/// Capturing deadlock sink for the detector tests: counts reports and
+/// records the waiting pids named by the report's pid-table walk.
+const TestDeadlockSink = struct {
+    report_count: usize = 0,
+    live_process_count: u64 = 0,
+    scheduler_count: usize = 0,
+    named_pid_bits: [8]u64 = @splat(0),
+    named_count: usize = 0,
+
+    fn hook(deadlock_context: ?*anyopaque, report: *const DeadlockReport) void {
+        const sink: *TestDeadlockSink = @ptrCast(@alignCast(deadlock_context.?));
+        sink.report_count += 1;
+        sink.live_process_count = report.live_process_count;
+        sink.scheduler_count = report.scheduler_count;
+        var live_iterator = report.pid_table.iterateLiveProcesses();
+        while (live_iterator.next()) |live| {
+            if (sink.named_count == sink.named_pid_bits.len) break;
+            sink.named_pid_bits[sink.named_count] = live.pid.toBits();
+            sink.named_count += 1;
+        }
+    }
+
+    fn names(sink: *const TestDeadlockSink, pid_bits: u64) bool {
+        for (sink.named_pid_bits[0..sink.named_count]) |named| {
+            if (named == pid_bits) return true;
+        }
+        return false;
+    }
+};
+
+test "Scheduler: standalone deadlock — two receive-blocked processes with no sender are detected, naming both" {
+    var sink = TestDeadlockSink{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .idle_strategy = .futex_park,
+        .deadlock_hook = TestDeadlockSink.hook,
+        .deadlock_context = &sink,
+        .deadlock_action = .report_and_stop,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    const first_pid = try kernel.scheduler.spawn(.{
+        .entry = waitForeverEntry,
+        .manager = manager.managerContext(),
+    });
+    const second_pid = try kernel.scheduler.spawn(.{
+        .entry = waitForeverEntry,
+        .manager = manager.managerContext(),
+    });
+
+    // Both processes park on empty mailboxes; nothing can ever wake them.
+    // The detector fires BEFORE the first futex park (exact standalone
+    // predicate), and `.report_and_stop` surfaces the run-loop error.
+    try testing.expectError(error.AllProcessesWaiting, kernel.scheduler.runUntilQuiescent());
+
+    try testing.expectEqual(@as(usize, 1), sink.report_count);
+    try testing.expectEqual(@as(u64, 2), sink.live_process_count);
+    try testing.expectEqual(@as(usize, 1), sink.scheduler_count);
+    try testing.expect(sink.names(first_pid.toBits()));
+    try testing.expect(sink.names(second_pid.toBits()));
+
+    kernel.scheduler.shutdownAllProcesses();
+    try testing.expectEqual(@as(usize, 2), manager.teardown_count);
+    try kernel.expectExactAccounting();
+}
+
+const TimedThenSendProbe = struct {
+    peer_pid_bits: u64 = 0,
+    timed_out: bool = false,
+};
+
+fn timedWaiterThenSendEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *TimedThenSendProbe = @ptrCast(@alignCast(argument.?));
+    // Park with an armed deadline — the after-arm WILL fire, so the system
+    // is never deadlocked while this timer is pending.
+    const outcome = context.receiveWaitTimeout(10 * std.time.ns_per_ms);
+    probe.timed_out = outcome == .timed_out;
+    _ = context.send(Pid.fromBits(probe.peer_pid_bits), .{}) catch
+        @panic("timedWaiterThenSendEntry: envelope allocation failed");
+}
+
+fn receiveOneThenExitEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    _ = argument;
+    envelope_pool_module.free(context.receive());
+}
+
+test "Scheduler: standalone deadlock — a pending receive-after timer is NOT flagged (the after-arm fires)" {
+    var sink = TestDeadlockSink{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .idle_strategy = .futex_park,
+        .spin_iterations_before_park = 32,
+        .deadlock_hook = TestDeadlockSink.hook,
+        .deadlock_context = &sink,
+        .deadlock_action = .report_and_stop,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var probe = TimedThenSendProbe{};
+    const receiver_pid = try kernel.scheduler.spawn(.{
+        .entry = receiveOneThenExitEntry,
+        .manager = manager.managerContext(),
+    });
+    probe.peer_pid_bits = receiver_pid.toBits();
+    _ = try kernel.scheduler.spawn(.{
+        .entry = timedWaiterThenSendEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+
+    // While every process waits, one armed timer exists — the detector must
+    // NOT flag the idle window; the timeout then fires, the waiter sends,
+    // the receiver exits, and the run reaches genuine quiescence.
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expect(probe.timed_out);
+    try testing.expectEqual(@as(usize, 0), sink.report_count);
+    try testing.expectEqual(@as(usize, 2), manager.teardown_count);
+    try kernel.expectExactAccounting();
+}
+
+/// Never-pick-the-head decision policy for the SYNTHETIC starvation proof
+/// (the deterministic-seam analogue of "a decision policy that never picks
+/// one runnable process"): always chooses the NEWEST queued record, so the
+/// FIFO head — the oldest — accumulates head tenure without being run.
+const StarveHeadDecisions = struct {
+    fn chooseNextReadyIndex(decision_context: ?*anyopaque, ready_count: usize) usize {
+        _ = decision_context;
+        return ready_count - 1;
+    }
+    fn chooseQuantumBudget(decision_context: ?*anyopaque, configured_budget: u32) u32 {
+        _ = decision_context;
+        return configured_budget;
+    }
+    const vtable = Decisions.VTable{
+        .chooseNextReadyIndex = chooseNextReadyIndex,
+        .chooseQuantumBudget = chooseQuantumBudget,
+    };
+    const decisions = Decisions{ .decision_context = null, .vtable = &vtable };
+};
+
+const TestStarvationSink = struct {
+    report_count: usize = 0,
+    last_report: StarvationReport = undefined,
+
+    fn hook(starvation_context: ?*anyopaque, report: *const StarvationReport) void {
+        const sink: *TestStarvationSink = @ptrCast(@alignCast(starvation_context.?));
+        sink.report_count += 1;
+        sink.last_report = report.*;
+    }
+};
+
+const StarvationVictimProbe = struct {
+    ran: bool = false,
+};
+
+fn starvationVictimEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    _ = context;
+    const probe: *StarvationVictimProbe = @ptrCast(@alignCast(argument.?));
+    probe.ran = true;
+}
+
+fn yieldManyEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    _ = argument;
+    var remaining_yields: usize = 64;
+    while (remaining_yields > 0) : (remaining_yields -= 1) {
+        context.yieldNow();
+    }
+}
+
+test "Scheduler: starvation watermark fires for a runnable head an unfair policy never picks, and names it" {
+    var sink = TestStarvationSink{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .decisions = StarveHeadDecisions.decisions,
+        .starvation_quantum_threshold = 16,
+        .starvation_hook = TestStarvationSink.hook,
+        .starvation_context = &sink,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    // The victim is spawned FIRST, so it is the FIFO head; the two yielding
+    // workers keep re-enqueueing at the tail, and the newest-first policy
+    // keeps picking them — the head is passed over on every pick.
+    var victim_probe = StarvationVictimProbe{};
+    const victim_pid = try kernel.scheduler.spawn(.{
+        .entry = starvationVictimEntry,
+        .argument = &victim_probe,
+        .manager = manager.managerContext(),
+    });
+    _ = try kernel.scheduler.spawn(.{
+        .entry = yieldManyEntry,
+        .manager = manager.managerContext(),
+    });
+    _ = try kernel.scheduler.spawn(.{
+        .entry = yieldManyEntry,
+        .manager = manager.managerContext(),
+    });
+
+    // The workers eventually exit (bounded yields), after which the victim
+    // is the only runnable process and finally runs — the run terminates.
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expect(victim_probe.ran);
+    try testing.expectEqual(@as(usize, 1), sink.report_count);
+    try testing.expectEqual(victim_pid.toBits(), sink.last_report.pid_bits);
+    try testing.expect(sink.last_report.head_tenure_quanta >= 16);
+    try testing.expect(sink.last_report.ready_queue_depth >= 1);
+    try testing.expectEqual(@as(usize, 3), manager.teardown_count);
+    try kernel.expectExactAccounting();
+}
+
+test "Scheduler: production FIFO never fires the starvation watermark (head tenure is structurally bounded)" {
+    var sink = TestStarvationSink{};
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        // The tightest possible watermark: ANY accumulated head tenure
+        // would fire. Production FIFO picks the head every time, so none
+        // accumulates.
+        .starvation_quantum_threshold = 1,
+        .starvation_hook = TestStarvationSink.hook,
+        .starvation_context = &sink,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var worker_index: usize = 0;
+    while (worker_index < 4) : (worker_index += 1) {
+        _ = try kernel.scheduler.spawn(.{
+            .entry = yieldManyEntry,
+            .manager = manager.managerContext(),
+        });
+    }
+    try kernel.scheduler.runUntilQuiescent();
+
+    try testing.expectEqual(@as(usize, 0), sink.report_count);
+    try testing.expectEqual(@as(usize, 4), manager.teardown_count);
+    try kernel.expectExactAccounting();
+}
+
+fn timedWaiterEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    _ = argument;
+    _ = context.receiveWaitTimeout(30 * std.time.ns_per_ms);
+}
+
+test "Scheduler: utilization splits the run window into busy and parked at the park boundaries" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .idle_strategy = .futex_park,
+        .spin_iterations_before_park = 32,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    // One timed waiter: the scheduler MUST park (nothing else can run) with
+    // the park bounded by the 30 ms deadline, then fire the timeout and
+    // finish — so the run window contains a genuine multi-millisecond park.
+    _ = try kernel.scheduler.spawn(.{
+        .entry = timedWaiterEntry,
+        .manager = manager.managerContext(),
+    });
+    try kernel.scheduler.runUntilQuiescent();
+
+    const utilization = kernel.scheduler.utilizationSnapshot();
+    try testing.expect(kernel.scheduler.parkCount() >= 1);
+    try testing.expect(utilization.window_nanoseconds > 0);
+    // The wait is a minimum: the park spans (nearly) the whole 30 ms
+    // deadline. 5 ms is a generous slack floor under oversubscription.
+    try testing.expect(utilization.parked_nanoseconds >= 5 * std.time.ns_per_ms);
+    try testing.expect(utilization.parked_nanoseconds <= utilization.window_nanoseconds);
+    try testing.expectEqual(
+        utilization.window_nanoseconds - utilization.parked_nanoseconds,
+        utilization.busy_nanoseconds,
+    );
+    try testing.expectEqual(@as(usize, 1), manager.teardown_count);
+    try kernel.expectExactAccounting();
+}
+
+test "Scheduler: runQueueDepth reflects queued admissions and returns to zero at quiescence" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(test_scheduler_options);
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    try testing.expectEqual(@as(usize, 0), kernel.scheduler.runQueueDepth());
+    var spawned: usize = 0;
+    while (spawned < 3) : (spawned += 1) {
+        _ = try kernel.scheduler.spawn(.{
+            .entry = yieldManyEntry,
+            .manager = manager.managerContext(),
+        });
+    }
+    try testing.expectEqual(@as(usize, 3), kernel.scheduler.runQueueDepth());
+    try kernel.scheduler.runUntilQuiescent();
+    try testing.expectEqual(@as(usize, 0), kernel.scheduler.runQueueDepth());
+    try testing.expectEqual(@as(usize, 3), manager.teardown_count);
     try kernel.expectExactAccounting();
 }

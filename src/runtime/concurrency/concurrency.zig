@@ -191,6 +191,7 @@ pub const deterministic = @import("deterministic.zig");
 pub const deterministic_mn = @import("deterministic_mn.zig");
 pub const introspection = @import("introspection.zig");
 pub const crash_report = @import("crash_report.zig");
+pub const trace = @import("trace.zig");
 
 pub const StackPool = stack_pool.StackPool;
 pub const Stack = stack_pool.Stack;
@@ -250,6 +251,13 @@ pub const ProcessListIterator = introspection.ProcessListIterator;
 pub const KernelCounters = introspection.KernelCounters;
 pub const CrashReport = crash_report.CrashReport;
 pub const ReportHook = crash_report.ReportHook;
+pub const TraceEventKind = trace.TraceEventKind;
+pub const TraceEventRecord = trace.TraceEventRecord;
+pub const DeadlockAction = scheduler.DeadlockAction;
+pub const DeadlockReport = scheduler.DeadlockReport;
+pub const DeadlockHook = scheduler.DeadlockHook;
+pub const StarvationReport = scheduler.StarvationReport;
+pub const StarvationHook = scheduler.StarvationHook;
 
 test {
     // FIRST on purpose: the expect-panic guard tests dispatch child
@@ -283,6 +291,11 @@ test {
     _ = deterministic_mn;
     _ = introspection;
     _ = crash_report;
+    // P6-J6: the compile-time-optional message-flow trace ring (plan item
+    // 6.5) — the ring mechanics are tested directly (small capacities, wrap,
+    // concurrent producers); the flag-ON end-to-end proof is the gate-ON
+    // traced Zap suite.
+    _ = trace;
     _ = @import("teardown_stress.zig");
     _ = @import("adversarial_stress.zig");
     // P4-J1: the scheduler-local-refcount invariant under REAL M:N scheduling

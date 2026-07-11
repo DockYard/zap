@@ -166,8 +166,12 @@ pub const TimingWheel = struct {
     /// Whether `base_clk` has been seeded to real time yet.
     clock_seeded: bool,
     /// Live entry count (the zero-`after` fast path: a scheduler with no timers
-    /// skips advancing entirely).
-    count: usize,
+    /// skips advancing entirely). An ATOMIC cell (P6-J6) purely so the
+    /// deadlock detector's cross-thread scan (`scheduler_pool.zig`) reads a
+    /// whole word race-free; ownership is unchanged — only the owning
+    /// scheduler thread mutates it, with `.monotonic` ops that compile to
+    /// plain loads/stores.
+    count: std.atomic.Value(usize),
     /// Total `advance` outer-loop passes over the wheel's life (telemetry). One
     /// pass fires up to a full level-0 rotation of ticks; a scheduler that stays
     /// current does 0–1 passes per `advance`. Exposed so the DEFER/PERF #5
@@ -192,7 +196,7 @@ pub const TimingWheel = struct {
             .overflow_head = null,
             .base_clk = 0,
             .clock_seeded = false,
-            .count = 0,
+            .count = .init(0),
             .advance_pass_total = 0,
             .allocator = allocator,
             .pool = .empty,
@@ -214,7 +218,17 @@ pub const TimingWheel = struct {
 
     /// Whether the wheel holds no timers — the zero-`after` fast path.
     pub fn isEmpty(wheel: *const TimingWheel) bool {
-        return wheel.count == 0;
+        return wheel.count.load(.monotonic) == 0;
+    }
+
+    /// Thread-safe entry count (P6-J6 observability / deadlock-detector
+    /// read): live timers PLUS stale entries awaiting lazy reap (a
+    /// cross-core message wake invalidates a timer by epoch but leaves the
+    /// node for its owning wheel — see the module doc). An upper bound on
+    /// live timers that converges as stale entries expire; a foreign reader
+    /// sees a momentarily-stale value, never a torn one.
+    pub fn armedCountApprox(wheel: *const TimingWheel) usize {
+        return wheel.count.load(.monotonic);
     }
 
     /// Round an absolute ns deadline up to the first base tick at or after it, so
@@ -260,7 +274,7 @@ pub const TimingWheel = struct {
         // fast path in `advance` covers the case where an advance runs first;
         // whichever fires first keeps `base_clk` current, so the O(1)-after-idle
         // guarantee holds regardless of call order.
-        if (wheel.count == 0) {
+        if (wheel.count.load(.monotonic) == 0) {
             const now_tick = now_nanoseconds / base_tick_nanoseconds;
             if (now_tick > wheel.base_clk) wheel.base_clk = now_tick;
         }
@@ -281,7 +295,7 @@ pub const TimingWheel = struct {
             .index = 0,
         };
         wheel.link(entry);
-        wheel.count += 1;
+        _ = wheel.count.fetchAdd(1, .monotonic);
         return entry;
     }
 
@@ -291,8 +305,8 @@ pub const TimingWheel = struct {
     pub fn cancel(wheel: *TimingWheel, entry: *Entry) void {
         wheel.unlink(entry);
         wheel.pool.destroy(entry);
-        std.debug.assert(wheel.count > 0);
-        wheel.count -= 1;
+        std.debug.assert(wheel.count.load(.monotonic) > 0);
+        _ = wheel.count.fetchSub(1, .monotonic);
     }
 
     /// Place `entry` into the correct level/bucket (or the overflow list) for its
@@ -363,7 +377,7 @@ pub const TimingWheel = struct {
     /// coarse bucket down and then re-tighten, which is correct (a timer only
     /// ever fires once `current_ns ≥ its deadline`).
     fn earliestBoundaryTick(wheel: *const TimingWheel) ?u64 {
-        if (wheel.count == 0) return null;
+        if (wheel.count.load(.monotonic) == 0) return null;
         var earliest: ?u64 = null;
         var level: usize = 0;
         while (level < level_count) : (level += 1) {
@@ -425,7 +439,7 @@ pub const TimingWheel = struct {
         // on a MESSAGE — costs O(idle_ticks / wheel_size) on the scheduler hot
         // path. `base_clk` lands on `now_tick` so the next `insert` places its
         // levels relative to real time.
-        if (wheel.count == 0) {
+        if (wheel.count.load(.monotonic) == 0) {
             if (now_tick > wheel.base_clk) wheel.base_clk = now_tick;
             return;
         }
@@ -478,8 +492,8 @@ pub const TimingWheel = struct {
                 node = entry.next;
                 _ = fire(fire_context, entry.context, entry.epoch);
                 wheel.pool.destroy(entry);
-                std.debug.assert(wheel.count > 0);
-                wheel.count -= 1;
+                std.debug.assert(wheel.count.load(.monotonic) > 0);
+                _ = wheel.count.fetchSub(1, .monotonic);
             }
         }
     }
@@ -539,7 +553,7 @@ pub const TimingWheel = struct {
         fire_context: Context,
         comptime fire: fn (Context, *anyopaque, u64) FireOutcome,
     ) bool {
-        if (wheel.count == 0) return false;
+        if (wheel.count.load(.monotonic) == 0) return false;
         // Advance to the earliest entry's exact deadline so at least one fires.
         const target_tick = wheel.earliestEntryDeadlineTick() orelse return false;
         wheel.advance(tickToNanoseconds(target_tick), Context, fire_context, fire);
@@ -630,18 +644,18 @@ test "TimingWheel: insert then advance past the deadline fires exactly once" {
 
     // Seed the clock at t=0, arm a 5 ms timer.
     _ = try wheel.insert(tagContext(1), 0, 5 * std.time.ns_per_ms, 0);
-    try testing.expectEqual(@as(usize, 1), wheel.count);
+    try testing.expectEqual(@as(usize, 1), wheel.count.load(.monotonic));
 
     // Advance to 4 ms: not yet due.
     wheel.advance(4 * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
     try testing.expectEqual(@as(usize, 0), log.fired.items.len);
-    try testing.expectEqual(@as(usize, 1), wheel.count);
+    try testing.expectEqual(@as(usize, 1), wheel.count.load(.monotonic));
 
     // Advance to 5 ms: fires.
     wheel.advance(5 * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
     try testing.expectEqual(@as(usize, 1), log.fired.items.len);
     try testing.expectEqual(@as(usize, 1), log.fired.items[0]);
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 
     // Advancing further fires nothing more.
     wheel.advance(100 * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
@@ -660,7 +674,7 @@ test "TimingWheel: advance/insert after an arbitrary idle is O(1), not O(gap) (D
     _ = try wheel.insert(tagContext(1), 0, seed_ns + base_tick_nanoseconds, seed_ns);
     wheel.advance(seed_ns + 2 * base_tick_nanoseconds, *FireLog, &log, FireLog.fire);
     try testing.expectEqual(@as(usize, 1), log.fired.items.len);
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
     const low_base_clk = wheel.base_clk;
 
     // A LONG timer-free idle: real time jumps ~1e9 ticks (≈ 11.6 days at 1 ms
@@ -683,7 +697,7 @@ test "TimingWheel: advance/insert after an arbitrary idle is O(1), not O(gap) (D
     try testing.expectEqual(@as(usize, 2), log.fired.items.len);
     try testing.expectEqual(@as(usize, 2), log.fired.items[1]);
     try testing.expect(wheel.advance_pass_total - passes_before_fire <= 2);
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 
     // Advance-side fast path: an advance on the now-empty wheel after ANOTHER
     // long idle snaps `base_clk` in O(1) — ZERO outer-loop passes.
@@ -716,9 +730,9 @@ test "TimingWheel: cancel removes a timer so it never fires (message beats deadl
     defer log.deinit();
 
     const entry = try wheel.insert(tagContext(7), 0, 50 * std.time.ns_per_ms, 0);
-    try testing.expectEqual(@as(usize, 1), wheel.count);
+    try testing.expectEqual(@as(usize, 1), wheel.count.load(.monotonic));
     wheel.cancel(entry);
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 
     wheel.advance(100 * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
     try testing.expectEqual(@as(usize, 0), log.fired.items.len);
@@ -738,12 +752,12 @@ test "TimingWheel: hierarchical cascade — a far timer fires at the right time"
     // Advance in coarse jumps up to just before the deadline: nothing fires.
     wheel.advance((deadline_ms - 1) * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
     try testing.expectEqual(@as(usize, 0), log.fired.items.len);
-    try testing.expectEqual(@as(usize, 1), wheel.count);
+    try testing.expectEqual(@as(usize, 1), wheel.count.load(.monotonic));
 
     // Reach the deadline: fires.
     wheel.advance(deadline_ms * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
     try testing.expectEqual(@as(usize, 1), log.fired.items.len);
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 }
 
 test "TimingWheel: many staggered timers fire in deadline order" {
@@ -766,7 +780,7 @@ test "TimingWheel: many staggered timers fire in deadline order" {
         _ = try wheel.insert(tagContext(i + 1), 0, @as(u64, ms) * std.time.ns_per_ms, 0);
         inserted += 1;
     }
-    try testing.expectEqual(@as(usize, total), wheel.count);
+    try testing.expectEqual(@as(usize, total), wheel.count.load(.monotonic));
 
     // Advance one ms at a time; each ms fires exactly the timer for that ms.
     var ms: usize = 1;
@@ -775,7 +789,7 @@ test "TimingWheel: many staggered timers fire in deadline order" {
         try testing.expectEqual(@as(usize, ms), log.fired.items.len);
         try testing.expectEqual(@as(usize, ms), log.fired.items[ms - 1]); // tag == ms, in order
     }
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 }
 
 test "TimingWheel: a single big advance fires all past-due timers in order" {
@@ -796,7 +810,7 @@ test "TimingWheel: a single big advance fires all past-due timers in order" {
     for (0..deadlines_ms.len) |k| {
         try testing.expectEqual(@as(usize, k + 1), log.fired.items[k]);
     }
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 }
 
 test "TimingWheel: earliestDeadline reflects the nearest timer and shrinks as timers fire" {
@@ -823,7 +837,7 @@ test "TimingWheel: earliestDeadline reflects the nearest timer and shrinks as ti
 
     // Drain the remaining timers (deinit asserts the wheel is empty).
     wheel.advance(5000 * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 }
 
 test "TimingWheel: stale (discarded) entries are freed without firing" {
@@ -841,7 +855,7 @@ test "TimingWheel: stale (discarded) entries are freed without firing" {
     // Only tag 1 recorded; both nodes freed (count back to 0).
     try testing.expectEqual(@as(usize, 1), log.fired.items.len);
     try testing.expectEqual(@as(usize, 1), log.fired.items[0]);
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 }
 
 test "TimingWheel: deterministic advanceToEarliestAndFire fires the earliest waiter" {
@@ -875,10 +889,10 @@ test "TimingWheel: overflow list holds a beyond-top-wheel deadline and fires it"
     const far: u64 = std.math.maxInt(u64) - base_tick_nanoseconds;
     const entry = try wheel.insert(tagContext(9), 0, far, 0);
     try testing.expectEqual(overflow_level, entry.level);
-    try testing.expectEqual(@as(usize, 1), wheel.count);
+    try testing.expectEqual(@as(usize, 1), wheel.count.load(.monotonic));
     // It is cancellable from the overflow list.
     wheel.cancel(entry);
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
 }
 
 /// A fire sink that records, per fired context, the tick at which it fired — so
@@ -920,7 +934,7 @@ test "TimingWheel: 10k timers with random deadlines each fire exactly once, neve
         deadline_tick[i] = ms; // 1 ms tick ⇒ tick == ms
         _ = try wheel.insert(tagContext(i + 1), 0, ms * std.time.ns_per_ms, 0);
     }
-    try testing.expectEqual(@as(usize, total), wheel.count);
+    try testing.expectEqual(@as(usize, total), wheel.count.load(.monotonic));
 
     var sink = StressSink{ .fire_tick = fire_tick, .fire_count = fire_count };
     // Advance 1 ms at a time to the horizon; every timer fires as its ms arrives.
@@ -931,7 +945,7 @@ test "TimingWheel: 10k timers with random deadlines each fire exactly once, neve
     }
 
     // Every timer fired exactly once, and never before its deadline tick.
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
     for (0..total) |k| {
         try testing.expectEqual(@as(u8, 1), fire_count[k]);
         try testing.expect(fire_tick[k] >= deadline_tick[k]); // never early
@@ -959,6 +973,6 @@ test "TimingWheel: interleaved insert/cancel/advance keeps counts exact (leak ch
         now_ms += 10;
         wheel.advance(now_ms * std.time.ns_per_ms, *FireLog, &log, FireLog.fire);
     }
-    try testing.expectEqual(@as(usize, 0), wheel.count);
+    try testing.expectEqual(@as(usize, 0), wheel.count.load(.monotonic));
     try testing.expectEqual(@as(usize, 200), log.fired.items.len); // only tag-2 survivors fired
 }

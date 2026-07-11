@@ -51,6 +51,19 @@
   bridge only; the `spawn`/`send`/`receive` language surface lands in
   later Phase 2 jobs of `docs/concurrency-implementation-plan.md`.
 
+  ## `runtime_tracing:` field
+
+  Comptime gate over the concurrency kernel's message-flow trace
+  points (spawn / exit / send / receive / signal delivery). When
+  `false` (the default), the kernel is compiled with ZERO trace
+  instructions on those paths and `RuntimeInfo.trace_enabled()` is
+  `false` — the zero-cost posture. When `true`, every event is
+  recorded into a bounded in-memory ring (the newest 4096 events)
+  readable through `RuntimeInfo.trace_*`. Requires
+  `runtime_concurrency: true` — enabling tracing on a gate-off build
+  is a build error. The CLI `-Druntime-tracing=on|off` flag overrides
+  this per-field.
+
   ## `pipeline:` field
 
   Overrides the command pipeline for this manifest. When omitted, Zap
@@ -71,6 +84,7 @@ pub struct Zap.Manifest {
   deps :: [Zap.Dep] = []
   memory :: Type = Memory.ARC
   runtime_concurrency :: Bool = false
+  runtime_tracing :: Bool = false
   build_opts :: [{String, String}] = []
   test_timeout :: i64 = 0
   error_style :: String = ""

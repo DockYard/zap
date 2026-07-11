@@ -2256,6 +2256,72 @@ power of two at or above the walker(page-backed-C)-vs-promote crossover; keep
 the gate-ON `test_concurrency/string_blob_test.zap` payload sizes at 2× the
 threshold.
 
+## P6-J6 — full observability (2026-07-10): trace-ring overhead + zero-cost-OFF proofs
+
+Plan item 6.5 (research.md §6.9). Method + numbers for the two claims the job
+must quantify: the message-flow trace ring's per-event cost when ON, and its
+zero cost when OFF.
+
+### Trace-ON overhead (kernel ping-pong, the E1 harness)
+
+`bench/concurrency-kernel` `pingpong` (100,000 RTTs, 5 reps, ReleaseFast,
+fork compiler, self-verified zero parks), compiled twice: once against the
+tree kernel (trace OFF) and once against a staged copy with
+`RUNTIME_TRACE_DEFAULT = true` (exactly what `-Druntime-tracing=on` stages).
+One RTT = 2 sends + 2 receives = 4 trace events (each: one clock read + one
+`fetchAdd` ticket + five relaxed atomic stores into the ring slot).
+
+| run | OFF median / min (ns/RTT) | ON median / min (ns/RTT) |
+|---|---|---|
+| 1 | 130.1 / 120.4 | 188.3 / 173.7 |
+| 2 | 133.5 / 121.4 | 168.9 / 164.5 |
+
+Overhead ≈ **40–58 ns per RTT** ⇒ **~10–15 ns per trace event**, i.e.
+**~20–29 ns per message** (its send + receive events). This is the
+documented price of `runtime_tracing: true`; the ring itself is 4096 × 40 B
+= 160 KiB of BSS, present only in trace-ON kernels.
+
+### Zero-cost-OFF proofs
+
+* **Symbol absence**: the trace-OFF bench binary carries ZERO trace-ring
+  symbols (`nm | grep -cE 'global_ring_storage|TraceRing|emitGlobal'` = 0);
+  the trace-ON binary carries `_trace.global_ring_storage` (the 160 KiB
+  ring). Every emit site is `if (comptime runtime_trace_active)` — comptime
+  elimination, so the OFF kernel contains no trace instruction and reads no
+  clock on any send/receive/spawn/exit/signal path.
+* **Gate-OFF byte-identity (pre/post-P6-J6 compiler)**: mandelbrot
+  (ReleaseFast, `zap run` script mode, fresh isolated `XDG_CACHE_HOME`)
+  compiled by the pre-job compiler (HEAD `6d1bd1e`, rebuilt at the SAME
+  tree path) and the post-job compiler have IDENTICAL `__TEXT,__text`
+  SHA-256 (`aa481e14…3481e5`), and both carry zero
+  `zap_proc_*`/`zap_trace_*`/`zap_sched_*`/`zap_introspect_*` symbols.
+  Environmental footnote discovered en route: a compiler built from
+  IDENTICAL source at a DIFFERENT absolute path (a /tmp worktree) emits
+  marginally different user-binary text (3 std-debug/io symbols flip
+  in/out; `__MergedGlobals` count shifts) — a pre-existing
+  path-sensitivity of the toolchain, isolated by a 2×2
+  compiler×stdlib swap (the stdlib and every P6-J6 source change are
+  text-neutral); same-path builds are deterministic and identical.
+
+### Detector posture (documented decisions)
+
+* **Deadlock**: detection is exact (the consistent-scan bracket in
+  `scheduler_pool.zig`); the default action is report-once-to-stderr +
+  continue parked (BEAM sits silently; Zap sits loudly).
+  `ZAP_DEADLOCK_ACTION=stop|panic` opts into fail-fast — sound because a
+  detected deadlock is permanent (every producer is a scheduler core or a
+  blocking-pool worker, and all are provably idle at detection). Known
+  benign detection DELAY: a stale cross-core-cancelled `receive … after`
+  wheel entry keeps the armed-timer count nonzero until its lazy reap, so
+  detection waits out the stale deadline — never lost, never early.
+* **Starvation**: head-tenure watermark (consecutive passed-over picks at a
+  core's FIFO head), threshold 4096 picks. Production FIFO picks the head
+  every time and the `runnext` bypass is fairness-bounded at 61, so the
+  detector is structurally silent in production (verified at threshold 1)
+  — it VERIFIES the P4-R2 fairness rather than assuming it, and fires with
+  a naming diagnostic under a genuinely unfair pick policy (the synthetic
+  never-pick-the-head `Decisions` test).
+
 ## Baseline comparison yardstick
 
 External systems' spawn/RTT numbers (from `research-round-2.md` Q10) — the

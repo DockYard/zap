@@ -1137,6 +1137,35 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
 - **6.5** Full observability: send/receive trace points (compile-time-optional), scheduler
   utilization, run-queue depth, deadlock ("all waiting, none runnable") and starvation
   detection.
+  - **DONE (P6-J6, 2026-07-10).** Ledger § "P6-J6 — full observability" has the method +
+    measurements. (1) **Trace points**: spawn/exit/send/receive/signal-delivery events into a
+    bounded lock-free in-memory ring (4096 newest; the honest v1 sink — readable from Zap, no
+    callback re-entrancy on hot paths), comptime-gated behind a NEW `runtime_tracing`
+    manifest field / `-Druntime-tracing=on` following the P2-J1 marker-rewrite pattern
+    applied to the kernel unit (`trace.zig`'s `RUNTIME_TRACE_DEFAULT`, rewritten in a STAGED
+    copy by `concurrency_driver.zig` — the tree is never touched; the flag joins the kernel
+    object's content-address key). OFF ⇒ zero trace instructions and zero ring storage
+    (verified: no `trace.global_ring_storage` symbol; gate-OFF binaries byte-identical
+    pre/post job); ON ⇒ ~40–58 ns per ping-pong RTT (4 events) ≈ 10–15 ns/event, measured.
+    (2) **Scheduler utilization**: per-core busy/parked wall-time split from monotonic
+    timestamps at the park/unpark boundaries (spin counts busy — the BEAM "active" notion);
+    thread-safe atomic snapshot composition. (3) **Run-queue depth**: per-core (locked FIFO +
+    atomic LIFO slot) + global-queue depth, coherent thread-safe reads. (4) **Deadlock
+    detection**: the pool's last-idle-core consistent scan (idle-exit-epoch bracket +
+    steal-sweep seqlock + per-core atomic wake/reattach/timer reads + blocking-pool
+    queued/in-flight under its lock) — provably no false positives under M:N; pending
+    `receive … after` timers and in-flight blocking work correctly suppress it; the
+    standalone scheduler's single-threaded predicate is exact. v1 action: report once
+    (hook or stderr diagnostic naming every waiting process with mailbox depth/heap
+    bytes/suspend pc) then CONTINUE parked by default (BEAM-compatible-plus-diagnostic);
+    `ZAP_DEADLOCK_ACTION=stop|panic` opts into fail-fast (sound: a detected deadlock is
+    permanent — no external wake source exists). (5) **Starvation detection**: head-tenure
+    watermark on the pick path (consecutive passed-over picks at a core's FIFO head) —
+    structurally silent under production FIFO + the 61-tick runnext fairness (verified by
+    a threshold=1 test), fires with a naming diagnostic under a synthetic never-pick-the-head
+    `Decisions` policy. (6) **Zap surface**: `lib/runtime_info.zap` (`RuntimeInfo`) —
+    process listing (pids/states/mailbox depths/heap bytes), per-core utilization +
+    queue depths, and the trace-ring read API; total in both trace modes.
 - **6.6** Gate-ON tight-loop safepoint mitigation (E2 follow-up; owner for the deferred
   mitigation flagged in item 2.5 and `docs/concurrency-bench-results.md` § E2). Amortize the
   cooperative safepoint poll on the tight non-FP loops that regressed gate-ON — fannkuch-redux

@@ -141,6 +141,22 @@ pub const SchedulerPool = struct {
     /// The root process's raw pid bits in root mode (0 ⇒ quiescent mode). When a
     /// process with these bits completes teardown the pool stops (Erlang halt).
     root_target_bits: u64,
+    /// P6-J6 deadlock-detector bracket, part 1: bumped every time a worker
+    /// DEREGISTERS from idle (`parkWorker`'s `idle_count` decrement). The
+    /// detector's scan is valid only if this is unchanged across it — an
+    /// unchanged epoch (with `idle_count == N` at both ends) proves no core
+    /// left idle during the scan, closing the register→work→re-register ABA
+    /// window on `idle_count` alone. See `maybeDetectDeadlock`.
+    idle_exit_epoch: std.atomic.Value(u64),
+    /// P6-J6 deadlock-detector bracket, part 2: a seqlock around every steal
+    /// sweep (`tryStealFor` bumps it before and after, so ODD = a sweep is in
+    /// flight). A sweep holds detached records in hand — invisible to any
+    /// queue scan — between the victim unlink and the thief splice; the
+    /// detector requires an EVEN, UNCHANGED value across its scan so no
+    /// in-hand work can hide from it.
+    steal_bracket: std.atomic.Value(u64),
+    /// One deadlock report per `drive` run (reset there).
+    deadlock_reported: std.atomic.Value(bool),
 
     /// Construction options.
     pub const Options = struct {
@@ -192,6 +208,9 @@ pub const SchedulerPool = struct {
             .idle_count = .init(0),
             .stopping = .init(false),
             .root_target_bits = 0,
+            .idle_exit_epoch = .init(0),
+            .steal_bracket = .init(0),
+            .deadlock_reported = .init(false),
         };
 
         // Bring up the shared blocking / dirty-scheduler pool AFTER `pool.*` is
@@ -348,6 +367,7 @@ pub const SchedulerPool = struct {
     fn drive(pool: *SchedulerPool) void {
         pool.stopping.store(false, .release);
         pool.idle_count.store(0, .release);
+        pool.deadlock_reported.store(false, .release);
 
         // Start worker threads for cores 1..N−1. If a thread fails to spawn the
         // pool degrades to fewer cores (the already-started workers plus the
@@ -451,6 +471,11 @@ pub const SchedulerPool = struct {
     fn tryStealFor(pool: *SchedulerPool, thief: *Scheduler, steal_rng: *u64) bool {
         const n = pool.cores.len;
         if (n <= 1) return false;
+        // Deadlock-detector seqlock (P6-J6): a sweep holds detached records
+        // in hand between the victim unlink and the thief splice — open the
+        // bracket (odd) so a concurrent deadlock scan cannot miss them.
+        _ = pool.steal_bracket.fetchAdd(1, .seq_cst);
+        defer _ = pool.steal_bracket.fetchAdd(1, .seq_cst);
         const start = randNext(steal_rng) % n;
         var offset: usize = 0;
         while (offset < n) : (offset += 1) {
@@ -479,11 +504,161 @@ pub const SchedulerPool = struct {
             !pool.global_queue.isEmptyApprox() or
             pool.tryStealFor(core, steal_rng))
         {
-            _ = pool.idle_count.fetchSub(1, .seq_cst);
+            pool.deregisterIdle();
             return;
         }
+        // P6-J6: every source is empty and this core is about to sleep — if
+        // EVERY core is in the same position, the system may be deadlocked.
+        // The scan is cheap, runs only on the park path (never on a hot
+        // path), and re-runs on every park cycle (the park is time-bounded),
+        // so a detection deferred by a racing bracket is only delayed one
+        // park timeout, never lost.
+        pool.maybeDetectDeadlock();
         core.parkForWork();
+        pool.deregisterIdle();
+    }
+
+    /// Leave the idle set (P6-J6 bracket discipline): the epoch bump is
+    /// sequenced AFTER the decrement, so a detector that read
+    /// `idle_count == N` including this worker's later RE-registration is
+    /// guaranteed to observe the bump (seq_cst total order) — no
+    /// deregister→work→re-register episode can hide inside a scan bracket.
+    fn deregisterIdle(pool: *SchedulerPool) void {
         _ = pool.idle_count.fetchSub(1, .seq_cst);
+        _ = pool.idle_exit_epoch.fetchAdd(1, .seq_cst);
+    }
+
+    // -------------------------------------------------------------------------
+    // Deadlock detection (P6-J6, plan item 6.5 — research.md §6.9 "all
+    // processes waiting, none runnable")
+    // -------------------------------------------------------------------------
+
+    /// The M:N system-deadlock predicate: live processes exist, yet no core
+    /// holds runnable work, no revival is pending, no `receive … after`
+    /// timer is armed anywhere, and no blocking-pool work is queued or in
+    /// flight — i.e. NO source of progress exists. On a consistent
+    /// observation, report once and apply the configured `DeadlockAction`
+    /// (`core_options.deadlock_*` — all cores share one options value).
+    ///
+    /// ## Consistency argument (why this cannot false-positive under M:N)
+    ///
+    /// Work (a runnable process, a wake, a timer fire) is created ONLY by
+    /// (a) a scheduler core running its loop, or (b) a blocking-pool worker
+    /// finishing an op. There is no other producer: `spawn` is
+    /// core-resident, timers fire on their owning core, and the driver
+    /// thread IS core 0. The scan therefore brackets itself:
+    ///
+    ///   1. read `idle_exit_epoch` (E1), require `idle_count == N`, require
+    ///      `steal_bracket` even (S1);
+    ///   2. scan: pool-wide live count > 0; blocking pool idle (queue +
+    ///      in-flight == 0, under its lock); per core — wake stack empty,
+    ///      reattach stack empty, armed-timer count 0, run-queue depth 0
+    ///      (FIFO under that core's lock + the atomic LIFO slot);
+    ///   3. re-read in reverse: `steal_bracket == S1`, `idle_count == N`,
+    ///      `idle_exit_epoch == E1`.
+    ///
+    /// `idle_count == N` at both ends with an UNCHANGED exit epoch proves no
+    /// core left the idle set during the scan (the epoch bump in
+    /// `deregisterIdle` is sequenced after the decrement, so a
+    /// leave-work-rejoin episode always changes E — the ABA `idle_count`
+    /// alone could miss). A core continuously in the idle set runs only the
+    /// park path, which creates no work and moves no queue except through a
+    /// steal sweep — and any sweep overlapping the scan flips or advances
+    /// the seqlock (`steal_bracket`), failing check 3. Work that PRE-dated
+    /// the last idle registration is visible to the scan: every publisher
+    /// (queue push under a run-queue lock, Treiber wake/reattach push,
+    /// atomic timer count, blocking submit under its lock) is ordered before
+    /// that core's seq_cst `idle_count` increment, which the scanner's
+    /// `idle_count == N` acquire-read synchronizes with. A blocking-pool op
+    /// still in flight fails the blocking check (its in-flight count
+    /// decrements only AFTER its re-attach push, under the same lock the
+    /// scan reads). Every leg reads an atomic or takes the owning lock —
+    /// the scan is ThreadSanitizer-clean and momentarily blocking at worst.
+    ///
+    /// False NEGATIVES are possible and benign: a racing bracket defers
+    /// detection to the next park cycle (parks are time-bounded), and a
+    /// stale cross-core-cancelled timer entry keeps `armedTimerCount`
+    /// nonzero until its lazy reap — detection is delayed until the stale
+    /// deadline expires, never lost.
+    fn maybeDetectDeadlock(pool: *SchedulerPool) void {
+        if (pool.deadlock_reported.load(.monotonic)) return;
+        if (pool.stopping.load(.acquire)) return;
+        const core_count = pool.cores.len;
+        // Bracket open.
+        const idle_exit_before = pool.idle_exit_epoch.load(.seq_cst);
+        if (pool.idle_count.load(.seq_cst) != core_count) return;
+        const steal_before = pool.steal_bracket.load(.seq_cst);
+        if (steal_before & 1 != 0) return; // a steal sweep is in flight
+        // Scan.
+        const live = pool.live_count.load(.seq_cst);
+        if (live <= 0) return; // quiescence, not deadlock
+        if (!pool.blocking_pool.isIdleApprox()) return; // an op will re-attach
+        for (pool.cores) |*core| {
+            if (core.hasPendingWake()) return;
+            if (core.hasPendingReattach()) return;
+            if (core.armedTimerCount() != 0) return; // an after-arm will fire
+            if (core.runQueueDepth() != 0) return;
+        }
+        if (!pool.global_queue.isEmptyApprox()) return;
+        // Bracket close (reverse order; see the doc).
+        if (pool.steal_bracket.load(.seq_cst) != steal_before) return;
+        if (pool.idle_count.load(.seq_cst) != core_count) return;
+        if (pool.idle_exit_epoch.load(.seq_cst) != idle_exit_before) return;
+        // Consistent observation — a genuine deadlock. Exactly one core
+        // reports (the swap arbitrates racing detectors).
+        if (pool.deadlock_reported.swap(true, .seq_cst)) return;
+        pool.reportDeadlock(@intCast(live));
+    }
+
+    /// Report a detected deadlock through the shared sink
+    /// (`scheduler.fireDeadlockReport`) and apply the configured action.
+    /// All cores share one options value, so core 0's is authoritative.
+    fn reportDeadlock(pool: *SchedulerPool, live: u64) void {
+        const options = &pool.cores[0].options;
+        const report = scheduler_module.DeadlockReport{
+            .live_process_count = live,
+            .scheduler_count = pool.cores.len,
+            .pid_table = pool.pid_table,
+        };
+        scheduler_module.fireDeadlockReport(
+            options.deadlock_hook,
+            options.deadlock_context,
+            &report,
+            options.deadlock_action,
+        );
+        switch (options.deadlock_action) {
+            .report_and_continue => {},
+            .report_and_stop => {
+                pool.stopping.store(true, .release);
+                pool.wakeAll();
+            },
+            .report_and_panic => @panic(
+                "zap: system deadlock detected — every process is waiting and nothing can wake one " ++
+                    "(deadlock_action = report_and_panic)",
+            ),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Observability surfaces (P6-J6, plan item 6.5)
+    // -------------------------------------------------------------------------
+
+    /// Run-queue depth of core `core_index` (thread-safe; see
+    /// `Scheduler.runQueueDepth`).
+    pub fn coreRunQueueDepth(pool: *SchedulerPool, core_index: usize) usize {
+        return pool.cores[core_index].runQueueDepth();
+    }
+
+    /// Depth of the shared global overflow queue (approximate under
+    /// concurrency, exact at quiescence).
+    pub fn globalRunQueueDepth(pool: *const SchedulerPool) usize {
+        return pool.global_queue.count.load(.monotonic);
+    }
+
+    /// Busy/idle utilization split of core `core_index` (thread-safe; see
+    /// `Scheduler.utilizationSnapshot`).
+    pub fn coreUtilization(pool: *const SchedulerPool, core_index: usize) Scheduler.UtilizationSnapshot {
+        return pool.cores[core_index].utilizationSnapshot();
     }
 
     // -------------------------------------------------------------------------
@@ -1251,5 +1426,274 @@ test "SchedulerPool: message-vs-after-timer race across cores yields exactly one
     try testing.expectEqual(pair_count * 2, manager.teardown_count.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), pid_table.statistics().live_process_count);
     try testing.expectEqual(@as(u32, 0), envelope_pool.statistics().live_page_count);
+    try testing.expectEqual(@as(i64, 0), pool.liveProcessCount());
+}
+
+// -- P6-J6 deadlock detection under the real M:N pool (plan item 6.5) ----------
+
+/// Test-only monotonic clock for the blocking-op spin (test code may use
+/// libc — the kernel's own paths do not; same idiom as `blocking_stress.zig`).
+fn testNowNanoseconds() u64 {
+    var now: std.c.timespec = undefined;
+    std.debug.assert(std.c.clock_gettime(.MONOTONIC, &now) == 0);
+    return @as(u64, @intCast(now.sec)) * std.time.ns_per_s + @as(u64, @intCast(now.nsec));
+}
+
+/// Capturing deadlock sink (the pool-detector analogue of the standalone
+/// sink in `scheduler.zig`): counts reports and records the waiting pids.
+const PoolDeadlockSink = struct {
+    report_count: std.atomic.Value(usize) = .init(0),
+    live_process_count: std.atomic.Value(u64) = .init(0),
+    scheduler_count: std.atomic.Value(usize) = .init(0),
+    named_pid_bits: [8]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+
+    fn hook(deadlock_context: ?*anyopaque, report: *const scheduler_module.DeadlockReport) void {
+        const sink: *PoolDeadlockSink = @ptrCast(@alignCast(deadlock_context.?));
+        _ = sink.report_count.fetchAdd(1, .seq_cst);
+        sink.live_process_count.store(report.live_process_count, .seq_cst);
+        sink.scheduler_count.store(report.scheduler_count, .seq_cst);
+        var named: usize = 0;
+        var live_iterator = report.pid_table.iterateLiveProcesses();
+        while (live_iterator.next()) |live| {
+            if (named == sink.named_pid_bits.len) break;
+            sink.named_pid_bits[named].store(live.pid.toBits(), .seq_cst);
+            named += 1;
+        }
+    }
+
+    fn names(sink: *const PoolDeadlockSink, pid_bits: u64) bool {
+        for (&sink.named_pid_bits) |*named| {
+            if (named.load(.seq_cst) == pid_bits) return true;
+        }
+        return false;
+    }
+};
+
+fn deadlockedWaiterBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    _ = argument;
+    _ = context.receive();
+    @panic("deadlockedWaiterBody: received a message nobody can send");
+}
+
+test "SchedulerPool: a genuinely deadlocked system (two receive-blocked processes, no sender) is detected and both are named" {
+    var pid_table = try PidTable.init(testing.allocator, .{ .capacity = 16 });
+    defer pid_table.deinit();
+    var envelope_pool = EnvelopePool.init(testing.allocator, .{});
+    defer envelope_pool.deinit();
+    var manager = PoolTestManager{};
+    var sink = PoolDeadlockSink{};
+
+    var pool: SchedulerPool = undefined;
+    try SchedulerPool.init(&pool, testing.allocator, &pid_table, &envelope_pool, .{
+        .scheduler_count = 4,
+        .core_options = .{
+            .deadlock_hook = PoolDeadlockSink.hook,
+            .deadlock_context = &sink,
+            // Stop the pool on detection so the test run terminates; the
+            // stragglers are reaped below (the documented stop semantics).
+            .deadlock_action = .report_and_stop,
+        },
+    });
+    defer pool.deinit();
+
+    const first_pid = try pool.primaryCore().spawn(.{
+        .entry = deadlockedWaiterBody,
+        .manager = manager.managerContext(),
+        .model = .refcounted,
+    });
+    const second_pid = try pool.primaryCore().spawn(.{
+        .entry = deadlockedWaiterBody,
+        .manager = manager.managerContext(),
+        .model = .refcounted,
+    });
+
+    // Both processes park; every core goes idle; the consistent-scan
+    // detector fires; `.report_and_stop` stops the pool and the run returns.
+    pool.runUntilQuiescent();
+
+    try testing.expectEqual(@as(usize, 1), sink.report_count.load(.seq_cst));
+    try testing.expectEqual(@as(u64, 2), sink.live_process_count.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 4), sink.scheduler_count.load(.seq_cst));
+    try testing.expect(sink.names(first_pid.toBits()));
+    try testing.expect(sink.names(second_pid.toBits()));
+
+    // Reap the deadlocked stragglers (Erlang halt), leak-exact.
+    pool.shutdownAllProcesses();
+    try testing.expectEqual(@as(usize, 2), manager.teardown_count.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), pid_table.statistics().live_process_count);
+    try testing.expectEqual(@as(i64, 0), pool.liveProcessCount());
+}
+
+const DeadlockTimerState = struct {
+    receiver_pid_bits: std.atomic.Value(u64) = .init(0),
+    timed_out: std.atomic.Value(bool) = .init(false),
+};
+
+fn timedWaiterThenSendBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    const state: *DeadlockTimerState = @ptrCast(@alignCast(argument.?));
+    // Park with an armed after-deadline: while every core idles, the armed
+    // timer is the one source of progress — the detector must NOT flag it.
+    const outcome = context.receiveWaitTimeout(20 * std.time.ns_per_ms);
+    if (outcome == .timed_out) state.timed_out.store(true, .seq_cst);
+    const receiver = Pid.fromBits(state.receiver_pid_bits.load(.acquire));
+    _ = context.send(receiver, .{}) catch {};
+}
+
+fn receiveOneBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    _ = argument;
+    const envelope = context.receive();
+    envelope_pool_module.free(envelope);
+}
+
+test "SchedulerPool: a pending receive-after timer is NOT flagged as deadlock (the after-arm fires)" {
+    var pid_table = try PidTable.init(testing.allocator, .{ .capacity = 16 });
+    defer pid_table.deinit();
+    var envelope_pool = EnvelopePool.init(testing.allocator, .{});
+    defer envelope_pool.deinit();
+    var manager = PoolTestManager{};
+    var sink = PoolDeadlockSink{};
+    var state = DeadlockTimerState{};
+
+    var pool: SchedulerPool = undefined;
+    try SchedulerPool.init(&pool, testing.allocator, &pid_table, &envelope_pool, .{
+        .scheduler_count = 4,
+        .core_options = .{
+            .deadlock_hook = PoolDeadlockSink.hook,
+            .deadlock_context = &sink,
+            .deadlock_action = .report_and_stop,
+        },
+    });
+    defer pool.deinit();
+
+    const receiver = try pool.primaryCore().spawn(.{
+        .entry = receiveOneBody,
+        .manager = manager.managerContext(),
+        .model = .refcounted,
+    });
+    state.receiver_pid_bits.store(receiver.toBits(), .release);
+    _ = try pool.primaryCore().spawn(.{
+        .entry = timedWaiterThenSendBody,
+        .argument = &state,
+        .manager = manager.managerContext(),
+        .model = .refcounted,
+    });
+
+    // The 20 ms all-idle window is bridged by the armed timer: no report,
+    // the timeout fires, the send unblocks the receiver, genuine quiescence.
+    pool.runUntilQuiescent();
+
+    try testing.expect(state.timed_out.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), sink.report_count.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 2), manager.teardown_count.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), pid_table.statistics().live_process_count);
+    try testing.expectEqual(@as(i64, 0), pool.liveProcessCount());
+}
+
+const DeadlockBlockingState = struct {
+    receiver_pid_bits: std.atomic.Value(u64) = .init(0),
+};
+
+fn spinOffCoreForAWhile(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    _ = operation_argument;
+    // Long enough that every core provably idles while this op is in
+    // flight on the blocking pool (parks are entered within microseconds).
+    const deadline = testNowNanoseconds() + 20 * std.time.ns_per_ms;
+    while (testNowNanoseconds() < deadline) std.atomic.spinLoopHint();
+    return null;
+}
+
+fn blockThenSendBody(context: *ProcessContext, argument: ?*anyopaque) void {
+    const state: *DeadlockBlockingState = @ptrCast(@alignCast(argument.?));
+    _ = context.blocking(spinOffCoreForAWhile, null);
+    const receiver = Pid.fromBits(state.receiver_pid_bits.load(.acquire));
+    _ = context.send(receiver, .{}) catch {};
+}
+
+test "SchedulerPool: blocking-pool work in flight is NOT flagged as deadlock (the op will re-attach)" {
+    var pid_table = try PidTable.init(testing.allocator, .{ .capacity = 16 });
+    defer pid_table.deinit();
+    var envelope_pool = EnvelopePool.init(testing.allocator, .{});
+    defer envelope_pool.deinit();
+    var manager = PoolTestManager{};
+    var sink = PoolDeadlockSink{};
+    var state = DeadlockBlockingState{};
+
+    var pool: SchedulerPool = undefined;
+    try SchedulerPool.init(&pool, testing.allocator, &pid_table, &envelope_pool, .{
+        .scheduler_count = 4,
+        .core_options = .{
+            .deadlock_hook = PoolDeadlockSink.hook,
+            .deadlock_context = &sink,
+            .deadlock_action = .report_and_stop,
+        },
+    });
+    defer pool.deinit();
+
+    const receiver = try pool.primaryCore().spawn(.{
+        .entry = receiveOneBody,
+        .manager = manager.managerContext(),
+        .model = .refcounted,
+    });
+    state.receiver_pid_bits.store(receiver.toBits(), .release);
+    _ = try pool.primaryCore().spawn(.{
+        .entry = blockThenSendBody,
+        .argument = &state,
+        .manager = manager.managerContext(),
+        .model = .refcounted,
+    });
+
+    // While the blocking op spins off-core, the receiver waits and every
+    // core idles with no timer armed — only the blocking-pool leg (queued +
+    // in-flight read under its lock) prevents a false positive. The op then
+    // re-attaches, sends, and the run reaches genuine quiescence.
+    pool.runUntilQuiescent();
+
+    try testing.expectEqual(@as(usize, 0), sink.report_count.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 2), manager.teardown_count.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), pid_table.statistics().live_process_count);
+    try testing.expectEqual(@as(i64, 0), pool.liveProcessCount());
+}
+
+test "SchedulerPool: utilization windows open per core and the queue-depth surfaces read zero at quiescence" {
+    var pid_table = try PidTable.init(testing.allocator, .{ .capacity = 64 });
+    defer pid_table.deinit();
+    var envelope_pool = EnvelopePool.init(testing.allocator, .{});
+    defer envelope_pool.deinit();
+    var manager = PoolTestManager{};
+    var state = WorkStealState{ .manager = &manager };
+
+    var pool: SchedulerPool = undefined;
+    try SchedulerPool.init(&pool, testing.allocator, &pid_table, &envelope_pool, .{ .scheduler_count = 2 });
+    defer pool.deinit();
+
+    var spawned: usize = 0;
+    while (spawned < 16) : (spawned += 1) {
+        _ = try pool.primaryCore().spawn(.{
+            .entry = incrementAndExitBody,
+            .argument = &state,
+            .manager = manager.managerContext(),
+            .model = .refcounted,
+        });
+    }
+    // Queue depth visible before the run: core 0 holds the spawned backlog
+    // (some may already have spilled to the global queue — count both).
+    const queued_before = pool.coreRunQueueDepth(0) + pool.globalRunQueueDepth();
+    try testing.expect(queued_before > 0);
+
+    pool.runUntilQuiescent();
+
+    // Core 0 (the driver) provably ran a window; its split is well-formed.
+    const utilization = pool.coreUtilization(0);
+    try testing.expect(utilization.window_nanoseconds > 0);
+    try testing.expectEqual(
+        utilization.window_nanoseconds,
+        utilization.busy_nanoseconds + utilization.parked_nanoseconds,
+    );
+    var core_index: usize = 0;
+    while (core_index < pool.coreCount()) : (core_index += 1) {
+        try testing.expectEqual(@as(usize, 0), pool.coreRunQueueDepth(core_index));
+    }
+    try testing.expectEqual(@as(usize, 0), pool.globalRunQueueDepth());
+    try testing.expectEqual(@as(usize, 16), manager.teardown_count.load(.monotonic));
     try testing.expectEqual(@as(i64, 0), pool.liveProcessCount());
 }
