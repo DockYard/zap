@@ -754,6 +754,18 @@ inline fn incrementRuntimeStatCounter(counter: *u64) void {
     }
 }
 
+/// Increment an ALWAYS-ON cross-thread observability counter. Unlike the
+/// `collect_arc_stats` family (diagnostics builds only, plain stores), these
+/// counters are a production observable — the move-vs-copy discriminator the
+/// `RuntimeInfo` surface exposes and the gate-ON move tests assert on — and
+/// their increment sites sit on kernel-crossing send/receive paths where
+/// concurrent processes on different cores may race, so the add is atomic.
+/// `.monotonic` suffices: readers need eventually-consistent monotone
+/// counts, never ordering against the payload transfer itself.
+inline fn incrementSharedRuntimeCounter(counter: *u64) void {
+    _ = @atomicRmw(u64, counter, .Add, 1, .monotonic);
+}
+
 inline fn addRuntimeStatCounter(counter: *u64, amount: u64) void {
     if (comptime collect_arc_stats) {
         ensureArcStatsAtexit();
@@ -4471,6 +4483,24 @@ fn movableContainerCell(comptime T: type) ?type {
     return movableFlatMapCell(T);
 }
 
+/// The byte length the receive type computes from a moved cell's OWN header
+/// fields — the moved-path shape witness. The sender detached exactly
+/// `Cell.bufferSize(<sender cell's header fields>)` bytes and the envelope
+/// carries that length, so when sender and receiver agree on the message
+/// type, reading the SAME header fields through the receiver's `Cell`
+/// layout must reproduce the envelope's payload length. A mismatch means
+/// the moved root is not a `Cell` at all (e.g. a moved flat `List` arriving
+/// at a `Map` receive — both movable, so the movability dispatch alone
+/// cannot catch it) and every later field read would fabricate garbage.
+/// `Map` cells are distinguished by their `entry_cap` header field (the
+/// same structural recognition `walkerMapCell` uses).
+fn movedCellPayloadByteLength(comptime Cell: type, cell: *const Cell) usize {
+    if (comptime @hasField(Cell, "entry_cap")) {
+        return Cell.bufferSize(cell.capacity, cell.entry_cap);
+    }
+    return Cell.bufferSize(cell.cap);
+}
+
 /// If `T` is the runtime representation of a Zap map value —
 /// `?*const Map(K, V)` — return the `Map(K, V)` cell type, else null.
 /// Structurally recognized (inline ARC header + `KeyType`/`ValueType` decls +
@@ -5280,6 +5310,46 @@ test "message walker: move-eligibility predicates accept exactly the flat contai
     try std.testing.expect(movableFlatListCell(FlatStruct) == null);
 }
 
+test "message walker: the moved-path shape witness matches exactly the sender's byte length (P6-R1 D2)" {
+    ensureMemoryStartup();
+    // `decodeReceivedEnvelope`'s moved path aborts when the adopted cell's
+    // own header does not reproduce the envelope's payload length under the
+    // receive type's layout — the moved-path mirror of the copy path's
+    // `CorruptMessage` abort. Pin the decision core: the witness equals the
+    // SEND side's detached byte length for a genuine cell, and any other
+    // length (a shape/type disagreement) mismatches.
+
+    var items: ?*const List(i64) = List(i64).new_empty(4);
+    items = List(i64).push(items, 11);
+    items = List(i64).push(items, 22);
+    const list_cell = items.?;
+    const list_sent_bytes = List(i64).bufferSize(list_cell.cap);
+    // Match: the receive-side witness reproduces the sender's length.
+    try std.testing.expectEqual(list_sent_bytes, movedCellPayloadByteLength(List(i64), list_cell));
+    // Mismatch: every perturbed length aborts instead of fabricating a value.
+    try std.testing.expect(movedCellPayloadByteLength(List(i64), list_cell) != list_sent_bytes + 8);
+    try std.testing.expect(movedCellPayloadByteLength(List(i64), list_cell) != list_sent_bytes - 1);
+
+    var table: ?*const Map(u32, i64) = null;
+    table = Map(u32, i64).put(table, 7, 70);
+    table = Map(u32, i64).put(table, 9, 90);
+    const map_cell = table.?;
+    const map_sent_bytes = Map(u32, i64).bufferSize(map_cell.capacity, map_cell.entry_cap);
+    try std.testing.expectEqual(map_sent_bytes, movedCellPayloadByteLength(Map(u32, i64), map_cell));
+    try std.testing.expect(movedCellPayloadByteLength(Map(u32, i64), map_cell) != map_sent_bytes + 8);
+
+    // Cross-shape disagreement (two MOVABLE shapes, so the movability
+    // dispatch alone cannot catch it): a moved flat List arriving at a Map
+    // receive reads the List's header through the Map layout and must NOT
+    // reproduce the List's sent byte length — the exact fabrication the
+    // post-adopt abort exists to stop.
+    const list_read_as_map: *const Map(i64, i64) = @ptrCast(@alignCast(list_cell));
+    try std.testing.expect(movedCellPayloadByteLength(Map(i64, i64), list_read_as_map) != list_sent_bytes);
+
+    List(i64).release(items);
+    Map(u32, i64).release(table);
+}
+
 test "message walker: a struct of scalar+String+List+Map deep-copies by value, independently" {
     ensureMemoryStartup();
     // The task's "a struct containing these" case: a by-value struct whose
@@ -5511,6 +5581,24 @@ pub const RuntimeInfo = struct {
         requireConcurrencyRuntimeGate();
         ZapConcurrencyKernel.zap_trace_reset();
         return true;
+    }
+
+    /// Total same-model O(1) region-move sends DELIVERED so far (binary-wide,
+    /// monotone). Together with `region_move_adopt_count` this is the
+    /// observable move-vs-copy discriminator: a copy-fallback send bumps
+    /// neither counter, so a test that expects the move path asserts the
+    /// count incremented across the send.
+    pub fn region_move_send_count() i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(@atomicLoad(u64, &region_move_sends_total, .monotonic));
+    }
+
+    /// Total moved value graphs ADOPTED by receivers so far (binary-wide,
+    /// monotone): the receive half of the region-move discriminator — the
+    /// payload was re-parented in place, never reconstructed.
+    pub fn region_move_adopt_count() i64 {
+        requireConcurrencyRuntimeGate();
+        return @intCast(@atomicLoad(u64, &region_move_adopts_total, .monotonic));
     }
 };
 
@@ -5951,8 +6039,9 @@ pub const ProcessRuntime = struct {
         if (status == 0) {
             // Delivered — the receiver owns the graph, zero payload bytes
             // copied. Observable via the `region_move_sends_total` counter
-            // (stats builds), the move-vs-copy assertion hook.
-            incrementRuntimeStatCounter(&region_move_sends_total);
+            // (always-on; `RuntimeInfo.region_move_send_count`), the
+            // move-vs-copy assertion hook.
+            incrementSharedRuntimeCounter(&region_move_sends_total);
             return true;
         }
         // Not delivered (dead-letter / OOM): nothing consumed the detached
@@ -6085,8 +6174,23 @@ pub const ProcessRuntime = struct {
             if (comptime movableContainerCell(MessageType)) |Cell| {
                 const alignment = comptime Cell.bufferAlign();
                 ArcRuntime.adoptRegion(@constCast(moved_root), payload_len, alignment);
-                incrementRuntimeStatCounter(&region_move_adopts_total);
-                return @as(MessageType, @ptrCast(@alignCast(moved_root)));
+                incrementSharedRuntimeCounter(&region_move_adopts_total);
+                const received_cell: MessageType = @ptrCast(@alignCast(moved_root));
+                // Post-adopt shape check — the moved-path mirror of the copy
+                // path's `CorruptMessage` abort below. A moved payload whose
+                // cell header does not reproduce the envelope's byte length
+                // under the receive type's layout is a sender/receiver type
+                // disagreement between two MOVABLE shapes (e.g. a moved flat
+                // `List` at a `Map` receive); returning it would fabricate
+                // garbage from misread header fields. Adopt-then-abort keeps
+                // the region owned by this process, so teardown reclaims it.
+                if (movedCellPayloadByteLength(Cell, received_cell.?) != payload_len) @panic(
+                    "zap: Process.receive got a MOVED payload whose cell header does not match the " ++
+                        "receive type's layout (protocol violation — the sender's message type differs " ++
+                        "in shape from the receive type; raw typed receive trusts the caller, the " ++
+                        "receive construct's message-union check narrows this)",
+                );
+                return received_cell;
             } else {
                 @panic("zap: Process.receive got a MOVED payload for a non-movable receive type (protocol violation — the sender and receiver message types disagree)");
             }
@@ -6669,14 +6773,20 @@ fn validateSpawnEntrySignature(comptime EntryType: type, comptime function_info:
 /// Shared compile-error path for spawn entries that are not bare
 /// functions: Zap closures with captured environments lower to a
 /// `{call_fn, env}` struct or a boxed `Callable` existential
-/// (`ProtocolBox`) — both carry sender-owned heap that cannot cross
-/// into the child without the P2-J5 deep-copy walker.
+/// (`ProtocolBox`) — both carry sender-owned heap that cannot cross a
+/// process boundary. This is the DELIBERATE v1 posture, not pending work:
+/// the item-2.4 deep-copy walker landed, and it rejects closures by design
+/// (`isWalkerSendable` — a closure environment has no walkable, ownerless
+/// serialization; the type checker enforces the same rule for messages), so
+/// a capture-carrying spawn entry stays a compile error. Hand the child its
+/// inputs by sending messages to its pid instead.
 fn rejectSpawnEntryType(comptime EntryType: type) noreturn {
     @compileError(
-        "Process.spawn requires a named (or capture-less) zero-parameter function in Phase 2; got `" ++
+        "Process.spawn requires a named (or capture-less) zero-parameter function; got `" ++
             @typeName(EntryType) ++ "`. Closures with captured environments would share the spawner's heap " ++
-            "into the child unsafely — capture support arrives with the P2-J5 deep-copy walker " ++
-            "(docs/concurrency-implementation-plan.md item 2.4). TODO(P2-J5): lift this restriction.",
+            "into the child unsafely, and closure environments are not walker-sendable (the same " ++
+            "sendability rule messages follow) — hand the child its inputs by sending messages to its " ++
+            "pid (typed via Pid(M)).",
     );
 }
 
@@ -7005,12 +7115,16 @@ pub var arc_return_elisions_total: u64 = 0;
 /// Same-model O(1) region-move sends DELIVERED (plan items 6.1/6.1a): the
 /// sender detached the cell's backing and the kernel enqueued it by pointer —
 /// zero payload bytes copied. Together with `region_move_adopts_total` this is
-/// the observable move-vs-copy discriminator the move bench and stats builds
-/// assert on (a copy-fallback send bumps NEITHER counter).
+/// the observable move-vs-copy discriminator (a copy-fallback send bumps
+/// NEITHER counter). Unlike the `collect_arc_stats` family these two are
+/// ALWAYS ON and updated atomically (`incrementSharedRuntimeCounter`) — they
+/// back the `RuntimeInfo.region_move_send_count`/`region_move_adopt_count`
+/// surface the gate-ON move tests assert on to distinguish a real move from
+/// a silent copy fallback.
 pub var region_move_sends_total: u64 = 0;
 /// Moved value graphs ADOPTED by a receiver: `decodeReceivedEnvelope` took a
 /// moved payload and re-parented its backing in place — no reconstruct, no
-/// hash-table rebuild.
+/// hash-table rebuild. Always-on atomic; see `region_move_sends_total`.
 pub var region_move_adopts_total: u64 = 0;
 /// Number of dense-Map mutating calls (put/delete) that took the
 /// rc-1 fast path (mutated the receiver in place).

@@ -344,7 +344,7 @@ const SLAB_MAGIC: u32 = 0x5A4D5342; // "ZMSB" in little-endian: Zap Memory Slab 
 /// points past the preamble. `release_sized` finds the preamble by
 /// pointer arithmetic; the magic byte sequence is checked before any
 /// dereference of the trailing fields.
-const LARGE_MAGIC: u32 = 0x5A4D4C47; // "ZMLG": Zap Memory LarGe.
+pub const LARGE_MAGIC: u32 = 0x5A4D4C47; // "ZMLG": Zap Memory LarGe. Pub for the cross-manager ABI drift test.
 
 /// Size classes for the slab pool. Modelled on the mimalloc / jemalloc
 /// 1.5x progression, capped at 4096 bytes (one Linux page minus header).
@@ -1033,10 +1033,13 @@ fn slabFreeSlot(pool: *SlabPool, slab: *SlabHeader, slot_index: u32) void {
 // ANY two refcounted-model processes — ARC->ARC, ORC->ORC, ARC->ORC, or
 // ORC->ARC — so the adopting manager reads the header the detaching manager
 // wrote, and `free_detached_region` on either manager reclaims either's
-// orphan. Any change here MUST be made to both definitions in lockstep.
+// orphan. Any change here MUST be made to both definitions in lockstep;
+// `src/memory/region_move_header_abi_test.zig` (the drift test) fails when
+// the two layouts, magics, or placement rules diverge — which is why the
+// header, `LARGE_MAGIC`, and `largeLeadingFor` are `pub`.
 // ---------------------------------------------------------------------------
 
-const LargeHeader = extern struct {
+pub const LargeHeader = extern struct {
     magic: u32,
     _pad0: u32,
     size: usize,
@@ -1070,7 +1073,7 @@ comptime {
 /// The header is placed at `user_ptr - leading`, where `leading` is the
 /// larger of `sizeOf(LargeHeader)` and the requested alignment (rounded
 /// up to the page allocator's alignment guarantees).
-inline fn largeLeadingFor(alignment: u32) usize {
+pub inline fn largeLeadingFor(alignment: u32) usize {
     const min_lead: usize = @sizeOf(LargeHeader);
     const aligned_lead: usize = std.mem.alignForward(usize, min_lead, alignment);
     return aligned_lead;

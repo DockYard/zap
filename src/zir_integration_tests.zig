@@ -5990,9 +5990,11 @@ test "ZIR concurrency: Process.send rejects a message whose type mismatches the 
 }
 
 test "ZIR concurrency: Process.spawn rejects a closure with a captured environment" {
-    // A closure capturing `captured` cannot cross into the child without
-    // the P2-J5 deep-copy walker (it would share the spawner's heap
-    // unsoundly), so the Phase-2 spawn surface rejects it at compile time.
+    // A closure capturing `captured` would share the spawner's heap into
+    // the child unsoundly, and closure environments are deliberately not
+    // walker-sendable (the same sendability rule messages follow), so the
+    // spawn surface rejects it at compile time — a durable v1 posture, not
+    // a pending TODO.
     try expectGatedCompileFailsWithDiagnostic(
         \\pub struct TestProg {
         \\  pub fn main() -> u8 {
@@ -6005,7 +6007,7 @@ test "ZIR concurrency: Process.spawn rejects a closure with a captured environme
         \\  }
         \\}
     ,
-        "Process.spawn requires a named (or capture-less) zero-parameter function in Phase 2",
+        "Process.spawn requires a named (or capture-less) zero-parameter function",
     );
 }
 

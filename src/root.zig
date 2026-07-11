@@ -242,4 +242,5 @@ test {
     _ = @import("memory/orc/manager.zig");
     _ = @import("memory/orc/cross_thread_stress.zig");
     _ = @import("memory/arena/manager.zig");
+    _ = @import("memory/region_move_header_abi_test.zig");
 }

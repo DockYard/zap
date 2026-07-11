@@ -755,6 +755,17 @@ fn analyzeFunction(
 
 /// Condition 3: no heap-possible local's [first-def, last-use] interval
 /// strictly contains `position`.
+///
+/// The STRICT inequalities pin an assumption: every receive primitive is
+/// ZERO-ARG (`src/macro.zig`'s `buildReceiveDecodeCall` lowers each decode
+/// as `buildProcessRuntimeCall(name, &.{}, …)`, and the runtime surface
+/// takes no runtime parameters), so no local is ever USED at a receive
+/// position and `last_use == position` cannot name a value the receive
+/// itself still needs. If a future receive primitive took a heap argument,
+/// `position < last_use` would pass while the inserted reset frees that
+/// argument before the receive reads it. The vocabulary test
+/// ("the receive-primitive vocabulary is zero-arg…") locks this at the
+/// runtime surface.
 fn noHeapLiveAcross(info: *const LinearFunction, position: u32) bool {
     for (info.heap_possible, 0..) |heap, local| {
         if (!heap) continue;
@@ -817,6 +828,23 @@ fn resolveClosureSanctions(
     info: *LinearFunction,
 ) error{OutOfMemory}!void {
     if (info.closure_refs.items.len == 0) return;
+
+    // Backward-branch guard (the condition-3 parity the scan needs): the
+    // alias scan below is ORDER-DEPENDENT — it attributes uses in one
+    // forward pass, so its "every use is sanctioned" verdict assumes
+    // definition-before-use linear order. Under a backward intra-function
+    // branch in the SPAWNER, an escape at an earlier linear position could
+    // execute AFTER the spawn touch, leaving an escaped closure sanctioned —
+    // a reset context invocable from a dirty stack. The frontend emits no
+    // backward label-branches today (loops lower to tail calls), so this is
+    // a dormant hole; `has_backward_branch` is already modeled for
+    // condition 3 (shape eligibility), and the sanction scan must apply the
+    // same conservatism: no spawn-entry evidence from a backward-branching
+    // function.
+    if (info.has_backward_branch) {
+        for (info.closure_refs.items) |*closure_ref| closure_ref.sanctioned = false;
+        return;
+    }
 
     // Per-closure-ref alias set (index-aligned with `closure_refs`).
     const AliasSet = std.AutoHashMapUnmanaged(ir.LocalId, void);
@@ -1280,7 +1308,15 @@ const Rebuilder = struct {
             .union_switch => |x| {
                 var rebuilt = x;
                 rebuilt.cases = try self.rebuildUnionCases(x.cases);
-                rebuilt.else_instrs = try self.rebuildStream(x.else_instrs);
+                // Mirror `ir.forEachChildStream`'s `has_else` guard: the
+                // Walker visits `else_instrs` ONLY when `has_else` is set,
+                // so the Rebuilder must not consume receive ordinals from a
+                // stream the Walker never counted (ordinal alignment is the
+                // soundness invariant — see `rebuildStream`'s doc).
+                rebuilt.else_instrs = if (x.has_else)
+                    try self.rebuildStream(x.else_instrs)
+                else
+                    x.else_instrs;
                 return .{ .union_switch = rebuilt };
             },
             .union_switch_return => |x| {
@@ -1305,7 +1341,24 @@ const Rebuilder = struct {
                 rebuilt.struct_instrs = try self.rebuildStream(x.struct_instrs);
                 return .{ .optional_dispatch = rebuilt };
             },
-            else => return instr.*,
+            // Comptime exhaustiveness cross-check against the canonical
+            // carrier set: a variant reaching this passthrough must carry NO
+            // child instruction streams. If a new carrier variant is added
+            // to `ir.forEachChildStream` without a rebuild arm above, the
+            // Walker would count receive ordinals inside its children while
+            // the Rebuilder skipped them — a silent Walker/Rebuilder ordinal
+            // misalignment that resets before the WRONG receive (the UAF
+            // class this pass exists to prevent). Fail compilation instead.
+            inline else => |_, tag| {
+                comptime if (ir.instructionTagCarriesChildStreams(tag)) @compileError(
+                    "receive_reset.Rebuilder.rebuildInstruction does not rebuild Instruction." ++
+                        @tagName(tag) ++ ", which carries a nested `[]const Instruction` sub-stream. " ++
+                        "Add a rebuild arm above that recurses into every child stream in " ++
+                        "`ir.forEachChildStream`'s canonical order (Walker and Rebuilder receive " ++
+                        "ordinals must stay aligned).",
+                );
+                return instr.*;
+            },
         }
     }
 
@@ -1742,4 +1795,116 @@ test "a program without receive primitives is untouched (the gate-OFF fast path)
     try testing.expectEqual(@as(u32, 0), inserted);
     // Not even the block slices were rebuilt.
     try testing.expectEqual(original_body_pointer, program.functions[0].body.ptr);
+}
+
+test "a spawner with a backward intra-function branch sanctions no spawn-entry reference (order-dependence guard)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The server loop itself is the clean, provable shape.
+    const server_instructions = [_]ir.Instruction{
+        try buildReceiveCall(arena, 0),
+        .{ .tail_call = .{ .name = "Server.loop", .args = &.{} } },
+    };
+    // The SPAWNER carries a backward branch (a `branch` targeting its own
+    // block label). The forward alias scan's "every use is sanctioned"
+    // verdict is order-dependent, so under a backward edge an early-position
+    // escape could execute AFTER the spawn touch — `resolveClosureSanctions`
+    // must therefore sanction nothing from this function, even though every
+    // use it SEES is the sanctioned spawn-entry shape.
+    const args = try arena.alloc(ir.LocalId, 2);
+    args[0] = 0;
+    args[1] = 1;
+    const modes = try arena.alloc(ir.ValueMode, 2);
+    @memset(modes, .share);
+    const spawner_instructions = [_]ir.Instruction{
+        .{ .make_closure = .{ .dest = 0, .function = 10, .captures = &.{} } },
+        .{ .const_int = .{ .dest = 1, .value = 1 } },
+        .{ .call_builtin = .{ .dest = 2, .name = "ProcessRuntime.spawn_process_at", .args = args, .arg_modes = modes, .result_type = .u64 } },
+        .{ .branch = .{ .target = 0 } },
+        .{ .ret = .{ .value = null } },
+    };
+    var functions = try arena.alloc(ir.Function, 2);
+    functions[0] = try buildTestFunction(arena, 10, "Server.loop", 0, &.{}, &server_instructions, 1);
+    functions[1] = try buildTestFunction(arena, 11, "Spawner.run", 0, &.{}, &spawner_instructions, 3);
+
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+    const inserted = try instrumentProvenReceiveSites(arena, &program);
+    try testing.expectEqual(@as(u32, 0), inserted);
+    try testing.expectEqual(@as(u32, 0), countResetCalls(&program.functions[0]));
+}
+
+test "a receive inside a union_switch else prong is proven and instrumented with aligned ordinals" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A well-formed `union_switch` catch-all (`has_else = true`): the Walker
+    // visits `else_instrs` (the `union_switch_else` child stream), so the
+    // Rebuilder must rebuild the same stream — the receive inside it gets
+    // its reset in place, proving Walker/Rebuilder ordinal alignment through
+    // the `has_else`-guarded slot.
+    const else_body = [_]ir.Instruction{
+        try buildReceiveCall(arena, 2),
+        .{ .tail_call = .{ .name = "Server.loop", .args = &.{} } },
+    };
+    const cases = try arena.alloc(ir.UnionCase, 1);
+    cases[0] = .{
+        .variant_name = "Ping",
+        .field_bindings = &.{},
+        .body_instrs = &.{},
+        .return_value = null,
+    };
+    const server_instructions = [_]ir.Instruction{
+        .{ .const_int = .{ .dest = 0, .value = 0 } },
+        .{ .union_switch = .{
+            .dest = 1,
+            .scrutinee = 0,
+            .cases = cases,
+            .else_instrs = try arena.dupe(ir.Instruction, &else_body),
+            .else_result = null,
+            .has_else = true,
+        } },
+        .{ .ret = .{ .value = null } },
+    };
+    var functions = try arena.alloc(ir.Function, 2);
+    functions[0] = try buildTestFunction(arena, 10, "Server.loop", 0, &.{}, &server_instructions, 3);
+    functions[1] = try buildSpawnerFunction(arena, 11, 10);
+
+    var program = ir.Program{ .functions = functions, .type_defs = &.{}, .entry = null };
+    const inserted = try instrumentProvenReceiveSites(arena, &program);
+    try testing.expectEqual(@as(u32, 1), inserted);
+    const rebuilt = program.functions[0].body[0].instructions[1].union_switch;
+    try testing.expect(rebuilt.has_else);
+    try testing.expectEqualStrings(RESET_PRIMITIVE_BUILTIN_NAME, rebuilt.else_instrs[0].call_builtin.name);
+    try testing.expectEqualStrings("ProcessRuntime.receive_i64", rebuilt.else_instrs[1].call_builtin.name);
+    try testing.expectEqual(@as(u32, 1), countResetCalls(&program.functions[0]));
+}
+
+test "the receive-primitive vocabulary is zero-arg at the runtime surface (the strict-interval assumption)" {
+    // `noHeapLiveAcross`'s STRICT interval test assumes no local is ever
+    // used AT a receive position — sound only while every receive primitive
+    // is lowered with zero arguments (`src/macro.zig`'s
+    // `buildReceiveDecodeCall`: `buildProcessRuntimeCall(name, &.{}, …)`).
+    // Lock the runtime surface: every vocabulary entry resolves to a
+    // function with zero RUNTIME parameters.
+    const runtime = @import("runtime.zig");
+    const prefix = "ProcessRuntime.";
+    inline for (receive_primitive_names) |primitive_name| {
+        comptime std.debug.assert(std.mem.startsWith(u8, primitive_name, prefix));
+        const bare_name = primitive_name[prefix.len..];
+        if (comptime std.mem.eql(u8, bare_name, "receive_message")) {
+            // The generic decode: the ZIR backend intercepts this name and
+            // monomorphizes `ProcessRuntime.receiveMessage(T)` on the
+            // annotated message type (`src/zir_builder.zig`) — ONE comptime
+            // type parameter, zero runtime arguments.
+            const generic_info = @typeInfo(@TypeOf(runtime.ProcessRuntime.receiveMessage)).@"fn";
+            try testing.expectEqual(@as(usize, 1), generic_info.params.len);
+            try testing.expect(generic_info.params[0].type.? == type);
+        } else {
+            const decode_info = @typeInfo(@TypeOf(@field(runtime.ProcessRuntime, bare_name))).@"fn";
+            try testing.expectEqual(@as(usize, 0), decode_info.params.len);
+        }
+    }
 }

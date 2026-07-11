@@ -4347,6 +4347,18 @@ fn comptime_child_stream_exhaustiveness() void {
     }
 }
 
+/// Comptime: whether `Instruction` variant `tag`'s payload carries a nested
+/// `[]const Instruction` sub-stream — i.e. whether the variant is a member
+/// of the `forEachChildStream` carrier set. Exported for consumers that
+/// hand-mirror the carrier set case by case (the receive-reset `Rebuilder`'s
+/// per-variant stream rebuild) so their non-carrier passthrough arm can
+/// comptime-fail when a NEW carrier variant is added, instead of silently
+/// skipping its children (the Walker/Rebuilder ordinal-desync class).
+pub fn instructionTagCarriesChildStreams(comptime tag: std.meta.Tag(Instruction)) bool {
+    @setEvalBranchQuota(20000);
+    return typeContainsInstructionStream(@FieldType(Instruction, @tagName(tag)));
+}
+
 /// Comptime: does type `T` contain (directly, or through a slice of
 /// structs) a `[]const Instruction` field? Detects every nested
 /// instruction stream regardless of how it is wrapped (a bare slice on

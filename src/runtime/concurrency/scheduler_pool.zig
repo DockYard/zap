@@ -546,7 +546,20 @@ pub const SchedulerPool = struct {
     /// (a) a scheduler core running its loop, or (b) a blocking-pool worker
     /// finishing an op. There is no other producer: `spawn` is
     /// core-resident, timers fire on their owning core, and the driver
-    /// thread IS core 0. The scan therefore brackets itself:
+    /// thread IS core 0.
+    ///
+    /// CLOSED-WORLD INVARIANT: the producer inventory above is exhaustive
+    /// TODAY and the whole consistency argument stands on it. Any NEW wake
+    /// source — an I/O poller thread parking in kqueue/io_uring, a
+    /// foreign-thread (FFI) send API, an OS signal handler that enqueues —
+    /// is a producer this bracket does not observe, so landing one MUST
+    /// re-adjudicate the deadlock bracket: either the new source's publish
+    /// is ordered before an `idle_count`-visible transition the scan reads
+    /// (extending legs 1–3 below), or the predicate must additionally
+    /// require that source idle (the blocking-pool treatment). See plan
+    /// item 7.6 (`docs/concurrency-implementation-plan.md`).
+    ///
+    /// The scan brackets itself:
     ///
     ///   1. read `idle_exit_epoch` (E1), require `idle_count == N`, require
     ///      `steal_bracket` even (S1);

@@ -287,12 +287,18 @@ V11 by advancing the compile past the earlier abort. Out of concurrency scope; l
     each `receive M { … }` names its own message type M (scalar, `String`, `List`/`Map` of
     sendable elements, a by-value struct of those, or a payload-free union), with the
     payload-free-union exhaustiveness verifier (`checkReceiveMessageUnion`, `src/types.zig`)
-    and out-of-union send as a send-site compile error against the typed `Pid(M)`. **Deferred
-    to Phase 3+:** the two ergonomic forms that let a process fix ONE message type across all
-    of its receives — (a) inference of M from the union of a process's receive patterns, and
-    (b) the `process … receives M` block-annotation spelling. Phase 2 requires the type at
+    and out-of-union send as a send-site compile error against the typed `Pid(M)`. **Deferred:**
+    the two ergonomic forms that let a process fix ONE message type across all
+    of its receives — now item **2.2a** below. Phase 2 requires the type at
     each `receive` instead; neither deferred form changes the sendability/exhaustiveness rules,
     only where M is written.]*
+  - **2.2a (DEFERRED — post-v1 ergonomics; decision recorded P6-R1).** The numbered owner for
+    the two deferred spellings: (a) inference of M from the union of a process's receive
+    patterns, and (b) the `process … receives M` block-annotation form. Explicitly OUT of v1:
+    the per-receive `<M>` token is fully expressive, neither form changes the
+    sendability/exhaustiveness rules (only where M is written), and both are pure
+    front-end sugar over the shipped checker. Picked up post-v1 on user-demand evidence,
+    not on a phase trigger.
 - **2.3** `receive`/`after` lowering onto `Io.Select` (mailbox arm, timer-wheel arm,
   exit-signal arm); `after 0` = poll; suspension at arbitrary call depth (stackful fibers).
 - **2.4** Deep-copy send: sender copies into detachable fragment (closures: share code pointer,
@@ -822,6 +828,16 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
 - **6.1** Same-model O(1) region move: region-closure verifier constraint over
   `src/region_solver.zig` + escape lattice + uniqueness facts; slab detach/adopt (**E5**:
   truly O(1) and leak-free, else copy-on-move stays, documented).
+  **DONE — absorbed (annotation added P6-R1).** The substance closed elsewhere: **E5** +
+  P3-J5 landed the same-model O(1) move for flat `List` (detach/adopt of the cell's
+  page-backed large-block backing through the REFC v1.2 relocate slots — truly O(1) and
+  leak-free, so copy-on-move did NOT stay for the eligible shapes), and item 6.1a below
+  (P6-J1, `d14731c`) extended it to flat `Map`. Eligibility is proven by the comptime
+  shape predicates (`movableFlatListCell`/`movableFlatMapCell`) plus the runtime
+  rc==1/same-model/relocatable gates, with `send_move`'s consuming convention
+  type-checked at the send site — the originally-sketched region-solver/escape-lattice
+  verifier constraint was not needed for these shapes. Slab-backed (small) cells and
+  nested graphs still copy, documented at 6.1a.
 - **6.1a** `Map` O(1)-move migration — the numbered owner for the R4 residual
   recorded under item 3.4. Today `Map` backing buffers allocate through
   `c_allocator`, NOT the sending process's ARC core large-block path, so every
@@ -838,7 +854,7 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
   ARC children in separate cells) still copy. Exit: an E6 `Map`-crossover re-run
   shows the move path replacing the 2.19 ms/MB rebuild for large uniquely-owned
   maps. `docs/concurrency-bench-results.md` § E6.
-  **DONE (P6-J1, 2026-07-10)** — the one-call-site migration landed:
+  **DONE (P6-J1, 2026-07-10, `d14731c`)** — the one-call-site migration landed:
   `Map.bufferAlloc`/`bufferFreeShallow` carry the exact gate-branch `List` uses
   (gate-ON → `containerBufferAlloc`/`containerBufferFree`, the running process's
   private manager heap — a killed process's map cells now also reclaim wholesale;
@@ -863,19 +879,21 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
 - **6.2** `Blob` (atomically-refcounted immutable byte buffer; naming folds into the pending
   V8→dense rename sweep): the one sanctioned share tier; global immutable registry
   (`persistent_term` analogue).
-  **DONE (P6-J2, 2026-07-10)** — the share tier landed end to end. The blob domain
+  **DONE (P6-J2, 2026-07-10, `0b5631c`)** — the share tier landed end to end. The blob domain
   (`src/runtime/concurrency/blob.zig`) is its own allocation domain (page-backed
   `[header | bytes]` payloads owned by NEITHER manager — the envelope-pool third-domain
   discipline): a segmented, type-stable generational slot table whose packed per-slot
-  `{share_count, generation}` word is THE one atomic refcount in the system (the freeing
-  1→0 CAS bumps the generation in the same word, so stale/forged handles can never
+  `{share_count, generation}` word is the one SHARED (cross-thread) atomic refcount in the
+  system — per-process ARC/ORC refcounts also use atomic instructions (per the manager ABI)
+  but stay thread-confined; only the blob count is ever CONTENDED across threads — (the
+  freeing 1→0 CAS bumps the generation in the same word, so stale/forged handles can never
   resurrect or fault — every validate/mutate touches only stable slot memory; Constraint 3
   atomicity confined to this module + the two cold-path spinlocks). Handles are
   `{slot, generation}` `u64`s carried by the Zap-level `Blob` struct (`lib/blob.zap`)
   whose reserved `zap_blob_handle` field the runtime recognizes STRUCTURALLY (field shape,
   never struct name) — top-level messages only in v1: `isWalkerSendable` rejects nested
   blobs (an interior flight reference would leak through dead-letter/teardown; the
-  serialized-payload cleanup walker is the documented follow-on), mirrored in the checker
+  serialized-payload cleanup walker is the documented follow-on — item 6.2a), mirrored in the checker
   (`typeIsWalkerSendable`'s depth-gated blob arm) and locked in the N10 vocabulary test.
   A send is ownership-gated (per-process `BlobLedger`, a PCB field drained at teardown
   step 4b — the drop-list discipline) + one atomic flight retain riding the EXISTING
@@ -901,8 +919,8 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
   assertions). Blob is gate-ON-only by design (it exists to be shared across processes;
   gate-OFF binaries carry zero blob code — `BlobRuntime` is unreferenced and elided).
   Blob correlated replies (`Task`) and blob-inside-containers are documented v1
-  exclusions; 6.3's String work builds on the header-recoverable payload layout
-  (`BlobHeader.fromPayloadPointer`).
+  exclusions (collected under item 6.2a); 6.3's String work builds on the
+  header-recoverable payload layout (`BlobHeader.fromPayloadPointer`).
   **Follow-on — FIXED (zap 9a36e6f, fork 6ba5c3e632): the `Option(<user
   struct>)` gate-ON miscompile/ICE discovered and bisected by P6-J2.** Three stacked
   root causes, none specific to the concurrency gate (the gate only changed which
@@ -943,9 +961,22 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
   `Blob.fetch_global/1 -> Option(Blob)` now ships alongside the Elixir-canonical
   `Blob.get_global(key, default)` (which stays the primary), with a gate-ON
   leak-exact registry test.
+- **6.2a (DEFERRED — the Blob/String v1-exclusion cluster; one numbered owner, P6-R1).**
+  Collects every documented v1 exclusion of the share tier so none of them lives only in
+  prose: (i) **nested blobs** — blob handles inside `List`/`Map`/struct payloads
+  (`isWalkerSendable`/`typeIsWalkerSendable` reject the shape; N10-locked). Unlocking them
+  needs the serialized-payload CLEANUP WALKER mirroring the measure/write grammar, so an
+  interior flight reference can be released on dead-letter/teardown-drain instead of
+  leaking. (ii) **Blob correlated replies** — `call`/`Task` replies ride
+  `zap_proc_send_correlated`, which is bytes-only (no moved-envelope/flight-reclaim hook on
+  the correlated transport). (iii) **the 6.3 mirrored String exclusions** — strings nested
+  in containers keep the walker byte-copy, and correlated string replies keep the walker
+  copy; both are the SAME two mechanisms as (i)/(ii) applied to the string tier. All are
+  deliberate v1 scope decisions, not defects; landing (i)'s cleanup walker plus a
+  moved-capable correlated transport clears the whole cluster for Blob and String at once.
 - **6.3** Blob-backed String per rev 2 §5.4: copy-out slices, SSO, 64 B promotion (tuned by
   measurement), rc==1 in-place append via the uniqueness prover, opt-in aliasing view.
-  **DONE at the send-path scope (P6-J3, 2026-07-10)** — large strings ride the P6-J2 share
+  **DONE at the send-path scope (P6-J3, 2026-07-10, `8b34f70`)** — large strings ride the P6-J2 share
   tier; the String VALUE representation (`[]const u8`) is untouched, which is the honest
   scope decision (see the 6.3a deferral). Mechanism (`blob.zig` + the `zap_blob_string_*`
   ABI in `abi.zig`) vs policy (`src/runtime.zig`, the threshold + send/receive/concat
@@ -999,11 +1030,11 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
     and the page-offset mask — answer ~every call without a C-ABI crossing); arena concat,
     interpolation, and every `String.*` builder are byte-for-byte pre-P6-J3, gate-ON and
     gate-OFF (the gate-OFF binary contains none of this — comptime-elided; CLBG unaffected).
-  - **v1 exclusions** (mirroring Blob's): strings nested in `List`/`Map`/struct payloads
-    keep the walker byte-copy (interior flight references would leak through
-    dead-letter/teardown — same follow-on as blob-in-containers); correlated `call`/`Task`
-    replies keep the walker copy (`zap_proc_send_correlated` is bytes-only — same exclusion
-    as Blob correlated replies).
+  - **v1 exclusions** (mirroring Blob's — collected under item 6.2a): strings nested in
+    `List`/`Map`/struct payloads keep the walker byte-copy (interior flight references
+    would leak through dead-letter/teardown — same follow-on as blob-in-containers);
+    correlated `call`/`Task` replies keep the walker copy (`zap_proc_send_correlated` is
+    bytes-only — same exclusion as Blob correlated replies).
   - **Proofs:** kernel `blob.zig` (7 new tests: page-offset/capacity invariants,
     `createFromParts`, frontier/shared/capacity append rules, whole-view-only + stale-header
     probe rejection, and a 6-thread append-chain + adversarial fake-header probe stress —
@@ -1031,7 +1062,7 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
     (the view can then hold a counted reference), documented as pinning.
 - **6.4** Arena auto-reset at the receive back-edge for solver-proven loop-closed processes;
   `hibernate` intrinsic (arena reset + stack shrink).
-  **DONE (P6-J4, 2026-07-10)** — research.md §6.5's "single most promising Zap-specific
+  **DONE (P6-J4, 2026-07-10, `30ac6a8`)** — research.md §6.5's "single most promising Zap-specific
   optimization" landed end to end; the §2.4 arena-server growth warning is CLOSED.
   - **The mechanism (manager ABI, additive per spec §2.3/§7.2):** two new DESCRIPTOR-ONLY
     capabilities on the `CYCL` pattern (spec §8.8; `declared_caps` untouched — the reserved
@@ -1127,17 +1158,18 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
     `zap_proc_*`/`receive_iteration`/`hibernate` symbols (the E2 durable proof; the
     only deliberate gate-OFF byte change is confined to `Memory.Arena`-manifest
     binaries, whose manager gained the STAT counter on its cold chunk-refill path).
-  - **Observed during validation (pre-existing, not this item's):** the manifest
+  - **6.4a (fork-hygiene follow-on) — the manifest incremental-daemon spurious relink.**
+    Observed during P6-J4 validation (pre-existing, not that item's): the manifest
     incremental DAEMON intermittently fails an incremental relink with a spurious
     `duplicate symbol _zap_runtime_atomic_add_u32_acq_rel` (kernel object vs zcu
     object) even though `nm` shows the on-disk kernel object contains no such global —
     stale incremental link state in the fork's zir_api, the P6-J2 daemon-state bug
-    class. Fresh (non-incremental) builds are deterministic and green; root-causing
-    the incremental linker is a fork-hygiene follow-on.
+    class. Fresh (non-incremental) builds are deterministic and green; the numbered
+    work is root-causing the fork's incremental linker state.
 - **6.5** Full observability: send/receive trace points (compile-time-optional), scheduler
   utilization, run-queue depth, deadlock ("all waiting, none runnable") and starvation
   detection.
-  - **DONE (P6-J6, 2026-07-10).** Ledger § "P6-J6 — full observability" has the method +
+  - **DONE (P6-J6, 2026-07-10, `ed51b26`).** Ledger § "P6-J6 — full observability" has the method +
     measurements. (1) **Trace points**: spawn/exit/send/receive/signal-delivery events into a
     bounded lock-free in-memory ring (4096 newest; the honest v1 sink — readable from Zap, no
     callback re-entrancy on hot paths), comptime-gated behind a NEW `runtime_tracing`
@@ -1175,7 +1207,7 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
   becomes register-local instead of riding the global reduction counter's per-iteration
   load/store. NOT a kill-criterion item (E2 already passed with the poll on every loop) — this
   is a perf-tier refinement that gives the deferred mitigation an explicit owner.
-  - **DONE (P6-J5, 2026-07-10).** Both levers landed; ledger § E2 "P6-J5 mitigation" has the
+  - **DONE (P6-J5, 2026-07-10, `6d1bd1e`).** Both levers landed; ledger § E2 "P6-J5 mitigation" has the
     full method + table. Honest re-baseline first: P4-J1's threadlocal counters had silently
     inflated the gate-ON regressions past the figures above (mandelbrot +34%, fannkuch ~+23%
     at HEAD-`30ac6a8` — every budget access became a Darwin TLV-getter call). Lever (b):
@@ -1187,7 +1219,7 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
     dominated short-span loops; sub-K entries pay zero) → fannkuch **~+23% → +7.1%**.
     Kill-criterion pair untouched (nbody −2.1%, spectral-norm −2.0%);
     binarytrees/k-nucleotide unchanged (their +20%/+6% gate-ON penalties are the
-    PRE-EXISTING P4-J1 layer-1 TLV cost — a named follow-up, the J2
+    PRE-EXISTING P4-J1 layer-1 TLV cost — item **6.6a**, the
     register/parameter-threading ceiling). Two measured dead ends documented and kept off
     (unrolling weight-96 multi-call bodies: +55%; unrolling loops calling looping/heavy
     callees: k-nucleotide +6% → +18%). Latency bound re-stated (K-granularity addendum,
@@ -1197,6 +1229,21 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
     all six gate-OFF CLBG `__TEXT,__text` sections byte-identical pre/post-P6-J5. Gates:
     gate-ON `:test_concurrency` 171/0 (451 assertions), `zig build test` 0, `zig build
     test-kernel` (Debug + ReleaseFast, fork compiler) 0.
+- **6.6a (DEFERRED — gate-ON reduction-budget register/parameter threading, the TLV
+  elimination).** The numbered owner for the pre-existing P4-J1 layer-1 cost 6.6's levers
+  deliberately left unchanged. P4-J1's M:N-correct THREADLOCAL budget counters turned
+  every layer-1 alloc-piggyback tick (and every per-entry loop seed) into a Darwin
+  TLV-getter CALL; the measured residue at P6-J5 close is **binarytrees +19.6%** and
+  **k-nucleotide +5.8%** gate-ON (ledger § E2 "P6-J5 mitigation" — the before/after table
+  marks both "pre-existing, unchanged"; entry evidence for this item). The fix direction
+  is the ceiling A.4 OQ1 already measured against: thread the reduction budget through a
+  register/parameter across the emitted-code hot path instead of re-reading TLS — the
+  same published-vs-register/parameter analysis that resolved the current-process pointer
+  (OQ1: the published-per-quantum global costs +2.2% pure / +0.7% mix OVER that ceiling;
+  ledger § OQ1 is the design input), extended from the manager context to the budget
+  counters, riding the compiler frame-threading the J2 monomorphization arm (item 3.2)
+  already owns. Exit: binarytrees/k-nucleotide gate-ON penalties re-measured at or under
+  the E2 band without regressing the kill-criterion pair.
 
 Exit gate: E6 re-run — crossover documented; ping-pong within target with move path on.
 
@@ -1221,6 +1268,27 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   allocator posture everywhere else — a kernel that cannot deliver exit signals
   has lost supervision soundness), or, if best-effort survives, every unbounded
   signal wait needs an OOM-aware bound. Preference recorded: panic-on-OOM.
+- **7.6** Deadlock-bracket re-adjudication for any NEW wake source (the P6-J6
+  closed-world hook). The deadlock detector's no-false-positive proof
+  (`scheduler_pool.zig` `maybeDetectDeadlock`) stands on a CLOSED producer
+  inventory — work is created only by scheduler cores and blocking-pool
+  workers, and every producer's publish is ordered before an idle-visible
+  transition the consistent scan reads. Landing ANY new producer — the I/O
+  poller thread (kqueue `EVFILT_USER` / the A.4.2 Linux primitive), a
+  foreign-thread (FFI) send entry point, an OS signal handler that enqueues —
+  MUST re-adjudicate that bracket before it ships: either order the new
+  source's publishes into the existing idle-count/epoch discipline, or add a
+  "source idle" leg to the predicate (the blocking-pool treatment). The code
+  carries the matching invariant note at the predicate.
+- **7.7** Toolchain build-path sensitivity (the P6-J6 environmental footnote,
+  ledger § P6-J6): a compiler built from IDENTICAL source at a DIFFERENT
+  absolute path emits marginally different user-binary text (3 std-debug/io
+  symbols flip in/out; the `__MergedGlobals` count shifts), isolated by a 2×2
+  compiler×stdlib swap. Same-path builds are deterministic — every
+  byte-identity gate compares same-path builds, so the campaign's proofs are
+  unaffected — but path-independent reproducibility is the durable posture:
+  root-cause the absolute-path leak into emitted text on the fork-hygiene
+  track.
 
 ## 6. Experiment gates → phases
 
@@ -1421,15 +1489,27 @@ Each is a design commitment, not a suggestion; each cites its evidence.
    J2 monomorphization arm's target (item 3.2) — it recovers the residual +2.2%, which only
    matters on a pure-alloc tight loop, and requires compiler frame-threading of the context
    through emitted code. OQ1 is resolved: published now, register/parameter as the J2
-   refinement.]*
+   refinement. The reduction-BUDGET counters are the sibling case of the same ceiling —
+   item **6.6a** owns extending this analysis to them (the P4-J1 TLV cost).]*
 2. **Linux poller wakeup primitive** — eventfd vs io_uring `MSG_RING` (E9 was Darwin-only);
-   measured when the Phase 4 poller lands.
+   measured when the Phase 4 poller lands. *[Trigger lapsed — re-pointed (P6-R1): Phase 4
+   landed multicore + the blocking pool WITHOUT an fd/I-O poller thread (no poller exists at
+   Phase-6 close; file/network I/O runs through `Process.blocking`), so the measurement
+   re-points to whenever the I/O poller lands. When it does, item 7.6's deadlock-bracket
+   re-adjudication applies to the same thread — the poller is a new wake producer.]*
 3. **Stack-pool sizing/watermark policy and its interaction with Darwin teardown** — decided
    empirically by Phase 1.7's spawn/die-cycle test. *[Update (Phase 1 close): 1.7 landed as the
    measuring instrument (the teardown-stress harness + soak knob); the sizing decision itself —
    including whether cached stacks get `madvise(MADV_FREE)`-style RSS decay — re-points to when
    real managers land (Phase 2 item 2.4 / Phase 3 items 3.x), measured with that harness. The
    Phase 1 constants remain the documented ARC-slab-mirror initial policy.]*
+   *[RESOLVED (P6-J4, 2026-07-10): the RSS-decay half is DECIDED and recorded at item 6.4
+   ("The A.4.3 decision (stack RSS decay), recorded") — hibernate DOES decommit (Darwin
+   `MADV_FREE_REUSABLE` with `MADV_FREE` fallback; Linux `MADV_DONTNEED`); pool
+   release-to-cache does NOT decommit (the acquire/release fast path stays syscall-free at
+   the E9 9 ns floor); idle-cache decay rides hibernate, per-process and demand-signaled.
+   The Phase-1 pool constants remain the sizing policy, now measured-good under the
+   spawn/die and hibernate-fleet workloads.]*
 4. **Root cause of the residual Dispatch `spawn-serial` race** — fork-hygiene track.
    **Triaged (job G2, 2026-07-05): classified Dispatch-specific**, evidence in
    `spike/concurrency-e1/triage/` (6 lldb crash captures) and the E1 †-note in

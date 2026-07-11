@@ -1400,8 +1400,8 @@ HEAD-`30ac6a8` (this item's "before"), mandelbrot's musttail tick measured
 allocation), k-nucleotide **+6%**. The before/after pairs below are measured
 in the SAME interleaved sessions, so the P6-J5 deltas are exact; the
 remaining binarytrees/k-nucleotide penalties are pre-existing HEAD facts
-this item leaves unchanged — the layer-1 TLV cost is a named follow-up
-candidate (register/parameter threading is the plan's J2 ceiling).
+this item leaves unchanged — the layer-1 TLV cost is plan item 6.6a
+(register/parameter threading, the plan's J2 ceiling).
 
 **Lever (b) — forced loopification of musttail self-recursion gate-ON.**
 When `runtime_concurrency` is ON, a TCO-safe self-recursion WITH parameters

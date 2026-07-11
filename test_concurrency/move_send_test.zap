@@ -16,6 +16,7 @@ pub struct TestConcurrency.MoveSendTest {
       # adopts it in place, no reconstruct). Same-model receiver (self, ARC).
       data = List.new_filled(1000, 42 :: i64)
       self_pid = (Pid.of(Process.self()) :: Pid([i64]))
+      moves_before = RuntimeInfo.region_move_send_count()
       _sent = Process.send_move(self_pid, data)
       received = receive [i64] {
         got -> got
@@ -23,6 +24,10 @@ pub struct TestConcurrency.MoveSendTest {
       assert(List.length(received) == 1000)
       assert(List.get(received, 0) == 42)
       assert(List.get(received, 999) == 42)
+      # The MOVE path actually ran — a silent copy fallback bumps neither
+      # region-move counter, so value-delivery asserts alone cannot tell the
+      # two apart.
+      assert(RuntimeInfo.region_move_send_count() == moves_before + 1)
     }
 
     test("a SMALL List send_move transparently degrades to copy and still delivers") {
@@ -31,12 +36,16 @@ pub struct TestConcurrency.MoveSendTest {
       # result is identical — the receiver gets the value — only the cost differs.
       small = [1, 2, 3]
       self_pid = (Pid.of(Process.self()) :: Pid([i64]))
+      moves_before = RuntimeInfo.region_move_send_count()
       _sent = Process.send_move(self_pid, small)
       received = receive [i64] {
         got -> got
       }
       assert(List.length(received) == 3)
       assert(List.get(received, 1) == 2)
+      # The copy fallback bumps NO region-move counter — the discriminator's
+      # negative half.
+      assert(RuntimeInfo.region_move_send_count() == moves_before)
     }
 
     test("a moved List is a fresh, independent value the receiver solely owns") {
@@ -65,12 +74,16 @@ pub struct TestConcurrency.MoveSendTest {
       # map whose buckets/hashes went stale would fail these probes.
       data = TestConcurrency.MoveSendTest.build_map(%{}, 400)
       self_pid = (Pid.of(Process.self()) :: Pid(%{i64 => i64}))
+      moves_before = RuntimeInfo.region_move_send_count()
       _sent = Process.send_move(self_pid, data)
       received = receive %{i64 => i64} {
         got -> got
       }
       assert(Map.size(received) == 400)
       assert(TestConcurrency.MoveSendTest.verify_map(received, 400))
+      # The Map rode the MOVE path (not the 2.19 ms/MB copy rebuild): the
+      # region-move send counter incremented across this send.
+      assert(RuntimeInfo.region_move_send_count() == moves_before + 1)
     }
 
     test("a SMALL flat Map send_move transparently degrades to copy and still delivers") {

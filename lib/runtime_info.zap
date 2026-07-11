@@ -285,4 +285,28 @@ pub struct RuntimeInfo {
   pub fn trace_reset() -> Bool {
     :zig.RuntimeInfo.trace_reset()
   }
+
+  @doc = """
+    Total same-model O(1) region-move sends DELIVERED so far
+    (binary-wide, monotone). Together with `region_move_adopt_count`
+    this is the observable move-vs-copy discriminator: a `send_move`
+    that fell back to the deep-copy send bumps neither counter, so a
+    test expecting the move path asserts this count incremented
+    across the send.
+    """
+
+  pub fn region_move_send_count() -> i64 {
+    :zig.RuntimeInfo.region_move_send_count()
+  }
+
+  @doc = """
+    Total moved value graphs ADOPTED by receivers so far
+    (binary-wide, monotone): the receive half of the region-move
+    discriminator — the payload was re-parented in place, never
+    reconstructed.
+    """
+
+  pub fn region_move_adopt_count() -> i64 {
+    :zig.RuntimeInfo.region_move_adopt_count()
+  }
 }
