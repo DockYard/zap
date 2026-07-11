@@ -93,10 +93,25 @@
 //!     the layer-1 alloc piggyback for allocating loops would leave a
 //!     conses-each-iteration loop polled only O(log n) times — far too
 //!     rarely to bound preemption.
+//!   * **Layer 2, K-unrolled tight loops (P6-J5, plan item 6.6)** — a
+//!     loopified loop whose body is tight, non-FP, iterating-path
+//!     allocation-free, and made only of small leaf callees is emitted as
+//!     K = 8 sequential body copies with ONE
+//!     `Kernel.procReductionTickAmortized(K)` at the back-edge: a K-sized
+//!     reduction on the shared per-thread budget once per K original
+//!     iterations, with NO preheader seed (the per-entry TLV budget read
+//!     dominated constantly-re-entered short-span loops — measured in
+//!     § E2 P6-J5 of the bench ledger). An entry shorter than K
+//!     iterations exits before the back-edge and pays zero.
 //!   * **Layer 2, musttail loops** — a TCO-safe self-recursive function
 //!     reuses its frame (no promotable loop-local slot), so its back-edge
 //!     poll (`Kernel.procReductionTick`) rides the shared GLOBAL reduction
-//!     counter `zap_proc_reductions_remaining`.
+//!     counter `zap_proc_reductions_remaining`. P6-J5 lever (b) narrowed
+//!     this form's gate-ON reach: TCO-safe self-recursion WITH parameters
+//!     is force-loopified instead (the per-iteration threadlocal
+//!     counter access measured mandelbrot at +34% gate-ON, vs noise once
+//!     loopified); what still musttails gate-ON is zero-param
+//!     self-recursion, closure self-recursion, and the program entry.
 //!   * **Layer 1, alloc piggyback** — `procReductionTick` again, one
 //!     reduction per manager cell/buffer allocation (`allocAny`/`bufferAlloc`),
 //!     the safepoint for allocation bursts outside a tail loop.
@@ -121,6 +136,20 @@
 //! separate E7 hazard (a fiber blocking INSIDE a manager call — a GC pause,
 //! a lazy-commit fault) is out of scope for the poll and handled by the
 //! Phase-4 dirty-scheduler handoff.
+//!
+//! P6-J5 K-amortization addendum (plan item 6.6): on the K-unrolled tight
+//! loops the poll granularity coarsens from 1 to K = 8 iterations — one
+//! reduction of size K per K iterations keeps the quantum length in
+//! iterations unchanged, but budget exhaustion (and thus a kill/watchdog
+//! observation) can be noticed up to K−1 iterations later than the
+//! per-iteration poll, and an entry that exits in fewer than K iterations
+//! runs un-polled (bounded by K−1 tight iterations returning into a
+//! polled caller context). At the ~ns/iteration cost that defines the
+//! unrolled class, the added worst-case latency is tens of nanoseconds —
+//! orders of magnitude inside the 1 ms watchdog tick. The deterministic
+//! preemption proof for the amortized form is
+//! `test_concurrency/safepoint_test.zap`'s "CPU-bound tight unrolled loop
+//! is still preempted" ordering test.
 //!
 //! ## Spawn (plan 1.4 + A.3: the E1-measured hot path)
 //!

@@ -4779,6 +4779,365 @@ const InstructionStreamWalker = struct {
 };
 
 // ============================================================
+// P6-J5 — back-edge safepoint loop-shape analysis (plan item 6.6)
+// ============================================================
+//
+// The ZIR backend's gate-ON safepoint emission needs two IR-level facts
+// about a function to pick its mitigation strategy for the E2 tight-loop
+// regressions:
+//
+//   * whether the body carries a self-recursive `tail_call` at all
+//     (`bodyContainsTailCall`) — the lever-(b) trigger: with the
+//     concurrency gate ON, a TCO-safe self-recursion that would lower to
+//     `musttail` (whose safepoint rides the shared GLOBAL reduction
+//     counter, a per-iteration load/store) is instead force-loopified so
+//     its poll becomes the register-local `subs`/`cbz` form; and
+//
+//   * the loop-body *shape* (`analyzeBackedgePollLoopShape`) — the
+//     lever-(a) eligibility test: only tight, non-FP, allocation-free
+//     loopified bodies get the K-way body unroll that amortizes the
+//     2-instruction register poll (FP-heavy loops already hide the poll
+//     in their arithmetic latency, and allocating loops are additionally
+//     covered by the layer-1 alloc piggyback, so neither is worth the
+//     code-size churn).
+//
+// Both walks live here (not in `zir_builder.zig`) because they need the
+// nested-stream traversal (`InstructionStreamWalker`) and the IR type
+// vocabulary; the gate-dependent *policy* (when to force-loopify, the
+// unroll factor K, the weight budget) stays in the ZIR backend.
+
+/// Shape summary of a (candidate) loopified function body, produced by
+/// `analyzeBackedgePollLoopShape` and consumed by the ZIR backend's
+/// back-edge-poll amortization policy (P6-J5 lever (a)).
+pub const BackedgePollLoopShape = struct {
+    /// Number of IR instructions in the function body, INCLUDING nested
+    /// streams (switch/case arms, guard blocks, if bodies) and EXCLUDING
+    /// the zero-cost debug markers (`dbg_stmt`/`dbg_var`, whose density
+    /// tracks source style rather than loop cost). The tightness metric:
+    /// a small weight means the 2-instruction back-edge poll is a large
+    /// fraction of the loop body.
+    instruction_weight: usize,
+    /// True when the function traffics in floats: a float-typed
+    /// parameter or return, a float constant, a float-typed arithmetic
+    /// op, a float widen, or a float match/binary-read. FP-heavy loops
+    /// (nbody, spectral-norm, mandelbrot) hide the register poll in
+    /// their FP latency — E2 measured them within noise — so they are
+    /// excluded from unrolling rather than churned.
+    contains_float_operation: bool,
+    /// True when the body's ITERATING path contains an instruction that
+    /// allocates a managed cell (list/map/struct/tuple/union/closure
+    /// construction, string concat, Perceus reuse). Allocating loops are
+    /// already safepointed by the layer-1 alloc piggyback and their
+    /// iteration cost is dominated by the manager call, so the poll is
+    /// not a meaningful body fraction there. Allocations on EXIT paths —
+    /// streams that terminate in a noreturn (`ret`/`ret_raise`/
+    /// `match_fail`/`match_error_return`), e.g. a base case constructing
+    /// its tuple return — run at most once per loop entry, not per
+    /// iteration, so they do NOT disqualify the loop. This is exact for
+    /// tail-rewritten IR: the rewriter pushes `ret` only into arms that
+    /// carry no `tail_call`, so nothing nested inside a `ret`-terminated
+    /// arm can reach the loop back-edge.
+    contains_allocating_operation: bool,
+    /// True when the body's ITERATING path calls a function whose body
+    /// K-unrolling would multiply badly:
+    ///
+    ///   * a LOOPING callee (its body carries a `tail_call`) — measured:
+    ///     unrolling fannkuch `count_flips` (which calls the
+    ///     `reverse_range` loop every iteration) regressed gate-ON +43%
+    ///     vs +7% excluded, because LLVM inlines the K-plicated
+    ///     whole-loop call sites and wrecks the I-cache; the callee's
+    ///     own safepoints already bound preemption across the call;
+    ///   * a HEAVY leaf callee (body weight above the caller-supplied
+    ///     `leaf_callee_weight_limit`) — measured: unrolling
+    ///     k-nucleotide `encode_at` (which calls the 38-weight
+    ///     string-match dispatch `base_code` every iteration) regressed
+    ///     gate-ON from +6% to +18% for the same inline-bloat reason,
+    ///     and a heavy callee dominates the iteration anyway, so the
+    ///     poll is not a meaningful body fraction;
+    ///   * an indirect/dispatched callee whose body is unknown (closure
+    ///     calls, protocol dispatch — pessimistically disqualifying).
+    ///
+    /// TRUE leaf callees (`Integer.+`, `List.get`/`set` specializations,
+    /// builtins — weight ≲ 10) do not set this: tight loops like
+    /// fannkuch `reverse_range` are made of them. The check is one level
+    /// deep by design: a small wrapper concealing a loop behind a second
+    /// call hop is not detected (a policy heuristic for a perf lever,
+    /// not a soundness condition — safepoint coverage never depends on
+    /// it).
+    iterating_path_calls_disqualifying_callee: bool,
+};
+
+/// Whether `t` is a float scalar type (see `BackedgePollLoopShape
+/// .contains_float_operation`).
+fn zigTypeIsFloat(t: ZigType) bool {
+    return switch (t) {
+        .f16, .f32, .f64, .f80, .f128 => true,
+        else => false,
+    };
+}
+
+/// P6-J5 lever (b) trigger: report whether a function body carries a
+/// `tail_call` anywhere, including nested dispatch streams (switch/case
+/// arms, guard blocks). The public sibling of the lowering-internal
+/// `IrBuilder.containsTailCall`, operating on a materialized function
+/// body rather than the in-flight instruction list. The ZIR backend
+/// consults this with the concurrency gate ON to force-loopify TCO-safe
+/// self-recursion (whose `musttail` back-edge poll would otherwise ride
+/// the shared global reduction counter every iteration). Allocation-free
+/// native recursion — see `analyzeBackedgePollLoopShape` for the
+/// depth-boundedness argument.
+pub fn bodyContainsTailCall(body: []const Block) bool {
+    return functionBodyContainsTailCallForLoopShape(body);
+}
+
+/// Whether `stream` terminates in an unconditional noreturn — the marker
+/// that everything in it (and nested under it) runs at most once per loop
+/// entry before control leaves the function. See
+/// `BackedgePollLoopShape.contains_allocating_operation`.
+fn streamEndsNoReturnForLoopShape(stream: []const Instruction) bool {
+    if (stream.len == 0) return false;
+    return switch (stream[stream.len - 1]) {
+        .ret, .ret_raise, .match_fail, .match_error_return => true,
+        else => false,
+    };
+}
+
+/// Nested-stream probe: does `stream` (or anything nested under it)
+/// carry a `tail_call`? Used to classify a RETURNING-construct arm
+/// (`switch_return`/`union_switch_return`/`optional_dispatch`, whose arms
+/// return their `return_value` without an explicit `.ret` instruction):
+/// an arm with no reachable `tail_call` leaves the function, so its
+/// allocations are exit-path.
+const TailCallProbe = struct {
+    found: bool = false,
+
+    fn visitChild(ctx: *@This(), child: ChildStream) void {
+        if (ctx.found) return;
+        if (streamContainsTailCallForLoopShape(child.stream)) ctx.found = true;
+    }
+};
+
+fn streamContainsTailCallForLoopShape(stream: []const Instruction) bool {
+    for (stream) |*instr| {
+        if (instr.* == .tail_call) return true;
+        var probe = TailCallProbe{};
+        forEachChildStream(instr, &probe, TailCallProbe.visitChild);
+        if (probe.found) return true;
+    }
+    return false;
+}
+
+/// Whether a direct call to `function_body` targets a loop — the callee's
+/// body carries a `tail_call` (loopified or musttail self-recursion).
+fn functionBodyContainsTailCallForLoopShape(body: []const Block) bool {
+    for (body) |block| {
+        if (streamContainsTailCallForLoopShape(block.instructions)) return true;
+    }
+    return false;
+}
+
+/// Non-debug instruction weight of a stream including nested child
+/// streams — the callee-size metric for the heavy-leaf-callee rule (see
+/// `BackedgePollLoopShape.iterating_path_calls_disqualifying_callee`).
+const StreamWeightProbe = struct {
+    weight: usize = 0,
+
+    fn visitChild(ctx: *@This(), child: ChildStream) void {
+        ctx.weight += streamInstructionWeightForLoopShape(child.stream);
+    }
+};
+
+fn streamInstructionWeightForLoopShape(stream: []const Instruction) usize {
+    var weight: usize = 0;
+    for (stream) |*instr| {
+        switch (instr.*) {
+            .dbg_stmt, .dbg_var => continue,
+            else => {},
+        }
+        weight += 1;
+        var probe = StreamWeightProbe{};
+        forEachChildStream(instr, &probe, StreamWeightProbe.visitChild);
+        weight += probe.weight;
+    }
+    return weight;
+}
+
+fn functionBodyInstructionWeightForLoopShape(body: []const Block) usize {
+    var weight: usize = 0;
+    for (body) |block| {
+        weight += streamInstructionWeightForLoopShape(block.instructions);
+    }
+    return weight;
+}
+
+/// Recursion context for `accumulateBackedgePollLoopShape`: the shape
+/// accumulator, the program (for callee resolution), the heavy-callee
+/// bound, plus whether the enclosing stream chain already exits the
+/// function (so allocations and calls here are exit-path, not
+/// per-iteration).
+const BackedgePollShapeWalk = struct {
+    shape: *BackedgePollLoopShape,
+    program: *const Program,
+    leaf_callee_weight_limit: usize,
+    exits_function: bool,
+
+    fn visitChild(ctx: *const @This(), child: ChildStream) void {
+        // Arms of the RETURNING dispatch constructs leave the function
+        // with their arm value (no explicit `.ret` in the stream) unless
+        // the tail rewrite planted a `tail_call` in them — so a
+        // tail-call-free arm is exit-path in its entirety.
+        const arm_returns_out = switch (child.kind) {
+            .switch_ret_case,
+            .switch_ret_default,
+            .union_switch_ret_case,
+            .optional_dispatch_nil,
+            .optional_dispatch_struct,
+            => !streamContainsTailCallForLoopShape(child.stream),
+            else => false,
+        };
+        accumulateBackedgePollLoopShape(
+            ctx.shape,
+            ctx.program,
+            ctx.leaf_callee_weight_limit,
+            child.stream,
+            ctx.exits_function or arm_returns_out,
+        );
+    }
+};
+
+/// Classify a direct callee for
+/// `iterating_path_calls_disqualifying_callee`: resolve it in `program`
+/// and probe its body — a callee disqualifies unrolling when it is a loop
+/// (carries a `tail_call`) or a heavy leaf (body weight above
+/// `leaf_callee_weight_limit`). An UNRESOLVED name is treated as a small
+/// leaf (optimistic): in a full compilation every
+/// `call_named`/`call_direct` target is in the function table, and
+/// runtime builtins/externs are leaves by construction.
+fn calleeDisqualifiesUnrollForLoopShape(
+    program: *const Program,
+    leaf_callee_weight_limit: usize,
+    callee_id: ?FunctionId,
+    callee_name: ?[]const u8,
+) bool {
+    for (program.functions) |*candidate| {
+        const matches = if (callee_id) |id|
+            candidate.id == id
+        else if (callee_name) |name|
+            std.mem.eql(u8, candidate.name, name)
+        else
+            false;
+        if (matches) {
+            if (functionBodyContainsTailCallForLoopShape(candidate.body)) return true;
+            return functionBodyInstructionWeightForLoopShape(candidate.body) > leaf_callee_weight_limit;
+        }
+    }
+    return false;
+}
+
+/// Accumulate `shape` facts over `stream` and every nested child stream.
+/// `exits_context` is true when control past this stream cannot reach the
+/// loop back-edge (an ancestor stream terminates in a noreturn); the
+/// stream's own terminator extends the context for its contents.
+fn accumulateBackedgePollLoopShape(
+    shape: *BackedgePollLoopShape,
+    program: *const Program,
+    leaf_callee_weight_limit: usize,
+    stream: []const Instruction,
+    exits_context: bool,
+) void {
+    const exits_function = exits_context or streamEndsNoReturnForLoopShape(stream);
+    for (stream) |*instr| {
+        switch (instr.*) {
+            // Debug markers are zero-cost; excluding them keeps the
+            // weight a codegen-cost metric rather than a source-style
+            // metric.
+            .dbg_stmt, .dbg_var => continue,
+            .const_float, .float_widen, .match_float, .bin_read_float => {
+                shape.contains_float_operation = true;
+            },
+            .binary_op => |op| {
+                if (zigTypeIsFloat(op.result_type)) shape.contains_float_operation = true;
+                if (op.op == .concat and !exits_function) shape.contains_allocating_operation = true;
+            },
+            .list_init,
+            .list_cons,
+            .map_init,
+            .struct_init,
+            .union_init,
+            .tuple_init,
+            .box_as_protocol,
+            .make_closure,
+            .reset,
+            .reuse_alloc,
+            => {
+                if (!exits_function) shape.contains_allocating_operation = true;
+            },
+            .call_direct => |cd| {
+                if (!exits_function and calleeDisqualifiesUnrollForLoopShape(program, leaf_callee_weight_limit, cd.function, null)) {
+                    shape.iterating_path_calls_disqualifying_callee = true;
+                }
+            },
+            .call_named => |cn| {
+                if (!exits_function and calleeDisqualifiesUnrollForLoopShape(program, leaf_callee_weight_limit, null, cn.name)) {
+                    shape.iterating_path_calls_disqualifying_callee = true;
+                }
+            },
+            .try_call_named => |tcn| {
+                if (!exits_function and calleeDisqualifiesUnrollForLoopShape(program, leaf_callee_weight_limit, null, tcn.name)) {
+                    shape.iterating_path_calls_disqualifying_callee = true;
+                }
+            },
+            // Indirect / dispatched callees: the target body is unknown
+            // at this point, so pessimistically disqualify.
+            .call_closure, .call_dispatch, .protocol_dispatch => {
+                if (!exits_function) shape.iterating_path_calls_disqualifying_callee = true;
+            },
+            else => {},
+        }
+        shape.instruction_weight += 1;
+        const child_context = BackedgePollShapeWalk{
+            .shape = shape,
+            .program = program,
+            .leaf_callee_weight_limit = leaf_callee_weight_limit,
+            .exits_function = exits_function,
+        };
+        forEachChildStream(instr, &child_context, BackedgePollShapeWalk.visitChild);
+    }
+}
+
+/// P6-J5 lever (a) eligibility analysis: walk `function`'s whole body
+/// (nested streams included) and summarize the shape facts the ZIR
+/// backend's back-edge-poll amortization policy needs. See
+/// `BackedgePollLoopShape` for the meaning of each field. The descent is
+/// allocation-free native recursion — IR branch nesting is depth-bounded
+/// by the lowering's structural budget, and the tail-rewrite passes
+/// already recurse natively over the same trees.
+pub fn analyzeBackedgePollLoopShape(
+    program: *const Program,
+    function: *const Function,
+    leaf_callee_weight_limit: usize,
+) BackedgePollLoopShape {
+    var shape = BackedgePollLoopShape{
+        .instruction_weight = 0,
+        .contains_float_operation = false,
+        .contains_allocating_operation = false,
+        .iterating_path_calls_disqualifying_callee = false,
+    };
+
+    // Float-typed parameters or return: the loop's per-iteration work is
+    // FP arithmetic whose latency hides the register poll.
+    if (zigTypeIsFloat(function.return_type)) shape.contains_float_operation = true;
+    for (function.params) |param| {
+        if (zigTypeIsFloat(param.type_expr)) shape.contains_float_operation = true;
+    }
+
+    for (function.body) |block| {
+        accumulateBackedgePollLoopShape(&shape, program, leaf_callee_weight_limit, block.instructions, false);
+    }
+    return shape;
+}
+
+// ============================================================
 // Qualified instruction coordinates (P1J3, audit findings
 // arc-param--01 / perceus-region--02)
 // ============================================================
@@ -25370,4 +25729,267 @@ test "maxLocalSetIndex scans deep match decisions without native recursion" {
     const scrutinee = try testExpr(alloc, .{ .param_get = 0 });
     const match_expr = try testExpr(alloc, .{ .match = .{ .scrutinee = scrutinee, .decision = current } });
     try std.testing.expectEqual(@as(LocalId, 90_001), try maxLocalSetIndexInExpr(alloc, match_expr));
+}
+
+// ============================================================
+// P6-J5 — back-edge safepoint loop-shape analysis tests
+// ============================================================
+
+/// Test helper: run Zap `source` through the parse → collect → typecheck →
+/// HIR → IR pipeline (arena-owned) and return the IR program. Mirrors the
+/// setup the `rewriteTailCalls` tests inline; shared here so the loop-shape
+/// tests below stay focused on their assertions.
+fn buildIrProgramFromSourceForTest(alloc: std.mem.Allocator, source: []const u8) !Program {
+    var parser = try Parser.init(alloc, source);
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    try collector.collectProgram(&program);
+
+    var type_store = try types_mod.TypeStore.init(alloc, parser.interner);
+    var checker = types_mod.TypeChecker.initWithSharedStore(alloc, &type_store, parser.interner, &collector.graph);
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, &type_store);
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = &type_store;
+    return try ir_builder.buildProgram(&hir_program);
+}
+
+/// Test helper: find the first IR function whose name starts with `prefix`.
+fn findIrFunctionByNamePrefixForTest(program: Program, prefix: []const u8) ?*const Function {
+    for (program.functions) |*func| {
+        if (std.mem.startsWith(u8, func.name, prefix)) return func;
+    }
+    return null;
+}
+
+test "bodyContainsTailCall sees tail calls in nested dispatch streams" {
+    // The multi-clause dispatch places the `tail_call` inside a
+    // `switch_return` case body — a nested stream — so the scan must
+    // walk child streams, not just the top-level block.
+    const source =
+        \\pub struct ScalarShape {
+        \\  pub fn loop(acc :: i64, 0 :: i64) -> i64 {
+        \\    acc
+        \\  }
+        \\  pub fn loop(acc :: i64, n :: i64) -> i64 {
+        \\    ScalarShape.loop(acc + n, n - 1)
+        \\  }
+        \\
+        \\  pub fn plain(a :: i64, b :: i64) -> i64 {
+        \\    a + b
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ir_program = try buildIrProgramFromSourceForTest(alloc, source);
+
+    const loop_fn = findIrFunctionByNamePrefixForTest(ir_program, "ScalarShape__loop") orelse
+        return error.TestFunctionNotFound;
+    try std.testing.expect(bodyContainsTailCall(loop_fn.body));
+
+    const plain_fn = findIrFunctionByNamePrefixForTest(ir_program, "ScalarShape__plain") orelse
+        return error.TestFunctionNotFound;
+    try std.testing.expect(!bodyContainsTailCall(plain_fn.body));
+}
+
+test "analyzeBackedgePollLoopShape classifies a tight scalar loop as non-FP and alloc-free" {
+    const source =
+        \\pub struct TightScalar {
+        \\  pub fn loop(acc :: i64, 0 :: i64) -> i64 {
+        \\    acc
+        \\  }
+        \\  pub fn loop(acc :: i64, n :: i64) -> i64 {
+        \\    TightScalar.loop(acc + n, n - 1)
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ir_program = try buildIrProgramFromSourceForTest(alloc, source);
+    const loop_fn = findIrFunctionByNamePrefixForTest(ir_program, "TightScalar__loop") orelse
+        return error.TestFunctionNotFound;
+
+    const shape = analyzeBackedgePollLoopShape(&ir_program, loop_fn, 16);
+    try std.testing.expect(!shape.contains_float_operation);
+    try std.testing.expect(!shape.contains_allocating_operation);
+    // The weight must count the nested dispatch streams (the whole loop
+    // body is inside the clause dispatch), so it is well above the
+    // top-level instruction count, and a tight scalar loop must stay
+    // within the amortization budget the emitter uses.
+    try std.testing.expect(shape.instruction_weight > 4);
+    try std.testing.expect(shape.instruction_weight <= 48);
+}
+
+test "analyzeBackedgePollLoopShape flags float params and float operations" {
+    const source =
+        \\pub struct FloatShape {
+        \\  pub fn loop(acc :: f64, 0 :: i64) -> f64 {
+        \\    acc
+        \\  }
+        \\  pub fn loop(acc :: f64, n :: i64) -> f64 {
+        \\    FloatShape.loop(acc * 1.5, n - 1)
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ir_program = try buildIrProgramFromSourceForTest(alloc, source);
+    const loop_fn = findIrFunctionByNamePrefixForTest(ir_program, "FloatShape__loop") orelse
+        return error.TestFunctionNotFound;
+
+    const shape = analyzeBackedgePollLoopShape(&ir_program, loop_fn, 16);
+    try std.testing.expect(shape.contains_float_operation);
+}
+
+test "analyzeBackedgePollLoopShape flags iterating-path allocations" {
+    const source =
+        \\pub struct ConsShape {
+        \\  pub fn build(acc :: [i64], 0 :: i64) -> [i64] {
+        \\    acc
+        \\  }
+        \\  pub fn build(acc :: [i64], n :: i64) -> [i64] {
+        \\    ConsShape.build([n | acc], n - 1)
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ir_program = try buildIrProgramFromSourceForTest(alloc, source);
+    const build_fn = findIrFunctionByNamePrefixForTest(ir_program, "ConsShape__build") orelse
+        return error.TestFunctionNotFound;
+
+    // The cons feeding the tail call runs EVERY iteration — it must
+    // disqualify the loop from unrolling (layer 1 already covers it).
+    const shape = analyzeBackedgePollLoopShape(&ir_program, build_fn, 16);
+    try std.testing.expect(shape.contains_allocating_operation);
+}
+
+test "analyzeBackedgePollLoopShape ignores exit-path allocations" {
+    // The fannkuch `count_flips` shape: the ITERATING path is pure scalar
+    // and list traffic, but the base case constructs a tuple return. That
+    // allocation runs once per loop ENTRY (its arm terminates in `ret`),
+    // not per iteration, so it must NOT disqualify the loop from the
+    // back-edge amortization.
+    const source =
+        \\pub struct ExitAllocShape {
+        \\  pub fn walk(acc :: i64, 0 :: i64) -> {i64, i64} {
+        \\    {acc, 0}
+        \\  }
+        \\  pub fn walk(acc :: i64, n :: i64) -> {i64, i64} {
+        \\    ExitAllocShape.walk(acc + n, n - 1)
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ir_program = try buildIrProgramFromSourceForTest(alloc, source);
+    const walk_fn = findIrFunctionByNamePrefixForTest(ir_program, "ExitAllocShape__walk") orelse
+        return error.TestFunctionNotFound;
+
+    const shape = analyzeBackedgePollLoopShape(&ir_program, walk_fn, 16);
+    try std.testing.expect(!shape.contains_allocating_operation);
+    try std.testing.expect(!shape.contains_float_operation);
+}
+
+test "analyzeBackedgePollLoopShape flags iterating-path calls into looping callees" {
+    // The fannkuch `count_flips` -> `reverse_range` shape: the outer loop
+    // calls another LOOP every iteration. Unrolling such a body
+    // K-plicates whole-loop call sites (measured regression — see the
+    // shape field doc), so the analysis must flag it; the inner leaf-ish
+    // loop itself must stay unflagged.
+    const source =
+        \\pub struct NestedLoopShape {
+        \\  pub fn inner(acc :: i64, 0 :: i64) -> i64 {
+        \\    acc
+        \\  }
+        \\  pub fn inner(acc :: i64, n :: i64) -> i64 {
+        \\    NestedLoopShape.inner(acc + 1, n - 1)
+        \\  }
+        \\
+        \\  pub fn outer(acc :: i64, 0 :: i64) -> i64 {
+        \\    acc
+        \\  }
+        \\  pub fn outer(acc :: i64, n :: i64) -> i64 {
+        \\    stepped = NestedLoopShape.inner(acc, 3)
+        \\    NestedLoopShape.outer(stepped, n - 1)
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ir_program = try buildIrProgramFromSourceForTest(alloc, source);
+
+    const outer_fn = findIrFunctionByNamePrefixForTest(ir_program, "NestedLoopShape__outer") orelse
+        return error.TestFunctionNotFound;
+    const outer_shape = analyzeBackedgePollLoopShape(&ir_program, outer_fn, 16);
+    try std.testing.expect(outer_shape.iterating_path_calls_disqualifying_callee);
+
+    const inner_fn = findIrFunctionByNamePrefixForTest(ir_program, "NestedLoopShape__inner") orelse
+        return error.TestFunctionNotFound;
+    const inner_shape = analyzeBackedgePollLoopShape(&ir_program, inner_fn, 16);
+    try std.testing.expect(!inner_shape.iterating_path_calls_disqualifying_callee);
+}
+
+test "analyzeBackedgePollLoopShape flags iterating-path calls into heavy leaf callees" {
+    // The k-nucleotide `encode_at` -> `base_code` shape: the loop calls a
+    // NON-looping but heavy callee (a wide multi-clause dispatch) every
+    // iteration. Unrolling K-plicates those call sites, LLVM inlines
+    // them, and the caller bloats (measured regression — see the shape
+    // field doc), so a callee whose body weight exceeds the leaf bound
+    // must disqualify the loop.
+    const source =
+        \\pub struct HeavyLeafShape {
+        \\  pub fn chunky(x :: i64) -> i64 {
+        \\    a = x + 1
+        \\    b = a * 3
+        \\    c = b - 2
+        \\    d = c * 5
+        \\    e = d + 7
+        \\    f = e * 11
+        \\    g = f - 13
+        \\    h = g + 17
+        \\    h * 19
+        \\  }
+        \\
+        \\  pub fn loop(acc :: i64, 0 :: i64) -> i64 {
+        \\    acc
+        \\  }
+        \\  pub fn loop(acc :: i64, n :: i64) -> i64 {
+        \\    HeavyLeafShape.loop(acc + HeavyLeafShape.chunky(n), n - 1)
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ir_program = try buildIrProgramFromSourceForTest(alloc, source);
+
+    const loop_fn = findIrFunctionByNamePrefixForTest(ir_program, "HeavyLeafShape__loop") orelse
+        return error.TestFunctionNotFound;
+    // With a tight leaf bound the chunky callee disqualifies the loop...
+    const tight_shape = analyzeBackedgePollLoopShape(&ir_program, loop_fn, 16);
+    try std.testing.expect(tight_shape.iterating_path_calls_disqualifying_callee);
+    // ...and with a generous bound the same callee is admissible, proving
+    // the flag tracks the caller-supplied weight limit rather than some
+    // intrinsic property.
+    const loose_shape = analyzeBackedgePollLoopShape(&ir_program, loop_fn, 1000);
+    try std.testing.expect(!loose_shape.iterating_path_calls_disqualifying_callee);
 }

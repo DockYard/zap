@@ -44,6 +44,57 @@ pub struct TestConcurrency.SafepointTest {
     }
   }
 
+  describe("P6-J5 — forced loopification + K-amortized back-edge polls") {
+    test("a TCO-safe scalar loop is bit-exact across unroll-boundary iteration counts") {
+      # Gate-ON, `sum_loop` (all-scalar, would musttail) is force-loopified
+      # (lever b) and its tight non-FP alloc-free body is K-unrolled
+      # (lever a). Iteration counts around the K = 8 group boundary — and a
+      # large count that is NOT a multiple of K and crosses many reduction
+      # reseeds — must all stay bit-exact (the base case exits from any
+      # unrolled copy; there is no "remainder" iteration to mishandle).
+      assert(TestConcurrency.SafepointTest.sum_loop(0, 0) == 0)
+      assert(TestConcurrency.SafepointTest.sum_loop(0, 1) == 1)
+      assert(TestConcurrency.SafepointTest.sum_loop(0, 7) == 28)
+      assert(TestConcurrency.SafepointTest.sum_loop(0, 8) == 36)
+      assert(TestConcurrency.SafepointTest.sum_loop(0, 9) == 45)
+      assert(TestConcurrency.SafepointTest.sum_loop(0, 100003) == 5000350006)
+    }
+
+    test("a K-unrolled byref reversal loop is exact at every group-boundary length") {
+      # `reverse_span` mirrors the fannkuch-redux hot loop (the tight
+      # shape the E2 ledger flagged): naturally loopified (List param)
+      # and K-unrolled gate-ON.
+      # Lengths chosen so the swap count (length / 2) lands before, on, and
+      # after the K = 8 group boundary, plus the empty and single-element
+      # degenerate spans.
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(0))
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(1))
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(2))
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(3))
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(15))
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(16))
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(17))
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(32))
+      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(33))
+    }
+
+    test("a CPU-bound tight unrolled loop is still preempted so a co-runnable process replies first") {
+      # The K-amortized poll fires once per K iterations instead of every
+      # iteration — this proves the reduction budget STILL exhausts and the
+      # process STILL yields: the slow process runs ~900k tight-loop
+      # iterations (>> the 4000-reduction budget) through the K-amortized
+      # back-edge tick before replying.
+      slow = Process.pid(u64, Process.spawn(&TestConcurrency.SafepointTest.slow_reverse_reply_entry/0))
+      quick = Process.pid(u64, Process.spawn(&TestConcurrency.SafepointTest.quick_reply_entry/0))
+      _slow_channel = Process.send(slow, Process.self())
+      _quick_channel = Process.send(quick, Process.self())
+      first = Process.receive_raw(i64)
+      second = Process.receive_raw(i64)
+      assert(first == 2)
+      assert(second == 1)
+    }
+  }
+
   describe("layer 1 — alloc piggyback (allocating loops)") {
     test("an allocating loop builds correctly under the alloc piggyback") {
       # `build_list` conses one cell per iteration (an allocation), so it is
@@ -70,8 +121,11 @@ pub struct TestConcurrency.SafepointTest {
   # -- helper loops -----------------------------------------------------------
 
   @doc = """
-    Alloc-free tail-recursive accumulate. Loopifies; its iterating path is
-    allocation-free, so the ZIR builder emits a layer-2 back-edge poll here.
+    Alloc-free tail-recursive accumulate. All-scalar (TCO-safe, would
+    lower to `musttail` gate-OFF); gate-ON it is force-loopified (P6-J5
+    lever b) and, being tight/non-FP/alloc-free with only leaf callees,
+    K-unrolled (lever a), so its safepoint is ONE amortized shared-budget
+    tick per K iterations at the back-edge.
     """
 
   pub fn sum_loop(acc :: i64, 0 :: i64) -> i64 {
@@ -94,6 +148,76 @@ pub struct TestConcurrency.SafepointTest {
 
   pub fn build_list(acc :: [i64], n :: i64) -> [i64] {
     TestConcurrency.SafepointTest.build_list([n | acc], n - 1)
+  }
+
+  @doc = """
+    Fill `arr[index..length)` with the identity permutation
+    (`arr[i] = i`). A tight naturally-loopified (byref `List` param)
+    alloc-free loop — K-unrolled gate-ON.
+    """
+
+  pub fn fill_identity(arr :: List(i64), index :: i64, length :: i64) -> List(i64) {
+    if index >= length {
+      arr
+    } else {
+      one = 1 :: i64
+      arr = List.set(arr, index, index)
+      TestConcurrency.SafepointTest.fill_identity(arr, index + one, length)
+    }
+  }
+
+  @doc = """
+    Reverse `arr[lo..hi]` in place — the fannkuch-redux `reverse_range`
+    shape, the tight loop whose per-iteration safepoint the E2 ledger
+    flagged gate-ON before the P6-J5 amortization. Naturally loopified;
+    K-unrolled gate-ON.
+    """
+
+  pub fn reverse_span(arr :: List(i64), lo :: i64, hi :: i64) -> List(i64) {
+    if lo >= hi {
+      arr
+    } else {
+      one = 1 :: i64
+      a = List.get(arr, lo)
+      b = List.get(arr, hi)
+      arr = List.set(arr, lo, b)
+      arr = List.set(arr, hi, a)
+      TestConcurrency.SafepointTest.reverse_span(arr, lo + one, hi - one)
+    }
+  }
+
+  @doc = """
+    Check `arr[index..length)` holds the REVERSED identity permutation
+    (`arr[i] == length - 1 - i`). Verifies a `fill_identity` +
+    `reverse_span` round trip element-exactly.
+    """
+
+  pub fn reversed_prefix_intact(arr :: List(i64), index :: i64, length :: i64) -> Bool {
+    if index >= length {
+      true
+    } else {
+      one = 1 :: i64
+      expected = length - one - index
+      if List.get(arr, index) == expected {
+        TestConcurrency.SafepointTest.reversed_prefix_intact(arr, index + one, length)
+      } else {
+        false
+      }
+    }
+  }
+
+  @doc = """
+    Build an identity list of `n` elements, reverse it with the tight
+    unrolled `reverse_span` loop, and verify every element landed exactly
+    where the reversal puts it. `true` only on an element-exact round
+    trip — the unroll-boundary correctness probe.
+    """
+
+  pub fn reversal_roundtrip_ok(n :: i64) -> Bool {
+    arr = List.new_filled(n, 0 :: i64)
+    arr = TestConcurrency.SafepointTest.fill_identity(arr, 0 :: i64, n)
+    arr = TestConcurrency.SafepointTest.reverse_span(arr, 0 :: i64, n - (1 :: i64))
+    TestConcurrency.SafepointTest.reversed_prefix_intact(arr, 0 :: i64, n)
   }
 
   # -- child process entries (each first receives the parent's raw pid) -------
@@ -131,6 +255,26 @@ pub struct TestConcurrency.SafepointTest {
   pub fn slow_alloc_reply_entry() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
     _built = TestConcurrency.SafepointTest.build_list([], 60000)
+    _sent = Process.send(parent, 1)
+    nil
+  }
+
+  @doc = """
+    Runs ~900k iterations of the tight K-unrolled register-poll loops
+    (600k `fill_identity` + 300k `reverse_span` swap iterations — far
+    beyond the 4000-reduction budget) THEN replies with marker 1. Reaches
+    its reply only after yielding many times at the K-amortized back-edge
+    polls — the deterministic proof that amortization did not break
+    preemption.
+    """
+
+  pub fn slow_reverse_reply_entry() -> Nil {
+    parent = Process.pid(i64, Process.receive_raw(u64))
+    n = 600000 :: i64
+    arr = List.new_filled(n, 0 :: i64)
+    arr = TestConcurrency.SafepointTest.fill_identity(arr, 0 :: i64, n)
+    arr = TestConcurrency.SafepointTest.reverse_span(arr, 0 :: i64, n - (1 :: i64))
+    _checked = TestConcurrency.SafepointTest.reversed_prefix_intact(arr, 0 :: i64, n)
     _sent = Process.send(parent, 1)
     nil
   }

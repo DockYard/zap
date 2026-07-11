@@ -1378,6 +1378,112 @@ kill criterion passed): loop unrolling to amortize the poll over K
 iterations (Go's mitigation), and forcing loopification of musttail loops
 gate-ON so mandelbrot's poll becomes register-local too. Deferred as a
 follow-up optimization pass; noted in the ledger for whoever picks it up.
+**Landed as P6-J5 — see the "P6-J5 mitigation" subsection below.**
+
+### P6-J5 mitigation (plan item 6.6, 2026-07-10) — the tight-loop follow-up
+
+**VERDICT: both levers landed.** mandelbrot gate-ON goes from **+34% → +0.2%
+(noise)**; fannkuch-redux from **+23% → +7%**; the kill-criterion pair
+(nbody −2%, spectral-norm −2%) is untouched; binarytrees and k-nucleotide
+are unchanged (their gate-ON penalties predate this item — see the drift
+note). Zero-cost-OFF is re-proven byte-identically.
+
+**The P4-J1 drift (honest re-baseline).** The E2 table above was measured at
+P2-J6 (2026-07-07), when the reduction counters were plain globals. P4-J1
+(2026-07-09) made `zap_proc_reductions_budget`/`_remaining` **threadlocal**
+(the M:N correctness requirement), which turned every emitted budget access
+into a Darwin TLV-getter CALL. That silently inflated the gate-ON cost of
+every per-iteration global-counter poll and every per-entry loop seed: at
+HEAD-`30ac6a8` (this item's "before"), mandelbrot's musttail tick measured
+**+34%** (E2 recorded +3%), fannkuch **~+23%** (was +10–11%), binarytrees
+**+20%** (was +1%; the layer-1 alloc piggyback ticks a TLV counter per cell
+allocation), k-nucleotide **+6%**. The before/after pairs below are measured
+in the SAME interleaved sessions, so the P6-J5 deltas are exact; the
+remaining binarytrees/k-nucleotide penalties are pre-existing HEAD facts
+this item leaves unchanged — the layer-1 TLV cost is a named follow-up
+candidate (register/parameter threading is the plan's J2 ceiling).
+
+**Lever (b) — forced loopification of musttail self-recursion gate-ON.**
+When `runtime_concurrency` is ON, a TCO-safe self-recursion WITH parameters
+(previously `musttail` + per-iteration global tick) is emitted through the
+existing loopification machinery instead (`emitFunction`'s
+`emit_loopified`), giving it the loop-local register poll. Semantics
+preserved (same slot/loop/repeat lowering byref loops always used; bounded
+stack either way). Excluded: the program entry, closures, zero-param
+recursion (those keep musttail + `procReductionTick`). This alone took
+mandelbrot's `iter`/`row_loop` from +34% to noise.
+
+**Lever (a) — K = 8 body unroll + seedless amortized back-edge tick.** A
+loopified loop whose shape analysis (`ir.analyzeBackedgePollLoopShape`)
+says tight (non-debug IR weight ≤ 48), non-FP (no float params/ops — nbody/
+spectral-norm/mandelbrot are deliberately not churned), iterating-path
+allocation-free (exit-path allocs like a base case's tuple return don't
+disqualify), and leaf-only (every iterating-path callee non-looping and of
+weight ≤ 16) is emitted as K = 8 sequential body copies with ONE
+`Kernel.procReductionTickAmortized(8)` at the back-edge — a K-sized
+reduction on the shared per-thread budget once per 8 iterations, and NO
+preheader seed. The seedless form matters as much as the unroll: these
+loops are entered constantly with short spans (fannkuch `reverse_range`
+runs ~2–6 iterations per call), and the classic per-entry TLV seed
+dominated — the seed+register-poll variant was measured first and only
+halved the regression (+23% → +12.5%); the seedless tick took it to +7%.
+An entry shorter than K iterations exits before the back-edge and pays
+ZERO safepoint cost.
+
+**Two measured dead ends (kept OFF, with numbers).** (1) Widening the
+weight bound to 128 to unroll `rotate_loop`/`main_loop` (96 each):
+fannkuch +55% — K-plicating multi-call bodies that LLVM then inlines
+multiplies code size and wrecks the I-cache. (2) Unrolling loops whose
+iterating path calls a LOOPING or HEAVY callee: `count_flips` (calls the
+`reverse_range` loop per iteration) regressed fannkuch to +43%, and
+k-nucleotide's `encode_at` (calls the 38-weight string-match dispatch
+`base_code` per iteration) regressed k-nucleotide from +6% to +18%. Both
+exclusions are now explicit shape rules
+(`iterating_path_calls_disqualifying_callee`).
+
+Method: same E2 discipline — for each bench, FOUR binaries (HEAD-`30ac6a8`
+"before" compiler and P6-J5 "after" compiler × gate-OFF/gate-ON, ARC,
+`-Doptimize=ReleaseFast`, per-compiler XDG script caches) run strictly
+interleaved in one session, 15 reps after 2 warmups (10 reps k-nucleotide),
+medians; stdout byte-identity across all four binaries asserted before
+timing; load avg 2.4–4.6 recorded per session (the interleaving cancels
+shared load).
+
+| Benchmark (args) | gate-OFF | gate-ON @30ac6a8 | Δ before | gate-ON @P6-J5 | Δ after |
+|---|---|---|---|---|---|
+| **nbody** (5,000,000) | 0.1044 s | 0.1022 s | −2.0% | 0.1022 s | **−2.1%** |
+| **spectral-norm** (2500) | 0.1638 s | 0.1607 s | −2.0% | 0.1606 s | **−2.0%** |
+| mandelbrot (4000) | 0.5399 s | 0.7251 s | +34.3% | 0.5412 s | **+0.2%** |
+| fannkuch-redux (10) | 0.2344 s | 0.2911 s | +23.2% | 0.2510 s | **+7.1%** |
+| binarytrees (16) | 0.1359 s | 0.1636 s | +20.2% | 0.1626 s | +19.6% (pre-existing, unchanged) |
+| k-nucleotide (stdin) | 0.3094 s | 0.3282 s | +5.9% | 0.3274 s | +5.8% (pre-existing, unchanged) |
+
+Verified in the emitted code (otool, gate-ON scalar probe): the unrolled
+loop is 8 sequential body copies; the back-edge safepoint is
+`sub w8, w8, #0x8` on the TLV-resolved `zap_proc_reductions_remaining`
+(descriptor load hoisted to the preheader — no TLV call on entry) with
+`bl _abi.zap_proc_safepoint_slow` only when the budget is exhausted; base
+cases exit from any copy (the boundary-count bit-exactness tests in
+`safepoint_test.zap` pin this).
+
+Preemption-latency bound after amortization: on the unrolled class the
+poll granularity is K = 8 iterations — budget exhaustion can be observed
+up to 7 tight-loop iterations late, and a sub-K entry runs un-polled
+(bounded, returns into a polled caller) — tens of nanoseconds against the
+1 ms watchdog tick (see `scheduler.zig`'s module doc). The deterministic
+proof that the amortized form still preempts: `safepoint_test.zap`'s
+"CPU-bound tight unrolled loop is still preempted" ordering test (~900k
+tight iterations must yield to a co-runnable quick process), green in the
+gate-ON suite (171 tests / 451 assertions, exit 0).
+
+Zero-cost-OFF re-proof (P6-J5): all six gate-OFF CLBG binaries'
+`__TEXT,__text` sections are **byte-identical** between the HEAD-`30ac6a8`
+compiler and the P6-J5 compiler (SHA-256 via `segedit`: nbody
+`4e29d656b7c1…`, spectral-norm `1bf117c48fa6…`, mandelbrot
+`0389a227bc3e…`, fannkuch-redux `eeabe502afc1…`, binarytrees
+`4e2a4676cf5e…`, k-nucleotide `8a4f18f5673b…`), and the gate-OFF nbody
+still carries **zero** `zap_proc_*`/`reduction`/`safepoint` symbols (`nm`:
+0 matches). Every emission change is behind `runtime_concurrency`.
 
 Zero-cost-OFF proof (the whole point of the comptime gate). The **durable,
 HEAD-stable** evidence is symbol- and instruction-level and does NOT depend on

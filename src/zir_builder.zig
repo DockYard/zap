@@ -1043,21 +1043,39 @@ pub const ZirDriver = struct {
     current_function_return_type: ir.ZigType = .void,
     /// True when the current function is a closure (has captures).
     current_function_is_closure: bool = false,
-    /// When the function being emitted is a loopification candidate
-    /// (`Function.loopify == true`), this holds one mutable-stack-slot
-    /// pointer Ref per parameter. The function body is wrapped in a
-    /// `loop` block: `param_get(i)` loads from `loopify_slots[i]`, and
-    /// `tail_call` to self stores the new args back into the same
-    /// slots and emits `repeat`. `null` outside loopification.
+    /// When the function being emitted is lowered through loopification
+    /// (`Function.loopify == true`, or the P6-J5 gate-ON forced
+    /// loopification of TCO-safe self-recursion — see `emitFunction`),
+    /// this holds one mutable-stack-slot pointer Ref per parameter. The
+    /// function body is wrapped in a `loop` block: `param_get(i)` loads
+    /// from `loopify_slots[i]`, and `tail_call` to self stores the new
+    /// args back into the same slots and emits `repeat`. `null` outside
+    /// loopification.
     loopify_slots: ?[]u32 = null,
     /// P2-J6 layer-2 bare back-edge poll (plan item 2.5). When the current
-    /// loopified loop is alloc-free (`streamAllocatesCell` is false for its
-    /// body) and the `runtime_concurrency` gate is ON, this holds the
-    /// pointer Ref of the loop-local `u32` reduction counter allocated in
-    /// the loop preheader. The back-edge (right before the loop's top-level
-    /// `repeat`) emits one `Kernel.procBackedgePoll(<this>)` call. `null`
-    /// outside such a loop (including with the gate OFF — zero emission).
+    /// function is emitted loopified and the `runtime_concurrency` gate is
+    /// ON, this holds the pointer Ref of the loop-local `u32` reduction
+    /// counter allocated in the loop preheader. The back-edge (right before
+    /// the loop's top-level `repeat`) emits one
+    /// `Kernel.procBackedgePoll(<this>)` call. `null` outside such a loop
+    /// (including with the gate OFF — zero emission — and for K-unrolled
+    /// loops, whose back-edge uses the seedless
+    /// `Kernel.procReductionTickAmortized(K)` instead and needs no slot).
     loopify_safepoint_slot: ?u32 = null,
+    /// P6-J5 lever (a) — the back-edge poll amortization factor K for the
+    /// loopified function currently being emitted. `1` (the default and the
+    /// gate-OFF value) means the classic P2-J6 emission: one body copy, one
+    /// register-local `procBackedgePoll` per iteration. K > 1 means
+    /// `emitFunction` emits K sequential copies of the loop body inside the
+    /// `loop` block (each `tail_call` commits its args to the slots and
+    /// falls through to the next copy; base-case arms still `ret` out at
+    /// any copy) and ONE `procReductionTickAmortized(K)` on the shared
+    /// per-thread budget at the back-edge — no preheader seed at all, so
+    /// the safepoint cost is zero for entries shorter than K iterations
+    /// and one budget reduction per K iterations beyond that. Set by
+    /// `emitBackedgeSafepointSeed` from `backedgePollUnrollFactor`'s
+    /// loop-shape decision; reset by `endLoopification`.
+    loopify_backedge_unroll: u32 = 1,
     /// Nesting depth of capture contexts (case/switch/if-else bodies).
     /// When > 0, struct_init_typed can't be used because struct_init_field_type
     /// instructions (emitted via addInst) don't enter captured bodies.
@@ -5954,8 +5972,32 @@ pub const ZirDriver = struct {
         // slots and `repeat` the loop instead of musttail-ing — see
         // `Function.loopify` and the `tail_call` lowering for the
         // dispatch.
+        //
+        // P6-J5 lever (b) — forced loopification gate-ON (plan item 6.6):
+        // with the concurrency gate ON, a TCO-safe self-recursion that
+        // would lower to `musttail` is loopified INSTEAD, because the
+        // musttail back-edge safepoint rides the shared GLOBAL reduction
+        // counter (`procReductionTick`, a per-iteration threadlocal
+        // access — E2 measured mandelbrot at +3% when the counter was a
+        // plain global, +34% at HEAD once P4-J1 made it a Darwin TLV),
+        // while the loopified back-edge poll is a register-local
+        // decrement+branch that E2 measured within noise on the
+        // kill-criterion loops. The loopified lowering is
+        // semantics-preserving for these shapes (all-scalar params/return,
+        // bounded stack via the `loop` block — the same guarantee musttail
+        // gives); only WHEN it applies changes, not what it does. Excluded:
+        // the program entry (its emission is interwoven with the
+        // root-process bootstrap), closures (their capture calling
+        // convention is not slot-modeled), and zero-param recursion (no
+        // slots to poll through — it keeps the musttail + global-tick
+        // form). Gate OFF: `func.loopify` alone decides, byte-identical
+        // emission.
+        const emit_loopified = func.loopify or
+            (self.runtime_concurrency and !is_main and
+                func.captures.len == 0 and self.param_refs.items.len > 0 and
+                ir.bodyContainsTailCall(func.body));
         var loopify_capture_open = false;
-        if (func.loopify) {
+        if (emit_loopified) {
             try self.beginLoopification(func);
             // P2-J6 layer-2 bare back-edge poll (plan item 2.5): with the
             // concurrency gate ON, seed the loop-local reduction counter in
@@ -5974,33 +6016,52 @@ pub const ZirDriver = struct {
             // one for non-loop allocation and musttail-allocating loops). The
             // CLBG kill-criterion loops (nbody, spectral-norm) are alloc-free
             // and were already polled, so their measured cost is unchanged.
+            //
+            // P6-J5 lever (a): tight non-FP allocation-free leaf-only loop
+            // bodies get a K-way unroll (`backedgePollUnrollFactor`) with a
+            // SEEDLESS amortized back-edge tick instead of this counter —
+            // see `loopify_backedge_unroll`.
+            //
             // Gate OFF: nothing is emitted — the CLBG binaries are
             // byte-for-byte unchanged.
             if (self.runtime_concurrency) {
-                try self.emitBackedgeSafepointSeed();
+                const unroll_factor = self.backedgePollUnrollFactor(func);
+                try self.emitBackedgeSafepointSeed(unroll_factor);
             }
             self.beginCapture();
             loopify_capture_open = true;
         }
         errdefer if (loopify_capture_open) self.discardCapture();
 
-        // Emit body blocks.
-        for (func.body) |block| {
-            self.current_block_instructions = block.instructions;
+        // Emit body blocks — `loopify_backedge_unroll` sequential copies
+        // (P6-J5 lever (a); 1 — the default — everywhere but a gate-ON
+        // K-unrolled tight loop). Each copy re-emits the full instruction
+        // stream: dataflow between copies runs exclusively through the
+        // loopify param slots (a `tail_call` in copy c stores its args and
+        // falls through to copy c+1's fresh `param_get` loads), and
+        // base-case arms `ret` out of the function from any copy, so the
+        // concatenation is exactly K consecutive iterations of the original
+        // loop body with one back-edge poll at the end.
+        var body_copy_index: u32 = 0;
+        const body_copy_count: u32 = if (emit_loopified) self.loopify_backedge_unroll else 1;
+        while (body_copy_index < body_copy_count) : (body_copy_index += 1) {
+            for (func.body) |block| {
+                self.current_block_instructions = block.instructions;
 
-            for (block.instructions, 0..) |instr, instr_idx| {
-                self.current_instr_index = @intCast(instr_idx);
-                self.emitInstruction(instr) catch |err| {
-                    std.log.err(
-                        "ZIR emit failed in function {s} at instruction {d} ({s}): {s}",
-                        .{ func.name, instr_idx, @tagName(instr), @errorName(err) },
-                    );
-                    return err;
-                };
+                for (block.instructions, 0..) |instr, instr_idx| {
+                    self.current_instr_index = @intCast(instr_idx);
+                    self.emitInstruction(instr) catch |err| {
+                        std.log.err(
+                            "ZIR emit failed in function {s} at instruction {d} ({s}): {s}",
+                            .{ func.name, instr_idx, @tagName(instr), @errorName(err) },
+                        );
+                        return err;
+                    };
+                }
             }
         }
 
-        if (func.loopify) {
+        if (emit_loopified) {
             // The loop body must end on a noreturn instruction or
             // Sema's `analyzeBodyInner` walks past the end. The
             // dispatcher's value-producing `block` (from
@@ -6067,6 +6128,7 @@ pub const ZirDriver = struct {
         if (self.loopify_slots) |slots| self.allocator.free(slots);
         self.loopify_slots = null;
         self.loopify_safepoint_slot = null;
+        self.loopify_backedge_unroll = 1;
     }
 
     /// Emit a `zap_runtime.Kernel.<name>(args...)` call — the P2-J6 layer-2
@@ -6084,28 +6146,138 @@ pub const ZirDriver = struct {
         return ref;
     }
 
+    /// P6-J5 lever (a) — the back-edge poll amortization factor K. Applied
+    /// only to loop bodies `backedgePollUnrollFactor` classifies as tight
+    /// (small non-debug instruction weight), non-FP, and allocation-free:
+    /// the shapes where E2 measured the per-iteration safepoint as a large
+    /// body fraction (fannkuch-redux `reverse_range`). `emitFunction` emits
+    /// K sequential body copies inside the `loop` block and ONE
+    /// `procReductionTickAmortized(K)` at the back-edge — a K-sized
+    /// reduction on the shared per-thread budget once per K original
+    /// iterations, so a reduction still accounts for one original
+    /// iteration (quantum length unchanged) while the safepoint cost per
+    /// iteration divides by K. Unrolled loops deliberately carry NO
+    /// preheader seed: these loops are entered constantly with short spans
+    /// and the per-entry TLV budget read of the register-counter form
+    /// dominated their cost (measured — see § E2 P6-J5). An entry shorter
+    /// than K iterations exits before the back-edge and pays zero. The
+    /// honest trade (see the scheduler module doc's latency-bound
+    /// section): budget exhaustion is observed up to K-1 iterations late
+    /// on these loops — at the ~ns/iteration cost that defines "tight",
+    /// that is orders of magnitude inside the 1 ms watchdog tick. K = 8
+    /// chosen by the P6-J5 paired CLBG measurement
+    /// (docs/concurrency-bench-results.md § E2).
+    const backedge_poll_unroll_factor: u32 = 8;
+
+    /// P6-J5 lever (a) — the tightness budget: a loopified body whose
+    /// non-debug IR instruction weight (nested streams included) exceeds
+    /// this is NOT unrolled. Calibrated against the CLBG corpus: it
+    /// admits the fannkuch tight quartet (`reverse_range` 42,
+    /// `shift_left` 31, `copy_prefix` 29, `init_identity` 24), while the
+    /// composite outer loops (`rotate_loop`/`main_loop` 96) stay
+    /// excluded. Widening the bound to admit those was MEASURED and
+    /// REGRESSED badly (fannkuch gate-ON +55% vs +7% — K-plicating
+    /// multi-call bodies that LLVM then inlines multiplies code size and
+    /// wrecks the I-cache), so this is a hot-loop-tightness test, not
+    /// just a code-size guard. (`count_flips` 29 sits under the bound but
+    /// is excluded by the looping-callee rule — it calls the
+    /// `reverse_range` loop every iteration.)
+    const backedge_poll_unroll_weight_limit: usize = 48;
+
+    /// P6-J5 lever (a) — the TRUE-leaf callee bound: an iterating-path
+    /// direct callee whose own body weight exceeds this disqualifies the
+    /// loop from unrolling (see the
+    /// `iterating_path_calls_disqualifying_callee` field doc for the
+    /// measured k-nucleotide `encode_at`→`base_code` regression this
+    /// prevents). Calibrated against the corpus: the trivial arithmetic /
+    /// element accessors that tight loops are made of (`Integer.+` clause
+    /// fns ~6–8, `List.get` ~7–8, `List.set` ~9–10) sit under it; the
+    /// multi-clause string-match dispatches (`base_code` 38, `upper_base`
+    /// 36) sit well over.
+    const backedge_poll_unroll_callee_weight_limit: usize = 16;
+
+    /// P6-J5 lever (a) policy: decide the back-edge poll amortization
+    /// factor for the loopified function being emitted. Returns 1 (no
+    /// unroll) unless ALL hold:
+    ///
+    ///   * the loop actually polls through slots (`loopify_slots` present —
+    ///     a zero-param loopified body keeps the musttail/global-tick form
+    ///     and MUST NOT be body-duplicated: its `tail_call` is noreturn,
+    ///     so a second copy would be unreachable code);
+    ///   * the body is non-FP (float loops — nbody, spectral-norm,
+    ///     mandelbrot — hide the poll in FP latency; E2 measured them
+    ///     within noise, so unrolling would be pure code-size churn on the
+    ///     kill-criterion pair);
+    ///   * the ITERATING path is allocation-free (allocating loops are
+    ///     dominated by the manager call and additionally covered by the
+    ///     layer-1 piggyback; exit-path allocations like a base case's
+    ///     tuple return do not disqualify);
+    ///   * the ITERATING path calls only small TRUE-leaf functions
+    ///     (K-plicating whole-loop call sites regressed fannkuch +43%,
+    ///     and K-plicating heavy-leaf call sites regressed k-nucleotide
+    ///     +12% — see the shape field doc);
+    ///   * the body is tight (`backedge_poll_unroll_weight_limit`).
+    ///
+    /// Called only under the `runtime_concurrency` gate — gate-OFF builds
+    /// never reach it (zero-cost-OFF).
+    fn backedgePollUnrollFactor(self: *ZirDriver, func: ir.Function) u32 {
+        if (self.loopify_slots == null) return 1;
+        if (self.program == null) return 1;
+        const shape = ir.analyzeBackedgePollLoopShape(
+            &self.program.?,
+            &func,
+            backedge_poll_unroll_callee_weight_limit,
+        );
+        if (shape.contains_float_operation) return 1;
+        if (shape.contains_allocating_operation) return 1;
+        if (shape.iterating_path_calls_disqualifying_callee) return 1;
+        if (shape.instruction_weight > backedge_poll_unroll_weight_limit) return 1;
+        return backedge_poll_unroll_factor;
+    }
+
     /// P2-J6 layer-2 preheader emission (plan item 2.5): allocate the loop-
     /// local `u32` reduction counter and seed it from the current per-quantum
     /// budget (`Kernel.procReductionSeed`). Emitted ONCE, before the `loop`
     /// block, so it runs on loop entry rather than every iteration; the
     /// matching `emitBackedgeSafepointPoll` decrements it at the back-edge.
     /// The counter pointer is stashed in `loopify_safepoint_slot`.
-    fn emitBackedgeSafepointSeed(self: *ZirDriver) BuildError!void {
+    ///
+    /// P6-J5 lever (a): a K-unrolled tight loop (`unroll_factor > 1`) gets
+    /// NO preheader counter at all — its back-edge safepoint is the shared
+    /// per-thread `procReductionTickAmortized(K)` (see
+    /// `backedge_poll_unroll_factor` for why: the per-entry TLV seed
+    /// dominated on constantly-re-entered short-span loops). Only the
+    /// factor is recorded here.
+    fn emitBackedgeSafepointSeed(self: *ZirDriver, unroll_factor: u32) BuildError!void {
+        if (unroll_factor > 1) {
+            self.loopify_backedge_unroll = unroll_factor;
+            return;
+        }
         const u32_type = @intFromEnum(Zir.Inst.Ref.u32_type);
         const slot = try self.emitAllocMut(u32_type);
         const seed = try self.emitKernelCall("procReductionSeed", &.{});
         if (zir_builder_emit_store(self.handle, slot, seed) != 0) return error.EmitFailed;
         self.loopify_safepoint_slot = slot;
+        self.loopify_backedge_unroll = 1;
     }
 
     /// P2-J6 layer-2 back-edge emission (plan item 2.5): one
-    /// `Kernel.procBackedgePoll(counter)` call at the loop's back-edge, right
-    /// before the top-level `repeat`. Because `procBackedgePoll` is `inline`,
-    /// the counter pointer never escapes and LLVM keeps the counter in a
-    /// register — a register decrement + branch per iteration. A no-op when
-    /// no counter was seeded (gate OFF, or an allocating loop covered by
-    /// layer 1), so it is always safe to call on the loopify back-edge.
+    /// `Kernel.procBackedgePoll(counter)` call — or, for a K-unrolled tight
+    /// loop (P6-J5 lever (a)), one `Kernel.procReductionTickAmortized(K)`
+    /// on the shared per-thread budget — at the loop's back-edge, right
+    /// before the top-level `repeat`. The classic form is `inline`, so the
+    /// counter pointer never escapes and LLVM keeps the counter in a
+    /// register — a register decrement + branch per iteration; the
+    /// amortized form is one budget reduction per K iterations with zero
+    /// preheader cost. A no-op when neither was armed (gate OFF), so it is
+    /// always safe to call on the loopify back-edge.
     fn emitBackedgeSafepointPoll(self: *ZirDriver) BuildError!void {
+        if (self.loopify_backedge_unroll > 1) {
+            const stride_ref = zir_builder_emit_int(self.handle, self.loopify_backedge_unroll);
+            if (stride_ref == error_ref) return error.EmitFailed;
+            _ = try self.emitKernelCall("procReductionTickAmortized", &.{stride_ref});
+            return;
+        }
         const slot = self.loopify_safepoint_slot orelse return;
         _ = try self.emitKernelCall("procBackedgePoll", &.{slot});
     }
@@ -7803,15 +7975,18 @@ pub const ZirDriver = struct {
                 // slot LLVM could promote to a register — the poll therefore
                 // rides the shared GLOBAL reduction counter (`procReductionTick`,
                 // the same counter the layer-1 alloc piggyback uses) rather
-                // than the register-local `procBackedgePoll`. Emitted at every
-                // musttail back-edge when the gate is ON: an alloc-free
-                // musttail loop (e.g. a tight `i64` counter loop) has no other
-                // safepoint and MUST be polled here, and an allocating musttail
-                // loop already covered by layer 1 only pays a redundant
-                // decrement of the same counter (sound, negligible). This is a
+                // than the register-local `procBackedgePoll`. This is a
                 // non-tail call BEFORE the tail call, so the musttail call
-                // below stays in tail position. Gate OFF: nothing emitted (the
-                // CLBG kill-criterion loops loopify, so this path is not on the
+                // below stays in tail position.
+                //
+                // P6-J5 lever (b) narrowed this path's gate-ON reach: a
+                // TCO-safe self-recursion WITH parameters is now force-
+                // loopified (see `emitFunction`), taking the register-local
+                // poll instead. What still musttails gate-ON — and therefore
+                // still needs this global tick as its ONLY loop safepoint —
+                // is zero-param self-recursion, closure self-recursion, and
+                // the program entry. Gate OFF: nothing emitted (the CLBG
+                // kill-criterion loops loopify, so this path is not on the
                 // E2-measured hot paths regardless).
                 if (self.runtime_concurrency) {
                     _ = try self.emitKernelCall("procReductionTick", &.{});

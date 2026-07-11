@@ -803,6 +803,9 @@ cross-scheduler budget explicitly re-derived from the loaded numbers.
   then the Phase-5 seeded-determinism exit gate is SCOPED to kernel-level
   determinism (below); everything else in the gate-ON suite — including the whole
   supervision suite and the P5-R1 stray tests — is verified seed-clean.
+  (P6-J5 note: the count is now THREE — the new "CPU-bound tight unrolled loop is
+  still preempted" test is the same ordering shape and inherits the same
+  under-simulator caveat; same fix applies.)
 
 Exit gate: supervision-tree Zest suite (restart intensity, rest_for_one ordering, brutal_kill
 timing) under seeded determinism; R8 selective-receive benchmark (10⁶-deep mailbox, O(1)
@@ -1143,6 +1146,28 @@ seed-clean except the two pre-existing `SafepointTest` ordering assertions, owne
   becomes register-local instead of riding the global reduction counter's per-iteration
   load/store. NOT a kill-criterion item (E2 already passed with the poll on every loop) — this
   is a perf-tier refinement that gives the deferred mitigation an explicit owner.
+  - **DONE (P6-J5, 2026-07-10).** Both levers landed; ledger § E2 "P6-J5 mitigation" has the
+    full method + table. Honest re-baseline first: P4-J1's threadlocal counters had silently
+    inflated the gate-ON regressions past the figures above (mandelbrot +34%, fannkuch ~+23%
+    at HEAD-`30ac6a8` — every budget access became a Darwin TLV-getter call). Lever (b):
+    gate-ON, TCO-safe self-recursion WITH params is force-loopified through the existing
+    loopify machinery (zero-param/closure/entry recursion keeps musttail+`procReductionTick`)
+    → mandelbrot **+34% → +0.2% (noise)**. Lever (a): tight (IR weight ≤ 48), non-FP,
+    iterating-path-alloc-free, leaf-callee-only loopified bodies are K = 8-unrolled with ONE
+    seedless `procReductionTickAmortized(8)` at the back-edge (the per-entry TLV seed
+    dominated short-span loops; sub-K entries pay zero) → fannkuch **~+23% → +7.1%**.
+    Kill-criterion pair untouched (nbody −2.1%, spectral-norm −2.0%);
+    binarytrees/k-nucleotide unchanged (their +20%/+6% gate-ON penalties are the
+    PRE-EXISTING P4-J1 layer-1 TLV cost — a named follow-up, the J2
+    register/parameter-threading ceiling). Two measured dead ends documented and kept off
+    (unrolling weight-96 multi-call bodies: +55%; unrolling loops calling looping/heavy
+    callees: k-nucleotide +6% → +18%). Latency bound re-stated (K-granularity addendum,
+    `scheduler.zig` module doc): budget exhaustion observable ≤ K−1 tight iterations late —
+    tens of ns vs the 1 ms watchdog tick; the amortized form's preemption is proven
+    deterministically by the new `safepoint_test.zap` ordering test. Zero-cost-OFF re-proven:
+    all six gate-OFF CLBG `__TEXT,__text` sections byte-identical pre/post-P6-J5. Gates:
+    gate-ON `:test_concurrency` 171/0 (451 assertions), `zig build test` 0, `zig build
+    test-kernel` (Debug + ReleaseFast, fork compiler) 0.
 
 Exit gate: E6 re-run — crossover documented; ping-pong within target with move path on.
 

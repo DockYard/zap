@@ -16419,6 +16419,45 @@ pub const Kernel = struct {
         }
     }
 
+    /// P6-J5 lever (a) — the K-amortized back-edge safepoint for K-way
+    /// UNROLLED tight loopified loops: one reduction of `stride = K` on the
+    /// shared per-thread counter (`zap_proc_reductions_remaining`, the same
+    /// budget layer 1 and the musttail tick decrement), emitted ONCE at the
+    /// unrolled loop's back-edge (i.e. once per K original iterations), so
+    /// one reduction still accounts for one original iteration and the
+    /// quantum length in iterations is unchanged.
+    ///
+    /// Why the shared counter and NOT a loop-local register counter here:
+    /// the loop-local form (`procReductionSeed` + `procBackedgePoll`) pays a
+    /// per-LOOP-ENTRY seed, and since P4-J1 made the budget `threadlocal`
+    /// (the M:N correctness requirement) that seed is a Darwin TLV-getter
+    /// CALL. The tight loops this lever targets are entered constantly with
+    /// SHORT spans (fannkuch's `reverse_range` runs ~2–6 iterations per
+    /// call), so the per-entry seed dominated — the P6-J5 paired
+    /// measurement showed the seed+register-poll variant only halving the
+    /// regression. This form has NO preheader cost at all: an entry that
+    /// exits before completing K iterations never reaches the back-edge and
+    /// pays ZERO safepoint cost (sound: such an entry is ≤ K-1 iterations
+    /// of bounded work returning into a polled caller context), while a
+    /// long run pays one TLV reduction per K iterations.
+    ///
+    /// Preemption-latency contract: budget exhaustion (and thus a
+    /// kill/watchdog observation) can be noticed up to K-1 iterations later
+    /// than a per-iteration poll — see the scheduler module doc's
+    /// "Advertised preemption-latency bound". `n <= stride` (rather than
+    /// `== 0`) guards the decrement exactly like `procReductionTick`'s
+    /// `n <= 1`: the counter never stores 0 and never underflows; the slow
+    /// path refreshes it from the budget.
+    pub inline fn procReductionTickAmortized(stride: u32) void {
+        if (comptime !runtime_concurrency_active) return;
+        const n = @atomicLoad(u32, &ZapConcurrencyKernel.zap_proc_reductions_remaining, .monotonic);
+        if (n <= stride) {
+            ZapConcurrencyKernel.zap_proc_safepoint_slow();
+            return;
+        }
+        @atomicStore(u32, &ZapConcurrencyKernel.zap_proc_reductions_remaining, n - stride, .monotonic);
+    }
+
     /// Generic string conversion used by string interpolation. Strings
     /// pass through untouched; numbers/bools/enums are formatted via the
     /// runtime arena.
