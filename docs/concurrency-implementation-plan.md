@@ -72,6 +72,14 @@ What the 2026 devlog changes about our plan:
    `Io.Threaded` (real OS threads, 1:1) as an honest capability-matrix fallback — per-process
    heaps and non-atomic ARC still hold (refcounts stay process-local; only envelope handoff is
    atomic). Fiber+IOCP on Windows is fork work, deferred (Phase 7 stretch).
+   **[SUPERSEDED by the S0.5 decision + 7.2 adjudication (P7-J3, 2026-07-11).** This item was
+   written when the plan still drove processes through the fork's `std.Io` backends; S0.5
+   replaced that substrate with the bespoke fiber kernel, which has NO Threaded mode — the
+   fork's `Io.Threaded` is not the scheduling substrate and cannot host Zap processes.
+   Honest v1 posture: Windows gate-ON is **unsupported, cleanly diagnosed** at the driver's
+   OS capability gate (`validateKernelTargetSupport`); gate-OFF Windows cross-compiles work
+   (verified at HEAD). Windows gate-ON support = the enumerated kernel OS-primitive port,
+   scoped as **7.2a**; Fiber+IOCP folds into 7.2a as its I/O-integration stretch.]**
 
 ## 2. Locked design decisions (implemented by this plan)
 
@@ -1347,6 +1355,92 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   (native + explicit-triple) only; Windows end-to-end is 7.2's open item.
 - **7.2** Windows: Threaded-backend 1:1 fallback validated end-to-end; IOCP+fiber fork work
   scoped as a follow-on (stretch).
+  **DONE (P7-J3, 2026-07-11) — adjudicated to the honest posture: Windows gate-ON is
+  unsupported in v1, rejected at the driver's OS capability gate with the 7.2a port-list
+  diagnostic; gate-OFF Windows works.** The item's original wording ("Threaded-backend 1:1
+  fallback") predates S0.5: the bespoke fiber kernel replaced the `std.Io` backends as the
+  scheduling substrate and has no Threaded mode, so there is nothing to "fall back" to —
+  §1 item 5 carries the superseded-note. **The dependency enumeration (the adjudication
+  evidence — each kernel OS dependency → Windows status):** (a) futex park/unpark
+  (`futex.zig:41-61`): Darwin `os_sync_wait_on_address`/`__ulock_*` + Linux `futex(2)`,
+  `@compileError` otherwise — Windows analogue `WaitOnAddress`/`WakeByAddressSingle`, NOT
+  implemented; (b) receive/after + timing-wheel monotonic clock (`scheduler.zig:1851-1876`
+  `nowNanoseconds`): Darwin `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` + Linux
+  `clock_gettime(MONOTONIC)` syscall, `@compileError` otherwise — Windows analogue
+  `QueryPerformanceCounter`/`QueryUnbiasedInterruptTime`, NOT implemented; (c) guard-paged
+  lazy-commit fiber-stack pool (`stack_pool.zig:385-398` `posix.mmap` + `std.c.mprotect`
+  guard + Darwin/Linux `madvise` decommit, `posix.munmap`): `std.posix.mmap`'s `MAP` flags
+  type resolves to `void` on Windows (no mmap) — Windows analogue
+  `VirtualAlloc(MEM_RESERVE/MEM_COMMIT)` + `PAGE_NOACCESS` guard + `VirtualFree`, plus a
+  commit strategy decision (Windows has no overcommit; fault-commit needs `PAGE_GUARD` or
+  upfront commit), NOT implemented; (d) fiber entry trampoline
+  (`fiber_context.zig:578-583`): hardcodes SysV parameter registers (`leaq 8(%%rsp),
+  %%rdi`; `fiberMain`'s `.c` callconv is Win64 on windows — first parameter is rcx, not
+  rdi) — would compile silently and crash at runtime; (e) fiber↔TIB integration: the
+  fork's clobber-based `contextSwitch` (`lib/std/Io/fiber.zig`) is callee-saved-agnostic
+  (the compiler spills), but nothing maintains the Windows TEB stack bounds
+  (StackBase/StackLimit at gs:0x08/0x10) across a stack switch — SEH, `__chkstk` probes,
+  and stack-bound-validating Win32 APIs break on fiber stacks; (f) OS threads for
+  scheduler cores + blocking pool (`scheduler_pool.zig:378`, `blocking_pool.zig:213/312`
+  `std.Thread.spawn`): supported on Windows — fine; (g) exported `threadlocal`
+  scheduler/budget/context state (`process.zig` `zap_proc_*`, `scheduler.zig:1888`):
+  expected to work for statically linked COFF objects, unverified — validation item, not
+  a known blocker; (h) 64-bit atomics (blob/pid_table/scheduler_pool/signal): fine on
+  x86_64; (i) `std.c.getenv` env knobs (`abi.zig`): compile and link on windows-gnu
+  because the fork forces `link_libc = true` for every Windows object (`zir_api.zig`
+  `compileToObjectImpl`: `target_requires_libc = requiresLibC() or os == .windows` — the
+  mingw carve-out; this is why the today-capture showed no libc errors, unlike the 7.1a
+  Linux leg). Test-harness-only Darwin/Linux dependencies (panic_guards' `harness_supported`
+  gate, the stress suites' `std.c.clock_gettime` helpers, stack_pool's region-protection
+  readers) do not gate the kernel object. **Verification matrix (zap CLI, script mode,
+  hello fixture; real exit codes):** (i) gate-OFF `-Dtarget=x86_64-windows-gnu`
+  cross-compiles clean at HEAD (exit 0; artifact `PE32+ executable (console) x86-64, for
+  MS Windows`) — the pre-campaign runtime_os posture holds; no Wine on this host, so the
+  run leg is a documented Windows CI gap (compile-level verified only). (ii) gate-ON
+  `-Dtarget=x86_64-windows-gnu` BEFORE the fix: the arch check ADMITS x86_64, then the
+  kernel-object compile dies inside the kernel with four errors (`futex.zig:46/57`
+  parking `@compileError` ×2; `scheduler.zig:1868` clock `@compileError`;
+  `stack_pool.zig:389` `type 'void' does not support struct initialization syntax` — the
+  windows `MAP` flags void type) — the forbidden failure mode. AFTER the fix it fails
+  before ANY kernel work, exit 1, with ONE actionable diagnostic naming the 7.2a port
+  list (WaitOnAddress/WakeByAddressSingle futex, VirtualAlloc guard-paged stack pool,
+  QueryPerformanceCounter clock, Win64 fiber-entry ABI + TIB stack bounds) and both
+  escape hatches. (iii) controls: gate-ON explicit `-Dtarget=aarch64-macos` still
+  compiles AND runs (exit 0, correct stdout); gate-OFF windows re-verified at the fixed
+  binary (exit 0); gate-ON native `zap run test_concurrency` still green. **The fix**
+  (`src/concurrency_driver.zig`): `validateKernelTargetSupport` extended from arch-gating
+  to arch+OS gating — `kernelSupportsOperatingSystem` (Darwin family ∪ Linux, mirroring
+  the kernel's own comptime OS gates) checked after `FIBER_SUPPORTED_ARCHITECTURES` at
+  the same single earliest enforcement point (`kernelCacheKeyHex`); windows gets the
+  port-list diagnostic, other unsupported OSes (freebsd &c.) the generic OS wording;
+  malformed triples still defer to the compile path. Three driver unit tests red→green
+  (windows rejection with fork-primitive-never-invoked; bare `x86_64-windows` triple on
+  the cache-key path; `x86_64-freebsd-none` generic OS rejection). IOCP+fiber stretch:
+  folded into 7.2a. Gates: `zig build test` 0; `zig build test-kernel` (Debug +
+  ReleaseFast) 0; gate-ON `:test_concurrency` green; `zig fmt` clean.
+- **7.2a (FOLLOW-ON — the Windows kernel port; opens Windows gate-ON).** The dependency
+  enumeration in 7.2 IS this item's spec. Scope, in dependency order: (1) futex parking —
+  `WaitOnAddress`/`WakeByAddressSingle` (kernel32 synch API set) in `futex.zig`'s comptime
+  OS switch; (2) the monotonic scheduler clock — `QueryPerformanceCounter` (or
+  `QueryUnbiasedInterruptTime`) in `scheduler.zig`'s `nowNanoseconds`; (3) the stack pool —
+  `VirtualAlloc` reserve + guard + commit-strategy design (no overcommit on Windows:
+  choose `PAGE_GUARD` fault-commit or bounded upfront commit; decommit via
+  `VirtualFree(MEM_DECOMMIT)`/`MEM_RESET` replacing the Darwin/Linux `madvise` cache
+  path) in `stack_pool.zig`; (4) Win64 fiber-entry ABI — the x86_64 trampoline's
+  parameter registers (rcx/rdx, not rdi/rsi) in `fiber_context.zig`; (5) TIB stack-bound
+  maintenance across context switch (TEB StackBase/StackLimit swap, as Windows Fibers and
+  boost.context do) — coordinate with the fork's `Io/fiber.zig` since the switch asm is
+  the fork's; (6) validation items: exported-`threadlocal` COFF behavior, the
+  crash-reporter frame-record walk on Win64 (unwind tables vs FP chains), and the
+  test-harness Darwin/Linux gates for a Windows `test-kernel` leg. Then flip
+  `kernelSupportsOperatingSystem` to admit `.windows` — the driver gate must never admit
+  the OS before the kernel unit compiles for it. **Stretch (absorbed from 7.2's original
+  wording):** IOCP integration for the I/O poller seam once the port lands — fork work,
+  same posture as the original Fiber+IOCP note (§1 item 5). Budget/watchdog semantics on
+  Windows (risk §7 item 5) are re-scoped to this item: the kernel's own preemption model
+  applies unchanged once the port exists (no Threaded-fallback semantics difference to
+  document). Requires a Windows CI leg (or Wine) for end-to-end proof; no Windows host
+  existed in the P7-J3 environment.
 - **7.3** Docs: user-facing concurrency guide; FFI safety contract; message-versioning posture
   (never crash on unknown dynamic message); latency bound documentation incl. the one
   unbounded case.
@@ -1556,7 +1650,11 @@ Each is a design commitment, not a suggestion; each cites its evidence.
    sound: +4.7% relative on the realistic mix, +0.09–0.22 ns absolute.
 6. **Role of the remaining fork backends.** `Io.Threaded` is the Windows (and
    wasm-with-host-threads) capability-matrix fallback (§1 item 5, Phase 7) — real 1:1
-   threads, documented semantics differences; it is not a performance tier. The Evented
+   threads, documented semantics differences; it is not a performance tier. *[The
+   fallback reading is design intent, not shipped capability, for BOTH named targets:
+   7.1 (P7-J2) adjudicated wasm and 7.2 (P7-J3) adjudicated Windows to clean
+   capability rejections — `Io.Threaded` is not the scheduling substrate and cannot
+   host Zap processes; Windows gate-ON is the 7.2a port.]* The Evented
    backends are retained as *event-source references*: their kqueue/io_uring/GCD-source
    integration informs our poller (Phase 4), but their fiber scheduling, stack policy, and
    admission are not used. Remaining Dispatch defects (residual `spawn-serial` race, `deinit`
@@ -1655,4 +1753,7 @@ Each is a design commitment, not a suggestion; each cites its evidence.
    scheduler. The Dispatch-side fix itself stays on the fork-hygiene track for
    the fork's own I/O story.
 5. **Windows budget/watchdog semantics on the 1:1 Threaded fallback** — documented capability
-   difference, scoped in Phase 7.2.
+   difference, scoped in Phase 7.2. *[Re-scoped by the 7.2 adjudication (P7-J3): there is
+   no Threaded fallback (S0.5 — the bespoke kernel has no Threaded mode); Windows gate-ON
+   is the 7.2a kernel port, after which the kernel's own preemption model applies
+   unchanged — no fallback semantics difference exists to document.]*

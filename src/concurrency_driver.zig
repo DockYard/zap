@@ -75,7 +75,8 @@ pub const KERNEL_ROOT_BASENAME = "abi.zig";
 /// with ONE actionable diagnostic at the earliest point that knows both
 /// the gate and the target (plan 7.1's capability-matrix posture),
 /// instead of a screen of fiber/thread/atomic errors from deep inside
-/// the kernel-object compile.
+/// the kernel-object compile. The OS axis of the same capability matrix
+/// lives in `kernelSupportsOperatingSystem` (plan 7.2).
 pub const FIBER_SUPPORTED_ARCHITECTURES = [_]std.Target.Cpu.Arch{ .aarch64, .riscv64, .x86_64 };
 
 /// The intrinsic export the compiled object is asserted to carry. One
@@ -88,8 +89,10 @@ pub const KERNEL_SENTINEL_SYMBOL = "zap_proc_runtime_init";
 /// Driver-level errors, mirroring the memory driver's error/diagnostic
 /// discipline (each variant is paired with a populated diagnostic).
 pub const KernelResolveError = error{
-    /// The build target's cpu architecture cannot host the kernel at all
-    /// (no stackful-fiber support — see `FIBER_SUPPORTED_ARCHITECTURES`).
+    /// The build target cannot host the kernel at all — its cpu
+    /// architecture has no stackful-fiber support (see
+    /// `FIBER_SUPPORTED_ARCHITECTURES`) or its operating system has no
+    /// kernel OS-primitive layer (see `kernelSupportsOperatingSystem`).
     /// Raised BEFORE any kernel work with an actionable diagnostic.
     KernelTargetUnsupported,
     /// The kernel source directory or its root file could not be read.
@@ -326,52 +329,107 @@ pub fn resolveKernelObject(
     return .{ .object_path = object_path, .cache_key_hex = cache_key_hex };
 }
 
-/// Reject a build target whose cpu architecture cannot host the
-/// concurrency kernel (plan 7.1 — the capability-matrix compile-time
-/// check). The kernel is fiber-based: `FIBER_SUPPORTED_ARCHITECTURES`
-/// mirrors the fork's `std.Io.fiber.supported` set, and wasm is excluded
-/// architecturally — the wasm call stack is inaccessible, so no fiber
-/// substrate exists (Asyncify is ruled out by decision 9 of
-/// `zap-concurrency-research.md` §6; revisit when the wasm
-/// stack-switching proposal ships in major runtimes).
+/// Reject a build target that cannot host the concurrency kernel (plan
+/// 7.1/7.2 — the capability-matrix compile-time check), on either axis:
 ///
-/// A `null` target validates the native host architecture. A triple that
-/// does not parse is NOT rejected here: the compile path owns the
-/// malformed-triple diagnostic (`compileKernelUnit`), and this check must
-/// never mask it.
+/// * **Architecture** (plan 7.1, P7-J2): the kernel is fiber-based —
+///   `FIBER_SUPPORTED_ARCHITECTURES` mirrors the fork's
+///   `std.Io.fiber.supported` set, and wasm is excluded architecturally
+///   (the wasm call stack is inaccessible, so no fiber substrate exists;
+///   Asyncify is ruled out by decision 9 of `zap-concurrency-research.md`
+///   §6; revisit when the wasm stack-switching proposal ships in major
+///   runtimes).
+/// * **Operating system** (plan 7.2, P7-J3): the kernel's OS-primitive
+///   layer — futex parking (`futex.zig`), guard-paged lazy-commit fiber
+///   stacks (`stack_pool.zig`), and the receive/after monotonic clock
+///   (`scheduler.zig`) — is implemented for the Darwin family and Linux
+///   only (`kernelSupportsOperatingSystem`). Windows on a fiber-capable
+///   arch would otherwise pass the arch check and die inside the
+///   kernel-object compile on those primitives' `@compileError`s; it is
+///   rejected here with the plan 7.2a port list instead.
+///
+/// A `null` target validates the native host. A triple that does not
+/// parse is NOT rejected here: the compile path owns the malformed-triple
+/// diagnostic (`compileKernelUnit`), and this check must never mask it.
 pub fn validateKernelTargetSupport(
     target_triple: ?[]const u8,
     diag: *memory_driver.DriverDiagnostic,
 ) KernelResolveError!void {
-    const target_architecture: std.Target.Cpu.Arch = blk: {
-        const triple = target_triple orelse break :blk builtin.cpu.arch;
+    var target_architecture: std.Target.Cpu.Arch = builtin.cpu.arch;
+    var target_operating_system: std.Target.Os.Tag = builtin.os.tag;
+    if (target_triple) |triple| {
         const parsed = memory_driver.parseTargetTriple(triple) orelse return;
-        break :blk architectureFromForkTag(parsed.arch_tag) orelse return;
-    };
-    for (FIBER_SUPPORTED_ARCHITECTURES) |supported_architecture| {
-        if (target_architecture == supported_architecture) return;
+        target_architecture = architectureFromForkTag(parsed.arch_tag) orelse return;
+        target_operating_system = operatingSystemFromForkTag(parsed.os_tag) orelse return;
     }
     const triple_text = target_triple orelse "native";
-    switch (target_architecture) {
-        .wasm32, .wasm64 => diag.write(
-            "runtime_concurrency is not supported on {s} (target '{s}'): the concurrency " ++
-                "kernel requires stackful fibers, and the wasm call stack is architecturally " ++
-                "inaccessible — no wasm fiber substrate exists (Asyncify is ruled out; revisit " ++
-                "when the wasm stack-switching proposal ships). Build without " ++
-                "-Druntime-concurrency=on (or set `runtime_concurrency: false` in the " ++
-                "Zap.Manifest), or target a fiber-capable platform (aarch64/x86_64/riscv64).",
-            .{ @tagName(target_architecture), triple_text },
-        ),
-        else => diag.write(
-            "runtime_concurrency is not supported on {s} (target '{s}'): the concurrency " ++
-                "kernel requires stackful fiber support, which exists for " ++
-                "aarch64/x86_64/riscv64 only. Build without -Druntime-concurrency=on (or set " ++
-                "`runtime_concurrency: false` in the Zap.Manifest), or target a fiber-capable " ++
-                "architecture.",
-            .{ @tagName(target_architecture), triple_text },
-        ),
+
+    const architecture_is_fiber_capable = for (FIBER_SUPPORTED_ARCHITECTURES) |supported_architecture| {
+        if (target_architecture == supported_architecture) break true;
+    } else false;
+    if (!architecture_is_fiber_capable) {
+        switch (target_architecture) {
+            .wasm32, .wasm64 => diag.write(
+                "runtime_concurrency is not supported on {s} (target '{s}'): the concurrency " ++
+                    "kernel requires stackful fibers, and the wasm call stack is architecturally " ++
+                    "inaccessible — no wasm fiber substrate exists (Asyncify is ruled out; revisit " ++
+                    "when the wasm stack-switching proposal ships). Build without " ++
+                    "-Druntime-concurrency=on (or set `runtime_concurrency: false` in the " ++
+                    "Zap.Manifest), or target a fiber-capable platform (aarch64/x86_64/riscv64).",
+                .{ @tagName(target_architecture), triple_text },
+            ),
+            else => diag.write(
+                "runtime_concurrency is not supported on {s} (target '{s}'): the concurrency " ++
+                    "kernel requires stackful fiber support, which exists for " ++
+                    "aarch64/x86_64/riscv64 only. Build without -Druntime-concurrency=on (or set " ++
+                    "`runtime_concurrency: false` in the Zap.Manifest), or target a fiber-capable " ++
+                    "architecture.",
+                .{ @tagName(target_architecture), triple_text },
+            ),
+        }
+        return KernelResolveError.KernelTargetUnsupported;
     }
-    return KernelResolveError.KernelTargetUnsupported;
+
+    if (!kernelSupportsOperatingSystem(target_operating_system)) {
+        switch (target_operating_system) {
+            .windows => diag.write(
+                "runtime_concurrency is not supported on windows (target '{s}'): the concurrency " ++
+                    "kernel's OS-primitive layer exists for macOS/Darwin and Linux only — the " ++
+                    "Windows port (plan item 7.2a) still needs futex parking " ++
+                    "(WaitOnAddress/WakeByAddressSingle), a VirtualAlloc guard-paged fiber-stack " ++
+                    "pool, a monotonic scheduler clock (QueryPerformanceCounter), and Win64 " ++
+                    "fiber-entry ABI + TIB stack-bound maintenance. Build without " ++
+                    "-Druntime-concurrency=on (or set `runtime_concurrency: false` in the " ++
+                    "Zap.Manifest), or target macOS or Linux on a fiber-capable architecture.",
+                .{triple_text},
+            ),
+            else => diag.write(
+                "runtime_concurrency is not supported on {s} (target '{s}'): the concurrency " ++
+                    "kernel's OS-primitive layer (futex parking, guard-paged fiber stacks, the " ++
+                    "monotonic scheduler clock) is implemented for macOS/Darwin and Linux only. " ++
+                    "Build without -Druntime-concurrency=on (or set `runtime_concurrency: false` " ++
+                    "in the Zap.Manifest), or target macOS or Linux on a fiber-capable " ++
+                    "architecture.",
+                .{ @tagName(target_operating_system), triple_text },
+            ),
+        }
+        return KernelResolveError.KernelTargetUnsupported;
+    }
+}
+
+/// Whether the concurrency kernel's OS-primitive layer is implemented for
+/// `operating_system` — the OS axis of the capability matrix (plan 7.2,
+/// P7-J3), mirroring the kernel's own comptime OS gates: futex parking
+/// (`futex.zig` — Darwin `os_sync_*`/`__ulock_*`, Linux `futex(2)`,
+/// `@compileError` otherwise), the guard-paged lazy-commit stack pool
+/// (`stack_pool.zig` — `posix.mmap`/`mprotect`/`madvise`), and the
+/// receive/after monotonic clock (`scheduler.zig` —
+/// `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` / `clock_gettime(MONOTONIC)`,
+/// `@compileError` otherwise). Extending this set means porting those
+/// primitives FIRST (Windows: plan item 7.2a) — the driver gate must never
+/// admit an OS the kernel unit cannot compile for.
+fn kernelSupportsOperatingSystem(operating_system: std.Target.Os.Tag) bool {
+    return operating_system.isDarwin() or operating_system == .linux;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +443,15 @@ pub fn validateKernelTargetSupport(
 fn architectureFromForkTag(arch_tag: u16) ?std.Target.Cpu.Arch {
     return inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |field| {
         if (field.value == arch_tag) break @field(std.Target.Cpu.Arch, field.name);
+    } else null;
+}
+
+/// Resolve a `ZapForkTarget.os_tag` back to the `std.Target.Os.Tag` it
+/// encodes — `architectureFromForkTag`'s OS counterpart, with the same
+/// null-means-defer contract.
+fn operatingSystemFromForkTag(os_tag: u16) ?std.Target.Os.Tag {
+    return inline for (@typeInfo(std.Target.Os.Tag).@"enum".fields) |field| {
+        if (field.value == os_tag) break @field(std.Target.Os.Tag, field.name);
     } else null;
 }
 
@@ -1149,6 +1216,81 @@ test "concurrency driver: fiber-capable cross targets pass the capability check"
         // proceed to the kernel compile for every fiber-capable target.
         _ = try kernelCacheKeyHex(allocator, options, &diag);
     }
+}
+
+test "concurrency driver: gate-ON windows target fails early with the OS port-list diagnostic" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    mock_kernel_compile_count = 0;
+    var options = unit.options(mockForkCompileKernel);
+    options.target = "x86_64-windows-gnu";
+
+    try testing.expectError(
+        KernelResolveError.KernelTargetUnsupported,
+        resolveKernelObject(allocator, options, &diag),
+    );
+    // The rejection happens BEFORE any kernel work: the fork primitive is
+    // never invoked, so none of the futex/clock/mmap compile errors from
+    // inside the kernel-object compile ever surface (x86_64 passes the
+    // ARCH check — the OS gate is what must fire here).
+    try testing.expectEqual(@as(usize, 0), mock_kernel_compile_count);
+    // The diagnostic is actionable AND names the missing Windows
+    // primitives — the plan 7.2a port list.
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "runtime_concurrency is not supported on windows") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "WaitOnAddress") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "VirtualAlloc") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "-Druntime-concurrency") != null);
+}
+
+test "concurrency driver: the windows rejection covers the cache-key path and the bare arch-os triple" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    var options = unit.options(mockForkCompileKernel);
+    // A bare `arch-os` triple resolves its default ABI (`gnu` for windows,
+    // mirroring the build's own triple resolution) and must be rejected on
+    // `kernelCacheKeyHex` — the FIRST driver entry point every build path
+    // hits — exactly like the wasm rejection.
+    options.target = "x86_64-windows";
+
+    try testing.expectError(
+        KernelResolveError.KernelTargetUnsupported,
+        kernelCacheKeyHex(allocator, options, &diag),
+    );
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "runtime_concurrency is not supported on windows") != null);
+}
+
+test "concurrency driver: a fiber-capable architecture on an unsupported OS is rejected with the OS diagnostic" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    mock_kernel_compile_count = 0;
+    var options = unit.options(mockForkCompileKernel);
+    // x86_64 passes the arch check; freebsd has no kernel OS-primitive
+    // layer (futex parking, guard-paged stacks, the scheduler clock), so
+    // the generic OS rejection must fire with the supported-OS listing.
+    options.target = "x86_64-freebsd-none";
+
+    try testing.expectError(
+        KernelResolveError.KernelTargetUnsupported,
+        resolveKernelObject(allocator, options, &diag),
+    );
+    try testing.expectEqual(@as(usize, 0), mock_kernel_compile_count);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "runtime_concurrency is not supported on freebsd") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "macOS/Darwin and Linux") != null);
 }
 
 test "concurrency driver: a malformed triple defers to the compile-path diagnostic" {
