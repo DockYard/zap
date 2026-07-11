@@ -52,7 +52,16 @@
 //! pid/timestamp words could pair across the two writers — the ticket
 //! cross-check bounds this to a vanishing window and such an entry is
 //! diagnostic data, never dereferenced. Captures at quiescence (how the
-//! tests read) are exact over the last `ring_capacity` events.
+//! tests read) are exact over the last `ring_capacity` events UNLESS a
+//! writer lapped another during the run: a writer descheduled across a
+//! full ring circumference can land its OLDER event after the slot's
+//! final write, and the reader's ticket cross-check then skips that slot
+//! — a quiescent capture falls short by at most the number of such
+//! lap-crossed stragglers (bounded by the writer count in any instant).
+//! In the production regime the ring (4096 slots) vastly exceeds the
+//! number of concurrent writers, so a lap-crossed straggler requires a
+//! writer stalled mid-emit for thousands of events — the diagnostic
+//! window stays effectively exact.
 
 const std = @import("std");
 
@@ -194,7 +203,9 @@ pub fn TraceRing(comptime capacity: usize) type {
         /// Copy the retained events, oldest first, into `destination`;
         /// returns how many were written. Entries a racing writer is
         /// overwriting mid-capture are skipped (module doc). Exact at
-        /// quiescence.
+        /// quiescence up to lap-crossed stragglers (module doc: a writer
+        /// descheduled across a full ring circumference can leave one
+        /// slot holding an older, skipped entry).
         pub fn capture(ring: *Self, destination: []TraceEventRecord) usize {
             const end_ticket = ring.head.load(.acquire);
             const retained = @min(end_ticket, capacity);
@@ -399,8 +410,21 @@ test "TraceRing: concurrent producers lose nothing and every entry is coherent" 
     );
     var events: [1024]TraceEventRecord = undefined;
     const captured = ring.capture(&events);
-    // Quiescent capture: the full retained window is readable.
-    try testing.expectEqual(@as(usize, 1024), captured);
+    // Quiescent capture: the retained window is readable up to
+    // lap-crossed stragglers (module doc) — with 4 producers × 4096
+    // events into 1024 slots, lapping is guaranteed, and a producer
+    // descheduled across a full circumference can land its OLDER event
+    // after a slot's final write; the reader's ticket cross-check then
+    // (correctly) skips that slot. At most one emit per OTHER producer
+    // can be in flight when any slot's final write completes, so the
+    // shortfall is bounded by producer_count − 1.
+    if (captured < 1024 - (producer_count - 1)) {
+        std.debug.print(
+            "quiescent capture fell below the lap-straggler bound: captured={d} (want >= {d})\n",
+            .{ captured, 1024 - (producer_count - 1) },
+        );
+        return error.TestUnexpectedResult;
+    }
     var previous_sequence: u64 = 0;
     for (events[0..captured], 0..) |event, index| {
         if (index > 0) try testing.expect(event.sequence > previous_sequence);

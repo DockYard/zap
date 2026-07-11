@@ -3341,7 +3341,9 @@ test "abi: observability — process listing, scheduler surfaces, and the trace-
     // Process listing: exactly the two live stragglers, both named. Each is
     // `.waiting` (parked) or — if the root exited before a core gave it a
     // quantum — still `.runnable`; the listing is point-in-time, never a
-    // stop-the-world (introspection.zig's consistency contract).
+    // stop-the-world (introspection.zig's consistency contract). Every
+    // violation prints its observed state: a bare `expect` here once failed
+    // "without output" in-suite, which made the flake undiagnosable.
     const captured = zap_introspect_capture();
     try testing.expectEqual(@as(u64, 2), captured);
     var found_first = false;
@@ -3352,11 +3354,22 @@ test "abi: observability — process listing, scheduler surfaces, and the trace-
         if (pid_bits == first_pid_bits) found_first = true;
         if (pid_bits == second_pid_bits) found_second = true;
         const state_code = zap_introspect_state(index);
-        try testing.expect(state_code == 1 or state_code == 3); // runnable | waiting
+        if (!(state_code == 1 or state_code == 3)) { // runnable | waiting
+            std.debug.print(
+                "captured process {d} (pid 0x{x}) in unexpected state code {d} (want runnable=1 or waiting=3)\n",
+                .{ index, pid_bits, state_code },
+            );
+            return error.TestUnexpectedResult;
+        }
         try testing.expectEqual(@as(u64, 0), zap_introspect_mailbox_depth(index));
     }
-    try testing.expect(found_first);
-    try testing.expect(found_second);
+    if (!found_first or !found_second) {
+        std.debug.print(
+            "straggler listing mismatch: want pids 0x{x} and 0x{x}, captured 0x{x} and 0x{x}\n",
+            .{ first_pid_bits, second_pid_bits, zap_introspect_pid(0), zap_introspect_pid(1) },
+        );
+        return error.TestUnexpectedResult;
+    }
     // Past-the-count getters are total.
     try testing.expectEqual(@as(u64, 0), zap_introspect_pid(captured));
     try testing.expectEqual(@as(i64, -1), zap_introspect_state(captured));
@@ -3366,15 +3379,35 @@ test "abi: observability — process listing, scheduler surfaces, and the trace-
     // exact: busy + parked == window, per core.
     const core_count = zap_sched_core_count();
     try testing.expect(core_count >= 1);
+    var total_window_nanos: u64 = 0;
     var core_index: u64 = 0;
     while (core_index < core_count) : (core_index += 1) {
         const window = zap_sched_window_nanos(core_index);
         const parked = zap_sched_parked_nanos(core_index);
         const busy = zap_sched_busy_nanos(core_index);
-        try testing.expectEqual(window, busy + parked);
+        total_window_nanos += window;
+        if (window != busy + parked) {
+            std.debug.print(
+                "core {d} utilization split broken: window={d} busy={d} parked={d}\n",
+                .{ core_index, window, busy, parked },
+            );
+            return error.TestUnexpectedResult;
+        }
     }
-    // Core 0 is the driver — it provably ran a window.
-    try testing.expect(zap_sched_window_nanos(0) > 0);
+    // The root provably ran a quantum SOMEWHERE, so at least one core
+    // measured a nonzero window. Deliberately NOT asserted per-core: under
+    // work stealing a worker can steal and finish the whole run before the
+    // driver's (core 0) loop observes its first `stopping` check, leaving
+    // core 0 an episode shorter than one CLOCK_UPTIME_RAW tick (~42 ns on
+    // Apple Silicon) that quantizes to a zero-span window — the pre-P7-J1
+    // in-suite ReleaseFast flake, which asserted core 0 specifically.
+    if (total_window_nanos == 0) {
+        std.debug.print(
+            "no core measured a utilization window (core_count={d})\n",
+            .{core_count},
+        );
+        return error.TestUnexpectedResult;
+    }
     try testing.expectEqual(@as(u64, 0), zap_sched_global_queue_depth());
     // Out-of-range core indexes are total.
     try testing.expectEqual(@as(u64, 0), zap_sched_run_queue_depth(core_count + 7));
