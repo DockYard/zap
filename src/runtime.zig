@@ -6764,7 +6764,7 @@ pub const BlobRuntime = struct {
 fn validateSpawnEntrySignature(comptime EntryType: type, comptime function_info: std.builtin.Type.Fn) void {
     if (function_info.params.len != 0) {
         @compileError(
-            "Process.spawn entry `" ++ @typeName(EntryType) ++ "` must take zero parameters in Phase 2 — " ++
+            "Process.spawn entry `" ++ @typeName(EntryType) ++ "` must take zero parameters — " ++
                 "hand the child its inputs by sending messages to its pid (typed via Pid(M)).",
         );
     }

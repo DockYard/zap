@@ -1,7 +1,19 @@
 # Zap Concurrency Implementation Plan
 
-**Status: APPROVED — in execution.** (Ratified by the 2026-07-04 implementation directive;
-Phase 0 completed 2026-07-05 — see Appendix A and the gap-analysis record in the ledger.)
+**Status: CONSTRUCTION COMPLETE — Phases 0–6 all delivered and adversarially verified
+(each phase closed CLEAR through at least two gap-analysis rounds).** Ratified by the
+2026-07-04 implementation directive; Phase 0 completed 2026-07-05; Phase 6 (the final
+performance tier) completed 2026-07-11. Every phase exit gate adjudicated MET; the
+experiment ledger (E1–E10 + OQ1) fully recorded in `docs/concurrency-bench-results.md`;
+zero-cost-OFF byte-identity holds at HEAD. Remaining post-construction items carry
+numbered owners (2.2a, 5.5–5.9, 6.2a, 6.3a/6.3b, 6.4a, 6.6a, 7.1–7.6). **One
+deliberately user-run step remains: `zig build zir-test`** — the compile-fail fixtures
+written across the campaign (send type-mismatch, non-sendable receive, use-after-move,
+gate-off Process rejection, the Option(struct) regression, spawn-entry contracts, and
+the gated compile-and-run tests) are correct-by-construction (each diagnostic string
+matched against its emitter, several spot-verified via standalone zap-CLI compiles) but
+were never executed by agents per the standing instruction; they run when the user runs
+`zir-test`.
 
 **Lineage:** `research.md` (round-1 survey) → `research-round-2.md` (round-2 evidence) →
 `zap-concurrency-research.md` rev 2 (design positions, all resolved). This document turns those

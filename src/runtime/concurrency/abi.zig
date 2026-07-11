@@ -2937,6 +2937,14 @@ test "abi: each spawned process gets its own private context, wholesale-freed le
 
 test "abi: a killed process's live allocations are wholesale-freed at teardown (crash-teardown leak-exactness)" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    // The trailing deinit below is itself under test (teardown wholesale-free
+    // assertions follow it), so it cannot be a plain `defer` — but a failed
+    // expectation mid-test must still deinit, or the live runtime cascades
+    // `already_initialized` through every later abi test (the P6 round-2
+    // flake). The guard flag gives both: explicit deinit on the pass path,
+    // guaranteed cleanup on every error path.
+    var runtime_live = true;
+    defer if (runtime_live) zap_proc_runtime_deinit();
     TestManagerCore.resetAccounting();
     bindTestManager();
 
@@ -2958,6 +2966,7 @@ test "abi: a killed process's live allocations are wholesale-freed at teardown (
     // Program shutdown kills the straggler; its teardown wholesale-frees the
     // live allocation — every minted context deinit'd, zero residue.
     zap_proc_runtime_deinit();
+    runtime_live = false;
     try testing.expectEqual(TestManagerCore.init_total.load(.monotonic), TestManagerCore.deinit_total.load(.monotonic));
     try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count.load(.monotonic));
     try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total.load(.monotonic));
@@ -3277,6 +3286,11 @@ test "abi: zap_proc_current is null on the driver thread and matches the entry h
 test "abi: zap_proc_run_until_exit joins the target and leaves stragglers for deinit" {
     try testing.expectEqual(ZapProcStatus.not_initialized, zap_proc_run_until_exit(0));
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    // Deinit-then-assert is under test; the guard flag keeps failure paths
+    // from leaking a live runtime into later tests (see the crash-teardown
+    // test above for the rationale).
+    var runtime_live = true;
+    defer if (runtime_live) zap_proc_runtime_deinit();
     bindTestManager();
 
     const straggler_pid_bits = zap_proc_spawn(parkForeverEntry, null);
@@ -3300,11 +3314,18 @@ test "abi: zap_proc_run_until_exit joins the target and leaves stragglers for de
 
     // Program-shutdown semantics: deinit tears the straggler down.
     zap_proc_runtime_deinit();
+    runtime_live = false;
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
 }
 
 test "abi: observability — process listing, scheduler surfaces, and the trace-OFF read API (P6-J6)" {
     try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    // Deinit-then-assert is under test (the straggler reap + ledger check at
+    // the end); the guard flag keeps any failed expectation above it from
+    // leaking a live runtime into the ~19 later abi tests (the P6 round-2
+    // `already_initialized` cascade).
+    var runtime_live = true;
+    defer if (runtime_live) zap_proc_runtime_deinit();
     bindTestManager();
 
     // Uninitialized-index and empty-capture behavior is total (no traps).
@@ -3370,6 +3391,7 @@ test "abi: observability — process listing, scheduler surfaces, and the trace-
 
     // Deinit reaps the stragglers and releases the capture storage.
     zap_proc_runtime_deinit();
+    runtime_live = false;
     try testing.expectEqual(@as(usize, 0), payloadLedgerLiveBlockCount());
 }
 
