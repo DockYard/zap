@@ -796,6 +796,12 @@ pub struct Supervisor {
     child's spontaneous death, or the supervisor's own parent terminating it
     mid-sweep) into the returned strays — the caller folds them into
     supervisor state; nothing is discarded. Internal to `terminate_child`.
+
+    This wait is unbounded but SOUND: the supervisor is linked to the child
+    and traps exits, so the child's death always arms an exit signal, and
+    the kernel delivers signals or panics (it never drops one under memory
+    pressure — the plan-7.5 signal-delivery OOM posture). The wait is
+    therefore bounded by the child's teardown delivery.
     """
 
   fn reap_exit(pid :: u64, strays :: SupervisorStrays) -> SupervisorStrays {
@@ -815,6 +821,12 @@ pub struct Supervisor {
     queued); every signal from another sender is COLLECTED into the returned
     strays and the remaining time recomputed, so a burst of strays can never
     extend the child's grace period. Internal.
+
+    The deadline is a shutdown-protocol grace period, not a hedge against
+    lost signals: the kernel delivers signals or panics (the plan-7.5
+    signal-delivery OOM posture), so a child that died within the window is
+    always observed — `exited: false` genuinely means the child outlived its
+    grace period and must be killed.
     """
 
   fn wait_exit(pid :: u64, deadline_ms :: i64, strays :: SupervisorStrays) -> SupervisorReap {

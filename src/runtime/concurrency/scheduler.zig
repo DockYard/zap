@@ -621,6 +621,58 @@ pub const SendOutcome = enum {
     dead_lettered,
 };
 
+// ---------------------------------------------------------------------------
+// Signal-delivery OOM posture (plan item 7.5, P7-J1): signal delivery is
+// GUARANTEED-OR-PANIC. A dropped exit/`DOWN` signal is not lossy telemetry —
+// every supervision wait is unbounded by design (`lib/supervisor.zap`
+// `reap_exit`/`wait_exit`, the kernel's `signalDemonitorFlush` case-2 await),
+// so a signal lost to memory pressure converts a loud OOM into a silent
+// forever-hang (the S1 hang class, resurrected by OOM). The runtime's general
+// OOM posture is already panic (`runtime.zig` `interpretSendStatus`); signal
+// delivery matches it. These diagnostics are `pub` so the expect-panic guard
+// tests (`panic_guards.zig`) assert the exact messages.
+// ---------------------------------------------------------------------------
+
+/// Diagnostic for an exit/`DOWN` payload-block allocation failure inside
+/// `pushSignalMessage` (the payload seam returned null).
+pub const signal_payload_oom_panic_message =
+    "zap: signal delivery failed inside the concurrency runtime (out of memory " ++
+    "allocating an exit/DOWN payload); a kernel that cannot deliver exit signals " ++
+    "has lost supervision soundness";
+
+/// Diagnostic for a signal-envelope allocation failure inside
+/// `pushSignalMessage` (the sender's envelope handle could not grow).
+pub const signal_envelope_oom_panic_message =
+    "zap: signal delivery failed inside the concurrency runtime (out of memory " ++
+    "allocating a signal envelope); a kernel that cannot deliver exit signals " ++
+    "has lost supervision soundness";
+
+/// Diagnostic for a signal push reached with a signal runtime whose payload
+/// seam was never wired — a kernel misconfiguration, not an OOM: every
+/// embedder that wires `Scheduler.Options.signal_runtime` must wire
+/// `PayloadSeam.allocate` before any link/monitor/exit-signal traffic.
+pub const signal_seam_missing_panic_message =
+    "zap: signal delivery attempted with no payload seam wired; a signal runtime " ++
+    "must wire PayloadSeam.allocate before any link/monitor/exit-signal traffic " ++
+    "(kernel misconfiguration)";
+
+/// Diagnostic for a link-set node allocation failure inside `signalLink`.
+/// A silently unestablished link would forfeit exit propagation: a supervisor
+/// that believes it linked a child would wait forever for an exit signal the
+/// kernel never armed.
+pub const link_node_oom_panic_message =
+    "zap: link failed inside the concurrency runtime (out of memory allocating " ++
+    "a link-set node); a silently unestablished link would forfeit exit " ++
+    "propagation (supervision soundness lost)";
+
+/// Diagnostic for a monitor-set node allocation failure inside
+/// `signalMonitor`. A silently uninstalled monitor would never fire its
+/// `DOWN`: the caller holds a ref it believes is armed and waits forever.
+pub const monitor_node_oom_panic_message =
+    "zap: monitor failed inside the concurrency runtime (out of memory " ++
+    "allocating a monitor-set node); a silently uninstalled monitor would " ++
+    "never fire its DOWN (supervision soundness lost)";
+
 /// Errors surfaced by `Scheduler.spawn`.
 pub const SpawnError = error{OutOfMemory} ||
     stack_pool_module.AcquireError ||
@@ -3582,6 +3634,34 @@ pub const Scheduler = struct {
     // race-free against the target's concurrent teardown; teardown propagation
     // runs after `closeAndQuiesce`, which drains those pins, so no set-mutation
     // is ever missed or double-fired (P4-R1 grace period).
+    //
+    // ## Signal-delivery allocation audit (plan item 7.5, P7-J1)
+    //
+    // Signal delivery is GUARANTEED-OR-PANIC: no allocation failure on any
+    // signal path may silently drop a signal (a dropped exit/`DOWN` converts
+    // memory pressure into an unbounded supervision hang — the S1 class).
+    // Every allocation site on the signal paths, and its posture:
+    //
+    // | Site                                       | Allocation             | Posture |
+    // |--------------------------------------------|------------------------|---------|
+    // | `pushSignalMessage` payload block          | payload seam (ledger)  | PANIC on OOM (`signal_payload_oom_panic_message`) |
+    // | `pushSignalMessage` envelope               | envelope pool growth   | PANIC on OOM (`signal_envelope_oom_panic_message`) |
+    // | `pushSignalMessage` seam unwired           | none (configuration)   | PANIC (`signal_seam_missing_panic_message`) — a signal runtime without a wired seam is a kernel misconfiguration |
+    // | `signalLink` link nodes (both sides)       | signal-node pool growth| PANIC on OOM (`link_node_oom_panic_message`) |
+    // | `signalMonitor` monitor nodes (both sides) | signal-node pool growth| PANIC on OOM (`monitor_node_oom_panic_message`) |
+    // | `spawn` link/monitor node pre-allocation   | signal-node pool growth| `error.OutOfMemory` fails the spawn CLEANLY before the pid is minted — no relationship half-installed, loud error to the caller (P5-J2) |
+    // | `killWithReason` / kill delivery           | none                   | infallible (atomic stores + revive handshake) |
+    // | `propagateExitSignals` set drains          | none (frees only)      | infallible; deliveries route through `pushSignalMessage` above |
+    // | `unlink`/`demonitor`/flush/consume paths   | none (frees only)      | infallible |
+    // | `ReasonAtoms` registration                 | none (atomic stores)   | infallible; the atom ids are minted by the Zap atom table under its own OOM posture before the kernel sees them |
+    // | no signal runtime (`signalRuntimePtr` null)| n/a                    | structural no-op: a scheduler without a signal runtime has no link/monitor/trap surface, so no supervision wait can exist to starve |
+    //
+    // With every drop eliminated, the unbounded signal waits are sound:
+    // signals are delivered or the runtime has panicked, so each wait is
+    // bounded by the sender's delivery (`signalDemonitorFlush` case 2,
+    // `awaitSignal`, and the supervisor's `reap_exit`/`wait_exit` in
+    // `lib/supervisor.zap`). The expect-panic proofs live in
+    // `panic_guards.zig` (the five `signal_*` guard scenarios).
     // -------------------------------------------------------------------------
 
     /// The kernel signal runtime, or null when this scheduler has none wired (a
@@ -3620,9 +3700,18 @@ pub const Scheduler = struct {
     /// is a runtime ledger block (via the payload seam) so the receiver's
     /// ordinary `zap_proc_envelope_free` reclaims it exactly like a copied user
     /// payload; the `Fragment.signal_kind` discriminator marks it a signal. The
-    /// caller holds a `beginSend` pin on the target (mailbox-race-free). A
-    /// payload/envelope OOM drops the signal (best-effort, Erlang-faithful — a
-    /// signal is not guaranteed under memory pressure).
+    /// caller holds a `beginSend` pin on the target (mailbox-race-free).
+    ///
+    /// OOM posture (plan item 7.5): a payload/envelope allocation failure
+    /// PANICS — the signal is never dropped. Every supervision wait is
+    /// unbounded by design (a supervisor's `reap_exit`/`await_signal`, the
+    /// kernel's `signalDemonitorFlush` in-flight-`DOWN` await), so a signal
+    /// lost to memory pressure would convert a loud OOM into a silent
+    /// forever-hang; a kernel that cannot deliver exit signals has lost
+    /// supervision soundness. This matches the runtime's general OOM posture
+    /// (`runtime.zig` `interpretSendStatus` panics on send OOM). The no-runtime
+    /// early return is NOT a drop: a scheduler without a signal runtime has no
+    /// link/monitor/trap surface, so no signal can have been requested.
     fn pushSignalMessage(
         scheduler: *Scheduler,
         sender_record: *ProcessRecord,
@@ -3632,14 +3721,16 @@ pub const Scheduler = struct {
     ) void {
         const sr = scheduler.signalRuntimePtr() orelse return;
         const seam = sr.payload_seam;
-        const allocate = seam.allocate orelse return;
-        const body = allocate(seam.context, @sizeOf(signal_module.SignalPayload)) orelse return;
+        const allocate = seam.allocate orelse @panic(signal_seam_missing_panic_message);
+        const body = allocate(seam.context, @sizeOf(signal_module.SignalPayload)) orelse
+            @panic(signal_payload_oom_panic_message);
         const payload_slot: *signal_module.SignalPayload = @ptrCast(@alignCast(body));
         payload_slot.* = payload;
-        const envelope = sender_record.envelope_handle.allocate() catch {
-            if (seam.free) |free_payload| free_payload(seam.context, body, @sizeOf(signal_module.SignalPayload));
-            return;
-        };
+        // The payload block is deliberately NOT freed on the envelope-OOM
+        // branch: the panic below never returns, so cleanup would be dead
+        // code masquerading as recovery.
+        const envelope = sender_record.envelope_handle.allocate() catch
+            @panic(signal_envelope_oom_panic_message);
         envelope.fragment = .{
             .payload_pointer = body,
             .payload_byte_length = @sizeOf(signal_module.SignalPayload),
@@ -3844,12 +3935,15 @@ pub const Scheduler = struct {
         }
         // Add on the target side (pinned) then the self side; the pin gates the
         // target's teardown so its propagation sees this link (or, if it already
-        // closed, `beginSend` failed above and we took the noproc path).
-        _ = target_pcb.signal_state.linkPeer(&sr.node_pool, self_bits) catch return false;
-        _ = self_record.pcb.signal_state.linkPeer(&sr.node_pool, target_pid.toBits()) catch {
-            _ = target_pcb.signal_state.unlinkPeer(&sr.node_pool, self_bits);
-            return false;
-        };
+        // closed, `beginSend` failed above and we took the noproc path). A node
+        // OOM panics (plan item 7.5): returning false here would claim
+        // dead-target semantics (whose `noproc` signal was never delivered)
+        // while silently forfeiting exit propagation for a link the caller
+        // believes exists — the supervisor-hang class, from an allocator edge.
+        _ = target_pcb.signal_state.linkPeer(&sr.node_pool, self_bits) catch
+            @panic(link_node_oom_panic_message);
+        _ = self_record.pcb.signal_state.linkPeer(&sr.node_pool, target_pid.toBits()) catch
+            @panic(link_node_oom_panic_message);
         return true;
     }
 
@@ -3914,11 +4008,14 @@ pub const Scheduler = struct {
             scheduler.fireNoprocDown(self_record, ref, target_pid);
             return ref;
         }
-        target_pcb.signal_state.addMonitoredBy(&sr.node_pool, ref, self_bits) catch return ref;
-        self_record.pcb.signal_state.addMonitor(&sr.node_pool, ref, target_pid.toBits()) catch {
-            _ = target_pcb.signal_state.removeMonitoredByRef(&sr.node_pool, ref);
-            return ref;
-        };
+        // A node OOM panics (plan item 7.5): returning the ref with the monitor
+        // silently uninstalled (on either side) hands the caller a reference it
+        // believes is armed whose `DOWN` can never fire — an unbounded wait for
+        // the `call`/`Task.await` machinery built on it.
+        target_pcb.signal_state.addMonitoredBy(&sr.node_pool, ref, self_bits) catch
+            @panic(monitor_node_oom_panic_message);
+        self_record.pcb.signal_state.addMonitor(&sr.node_pool, ref, target_pid.toBits()) catch
+            @panic(monitor_node_oom_panic_message);
         return ref;
     }
 
@@ -3963,7 +4060,11 @@ pub const Scheduler = struct {
     ///    receive-mark when still armed for `ref` (the `DOWN` was pushed
     ///    after the mark, so this stays O(1)-from-mark) and is bounded by
     ///    the target's in-progress teardown, which cannot block on this
-    ///    process.
+    ///    process. "In flight" is a DELIVERY GUARANTEE, not an
+    ///    optimistic claim: signal-delivery OOM panics (plan item 7.5,
+    ///    `pushSignalMessage`), so the `DOWN` cannot have been dropped —
+    ///    it is enqueued or the runtime has already panicked, and this
+    ///    wait is bounded by that delivery.
     /// 3. No outgoing entry for `ref` (an immediately-fired `noproc`
     ///    monitor, whose `DOWN` was delivered at monitor() time and never
     ///    had a remote entry): flush a queued `DOWN` non-blockingly (one
@@ -3986,6 +4087,9 @@ pub const Scheduler = struct {
                 return true;
             }
             // Case 2: exactly one DOWN queued or in flight — consume it.
+            // The unbounded wait is sound: signals are delivered or the
+            // runtime has panicked (plan 7.5), so this wait is bounded by
+            // the tearing-down target's delivery.
             switch (context.receiveCorrelated(ref, .down_only, null)) {
                 .matched => |envelope| scheduler.freeSignalEnvelope(envelope),
                 .timed_out => unreachable, // no deadline was armed
@@ -4056,6 +4160,13 @@ pub const Scheduler = struct {
     /// wait does not match; a supervisor sent a stray user message must not
     /// abort) — caches its fields in `record.last_signal`, frees the payload +
     /// envelope, and returns the reason term.
+    ///
+    /// This wait is unbounded by design, and sound under the plan-7.5 OOM
+    /// posture: signals are delivered or the runtime has panicked
+    /// (`pushSignalMessage`), so a caller awaiting a provably-armed signal —
+    /// a supervisor reaping a linked child's exit (`lib/supervisor.zap`
+    /// `reap_exit`) — is bounded by that delivery, never starved by a
+    /// memory-pressure drop.
     fn awaitSignal(scheduler: *Scheduler, context: *ProcessContext) u64 {
         switch (context.receiveCorrelated(0, .signal_any, null)) {
             .matched => |envelope| return scheduler.consumeSignalEnvelope(context, envelope),

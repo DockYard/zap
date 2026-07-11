@@ -1280,6 +1280,39 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   allocator posture everywhere else — a kernel that cannot deliver exit signals
   has lost supervision soundness), or, if best-effort survives, every unbounded
   signal wait needs an OOM-aware bound. Preference recorded: panic-on-OOM.
+  **DONE (P7-J1, 2026-07-11)** — panic-on-OOM landed exactly as recorded:
+  signal delivery is GUARANTEED-OR-PANIC. The complete allocation-site audit
+  (every signal-path allocation → posture) lives as a table at the signal
+  mechanism section in `scheduler.zig`; the enforced sites are the
+  `pushSignalMessage` payload block and envelope (plus the unwired-seam
+  misconfiguration), `signalLink`'s two link nodes, and `signalMonitor`'s
+  two monitor nodes — each with a `pub` diagnostic naming the failed
+  allocation and why it is fatal (matching `interpretSendStatus`'s
+  panic-posture style). `spawn`'s P5-J2 node pre-allocation already failed
+  the spawn cleanly (pre-pid) and is documented as such; kill delivery, set
+  drains, and reason-atom registration are allocation-free. With drops
+  eliminated, the unbounded waits are sound and documented at each site:
+  `signalDemonitorFlush` case 2's "in flight" is now a delivery guarantee,
+  and `awaitSignal` + the supervisor's `reap_exit`/`wait_exit`
+  (`lib/supervisor.zap`) are bounded by delivery-or-panic. Proof: five new
+  expect-panic guards in `panic_guards.zig` (payload OOM on exit
+  propagation, payload OOM on monitor-`DOWN`, envelope OOM, link-node OOM,
+  monitor-node OOM — each injected through a production seam: a
+  null-returning payload seam or a failing backing allocator), red→green
+  (all five failed with "guard was removed" before the fix). Hot path
+  untouched: the error arms became noreturn panics; the success paths are
+  structurally identical, and signal delivery is gate-ON-only code. Gates:
+  `zig build test` 0; `zig build test-kernel` (fork compiler, Debug +
+  ReleaseFast) green 5× consecutively; TSan kernel clean (263/5/0); gate-ON
+  `:test_concurrency` 177/0 (478 assertions). Rode along (separate commit
+  `473f815`): two pre-existing ReleaseFast kernel flakes root-caused — the
+  abi observability test asserted the DRIVER core measured a nonzero
+  utilization window (not guaranteed under work stealing plus the ~42 ns
+  CLOCK_UPTIME_RAW tick; now asserts the total across cores) and the
+  TraceRing concurrent-producers test asserted quiescent-capture exactness
+  that lapping deliberately does not guarantee (now asserts the
+  lap-straggler bound); both now print their observed state instead of
+  failing without output.
 - **7.6** Deadlock-bracket re-adjudication for any NEW wake source (the P6-J6
   closed-world hook). The deadlock detector's no-false-positive proof
   (`scheduler_pool.zig` `maybeDetectDeadlock`) stands on a CLOSED producer
