@@ -16,6 +16,9 @@ the language is not stable yet.
 - Protocols and impls for extensible dispatch.
 - First-class functions and capturing anonymous functions.
 - Compile-time macros written in Zap.
+- BEAM-style concurrency: lightweight processes, typed message passing,
+  supervisors, and per-process memory managers — compiled in only when
+  enabled, zero cost when off.
 - Build manifests written in Zap and evaluated at compile time.
 - Zest test framework with compile-time test discovery.
 - Documentation generation from `@doc` attributes.
@@ -104,6 +107,8 @@ Common options:
 
 ```text
 -Dkey=value                    Pass a build option to build.zap
+-Druntime-concurrency=<on|off> Override the manifest's runtime_concurrency gate
+-Druntime-tracing=<on|off>     Override the manifest's runtime_tracing gate
 --build-file <path>            Use a build file other than build.zap
 --watch, -w                    Rebuild on changes
 --trace-incremental            Print incremental invalidation and backend selection trace
@@ -173,6 +178,8 @@ Manifest fields:
 | `paths` | Source glob patterns, relative to the project root |
 | `deps` | Dependency declarations |
 | `memory` | Memory manager type reference, defaults to `Memory.ARC` |
+| `runtime_concurrency` | Compile-time gate over the concurrency runtime, defaults to `false` |
+| `runtime_tracing` | Compile-time gate over message-flow tracing; requires `runtime_concurrency: true` |
 | `optimize` | `:debug`, `:release_safe`, `:release_fast`, or `:release_small` |
 | `test_timeout` | Test timeout in milliseconds |
 | `source_url` | Base source URL for generated documentation |
@@ -511,6 +518,110 @@ execution. This is how library features such as `Zest.Runner` use
 `Path.glob/1`, `SourceGraph.structs/1`, and reflection helpers without compiler
 special-casing standard-library struct names.
 
+## Concurrency
+
+Zap ships a BEAM-style concurrency runtime: lightweight processes scheduled
+M:N over CPU cores, share-nothing isolation, typed message passing, links,
+monitors, and supervisors — compiled into a binary only when you ask for it.
+
+```zap
+pub struct Greeter {
+  pub fn doubler() -> Nil {
+    parent = Process.pid(i64, Process.receive_raw(u64))
+    value = Process.receive_raw(i64)
+    _sent = Process.send(parent, value * 2)
+    nil
+  }
+}
+
+fn main(_args :: [String]) -> u8 {
+  child = Process.spawn(&Greeter.doubler/0)
+  _channel = Process.send(Process.pid(u64, child), Process.self())
+  _work = Process.send(Process.pid(i64, child), 21)
+  answer = Process.receive_raw(i64)
+  IO.puts("the child says: #{answer}")
+  0
+}
+```
+
+```sh
+zap run -Druntime-concurrency=on doubler.zap
+```
+
+What the runtime provides:
+
+- **Processes**: `Process.spawn`/`send`/`receive` with per-process mailboxes,
+  `receive ... after` timeouts, and preemptive scheduling through
+  compiler-emitted cooperative safepoints.
+- **Typed pids**: a `Pid(M)` handle is typed by the messages it carries, so an
+  ill-typed send is a compile error at the send site; `receive` over a message
+  union is exhaustiveness-checked.
+- **Request/response**: `Process.call`/`Process.reply` for the typed
+  synchronous-call shape, and `Task.async`/`Task.await` for one-shot workers.
+- **Fault tolerance**: links, monitors, `trap_exit`, named processes with
+  send-by-name, and OTP-style supervisors with restart strategies, restart
+  intensity, and shutdown protocols.
+- **Per-spawn memory managers**: every process owns its own heap, and each
+  spawn site can pick the manager for it — `Memory.ARC` (the default),
+  `Memory.Arena` (bulk-freed, with an automatic receive-loop reset for bounded
+  servers), `Memory.ORC` (ARC plus a per-process cycle collector), `Memory.GC`
+  (conservative per-process mark-sweep), and `Memory.Tracking`/`Memory.NoOp`/
+  `Memory.Leak` for diagnostics. The chosen model is monomorphized into the
+  spawn-reachable code, so hot allocation paths carry no per-allocation
+  dispatch.
+- **Big data without big copies**: O(1) region moves for large flat
+  `List`/`Map` sends (`Process.send_move`), the `Blob` shared immutable byte
+  tier with an atom-keyed global registry, and automatic promotion of large
+  sent strings (at or above 64 KiB) onto the shared tier.
+- **Blocking work**: `Process.blocking` moves a blocking FFI or CPU-bound call
+  onto a dedicated blocking-pool thread so it cannot stall a scheduler core.
+- **Observability**: `RuntimeInfo` process listing and scheduler utilization,
+  optional message-flow tracing (`runtime_tracing`), dead-letter telemetry,
+  and built-in deadlock and starvation detectors.
+
+The runtime sits behind a compile-time gate that defaults off: set
+`runtime_concurrency: true` in the manifest, or pass
+`-Druntime-concurrency=on` to `zap build`, `zap run`, or script mode. A
+gate-off binary contains none of the runtime — no kernel object is linked, no
+scheduler threads exist, and no safepoint instructions are emitted — proven at
+the symbol and byte level (gate-off binaries carry zero concurrency symbols
+and byte-identical code). Message-flow tracing is a second gate
+(`runtime_tracing: true` / `-Druntime-tracing=on`) that requires the
+concurrency gate.
+
+Platform support:
+
+- **Gate-on** requires stackful fibers and an OS-primitive layer, currently
+  aarch64/x86_64/riscv64 on macOS and Linux. macOS on Apple Silicon (aarch64)
+  is validated end-to-end — the full gate-on test suite runs there. Linux is
+  compile-validated (gate-on `x86_64-linux-gnu` kernel objects compile and the
+  final binary links cleanly); gate-on execution on a Linux host awaits the
+  Linux CI leg. Any other gate-on target — wasm32, 32-bit ARM, Windows — is
+  rejected at compile time with a diagnostic explaining why and what to do
+  (the Windows kernel port is a scoped follow-on).
+- **Gate-off** builds cross-compile to Zap's full pre-existing target matrix,
+  including `wasm32-wasi` and `x86_64-windows-gnu`.
+
+Measured performance (Apple M4, ReleaseFast; medians with the measurement
+conditions recorded in [docs/benchmarks.md](docs/benchmarks.md)):
+
+- Process spawn admission: **11.1 ns** (full spawn→run→exit lifecycle
+  43.0 ns).
+- Same-scheduler message round trip: **44.4 ns** quiet-run best case
+  (~50–90 ns median under session load; 135.6 ns median in the 2-core M:N
+  pool re-run at campaign close).
+- Large-payload moves are O(1) and size-independent: a 1 MB `Map` message
+  round trip costs ~255 ns moved vs ~5.2 ms copied (~20,535×).
+- Gate-off cost is zero — gate-off CLBG binaries are byte-identical and Zap's
+  CLBG standing is untouched; gate-on safepoints measure −2% (noise) on the
+  n-body/spectral-norm kill-criterion pair.
+
+The full user guide is [docs/guides/concurrency.md](docs/guides/concurrency.md)
+(enabling the runtime, typed messages, supervision, managers, `Blob`,
+observability, and the FFI/versioning/latency contracts). Curated benchmark
+results live in [docs/benchmarks.md](docs/benchmarks.md); the raw measurement
+ledger is [docs/concurrency-bench-results.md](docs/concurrency-bench-results.md).
+
 ## Testing With Zest
 
 Use `Zest.Case` for the test DSL and assertions:
@@ -597,6 +708,9 @@ The standard library lives in `lib/`. Important public structs and protocols:
 | `List`, `Map`, `Range` | Collection types and helpers |
 | `Enum` | Higher-order operations over `Enumerable` values |
 | `Path`, `File`, `System`, `IO` | Filesystem, process, and I/O helpers |
+| `Process`, `Pid`, `Task`, `Supervisor` | Concurrency: processes, typed pids, one-shot workers, supervision (gate-on) |
+| `Blob`, `RuntimeInfo` | Shared immutable byte tier; runtime observability (gate-on) |
+| `Memory.ARC`, `Memory.Arena`, `Memory.ORC`, `Memory.GC` | Memory managers, per manifest or per spawn |
 | `Struct`, `SourceGraph` | Compile-time reflection helpers |
 | `Zest`, `Zest.Case`, `Zest.Runner` | Test framework |
 | `Enumerable`, `Stringable`, `Arithmetic` | Core protocols |

@@ -1482,6 +1482,25 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   compile+run gate-ON via script mode at HEAD (12 scratch programs + the wasm/windows
   rejection diagnostics + the non-exhaustive-receive diagnostic reproduced live).
 - **7.4** README/CHANGELOG; benchmark suite results published in-repo.
+  **DONE (P7-J6, 2026-07-11)** — README: new user-facing `## Concurrency`
+  section (feature set as shipped, the `runtime_concurrency`/`runtime_tracing`
+  gates + zero-cost-off statement, the honest platform matrix — macOS aarch64
+  end-to-end, Linux compile-validated pending the CI leg, wasm/arm/windows
+  rejected with diagnostics, gate-off full matrix — headline ledger numbers,
+  guide/benchmarks pointers), plus Highlights bullet, `-Druntime-concurrency`/
+  `-Druntime-tracing` in the CLI common options, both manifest fields in the
+  fields table, and the concurrency stdlib structs in the stdlib table.
+  CHANGELOG.md created (Keep a Changelog; `[Unreleased]` with Added = the
+  feature set/gate/roster/guide, Changed = the 7.7 fork-stdlib hard configure
+  error replacing the silent fallback + the 7.5 panic-on-signal-OOM posture,
+  Fixed = the Option(user-struct) gate-ON miscompile). Benchmark publication:
+  curated summary at `docs/benchmarks.md` — spawn/RTT tables (11.1 ns
+  admission, 44.4 ns quiet-run RTT with the P1-R3 load context, the P4-J4
+  collocation honesty, 135.6 ns P6-J1 pool re-run), the P6-J1 O(1)-move table,
+  E6 crossover, the 64 KiB string-blob threshold, the E2/P6-J5 safepoint table
+  + gate-off byte-identity statement, trace-ring cost, and the exit-gate
+  verdict one-liners — every number verbatim-with-context from the ledger,
+  which it links as the raw record. Docs-only change (no code touched).
 - **7.5** Signal-delivery OOM posture (the P5-R1 D1 hook). `pushSignalMessage`
   DROPS a signal when the payload/envelope allocation fails ("best-effort under
   memory pressure"), while the runtime's general OOM posture is panic — and a
