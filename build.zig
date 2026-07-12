@@ -1060,4 +1060,3 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
     std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
     return true;
 }
-

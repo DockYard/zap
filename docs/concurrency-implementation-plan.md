@@ -1,12 +1,16 @@
 # Zap Concurrency Implementation Plan
 
-**Status: CONSTRUCTION COMPLETE — Phases 0–6 all delivered and adversarially verified
-(each phase closed CLEAR through at least two gap-analysis rounds).** Ratified by the
+**Status: CAMPAIGN COMPLETE — all seven phases (0–7) delivered and adversarially verified
+(Phases 0–6 each closed CLEAR through at least two gap-analysis rounds; Phase 7 closed
+through the P7-R1 review-resolution round).** Ratified by the
 2026-07-04 implementation directive; Phase 0 completed 2026-07-05; Phase 6 (the final
-performance tier) completed 2026-07-11. Every phase exit gate adjudicated MET; the
-experiment ledger (E1–E10 + OQ1) fully recorded in `docs/concurrency-bench-results.md`;
-zero-cost-OFF byte-identity holds at HEAD. Remaining post-construction items carry
-numbered owners (2.2a, 5.5–5.9, 6.2a, 6.3a/6.3b, 6.4a, 6.6a, 7.1–7.6, 7.1a). **One
+performance tier) completed 2026-07-11; Phase 7 (hardening + portability: 7.1, 7.1a,
+7.2, 7.3, 7.4, 7.5, 7.7) completed 2026-07-11. Every phase exit gate adjudicated MET;
+the experiment ledger (E1–E10 + OQ1) fully recorded in
+`docs/concurrency-bench-results.md`; zero-cost-OFF byte-identity holds at HEAD.
+Remaining post-construction items carry numbered owners (2.2a, 5.5–5.9, 6.2a,
+6.3a/6.3b, 6.4a, 6.6a, 7.2a, 7.2b, 7.3a); 7.6 is a standing re-adjudication invariant
+for future wake sources, not an open work item. **One
 deliberately user-run step remains: `zig build zir-test`** — the compile-fail fixtures
 written across the campaign (send type-mismatch, non-sendable receive, use-after-move,
 gate-off Process rejection, the Option(struct) regression, spawn-entry contracts, and
@@ -832,6 +836,18 @@ cross-scheduler budget explicitly re-derived from the loaded numbers.
   (P6-J5 note: the count is now THREE — the new "CPU-bound tight unrolled loop is
   still preempted" test is the same ordering shape and inherits the same
   under-simulator caveat; same fix applies.)
+  (P7-R1 note: the ordering fix has LANDED — the same assertion class also fired
+  once UNSEEDED in the Phase-7 review under ~4× CPU load, which is the same
+  root cause surfacing without a seed: the M:N pool may run the quick/slow pair
+  on different cores and the OS may deschedule a scheduler thread, so arrival
+  order is not guaranteed even in production mode. All three `SafepointTest`
+  assertions now assert the provable property — both replies arrive and the
+  reply set is exactly {quick, slow}, with the slow marker DERIVED from the
+  CPU-bound computation so a safepoint-corrupted loop fails the same assertion
+  — matching the `473f815` kernel-suite hardening class; verified ≥10×
+  consecutive gate-ON suite runs under ~4× CPU load. Remaining 5.8 scope: the
+  seeded `ZAP_SCHED_SEED` suite sweep to confirm the whole gate-ON suite is now
+  seed-clean and de-scope the Phase-5 exit-gate carve-out.)
 
 Exit gate: supervision-tree Zest suite (restart intensity, rest_for_one ordering, brutal_kill
 timing) under seeded determinism; R8 selective-receive benchmark (10⁶-deep mailbox, O(1)
@@ -1271,7 +1287,7 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
 
 - **7.1** Wasm: capability-matrix entries verified (spawn error clean, Threaded fallback where
   host threads exist); cross-compile smoke per the existing `runtime_os` gate.
-  **DONE (P7-J2, 2026-07-11)** — verified at HEAD; one fix landed (the clean gate-ON
+  **DONE (P7-J2, 2026-07-11, `e0d292e`)** — verified at HEAD; one fix landed (the clean gate-ON
   diagnostic); one distinct pre-existing defect split out to 7.1a. **Verification
   matrix** (zap CLI, script mode, hello fixture; real exit codes): (i) gate-OFF
   `-Dtarget=wasm32-wasi` cross-compiles clean (exit 0; artifact is `WebAssembly (wasm)
@@ -1296,7 +1312,13 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   7.1a. **The fix** (`src/concurrency_driver.zig`): `FIBER_SUPPORTED_ARCHITECTURES`
   (aarch64/riscv64/x86_64 — the driver-level mirror of the fork's
   `std.Io.fiber.supported` set and of the kernel's own `fiber_context.zig` comptime
-  guard) + `validateKernelTargetSupport(target, diag)` raising the new
+  guard) *[Amended P7-R1: riscv64 REMOVED from the set and from every diagnostic
+  hint — mirroring `fiber.supported` overadvertised; the fork compile primitive
+  rejects riscv64 triples and the kernel's `fiber_context.zig`
+  context/trampoline/register arms cover aarch64/x86_64 only, so a gate-ON riscv64
+  build could never actually work. The set is now the intersection the whole
+  pipeline supports (aarch64/x86_64); the riscv64 gate-ON port is item 7.2b.]* +
+  `validateKernelTargetSupport(target, diag)` raising the new
   `KernelResolveError.KernelTargetUnsupported`, enforced at the top of
   `kernelCacheKeyHex` — the single earliest driver entry point every gate-ON build path
   hits (the manifest compile tail, script-mode key computation, and the watch/daemon
@@ -1349,8 +1371,9 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   fork primitive's C ABI (a `link_libc` parameter on `zap_fork_compile_zig_to_object`,
   passed by both build drivers), NOT to strip the kernel's documented libc reads. Fork
   ABI change + fork rebuild — deliberately not smuggled into the P7-J2 wasm job.
-  **DONE (P7-J4a, 2026-07-11) — the caller's libc decision is threaded through the
-  primitive's C ABI and gate-ON Linux compiles+links.** Fork (`df4a90ae04`):
+  **DONE (P7-J4a, 2026-07-11, zap `98798eb` + fork `df4a90ae04`) — the caller's libc
+  decision is threaded through the primitive's C ABI and gate-ON Linux
+  compiles+links.** Fork (`df4a90ae04`):
   `zap_fork_compile_zig_to_object` gained a trailing `ZapForkLinkLibc` enum parameter
   (`default = 0` keeps the internal heuristic incl. the Windows always-libc carve-out
   — the exact pre-parameter behavior; `.on`/`.off` are honored exactly on every
@@ -1376,7 +1399,7 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   Windows end-to-end is 7.2's open item.
 - **7.2** Windows: Threaded-backend 1:1 fallback validated end-to-end; IOCP+fiber fork work
   scoped as a follow-on (stretch).
-  **DONE (P7-J3, 2026-07-11) — adjudicated to the honest posture: Windows gate-ON is
+  **DONE (P7-J3, 2026-07-11, `1902381`) — adjudicated to the honest posture: Windows gate-ON is
   unsupported in v1, rejected at the driver's OS capability gate with the 7.2a port-list
   diagnostic; gate-OFF Windows works.** The item's original wording ("Threaded-backend 1:1
   fallback") predates S0.5: the bespoke fiber kernel replaced the `std.Io` backends as the
@@ -1462,10 +1485,35 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   applies unchanged once the port exists (no Threaded-fallback semantics difference to
   document). Requires a Windows CI leg (or Wine) for end-to-end proof; no Windows host
   existed in the P7-J3 environment.
+- **7.2b (FOLLOW-ON — the riscv64 gate-ON port; opens riscv64 gate-ON).** Opened by the
+  P7-R1 riscv64-honesty fix: the campaign had advertised riscv64 as gate-ON-capable
+  (`FIBER_SUPPORTED_ARCHITECTURES`, the rejection-diagnostic hints, README/guide/
+  CHANGELOG) on the strength of the fork's `std.Io.fiber.supported` naming it — but a
+  gate-ON riscv64 build could never work: the fork compile primitive rejects the triple
+  ("zap_fork: unsupported target triple riscv64-linux-gnu (supports x86_64/aarch64
+  linux-gnu/musl, macos-none, windows-msvc/gnu, plus wasm32-wasi)") and the kernel's
+  `fiber_context.zig` has aarch64/x86_64 arms only (`initialContext`/
+  `fiberEntryTrampoline`/`savedRegisters` — `@compileError` otherwise). P7-R1 removed
+  riscv64 from the advertised set, so gate-ON riscv64 now fails at the driver's
+  capability gate with the clean fiber diagnostic (unit-tested; the driver gate must
+  never admit the arch before the whole pipeline compiles for it — the 7.2a posture).
+  Scope of the port, in dependency order: (1) fork triple support — riscv64 in the
+  fork primitive's target-triple parser (`~/projects/zig/src/zir_api.zig`) for both
+  the memory-manager and kernel-object compiles, plus whatever
+  linker/codegen legs the fork's riscv64 backend still needs; (2) kernel
+  context/trampoline/register arms — riscv64 `initialContext` (pc/sp/fp seeding),
+  a `fiberEntryTrampoline` that zeroes `ra` for the unwind-termination frame record,
+  and `savedRegisters`, matching the RISC-V psABI; (3) fork fiber validation — the
+  fork's riscv64 `contextSwitch` asm has never run under Zap's kernel; validate the
+  clobber set and the switch on real hardware or qemu-system-riscv64, including the
+  E9-class canary at ReleaseFast; (4) then re-add `.riscv64` to
+  `FIBER_SUPPORTED_ARCHITECTURES`, restore the diagnostic hints, and re-sweep
+  README/guide/CHANGELOG. Requires riscv64 hardware or a qemu CI leg for the
+  execution proof.
 - **7.3** Docs: user-facing concurrency guide; FFI safety contract; message-versioning posture
   (never crash on unknown dynamic message); latency bound documentation incl. the one
   unbounded case.
-  **DONE (P7-J5, 2026-07-11)** — `docs/guides/concurrency.md`: the user-facing guide
+  **DONE (P7-J5, 2026-07-11, `43c1d85`)** — `docs/guides/concurrency.md`: the user-facing guide
   (enabling the gate, first process, typed pids + message unions with the exhaustiveness
   contract, `Process.call`/`Task.async`, named processes, links/monitors/trap_exit +
   a complete Supervisor walkthrough, per-spawn managers with the bounded-Arena-server
@@ -1481,8 +1529,41 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   GC-collect-is-a-blocking-client guidance). Every embedded complete program verified
   compile+run gate-ON via script mode at HEAD (12 scratch programs + the wasm/windows
   rejection diagnostics + the non-exhaustive-receive diagnostic reproduced live).
+- **7.3a (FOLLOW-ON — the script-mode top-level-`main` macro-splice capture defect;
+  the P7-J5 unrecorded finding, reproduced and characterized at P7-R1).** The P7-J5
+  guide job hit a "script-mode macro-splice limitation" while verifying examples but
+  never recorded it; P7-R1 reproduced it at HEAD. **The defect:** a qualified function
+  capture spliced as a macro argument fails to resolve when the expression sits in
+  script mode's synthesized top-level `main` — concretely, the test_concurrency
+  suite's standard idiom `child = Process.pid(u64, Process.spawn(&G6.Nested.worker/0))`
+  (the capture flows through the `Process.pid` macro's `unquote`) fails with
+  ``error: I cannot find a function named `worker/0` `` (the struct qualifier is
+  dropped during the splice) plus the cascade ``argument 1 expects callable
+  `fn() -> Nil`, got `Function` ``. **Isolation matrix (all at HEAD, gate-ON):** the
+  identical nested expression works (i) in project mode (test_concurrency uses it
+  throughout — 177/0) and (ii) inside a `pub fn` of a struct in the SAME script file;
+  the un-nested form works in top-level `main` itself (`raw = Process.spawn(&…)`
+  then `Process.pid(u64, raw)`); and nesting the capture inside a plain FUNCTION
+  call in top-level `main` also works (the guide's typed-call example wraps
+  `Process.spawn(&…)` directly in `Pid.of`, a `pub fn`). So the trigger is exactly
+  {script-mode top-level `main`} × {capture spliced through a MACRO argument}.
+  **The guide worked around it silently:** every guide example's `main` binds
+  `Process.spawn(&…)` to a variable
+  before wrapping it in the `Process.pid` macro (e.g. the Blob example) — the examples remain
+  valid Zap, but the un-nesting is a workaround, not a style choice, and the guide's
+  `main`s must not be "simplified" back to the nested idiom until this is fixed. Fix
+  belongs in the script-mode top-level-`main` lowering's macro-argument resolution
+  scope (the deliberate `main/1` carve-out), not in `lib/process.zap`. *(Distinct
+  non-concurrency limitation also reproduced during this investigation, recorded here
+  so it isn't lost: an `if`/`case` in VALUE position whose arms are all integer
+  literals — e.g. `if n > 0 { 1 } else { 0 }` from an `fn … -> i64` — fails with
+  "value with comptime-only type 'comptime_int' depends on runtime control flow" in
+  BOTH script and project modes; the function return type is not propagated into
+  branch-arm literal typing, and an arm carrying any runtime-typed expression makes
+  the merge legal. Mode- and macro-independent, so not this item's scope — it belongs
+  to the general compiler typing backlog.)*
 - **7.4** README/CHANGELOG; benchmark suite results published in-repo.
-  **DONE (P7-J6, 2026-07-11)** — README: new user-facing `## Concurrency`
+  **DONE (P7-J6, 2026-07-11, `4aa3365`)** — README: new user-facing `## Concurrency`
   section (feature set as shipped, the `runtime_concurrency`/`runtime_tracing`
   gates + zero-cost-off statement, the honest platform matrix — macOS aarch64
   end-to-end, Linux compile-validated pending the CI leg, wasm/arm/windows
@@ -1512,7 +1593,7 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   allocator posture everywhere else — a kernel that cannot deliver exit signals
   has lost supervision soundness), or, if best-effort survives, every unbounded
   signal wait needs an OOM-aware bound. Preference recorded: panic-on-OOM.
-  **DONE (P7-J1, 2026-07-11)** — panic-on-OOM landed exactly as recorded:
+  **DONE (P7-J1, 2026-07-11, `481c877` + `473f815`)** — panic-on-OOM landed exactly as recorded:
   signal delivery is GUARANTEED-OR-PANIC. The complete allocation-site audit
   (every signal-path allocation → posture) lives as a table at the signal
   mechanism section in `scheduler.zig`; the enforced sites are the
@@ -1566,7 +1647,7 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
   unaffected — but path-independent reproducibility is the durable posture:
   root-cause the absolute-path leak into emitted text on the fork-hygiene
   track.
-  - **DONE (P7-J4, 2026-07-11).** Root cause: there is NO absolute-path leak
+  - **DONE (P7-J4, 2026-07-11, `e5f3872`).** Root cause: there is NO absolute-path leak
     into emitted text. Under controlled reproduction (ledger § P7-J4), user
     `__TEXT,__text` is BIT-EXACT across every path axis — nine
     runtime-supplied path axes (zig-stdlib dir, compiler run path, cache
@@ -1581,7 +1662,11 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
     /tmp-worktree situation) it silently embedded the BUILDING Zig's
     upstream stdlib — a compiler built that way emits materially different
     user text (measured −22,560 B `__text`, fork `std.debug.MachOFile`
-    machinery absent). FIXED: the fallback is now a hard configure error
+    machinery absent). The originally observed P6-J6 drift is therefore
+    attributed (per the ledger's hedged verdict) to the /tmp build's
+    dependency RESOLUTION diverging — the silent stdlib fallback and/or a
+    different dep set passed to the worktree build — not to path bytes
+    reaching codegen. FIXED: the fallback is now a hard configure error
     with an explicit `-Dzig-lib-dir` escape hatch
     (`detectBuildZigLibDir` deleted). Path-independent reproducibility of
     emitted user binaries now HOLDS and is loudly protected.

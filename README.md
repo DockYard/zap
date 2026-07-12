@@ -592,13 +592,13 @@ concurrency gate.
 Platform support:
 
 - **Gate-on** requires stackful fibers and an OS-primitive layer, currently
-  aarch64/x86_64/riscv64 on macOS and Linux. macOS on Apple Silicon (aarch64)
+  aarch64/x86_64 on macOS and Linux. macOS on Apple Silicon (aarch64)
   is validated end-to-end — the full gate-on test suite runs there. Linux is
   compile-validated (gate-on `x86_64-linux-gnu` kernel objects compile and the
   final binary links cleanly); gate-on execution on a Linux host awaits the
-  Linux CI leg. Any other gate-on target — wasm32, 32-bit ARM, Windows — is
-  rejected at compile time with a diagnostic explaining why and what to do
-  (the Windows kernel port is a scoped follow-on).
+  Linux CI leg. Any other gate-on target — wasm32, 32-bit ARM, riscv64,
+  Windows — is rejected at compile time with a diagnostic explaining why and
+  what to do (the Windows and riscv64 kernel ports are scoped follow-ons).
 - **Gate-off** builds cross-compile to Zap's full pre-existing target matrix,
   including `wasm32-wasi` and `x86_64-windows-gnu`.
 

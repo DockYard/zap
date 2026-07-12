@@ -82,18 +82,26 @@ pub const KERNEL_UNIT_RELATIVE_DIR = "src/runtime/concurrency";
 pub const KERNEL_ROOT_BASENAME = "abi.zig";
 
 /// The cpu architectures the concurrency kernel can exist on at all —
-/// the driver-level mirror of the fork's stackful-fiber support set
-/// (`~/projects/zig/lib/std/Io/fiber.zig`, `pub const supported`) and of
-/// the kernel's own comptime guard (`src/runtime/concurrency/
-/// fiber_context.zig`: "the Zap concurrency kernel requires stackful
-/// fiber support"). `validateKernelTargetSupport` checks this set BEFORE
-/// any kernel work so a gate-ON build for an unsupported target fails
-/// with ONE actionable diagnostic at the earliest point that knows both
-/// the gate and the target (plan 7.1's capability-matrix posture),
-/// instead of a screen of fiber/thread/atomic errors from deep inside
-/// the kernel-object compile. The OS axis of the same capability matrix
+/// the intersection every stage of the gate-ON pipeline actually
+/// supports: the fork compile primitive's target-triple parser, the
+/// kernel's per-architecture context/trampoline/register arms
+/// (`src/runtime/concurrency/fiber_context.zig`: `initialContext`,
+/// `fiberEntryTrampoline`, `savedRegisters` — aarch64/x86_64 only,
+/// `@compileError` otherwise), and the fork's stackful-fiber switch
+/// (`~/projects/zig/lib/std/Io/fiber.zig`). Deliberately NARROWER than
+/// the fork's `std.Io.fiber.supported` set: that set names riscv64, but
+/// the fork primitive rejects riscv64 triples and the kernel has no
+/// riscv64 arms, so advertising it here would trade this gate's ONE
+/// clean diagnostic for a fork-primitive error (or a kernel-compile
+/// `@compileError` screen). The riscv64 gate-ON port is plan item 7.2b.
+/// `validateKernelTargetSupport` checks this set BEFORE any kernel work
+/// so a gate-ON build for an unsupported target fails with ONE
+/// actionable diagnostic at the earliest point that knows both the gate
+/// and the target (plan 7.1's capability-matrix posture), instead of a
+/// screen of fiber/thread/atomic errors from deep inside the
+/// kernel-object compile. The OS axis of the same capability matrix
 /// lives in `kernelSupportsOperatingSystem` (plan 7.2).
-pub const FIBER_SUPPORTED_ARCHITECTURES = [_]std.Target.Cpu.Arch{ .aarch64, .riscv64, .x86_64 };
+pub const FIBER_SUPPORTED_ARCHITECTURES = [_]std.Target.Cpu.Arch{ .aarch64, .x86_64 };
 
 /// The intrinsic export the compiled object is asserted to carry. One
 /// symbol suffices as the build-time link-surface tripwire: all
@@ -398,13 +406,13 @@ pub fn validateKernelTargetSupport(
                     "inaccessible — no wasm fiber substrate exists (Asyncify is ruled out; revisit " ++
                     "when the wasm stack-switching proposal ships). Build without " ++
                     "-Druntime-concurrency=on (or set `runtime_concurrency: false` in the " ++
-                    "Zap.Manifest), or target a fiber-capable platform (aarch64/x86_64/riscv64).",
+                    "Zap.Manifest), or target a fiber-capable platform (aarch64/x86_64).",
                 .{ @tagName(target_architecture), triple_text },
             ),
             else => diag.write(
                 "runtime_concurrency is not supported on {s} (target '{s}'): the concurrency " ++
                     "kernel requires stackful fiber support, which exists for " ++
-                    "aarch64/x86_64/riscv64 only. Build without -Druntime-concurrency=on (or set " ++
+                    "aarch64/x86_64 only. Build without -Druntime-concurrency=on (or set " ++
                     "`runtime_concurrency: false` in the Zap.Manifest), or target a fiber-capable " ++
                     "architecture.",
                 .{ @tagName(target_architecture), triple_text },
@@ -1253,7 +1261,34 @@ test "concurrency driver: a fiber-incapable non-wasm architecture is rejected wi
     );
     try testing.expectEqual(@as(usize, 0), mock_kernel_compile_count);
     try testing.expect(std.mem.indexOf(u8, diag.text(), "runtime_concurrency is not supported on arm") != null);
-    try testing.expect(std.mem.indexOf(u8, diag.text(), "aarch64/x86_64/riscv64") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "aarch64/x86_64") != null);
+}
+
+test "concurrency driver: gate-ON riscv64 is rejected with the fiber diagnostic pending the 7.2b port" {
+    const allocator = testing.allocator;
+    var unit = try TestUnit.init(allocator);
+    defer unit.deinit(allocator);
+
+    var diag_buf: [1024]u8 = undefined;
+    var diag: memory_driver.DriverDiagnostic = .{ .buffer = &diag_buf };
+
+    mock_kernel_compile_count = 0;
+    var options = unit.options(mockForkCompileKernel);
+    options.target = "riscv64-linux-gnu";
+
+    // riscv64 appears in the fork's `std.Io.fiber.supported` set, but the
+    // fork compile primitive rejects riscv64 triples and the kernel's
+    // `fiber_context.zig` has no riscv64 context/trampoline arms — so the
+    // driver must reject it HERE, before any kernel work, with the same
+    // clean diagnostic every other fiber-incapable architecture gets.
+    // Plan item 7.2b owns the riscv64 gate-ON port.
+    try testing.expectError(
+        KernelResolveError.KernelTargetUnsupported,
+        resolveKernelObject(allocator, options, &diag),
+    );
+    try testing.expectEqual(@as(usize, 0), mock_kernel_compile_count);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "runtime_concurrency is not supported on riscv64") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.text(), "aarch64/x86_64") != null);
 }
 
 test "concurrency driver: fiber-capable cross targets pass the capability check" {
@@ -1268,7 +1303,6 @@ test "concurrency driver: fiber-capable cross targets pass the capability check"
     const fiber_capable_triples = [_][]const u8{
         "x86_64-linux-gnu",
         "aarch64-macos",
-        "riscv64-linux-gnu",
     };
     for (fiber_capable_triples) |triple| {
         options.target = triple;

@@ -57,11 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`runtime_tracing: true` / `-Druntime-tracing=on`, ~10–15 ns per event when
   on), and built-in deadlock and starvation detectors
   (`ZAP_DEADLOCK_ACTION=stop|panic` opts into fail-fast).
-- Platform capability gate for gate-on builds: aarch64/x86_64/riscv64 on
+- Platform capability gate for gate-on builds: aarch64/x86_64 on
   macOS and Linux. macOS on Apple Silicon is validated end-to-end; Linux is
   compile-validated (`x86_64-linux-gnu` kernel object + final link) with
   execution validation pending the Linux CI leg. Unsupported gate-on targets
-  (wasm32, 32-bit ARM, Windows) are rejected at compile time with an
+  (wasm32, 32-bit ARM, riscv64, Windows) are rejected at compile time with an
   actionable diagnostic. Gate-off builds keep the full pre-existing
   cross-target matrix, including `wasm32-wasi` and `x86_64-windows-gnu`.
 - New manifest fields `runtime_concurrency` and `runtime_tracing`, with

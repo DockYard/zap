@@ -43,7 +43,9 @@ genuine cross-core cost is the separately measured parked wake (min
 parked wakes ≈ **3.6 µs floor**, not directly measured.
 
 Substrate floors for scale (ledger E9): one-way fiber context switch 3.20 ns,
-pooled-stack spawn floor 8.99 ns, Darwin futex parked wake ~917 ns median.
+pooled-stack spawn floor 8.99 ns, Darwin futex parked wake ~917 ns median
+(original E9 session; the 7.1a rebuilt-fork re-measurement reproduced the
+same floor — 3.31 ns median one-way, 8.40 ns spawn minimum).
 
 ## O(1) large-payload moves
 

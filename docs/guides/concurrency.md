@@ -57,7 +57,7 @@ program exits (Erlang halt semantics). `Process.self()`, `send`, and
 The runtime requires stackful fibers and an OS-primitive layer that
 currently exist for:
 
-- **Architectures**: aarch64, x86_64, riscv64
+- **Architectures**: aarch64, x86_64
 - **Operating systems**: macOS and Linux
 
 A gate-on build for any other target is **rejected at compile time**

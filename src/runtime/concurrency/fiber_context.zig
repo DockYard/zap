@@ -95,7 +95,7 @@ const Stack = stack_pool.Stack;
 
 comptime {
     if (!fork_fiber.supported) {
-        @compileError("the Zap concurrency kernel requires stackful fiber support (aarch64/x86_64/riscv64)");
+        @compileError("the Zap concurrency kernel requires stackful fiber support (aarch64/x86_64)");
     }
 }
 

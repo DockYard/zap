@@ -20,8 +20,9 @@
 //!
 //! ## The watchdog-tick reference
 //!
-//! There is no wired watchdog TIMER yet (the P4 watchdog is flag-only; the timer
-//! thread is a later item). E7 uses the canonical "this call is long enough to
+//! The watchdog is flag-only BY DESIGN (locked decision 6: alloc piggyback +
+//! back-edge polls + flag-only watchdog — there is deliberately no watchdog
+//! timer thread). E7 uses the canonical "this call is long enough to
 //! need a dirty scheduler" thresholds as its reference: BEAM's guidance is that
 //! a NIF expected to run **> 1 ms** should be dirty; Go's sysmon preempts a
 //! goroutine running **> 10 ms**. E7 takes the CONSERVATIVE 1 ms (BEAM's dirty

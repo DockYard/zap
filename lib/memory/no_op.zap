@@ -1,24 +1,30 @@
 @doc = """
   No-op memory manager. Declares zero capabilities, the manager's
-  `allocate` vtable slot returns null, and `deallocate` is a no-op.
+  `allocate` vtable slot always returns null, and `deallocate` is a
+  no-op.
 
-  ## Phase 3 status
+  ## Behavior
 
-  In the Phase 3 ABI wiring, Zap's allocate/free paths still go
-  through the runtime's built-in ARC implementation regardless of
-  which manager is active — only retain/release dispatch through
-  the active manager today. The `allocate` vtable slot on this
-  manager is therefore reachable only via the Phase 4 dispatcher
-  refactor (`allocAny`/`freeAny`), at which point a program built
-  with `memory: Memory.NoOp` will terminate at its first
-  allocation with the documented OOM diagnostic.
+  Every allocation routes through the active manager, so a heap
+  running under `memory: Memory.NoOp` terminates at its FIRST
+  allocation: `allocate` returns null and the runtime aborts with
+  the documented OOM diagnostic. Because NoOp declares no
+  `REFCOUNT_V1` capability, the compiler's `BULK_OR_NEVER`
+  specialization also elides every retain/release call site — the
+  only manager surface a NoOp binary can reach is the always-null
+  `allocate`.
 
-  Phase 3's role for this manager is to validate the build pipeline
-  end-to-end: the manager `.zig` source compiles cleanly through
-  the in-process Zig fork, the `.zapmem` section round-trips
-  through the section parser, the build driver appends the
-  resulting `.o` to the link line, and the runtime bootstrap binds
-  the external vtable in place of the built-in ARC core.
+  ## Intended use case
+
+  NoOp is a build-pipeline validation fixture, not a runnable
+  manager: it proves the manager toolchain end-to-end with the
+  smallest possible backend — the manager `.zig` source compiles
+  cleanly through the in-process Zig fork, the `.zapmem` capability
+  section round-trips through the section parser, the build driver
+  appends the resulting `.o` to the link line, and the runtime
+  bootstrap binds the external vtable. An allocation-free program is
+  the only program that runs to completion under NoOp; anything else
+  exercises the deliberate first-allocation abort.
   """
 
 pub struct Memory.NoOp {

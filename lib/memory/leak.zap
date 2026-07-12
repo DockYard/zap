@@ -4,7 +4,8 @@
   Declared capabilities: none. Every allocation comes directly from
   `std.heap.page_allocator`; every individual deallocation is a
   deliberate no-op. Memory is intentionally leaked for the entire
-  lifetime of the process — the OS reclaims pages on exit.
+  lifetime of the owning heap — nothing is reclaimed until the OS
+  takes the pages back at program exit.
 
   ## Intended use cases
 
@@ -34,13 +35,14 @@
 
   ## Not for production
 
-  Leak is a CI / benchmarking tool. Long-running processes built
-  with Leak will exhaust the process's address space and abort with
-  OOM the moment `mmap` (or the host-OS equivalent) refuses another
-  page. For BEAM-style "leak until exit but bulk-free on shutdown"
-  semantics, use `Memory.Arena` instead — it has the same
-  no-individual-deallocation surface but reclaims its backing
-  storage in a single bulk free at `core.deinit`.
+  Leak is a CI / benchmarking tool. A long-running program (or a
+  long-lived spawned process) built with Leak will exhaust the
+  address space and abort with OOM the moment `mmap` (or the host-OS
+  equivalent) refuses another page. For BEAM-style "leak until exit
+  but bulk-free on shutdown" semantics, use `Memory.Arena` instead —
+  it has the same no-individual-deallocation surface but reclaims
+  its backing storage in a single bulk free at `core.deinit` (at
+  process exit for a per-spawn Arena heap).
   """
 
 pub struct Memory.Leak {
