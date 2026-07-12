@@ -1465,6 +1465,22 @@ Exit gate: E6 re-run — crossover documented; ping-pong within target with move
 - **7.3** Docs: user-facing concurrency guide; FFI safety contract; message-versioning posture
   (never crash on unknown dynamic message); latency bound documentation incl. the one
   unbounded case.
+  **DONE (P7-J5, 2026-07-11)** — `docs/guides/concurrency.md`: the user-facing guide
+  (enabling the gate, first process, typed pids + message unions with the exhaustiveness
+  contract, `Process.call`/`Task.async`, named processes, links/monitors/trap_exit +
+  a complete Supervisor walkthrough, per-spawn managers with the bounded-Arena-server
+  story + hibernate, Blob + the global registry + automatic large-string promotion,
+  `Process.blocking`, RuntimeInfo/tracing/deadlock-starvation detectors, platform
+  capability matrix) plus the three contracts as their own sections: the FFI safety
+  contract (un-annotated blocking stalls a core — BEAM NIF parity; `Process.blocking`
+  escape; leaf-call rule; shared-image crash reality with the out-of-process-port
+  future note), the message-versioning posture (exhaustive-union evolution, dead-letter
+  never-crash-the-program on unexpected dynamic messages, the catch-all escape for
+  rolling deploys), and the latency bound (budget-or-watchdog-tick advertised bound,
+  K=8 amortization ≤ K−1 late, the one unbounded un-polled leaf-kernel case, the E7
+  GC-collect-is-a-blocking-client guidance). Every embedded complete program verified
+  compile+run gate-ON via script mode at HEAD (12 scratch programs + the wasm/windows
+  rejection diagnostics + the non-exhaustive-receive diagnostic reproduced live).
 - **7.4** README/CHANGELOG; benchmark suite results published in-repo.
 - **7.5** Signal-delivery OOM posture (the P5-R1 D1 hook). `pushSignalMessage`
   DROPS a signal when the payload/envelope allocation fails ("best-effort under
