@@ -103,6 +103,11 @@ pub struct Greeter {
 }
 
 fn main(_args :: [String]) -> u8 {
+  # Note the bind-then-wrap shape: `Process.spawn` is bound to a local BEFORE
+  # `Process.pid(...)` wraps it. In script-mode `main` specifically, nesting the
+  # spawn call directly inside `Process.pid(...)`'s macro argument fails to
+  # resolve the function capture (a known limitation, plan item 7.3a) — keep
+  # the two steps separate; do not "simplify" them into one expression.
   child_bits = Process.spawn(&Greeter.doubler/0)
   _channel = Process.send(Process.pid(u64, child_bits), Process.self())
   _work = Process.send(Process.pid(i64, child_bits), 21)

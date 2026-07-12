@@ -11,13 +11,18 @@ the experiment ledger (E1–E10 + OQ1) fully recorded in
 Remaining post-construction items carry numbered owners (2.2a, 5.5–5.9, 6.2a,
 6.3a/6.3b, 6.4a, 6.6a, 7.2a, 7.2b, 7.3a); 7.6 is a standing re-adjudication invariant
 for future wake sources, not an open work item. **One
-deliberately user-run step remains: `zig build zir-test`** — the compile-fail fixtures
-written across the campaign (send type-mismatch, non-sendable receive, use-after-move,
-gate-off Process rejection, the Option(struct) regression, spawn-entry contracts, and
-the gated compile-and-run tests) are correct-by-construction (each diagnostic string
-matched against its emitter, several spot-verified via standalone zap-CLI compiles) but
-were never executed by agents per the standing instruction; they run when the user runs
-`zir-test`.
+deliberately user-run step remains: `zig build zir-test`** — the 12 campaign-added
+tests in `src/zir_integration_tests.zig` (11 compile-fail contracts: Pid(M) send
+type-mismatch, send outside the typed union, captured-env-closure spawn rejection,
+send_move use-after-move ×2, receive_raw/Process.pid/receive unsendable-type
+rejections, receive exhaustiveness, gate-off Process.*/receive rejections; plus 1
+gated compile-AND-RUN test: first-op spawn_monitor DOWN carries `:normal`) are
+correct-by-construction (each diagnostic string matched against its emitter, several
+spot-verified via standalone zap-CLI compiles) but were never executed by agents per
+the standing instruction; they run when the user runs `zir-test`. Expect child-stderr
+noise on passing steps and a long runtime. (The Option(user-struct) regression pin
+lives in `test_concurrency/option_struct_test.zap` and already runs in the gate-ON
+suite — it is not a zir-test fixture.)
 
 **Lineage:** `research.md` (round-1 survey) → `research-round-2.md` (round-2 evidence) →
 `zap-concurrency-research.md` rev 2 (design positions, all resolved). This document turns those
