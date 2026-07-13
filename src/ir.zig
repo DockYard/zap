@@ -15778,6 +15778,73 @@ pub const IrBuilder = struct {
         };
     }
 
+    /// Resolve the result type of an error-pipe step call at its PIPED
+    /// arity (the step's rhs args plus the piped-in first argument). The
+    /// step's HIR `type_id` is frequently `UNKNOWN` — pipe steps are
+    /// HIR-built from the raw rhs call at un-piped arity, so the type
+    /// checker's stamp does not reliably survive onto the step node —
+    /// which would leave the step's IR result local untyped and
+    /// `.trivial`-classified. Prefer the node's own usable stamp; fall
+    /// back to resolving the callee group at the piped arity and taking
+    /// its declared return type (arity-only resolution, no argument
+    /// unification — the un-piped HIR arg list cannot be pairwise-unified
+    /// against the piped parameter list). Returns null when the callee
+    /// cannot be resolved or its return type is not usable for tracking
+    /// (UNKNOWN / unresolved type vars / `.any`) — callers then skip
+    /// stamping, preserving the conservative untyped default.
+    fn errorPipeStepResultType(
+        self: *IrBuilder,
+        step_expr: *const hir_mod.Expr,
+    ) TypeWalkError!?types_mod.TypeId {
+        if (try self.usableContextType(step_expr.type_id)) |stamped_type| return stamped_type;
+        if (step_expr.kind != .call) return null;
+        const call = step_expr.kind.call;
+        const piped_arity: u32 = @intCast(call.args.len + 1);
+        const resolved_return_type = self.callTargetReturnType(call.target, piped_arity) orelse blk: {
+            // `callTargetReturnType` resolves only struct-QUALIFIED named
+            // calls; an error-pipe step is usually an UNQUALIFIED call to
+            // a sibling function of the struct being lowered. Resolve it
+            // against the current struct's own HIR groups.
+            if (call.target != .named) return null;
+            const named = call.target.named;
+            if (named.struct_name != null) return null;
+            const group = (try self.resolveBareHirGroupInCurrentStruct(named.name, piped_arity)) orelse return null;
+            if (group.clauses.len == 0) return null;
+            break :blk group.clauses[0].return_type;
+        };
+        return try self.usableContextType(resolved_return_type);
+    }
+
+    /// Resolve a BARE (unqualified) function name to its HIR group within
+    /// the struct currently being lowered. `resolveNamedHirGroup` requires
+    /// a struct qualifier, so unqualified same-struct calls (the common
+    /// error-pipe step shape) cannot resolve through it. Walks
+    /// `current_hir_program.structs` for the struct whose prefix matches
+    /// `current_struct_prefix` and returns its matching (name, arity)
+    /// group, or null when the builder is lowering top-level functions or
+    /// no such group exists.
+    fn resolveBareHirGroupInCurrentStruct(
+        self: *IrBuilder,
+        function_name: []const u8,
+        arity: u32,
+    ) std.mem.Allocator.Error!?*const hir_mod.FunctionGroup {
+        const current_prefix = self.current_struct_prefix orelse return null;
+        const program = self.current_hir_program orelse return null;
+        for (program.structs) |*struct_info| {
+            const candidate_prefix = try self.structNameToPrefix(struct_info.name);
+            if (!std.mem.eql(u8, candidate_prefix, current_prefix)) continue;
+            for (struct_info.functions) |*function_group| {
+                if (function_group.arity == arity and
+                    std.mem.eql(u8, self.interner.get(function_group.name), function_name))
+                {
+                    return function_group;
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
     /// Lower a non-dispatched call step inside an error pipe (a
     /// single-clause total function). The call is emitted inline at the
     /// current `current_instrs` position. Returns the local that holds the
@@ -15816,6 +15883,18 @@ pub const IrBuilder = struct {
         });
         final_args_owner = null;
         modes_owner = null;
+        // The step result local is allocated HERE, outside `lowerExpr`'s
+        // dest allocation, so it never receives the `local_hir_types`
+        // stamp `lowerExpr` gives every ordinary expression dest. Without
+        // the stamp `computeLocalOwnership` finds no HIR type and
+        // classifies the local `.trivial` even when the callee returns an
+        // ARC-managed value — breaking the ARC verifier's V11 contract
+        // (an ARC-affecting read of a `.trivial`-classified local) and
+        // skipping the local in `arc_liveness.identifyArcLocals`' seed
+        // walk, so the callee's owned +1 never gets a scope-exit release.
+        // Mirror the ordinary call lowering: stamp the dest with the
+        // step call's result type, resolved at the piped arity.
+        try self.trackCallResultType(call_dest, try self.errorPipeStepResultType(step.expr));
         return call_dest;
     }
 
@@ -15824,6 +15903,12 @@ pub const IrBuilder = struct {
     /// branch so that a dispatch failure jumps directly to the handler
     /// without running the trailing steps. Returns the local that the ZIR
     /// backend will populate with the catch-basin expression value.
+    ///
+    /// `basin_result_type_id` is the HIR type of the WHOLE `~>` catch-basin
+    /// expression (the join of the success value and the handler value).
+    /// It stamps the try's dest local so `computeLocalOwnership` classifies
+    /// the basin value as ARC-managed when its type is — see the stamp
+    /// below for the V11 contract this upholds.
     fn lowerErrorPipeTryStep(
         self: *IrBuilder,
         step: hir_mod.ErrorPipeStep,
@@ -15831,6 +15916,7 @@ pub const IrBuilder = struct {
         remaining: []const hir_mod.ErrorPipeStep,
         err_local: ?u32,
         handler_hir: *const hir_mod.Expr,
+        basin_result_type_id: types_mod.TypeId,
     ) anyerror!LocalId {
         const budget_root = self.beginErrorPipeTryLoweringBudget(step.expr.span);
         defer self.endErrorPipeTryLoweringBudget(budget_root);
@@ -15894,6 +15980,7 @@ pub const IrBuilder = struct {
                 remaining[rem_idx + 1 ..],
                 err_local,
                 handler_hir,
+                basin_result_type_id,
             );
             success_pipe_val = inner;
             // After a nested try_call_named, the rest of the pipe has
@@ -15940,6 +16027,30 @@ pub const IrBuilder = struct {
         modes_owner = null;
         handler_instrs_owner = null;
         success_instrs_owner = null;
+        // The basin dest is allocated HERE, outside `lowerExpr`'s dest
+        // allocation (the `.error_pipe` arm returns this local INSTEAD of
+        // the `dest` it pre-stamped), so without an explicit stamp it has
+        // no `local_hir_types` entry and `computeLocalOwnership` classifies
+        // it `.trivial` even when the basin value is ARC-managed. That
+        // misclassification propagates through `recordLocalSetAliasMetadata`
+        // to any `basin = … ~> …` binding, whose later reads DO lower to
+        // ARC-affecting aliases (`.copy_value`/`.move_value` — their dest
+        // temps are typed from the HIR variable reference) — tripping ARC
+        // verifier V11 (ARC-affecting read of a `.trivial`-classified
+        // local) and, worse, hiding the basin's owned +1 from the
+        // `arc_liveness.identifyArcLocals` seed walk so no scope-exit
+        // release is ever inserted (the binarytrees-class leak V11 exists
+        // to catch). Stamp the dest with the catch-basin expression's own
+        // HIR type, exactly as ordinary call lowering stamps its dest.
+        //
+        // `payload_local` is deliberately NOT stamped: the success payload's
+        // +1 is dest-mediated (it flows out as `success_result` into this
+        // same dest, or into the next step's argument slot), and
+        // `arc_liveness.applyOwnsEffect`'s generic def handling would set
+        // owner bits for BOTH dest and payload — double-counting the single
+        // +1 — because `try_call_named` has no per-arm
+        // `applyAggregateResultTransfer` plumbing like `case_block`/switch.
+        try self.trackCallResultType(call_dest, basin_result_type_id);
         return call_dest;
     }
 
@@ -17669,6 +17780,23 @@ pub const IrBuilder = struct {
 
                 const remaining_steps = ep.steps[1..];
 
+                // The catch-basin value's HIR type. `buildErrorPipe` stamps
+                // the error-pipe node with the LAST step's type, but that
+                // stamp is frequently `UNKNOWN` (pipe-step calls are HIR-
+                // built from the raw rhs AST at un-piped arity, so the type
+                // checker's result type does not reliably survive onto the
+                // step node). Fall back to resolving the last step's callee
+                // at the piped arity — the same "result type is the last
+                // step's type" rule `buildErrorPipe` encodes. This type
+                // stamps every `try_call_named` dest below so ARC ownership
+                // classification sees the basin value's true type.
+                const basin_result_type_id = if (remaining_steps.len == 0)
+                    tracked_hir_type
+                else
+                    (try self.usableContextType(tracked_hir_type)) orelse
+                        (try self.errorPipeStepResultType(remaining_steps[remaining_steps.len - 1].expr)) orelse
+                        tracked_hir_type;
+
                 // Walk the remaining steps. As soon as we hit a dispatched
                 // step, the rest of the pipe must be emitted INSIDE that
                 // step's success branch (so a failure jumps over them all
@@ -17694,6 +17822,7 @@ pub const IrBuilder = struct {
                         remaining_steps[idx + 1 ..],
                         ep.err_local,
                         handler_hir,
+                        basin_result_type_id,
                     );
                     return try_local;
                 }
@@ -21505,6 +21634,124 @@ test "Phase E.5 Gap 1: share_value shared_local has ARC-managed local_ownership"
         }
     }
     try std.testing.expect(found_share);
+}
+
+test "error-pipe catch-basin dest gets ARC-managed local_ownership (V11 / uniqueness--03 regression)" {
+    // `basin = base |> step(:stop) ~> { _ -> base }` lowers the dispatched
+    // step to a `try_call_named` whose dest local is allocated inside
+    // `lowerErrorPipeTryStep` — OUTSIDE `lowerExpr`'s dest allocation — so
+    // it historically received no `local_hir_types` stamp and
+    // `computeLocalOwnership` classified it `.trivial` even though the
+    // basin value is an ARC-managed Map. Downstream reads of the basin
+    // binding then lowered to `.copy_value` against a `.trivial`-classified
+    // source, tripping ARC verifier V11 (and hiding the basin's owned +1
+    // from `arc_liveness.identifyArcLocals`' seed walk — the
+    // binarytrees-class leak V11 exists to catch). The fix stamps the try
+    // dest with the catch-basin expression's HIR type, resolved from the
+    // LAST pipe step's callee at the piped arity when the HIR node's own
+    // stamp is UNKNOWN. This pins the classification; the end-to-end
+    // runtime behavior is pinned by
+    // `test/closure_test.zap`'s "catch-basin handler-arm aliasing
+    // soundness (uniqueness--03)" describe block.
+    //
+    // The pipe also carries a NON-dispatched total step (`touch`, bare
+    // binding — no runtime pattern inspection) so the same stamp gap in
+    // `lowerSingleErrorPipeCall` is pinned too: its `call_named` dest is
+    // likewise allocated outside `lowerExpr` and historically stayed
+    // `.trivial` even though `touch` returns an ARC-managed Map. Both
+    // step callees are UNQUALIFIED same-struct calls, so the piped-arity
+    // fallback resolution (`resolveBareHirGroupInCurrentStruct`) is on
+    // the asserted path.
+    const source =
+        \\pub struct Test {
+        \\  fn touch(receiver :: %{Atom => i64}) -> %{Atom => i64} {
+        \\    receiver
+        \\  }
+        \\
+        \\  fn step(receiver :: %{Atom => i64}, :go :: Atom) -> %{Atom => i64} {
+        \\    receiver
+        \\  }
+        \\
+        \\  pub fn run() -> %{Atom => i64} {
+        \\    base = %{kept: 7}
+        \\    basin = base
+        \\    |> touch()
+        \\    |> step(:stop)
+        \\    ~> {
+        \\      _ -> base
+        \\    }
+        \\    basin
+        \\  }
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parser = try Parser.init(alloc, source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+
+    var collector = try Collector.init(alloc, parser.interner, null);
+    defer collector.deinit();
+    try collector.collectProgram(&program);
+
+    var checker = try types_mod.TypeChecker.init(alloc, parser.interner, &collector.graph);
+    defer checker.deinit();
+    try checker.checkProgram(&program);
+
+    var hir_builder = hir_mod.HirBuilder.init(alloc, parser.interner, &collector.graph, checker.store);
+    defer hir_builder.deinit();
+    const hir_program = try hir_builder.buildProgram(&program);
+
+    var ir_builder = IrBuilder.init(alloc, parser.interner);
+    ir_builder.type_store = checker.store;
+    defer ir_builder.deinit();
+    const ir_program = try ir_builder.buildProgram(&hir_program);
+
+    var run_func: ?*const Function = null;
+    for (ir_program.functions) |*function| {
+        if (std.mem.indexOf(u8, function.name, "run") != null) {
+            run_func = function;
+            break;
+        }
+    }
+    const func = run_func orelse return error.MissingFunction;
+
+    var found_try_call = false;
+    var found_step_call = false;
+    for (func.body) |block| {
+        for (block.instructions) |instr| {
+            switch (instr) {
+                .try_call_named => |try_call| {
+                    found_try_call = true;
+                    // The catch-basin dest holds an ARC-managed Map on
+                    // both paths (the step's owned result, or the
+                    // handler's aliased binding). It must never be
+                    // classified `.trivial` — that is exactly the V11
+                    // seeding-miss class of bug.
+                    try std.testing.expect(try_call.dest < func.local_ownership.len);
+                    try std.testing.expect(func.local_ownership[try_call.dest] != .trivial);
+                },
+                .call_named => |step_call| {
+                    // The non-dispatched `touch` step's result local —
+                    // allocated by `lowerSingleErrorPipeCall`, likewise
+                    // outside `lowerExpr`'s dest allocation — holds the
+                    // callee's owned ARC-managed Map and must be
+                    // classified so `arc_liveness.identifyArcLocals`
+                    // seeds its scope-exit release.
+                    if (std.mem.indexOf(u8, step_call.name, "touch") == null) continue;
+                    found_step_call = true;
+                    try std.testing.expect(step_call.dest < func.local_ownership.len);
+                    try std.testing.expect(func.local_ownership[step_call.dest] != .trivial);
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(found_try_call);
+    try std.testing.expect(found_step_call);
 }
 
 test "Phase E.5 Gap 2: param_get HIR-expression dest gets ARC-managed local_ownership in single-clause function" {
@@ -25705,7 +25952,7 @@ test "lowerErrorPipeTryStep reports structural budget for deep dispatched chains
 
     try std.testing.expectError(
         error.IrStructuralBudgetExceeded,
-        builder.lowerErrorPipeTryStep(steps[0], 0, steps[1..], null, handler),
+        builder.lowerErrorPipeTryStep(steps[0], 0, steps[1..], null, handler, types_mod.TypeStore.UNKNOWN),
     );
 
     try std.testing.expectEqual(@as(usize, 1), builder.errors.items.len);
