@@ -29,7 +29,7 @@ pub struct Zest.Runner {
     test_structs = for s <- source_structs, Struct.has_function?(s, "zest_run_selected_case", 1) and Struct.has_function?(s, "zest_case_count", 0) {
       s
     }
-    total_case_count = build_total_case_count(test_structs, 0)
+    total_case_count = build_total_case_count(test_structs, 0, list_length(test_structs))
     selected_suite_scans = for s <- test_structs {
       quote {
         if :zig.Zest.enter_selected_suite(unquote(s).zest_case_count()) {
@@ -68,15 +68,31 @@ pub struct Zest.Runner {
     }
   }
 
-  macro build_total_case_count(test_structs :: Expr, index :: Expr) -> Expr {
-    if index >= list_length(test_structs) {
+  # Builds the total-case-count expression for the half-open range
+  # [start_index, end_index) of `test_structs` by divide and conquer, so
+  # the macro recursion depth stays at log2(count) instead of count. A
+  # linear one-struct-per-level recursion hits the comptime dispatch
+  # recursion limit as soon as the suite reaches that many test structs;
+  # the balanced split keeps discovery scalable to arbitrarily large
+  # suites.
+  macro build_total_case_count(test_structs :: Expr, start_index :: Expr, end_index :: Expr) -> Expr {
+    if start_index >= end_index {
       quote { 0 }
     } else {
-      test_struct = list_at(test_structs, index)
-      rest = build_total_case_count(test_structs, index + 1)
+      if start_index + 1 == end_index {
+        test_struct = list_at(test_structs, start_index)
 
-      quote {
-        unquote(test_struct).zest_case_count() + unquote(rest)
+        quote {
+          unquote(test_struct).zest_case_count()
+        }
+      } else {
+        midpoint = (start_index + end_index) / 2
+        left_count = build_total_case_count(test_structs, start_index, midpoint)
+        right_count = build_total_case_count(test_structs, midpoint, end_index)
+
+        quote {
+          unquote(left_count) + unquote(right_count)
+        }
       }
     }
   }

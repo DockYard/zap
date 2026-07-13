@@ -88,6 +88,35 @@ pub struct Enum {
   }
 
   @doc = """
+    Folds the collection with early termination. The callback receives
+    `(accumulator, element)` and returns `{:cont, accumulator}` to keep
+    folding or `{:halt, accumulator}` to stop immediately; the
+    accumulator carried by `:halt` becomes the result.
+
+    On `:halt` the remaining iteration state is disposed through
+    `Enumerable.dispose/1`, releasing any cursor resources without
+    walking the rest of the collection — the same short-circuit
+    discipline as `find/3` and `any?/2`.
+
+    Follows Elixir's `Enum.reduce_while/3` semantics, with this
+    module's `(accumulator, element)` callback argument order.
+
+    ## Examples
+
+        Enum.reduce_while([1, 2, 3, 4, 5], 0, fn(acc, x) {
+          if acc + x > 5 { {:halt, acc} } else { {:cont, acc + x} }
+        })
+        # => 3
+
+        Enum.reduce_while(1..4, 0, fn(acc, x) { {:cont, acc + x} })
+        # => 10
+    """
+
+  pub fn reduce_while(collection :: unique Enumerable(element), initial :: accumulator, callback :: fn(accumulator, element) -> {Atom, accumulator}) -> accumulator {
+    reduce_while_next(collection, initial, callback)
+  }
+
+  @doc = """
     Applies the callback to each element for side effects.
     Returns `nil` after the collection has been exhausted.
 
@@ -541,6 +570,17 @@ pub struct Enum {
     case Enumerable.next(state) {
       {:done, _, _} -> accumulator
       {:cont, value, next_state} -> reduce_next(next_state, callback(accumulator, value), callback)
+    }
+  }
+
+  fn reduce_while_next(state :: unique Enumerable(element), accumulator :: accumulator_type, callback :: fn(accumulator_type, element) -> {Atom, accumulator_type}) -> accumulator_type {
+    case Enumerable.next(state) {
+      {:done, _, _} -> accumulator
+      {:cont, value, next_state} ->
+        case callback(accumulator, value) {
+          {:cont, continued_accumulator} -> reduce_while_next(next_state, continued_accumulator, callback)
+          {:halt, halted_accumulator} -> dispose_and_return(next_state, halted_accumulator)
+        }
     }
   }
 
