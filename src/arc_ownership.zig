@@ -1676,10 +1676,20 @@ fn recordInstructionUses(
         },
         .protocol_dispatch => |pd| {
             // Dispatch reads the receiver and each non-receiver arg.
-            // The receiver itself is a borrow at the dispatch site —
-            // ownership of the box stays with the surrounding scope
-            // whose scope-exit drop pairs against the construction.
-            try summary.recordUse(allocator, pd.receiver, false);
+            // A method with a SHARED receiver borrows it — ownership of
+            // the box stays with the surrounding scope whose scope-exit
+            // drop pairs against the construction. A method with a
+            // CONSUMING (`unique`) receiver takes the box's ownership
+            // into the dispatch: record the receiver as an
+            // aggregate-store (consuming) use so a last-use read lowers
+            // `.move_value` and a still-live source goes through the
+            // clone-on-share copy path (mirroring `box_as_protocol`'s
+            // source treatment).
+            if (pd.receiver_consuming) {
+                try summary.recordAggregateStoreUse(allocator, pd.receiver);
+            } else {
+                try summary.recordUse(allocator, pd.receiver, false);
+            }
             for (pd.args) |arg| try summary.recordUse(allocator, arg, false);
         },
         .protocol_box_unbox => |bu| {

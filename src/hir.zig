@@ -51,6 +51,53 @@ pub const ProtocolInfo = struct {
     function_arities: []const u32,
 };
 
+/// One parametric-target impl bound to one concrete parametric-protocol
+/// instantiation reachable as a boxed existential. Produced by the
+/// monomorphizer's boxed-instantiation pass (which force-specializes the
+/// impl's method groups for the instantiation, since no devirtualized
+/// call site exists to trigger call-driven specialization) and consumed
+/// by the IR builder's protocol-vtable populator: each entry becomes a
+/// `<Instantiation>VTable_for_<Target>` instance whose adapters call
+/// the specialized method symbols recorded here.
+pub const BoxedImplSpec = struct {
+    /// Mangled per-instantiation protocol name (`Enumerable_i64`) —
+    /// the `.protocol_box` vtable-family key construction and dispatch
+    /// sites carry.
+    protocol_instantiation: []const u8,
+    /// The protocol's bare name (`Enumerable`).
+    protocol_name: ast.StringId,
+    /// Concrete protocol type-argument TypeIds of this instantiation,
+    /// in protocol formal order.
+    protocol_arg_type_ids: []const TypeId,
+    /// The impl's target type with the instantiation's bindings
+    /// applied (`List(member)` with `member := i64` -> `List(i64)`).
+    target_type_id: TypeId,
+    /// Scope id of the source impl declaration — correlates this entry
+    /// with the scope graph's `ImplEntry` so the IR builder can read
+    /// the impl's declared method signatures.
+    impl_scope_id: scope_mod.ScopeId,
+    /// Per-method call/bridging info, in no particular order — the IR
+    /// matches entries to protocol slots by name + arity.
+    methods: []const BoxedImplMethodSpec,
+};
+
+pub const BoxedImplMethodSpec = struct {
+    /// The protocol method's source-level name (`next`).
+    method_name: []const u8,
+    /// Source arity including the receiver.
+    arity: u32,
+    /// Struct module whose emitted file publishes the specialized
+    /// method symbol (the impl's defining struct — `List`).
+    impl_module: []const u8,
+    /// The specialized method's published local symbol inside
+    /// `impl_module`'s file (`List_next__i64__1` — the
+    /// specialization-mangled group name plus the arity suffix).
+    local_symbol: []const u8,
+    /// The specialized method's concrete return TypeId — the impl
+    /// side of the adapter's return-bridging comparison.
+    return_type_id: TypeId,
+};
+
 pub const ImplInfo = struct {
     protocol_name: ast.StringId,
     protocol_type_args: []const TypeId = &.{},

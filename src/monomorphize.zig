@@ -192,6 +192,13 @@ pub const MonomorphResult = struct {
     specialization_count: u32,
     /// Compile errors collected while refusing unbounded specialization growth.
     errors: []const MonomorphError = &.{},
+    /// Parametric-target impls bound to concrete boxed protocol
+    /// instantiations (`impl Enumerable(member) for List(member)` bound
+    /// to `Enumerable(i64)`), with their force-specialized method
+    /// symbols. Consumed by the IR builder's protocol-vtable populator
+    /// to emit per-instantiation vtable instances for targets that no
+    /// concrete impl covers. See `hir.BoxedImplSpec`.
+    boxed_impl_specs: []const hir.BoxedImplSpec = &.{},
 };
 
 /// Run the monomorphization pass on a HIR program.
@@ -309,6 +316,57 @@ pub fn monomorphize(
         ctx.current_scan_struct_idx = null;
     }
 
+    // Phase B.2 — boxed-instantiation reachability. A PARAMETRIC protocol
+    // used as a boxed existential (`Enumerable(i64)` in a param/return/
+    // field position) dispatches through a per-instantiation vtable whose
+    // per-impl adapters call the impl's method symbols. For a
+    // PARAMETRIC-TARGET impl (`impl Enumerable(member) for List(member)`)
+    // those methods are generic, and no devirtualized call site exists to
+    // trigger call-driven specialization — the box erases the concrete
+    // receiver. Force the specializations here: scan the type store for
+    // concrete parametric `protocol_constraint` types (each one is a use
+    // site of a boxed instantiation), bind each matching parametric
+    // impl's type variables by unifying its declared protocol type args
+    // against the instantiation's concrete args, and specialize every
+    // impl method group under those bindings. The specialized groups are
+    // PLACED IN THE IMPL'S DEFINING STRUCT so the synthetic
+    // vtable-adapter files can reach the published symbols via a stable
+    // module import; the resulting `BoxedImplSpec` table flows to the IR
+    // builder's vtable populator.
+    var boxed_impl_specs: std.ArrayListUnmanaged(hir.BoxedImplSpec) = .empty;
+    defer boxed_impl_specs.deinit(allocator);
+    {
+        const forced_scan_start = ctx.new_groups.items.len;
+        ctx.forceBoxedImplSpecializations(&boxed_impl_specs) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Structural type-walk budget refusals: a type too large to
+            // walk here is also too large to name at any boxing site, so
+            // no vtable instance can be needed for it. Keep whatever
+            // entries were completed before the refusal.
+            else => {},
+        };
+        // The forced specializations' bodies may call other generic
+        // functions — run the transitive scan over them to fixpoint,
+        // exactly like the call-driven Phase B closure above.
+        var scan_start: usize = forced_scan_start;
+        while (scan_start < ctx.new_groups.items.len) {
+            const scan_end = ctx.new_groups.items.len;
+            var entries_to_scan = try ctx.collectTransitiveScanEntries(ctx.new_groups.items[scan_start..scan_end]);
+            defer entries_to_scan.deinit(allocator);
+            for (entries_to_scan.items) |entry| {
+                ctx.current_scan_struct_idx = entry.target_struct_idx;
+                for (entry.group.clauses) |clause| {
+                    ctx.current_scan_params = clause.params;
+                    ctx.local_types.clearRetainingCapacity();
+                    try ctx.scanBlock(clause.body);
+                    ctx.current_scan_params = null;
+                }
+            }
+            scan_start = scan_end;
+        }
+        ctx.current_scan_struct_idx = null;
+    }
+
     if (ctx.errors.items.len > 0) {
         return .{
             .program = program.*,
@@ -386,6 +444,7 @@ pub fn monomorphize(
         },
         .specialization_count = @intCast(ctx.new_groups.items.len),
         .errors = try ctx.errors.toOwnedSlice(allocator),
+        .boxed_impl_specs = try boxed_impl_specs.toOwnedSlice(allocator),
     };
 }
 
@@ -940,6 +999,279 @@ const MonomorphContext = struct {
             if (try containsTypeVar(self.store, actual_arg, self.allocator)) continue;
             _ = try self.store.unify(constraint_arg, actual_arg, subs);
         }
+    }
+
+    /// Phase B.2 driver — see the call site in `monomorphize` for the
+    /// full rationale. Scans the type store for concrete parametric
+    /// protocol instantiations and force-specializes every matching
+    /// parametric-target impl's method groups, recording one
+    /// `BoxedImplSpec` per (instantiation, impl) pair.
+    fn forceBoxedImplSpecializations(
+        self: *MonomorphContext,
+        boxed_impl_specs: *std.ArrayListUnmanaged(hir.BoxedImplSpec),
+    ) !void {
+        var seen_instantiations = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var key_iter = seen_instantiations.keyIterator();
+            while (key_iter.next()) |key| self.allocator.free(key.*);
+            seen_instantiations.deinit();
+        }
+        // Snapshot the store size — `applyToType` interns new TypeIds
+        // while we iterate, and those derived types are never
+        // themselves boxed-instantiation use sites.
+        const store_snapshot_len = self.store.types.items.len;
+        var constraint_type_id: TypeId = 0;
+        while (constraint_type_id < store_snapshot_len) : (constraint_type_id += 1) {
+            const typ = self.store.getType(constraint_type_id);
+            if (typ != .protocol_constraint) continue;
+            const constraint = typ.protocol_constraint;
+            if (constraint.type_params.len == 0) continue;
+            var has_type_var = false;
+            for (constraint.type_params) |constraint_arg| {
+                if (try containsTypeVar(self.store, constraint_arg, self.allocator)) {
+                    has_type_var = true;
+                    break;
+                }
+            }
+            if (has_type_var) continue;
+            const mangled_instantiation = types_mod.typeIdMangledName(
+                self.allocator,
+                self.store,
+                constraint_type_id,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // A name over the structural budget cannot appear at a
+                // boxing site either (the same mangler names the box);
+                // skip rather than fail the whole build here.
+                else => continue,
+            };
+            if (seen_instantiations.contains(mangled_instantiation)) {
+                self.allocator.free(mangled_instantiation);
+                continue;
+            }
+            try seen_instantiations.put(mangled_instantiation, {});
+            try self.forceBoxedImplSpecializationsForInstantiation(
+                boxed_impl_specs,
+                constraint,
+                mangled_instantiation,
+            );
+        }
+    }
+
+    /// Bind every parametric-target impl of one concrete protocol
+    /// instantiation and specialize its method groups, placing the
+    /// specializations in the impl's defining struct.
+    fn forceBoxedImplSpecializationsForInstantiation(
+        self: *MonomorphContext,
+        boxed_impl_specs: *std.ArrayListUnmanaged(hir.BoxedImplSpec),
+        constraint: types_mod.Type.ProtocolConstraintType,
+        mangled_instantiation: []const u8,
+    ) !void {
+        for (self.program.impls) |impl_info| {
+            if (!self.sameName(impl_info.protocol_name, constraint.protocol_name)) continue;
+            if (impl_info.protocol_type_args.len != constraint.type_params.len) continue;
+            if (impl_info.target_type_pattern == types_mod.TypeStore.UNKNOWN) continue;
+            // A partially-collected impl (its method groups not visible in
+            // this compilation slice — CTFE and per-struct check passes)
+            // cannot produce usable method symbols; the whole-program
+            // monomorphize pass is the one that records the table.
+            if (impl_info.function_group_ids.len == 0) continue;
+            // Concrete-target impls need no forced specialization: their
+            // methods are ordinary functions published under the target's
+            // own module, and the vtable populator's concrete path emits
+            // their instances.
+            if (!(try containsTypeVar(self.store, impl_info.target_type_pattern, self.allocator))) continue;
+
+            var subs = SubstitutionMap.init(self.allocator);
+            defer subs.deinit();
+            var all_unified = true;
+            for (impl_info.protocol_type_args, constraint.type_params) |pattern_arg, concrete_arg| {
+                if (!(try self.store.unify(pattern_arg, concrete_arg, &subs))) {
+                    all_unified = false;
+                    break;
+                }
+            }
+            if (!all_unified) continue;
+            const target_type_id = try subs.applyToType(self.store, impl_info.target_type_pattern);
+            if (try containsTypeVar(self.store, target_type_id, self.allocator)) continue;
+
+            var method_specs: std.ArrayListUnmanaged(hir.BoxedImplMethodSpec) = .empty;
+            errdefer method_specs.deinit(self.allocator);
+            var all_methods_resolved = true;
+            for (impl_info.function_group_ids) |method_group_id| {
+                const located = self.locateGroupDefiningStruct(method_group_id) orelse {
+                    all_methods_resolved = false;
+                    break;
+                };
+                const method_spec = (try self.forceBoxedImplMethodSpecialization(located, target_type_id)) orelse {
+                    all_methods_resolved = false;
+                    break;
+                };
+                try method_specs.append(self.allocator, method_spec);
+            }
+            if (!all_methods_resolved) {
+                method_specs.deinit(self.allocator);
+                continue;
+            }
+
+            const protocol_arg_type_ids = try self.allocator.dupe(TypeId, constraint.type_params);
+            try boxed_impl_specs.append(self.allocator, .{
+                .protocol_instantiation = try self.allocator.dupe(u8, mangled_instantiation),
+                .protocol_name = constraint.protocol_name,
+                .protocol_arg_type_ids = protocol_arg_type_ids,
+                .target_type_id = target_type_id,
+                .impl_scope_id = impl_info.impl_scope_id,
+                .methods = try method_specs.toOwnedSlice(self.allocator),
+            });
+        }
+    }
+
+    const LocatedGroup = struct {
+        group: *const hir.FunctionGroup,
+        struct_idx: usize,
+        struct_name: []const u8,
+    };
+
+    /// Locate a function group and its defining struct module by id.
+    fn locateGroupDefiningStruct(self: *const MonomorphContext, group_id: u32) ?LocatedGroup {
+        for (self.program.structs, 0..) |mod, mod_idx| {
+            for (mod.functions) |*group| {
+                if (group.id != group_id) continue;
+                if (mod.name.parts.len == 0) return null;
+                return .{
+                    .group = group,
+                    .struct_idx = mod_idx,
+                    .struct_name = self.interner.get(mod.name.parts[mod.name.parts.len - 1]),
+                };
+            }
+        }
+        return null;
+    }
+
+    /// Specialize (or reuse) one impl method group under the boxed
+    /// instantiation's bindings and return its published-symbol spec.
+    /// Returns null when the method cannot be specialized (budget
+    /// refusal, structural failure, an under-determined signature) —
+    /// the caller then skips the impl.
+    ///
+    /// The bindings are derived by unifying the method's OWN receiver
+    /// parameter type (`list :: List(member)` — expressed in the
+    /// group's type-variable scope) against the instantiation's
+    /// substituted concrete target (`List(i64)`), so the substitution
+    /// map speaks the group's variable ids regardless of how the impl
+    /// header's variables were scoped.
+    fn forceBoxedImplMethodSpecialization(
+        self: *MonomorphContext,
+        located: LocatedGroup,
+        target_type_id: TypeId,
+    ) !?hir.BoxedImplMethodSpec {
+        const group = located.group;
+        if (group.clauses.len == 0) return null;
+        const clause = &group.clauses[0];
+        if (clause.params.len == 0) return null;
+
+        var subs = SubstitutionMap.init(self.allocator);
+        defer subs.deinit();
+        if (!(try self.store.unify(clause.params[0].type_id, target_type_id, &subs))) return null;
+        const substituted_return = try subs.applyToType(self.store, clause.return_type);
+        if (try containsTypeVar(self.store, substituted_return, self.allocator)) return null;
+        for (clause.params) |param| {
+            const substituted_param = try subs.applyToType(self.store, param.type_id);
+            if (try containsTypeVar(self.store, substituted_param, self.allocator)) return null;
+        }
+
+        // A parametric impl whose particular method is already concrete
+        // (mentions none of the impl's type variables) is published under
+        // its ordinary `<name>__<arity>` local symbol — no clone needed.
+        if (!self.generic_groups.contains(group.id)) {
+            return .{
+                .method_name = try self.allocator.dupe(u8, self.interner.get(group.name)),
+                .arity = group.arity,
+                .impl_module = try self.allocator.dupe(u8, located.struct_name),
+                .local_symbol = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}__{d}",
+                    .{ self.interner.get(group.name), group.arity },
+                ),
+                .return_type_id = substituted_return,
+            };
+        }
+
+        // Deterministic specialization key — same shape as the
+        // call-driven Phase B key, salted with the DEFINING struct index
+        // so a call-driven specialization already placed in the defining
+        // struct is reused rather than duplicated.
+        var type_args: std.ArrayListUnmanaged(TypeId) = .empty;
+        defer type_args.deinit(self.allocator);
+        {
+            var var_ids: std.ArrayListUnmanaged(types_mod.TypeVarId) = .empty;
+            defer var_ids.deinit(self.allocator);
+            var binding_iter = subs.bindings.iterator();
+            while (binding_iter.next()) |entry| {
+                try var_ids.append(self.allocator, entry.key_ptr.*);
+            }
+            std.mem.sort(types_mod.TypeVarId, var_ids.items, {}, std.sort.asc(types_mod.TypeVarId));
+            for (var_ids.items) |var_id| {
+                if (subs.bindings.get(var_id)) |concrete| {
+                    try type_args.append(self.allocator, concrete);
+                }
+            }
+        }
+        if (type_args.items.len == 0) return null;
+
+        const struct_salt: u32 = @intCast(located.struct_idx);
+        const base_key = hashInstantiation(group.id, type_args.items);
+        const key = base_key +% @as(u64, struct_salt) *% 0x9E3779B97F4A7C15;
+
+        const specialized_name: []const u8 = blk: {
+            if (self.specializations.get(key)) |existing_id| {
+                for (self.new_groups.items) |entry| {
+                    if (entry.group.id == existing_id) break :blk self.interner.get(entry.group.name);
+                }
+                return null; // stale key with no group — refuse rather than mis-name
+            }
+            if (!try self.specializationWithinBudget(group, type_args.items, clause.debug_span)) return null;
+            const new_id = self.next_group_id.*;
+            const empty_protocol_param_types: []const TypeId = &.{};
+            const specialized = self.cloneGroupWithSubs(
+                group,
+                &subs,
+                empty_protocol_param_types,
+                type_args.items,
+                new_id,
+                0,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    try self.appendError(
+                        clause.debug_span,
+                        "boxed-instantiation specialization of impl method `{s}/{d}` failed structurally",
+                        .{ self.interner.get(group.name), group.arity },
+                    );
+                    return null;
+                },
+            };
+            self.next_group_id.* += 1;
+            try self.new_groups.append(self.allocator, .{
+                .group = specialized,
+                .source_group_id = group.id,
+                .target_struct_idx = located.struct_idx,
+            });
+            try self.specializations.put(key, new_id);
+            break :blk self.interner.get(specialized.name);
+        };
+
+        return .{
+            .method_name = try self.allocator.dupe(u8, self.interner.get(group.name)),
+            .arity = group.arity,
+            .impl_module = try self.allocator.dupe(u8, located.struct_name),
+            .local_symbol = try std.fmt.allocPrint(
+                self.allocator,
+                "{s}__{d}",
+                .{ specialized_name, group.arity },
+            ),
+            .return_type_id = substituted_return,
+        };
     }
 
     fn defaultUnboundTypeVars(self: *const MonomorphContext, type_id: TypeId, default_type: TypeId) TypeWalkError!TypeId {

@@ -9112,6 +9112,14 @@ pub const ArcRuntime = struct {
                 }
                 break :blk false;
             },
+            // A TOP-LEVEL optional/pointer subject — the shape of a boxed
+            // protocol existential's inner cell for a runtime-native
+            // container value (`?*const List(T)` / `?*const Map(K, V)`
+            // stored via `allocAny` at `box_as_protocol`). The pointee is
+            // the subject's single ARC child; without this arm the
+            // deep-walkers skip it entirely (leaking the container on box
+            // drop and aliasing it on box clone).
+            .optional, .pointer => fieldTypeHasArcChild(T),
             else => false,
         };
     }
@@ -9761,6 +9769,13 @@ pub const ArcRuntime = struct {
                     }
                 }
             },
+            // A top-level optional/pointer subject (a boxed native
+            // container's inner cell, `?*const List(T)`): the pointee is
+            // the single ARC child — delegate to the field-level clone so
+            // the new owner's container follows the model's sharing rule
+            // (deep clone under clone-on-share, refcount bump under
+            // REFCOUNT_V1).
+            .optional, .pointer => cloneFieldChildInPlace(T, allocator, value),
             else => {},
         }
     }
@@ -10189,6 +10204,12 @@ pub const ArcRuntime = struct {
                     }
                 }
             },
+            // A top-level optional/pointer subject (a boxed native
+            // container's inner cell, `?*const List(T)`): the pointee is
+            // the single ARC child — release it through the field-level
+            // walker so the box's `__drop__` zero-transition reclaims the
+            // container it owns.
+            .optional, .pointer => releaseFieldChildAny(T, allocator, value),
             else => {},
         }
     }
@@ -10373,6 +10394,11 @@ pub const ArcRuntime = struct {
                     }
                 }
             },
+            // A top-level optional/pointer subject (a boxed native
+            // container's inner cell, `?*const List(T)`): retain the
+            // pointee through the field-level walker — symmetric with
+            // `releaseChildrenAny`'s arm.
+            .optional, .pointer => retainFieldChildAny(T, value),
             else => {},
         }
     }

@@ -922,6 +922,22 @@ const Analyzer = struct {
         var arc_param_indices: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer arc_param_indices.deinit(self.allocator);
         for (params, 0..) |param, idx| {
+            // A parameter whose lowered ZigType is a protocol existential
+            // (`.protocol_box`) is a genuine boxed owner when its
+            // convention says so (post-monomorphization, a devirtualized
+            // value's specialized parameter carries its concrete type
+            // instead). The HIR-type predicate deliberately returns false
+            // for parametric `protocol_constraint`s (the devirtualized-
+            // value hazard), so the ZigType shape is the boxed-param
+            // signal here — without it the `.owned` box param's
+            // `param_get` aliases never form an alias group, the forward
+            // `owns` dataflow double-counts the slot's single +1, and
+            // drop insertion emits a second `protocol_box_drop` on a
+            // consumed box (use-after-free).
+            if (param.type_expr == .protocol_box) {
+                try arc_param_indices.put(self.allocator, @intCast(idx), {});
+                continue;
+            }
             const tid = param.type_id orelse continue;
             if (self.arc_managed(self.type_store, tid)) {
                 try arc_param_indices.put(self.allocator, @intCast(idx), {});
@@ -948,6 +964,7 @@ const Analyzer = struct {
         }
         const param_conventions = self.function.param_conventions;
 
+        const record_local_ownership = self.function.local_ownership;
         for (self.records.items) |rec| {
             switch (rec.instr.*) {
                 .param_get => |pg| {
@@ -955,16 +972,28 @@ const Analyzer = struct {
                         if (!seen.contains(pg.dest)) {
                             try seen.put(self.allocator, pg.dest, {});
                         }
-                        // Collect this dest into the slot's alias
-                        // group when the convention is `.owned`.
-                        if (pg.index < param_conventions.len and
-                            param_conventions[pg.index] == .owned)
-                        {
-                            const gop = try owned_param_dests.getOrPut(self.allocator, pg.index);
-                            if (!gop.found_existing) gop.value_ptr.* = .empty;
-                            try gop.value_ptr.append(self.allocator, pg.dest);
-                            try self.owned_param_slot_by_local.put(self.allocator, pg.dest, pg.index);
-                        }
+                    }
+                    // Collect this dest into the slot's alias group when
+                    // the convention is `.owned` and the IR builder
+                    // classified the dest local `.owned`. The dest-local
+                    // classification is the authoritative signal — a
+                    // boxed protocol-existential param of a type-only
+                    // overload group carries `.any` as its declared
+                    // param type (so the type-driven `arc_param_indices`
+                    // misses it), yet its `param_get` dests are genuine
+                    // owner aliases of one +1; without the group the
+                    // forward `owns` dataflow double-counts the slot and
+                    // drop insertion emits a second release on a
+                    // consumed box (use-after-free).
+                    if (pg.index < param_conventions.len and
+                        param_conventions[pg.index] == .owned and
+                        pg.dest < record_local_ownership.len and
+                        record_local_ownership[pg.dest] == .owned)
+                    {
+                        const gop = try owned_param_dests.getOrPut(self.allocator, pg.index);
+                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                        try gop.value_ptr.append(self.allocator, pg.dest);
+                        try self.owned_param_slot_by_local.put(self.allocator, pg.dest, pg.index);
                     }
                 },
                 .capture_get => |cg| {
@@ -2825,6 +2854,21 @@ const Analyzer = struct {
                     self.clearOwnsForLocalAndAliases(lt.list, owns, consumed_owned_param_slots);
                 }
                 self.applyCallDestEffect(lt.dest, owns);
+            },
+            // A boxed protocol dispatch whose method declares a CONSUMING
+            // (`unique`) receiver consumes the box: the vtable adapter owns
+            // the inner cell's disposal (state-transfer reuse, or a shallow
+            // cell free), so the receiver's owns bit must clear here —
+            // otherwise `live_before_ret` carries the consumed box to a
+            // terminator and drop insertion emits a `protocol_box_drop`
+            // on top of the adapter's own disposal (double-free, slab
+            // corruption). Non-consuming receivers keep the borrow
+            // contract: ownership stays with the surrounding scope.
+            .protocol_dispatch => |pd| {
+                if (pd.receiver_consuming) {
+                    self.clearOwnsForLocalAndAliases(pd.receiver, owns, consumed_owned_param_slots);
+                }
+                self.applyCallDestEffect(pd.dest, owns);
             },
             // Phase H.6: `param_get` for an `.owned`-convention slot
             // produces an ALIAS to the function's single +1 for that

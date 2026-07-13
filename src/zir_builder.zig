@@ -836,6 +836,35 @@ fn appendZigTypeForVTable(
                 try buf.appendSlice(allocator, " }");
             }
         },
+        // A Zap list value is the runtime flat-buffer cell pointer
+        // `?*const zap_runtime.List(T)` — the same value shape
+        // `emitContainerElementTypeRef` resolves via `List(T).empty()`.
+        // Rendering it here lets a `[element]`-typed protocol method
+        // slot type-check against the impl method's actual list
+        // return/param instead of degrading to `anytype` (invalid
+        // inside a vtable's fn-pointer field type).
+        .list => |element_type| {
+            try buf.appendSlice(allocator, "?*const zap_runtime.List(");
+            try appendZigTypeForVTable(allocator, buf, element_type.*);
+            try buf.appendSlice(allocator, ")");
+        },
+        // A Zap map value is `?*const zap_runtime.Map(K, V)` — the
+        // map counterpart of the `.list` arm above.
+        .map => |map_type| {
+            try buf.appendSlice(allocator, "?*const zap_runtime.Map(");
+            try appendZigTypeForVTable(allocator, buf, map_type.key.*);
+            try buf.appendSlice(allocator, ", ");
+            try appendZigTypeForVTable(allocator, buf, map_type.value.*);
+            try buf.appendSlice(allocator, ")");
+        },
+        .optional => |inner| {
+            try buf.appendSlice(allocator, "?");
+            try appendZigTypeForVTable(allocator, buf, inner.*);
+        },
+        .ptr => |pointee| {
+            try buf.appendSlice(allocator, "*const ");
+            try appendZigTypeForVTable(allocator, buf, pointee.*);
+        },
         else => try buf.appendSlice(allocator, "anytype"),
     }
 }
@@ -860,6 +889,97 @@ fn appendVTableReturnType(
 ) std.mem.Allocator.Error!void {
     if (raises) try buf.appendSlice(allocator, "anyerror!");
     try appendZigTypeForVTable(allocator, buf, zig_type);
+}
+
+/// True when any boxed position in the glue plan reuses the receiver's
+/// inner cell — the adapter then needs a MUTABLE `inner` pointer for
+/// the write-back.
+fn vtableReturnGlueReusesCell(glue: ir.VTableReturnGlue) bool {
+    return switch (glue) {
+        .direct => false,
+        .box => |box_glue| box_glue.reuse_receiver_cell,
+        .tuple => |element_glues| for (element_glues) |element_glue| {
+            if (vtableReturnGlueReusesCell(element_glue)) break true;
+        } else false,
+    };
+}
+
+/// Emit the cell write-back statements for every reuse position in the
+/// glue plan: `inner.* = impl_result[i];`. Runs BEFORE the return
+/// expression so the re-wrapped receiver cell already holds the
+/// returned next state.
+fn appendVTableGlueWriteBacks(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    glue: ir.VTableReturnGlue,
+    source_expr: []const u8,
+) std.mem.Allocator.Error!void {
+    switch (glue) {
+        .direct => {},
+        .box => |box_glue| if (box_glue.reuse_receiver_cell) {
+            try buf.appendSlice(allocator, "    inner.* = ");
+            try buf.appendSlice(allocator, source_expr);
+            try buf.appendSlice(allocator, ";\n");
+        },
+        .tuple => |element_glues| for (element_glues, 0..) |element_glue, index| {
+            const element_expr = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ source_expr, index });
+            defer allocator.free(element_expr);
+            try appendVTableGlueWriteBacks(allocator, buf, element_glue, element_expr);
+        },
+    }
+}
+
+/// Emit the adapter's return expression for a glue plan, transforming
+/// the impl result (`source_expr`) into the slot's boxed shape:
+///   * `.direct` — the source expression verbatim.
+///   * `.box` with cell reuse — re-wrap the receiver's own cell (the
+///     write-back already stored the next state there) with this
+///     instance's vtable.
+///   * `.box` fresh — heap-allocate an inner cell for the returned
+///     concrete value and wrap it with the position's impl vtable
+///     (`boxAsProtocol(allocAny(...), vtable_addr())` — the same
+///     construction the IR-level `box_as_protocol` lowering emits).
+///   * `.tuple` — a positional tuple literal of recursively-glued
+///     elements, coercing into the slot's tuple return type.
+fn appendVTableGlueExpr(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    glue: ir.VTableReturnGlue,
+    source_expr: []const u8,
+    self_instance_name: []const u8,
+) std.mem.Allocator.Error!void {
+    switch (glue) {
+        .direct => try buf.appendSlice(allocator, source_expr),
+        .box => |box_glue| {
+            if (box_glue.reuse_receiver_cell) {
+                try buf.appendSlice(allocator, "zap_runtime.ProtocolBox{ .data_ptr = data_ptr, .vtable = vtable_addr() }");
+                return;
+            }
+            try buf.appendSlice(allocator, "zap_runtime.ArcRuntime.boxAsProtocol(zap_runtime.ArcRuntime.allocAny(@TypeOf(");
+            try buf.appendSlice(allocator, source_expr);
+            try buf.appendSlice(allocator, "), std.heap.page_allocator, ");
+            try buf.appendSlice(allocator, source_expr);
+            try buf.appendSlice(allocator, "), ");
+            if (std.mem.eql(u8, box_glue.vtable_instance_name, self_instance_name)) {
+                try buf.appendSlice(allocator, "vtable_addr()");
+            } else {
+                try buf.appendSlice(allocator, "@import(\"");
+                try buf.appendSlice(allocator, box_glue.vtable_instance_name);
+                try buf.appendSlice(allocator, "\").vtable_addr()");
+            }
+            try buf.appendSlice(allocator, ")");
+        },
+        .tuple => |element_glues| {
+            try buf.appendSlice(allocator, ".{ ");
+            for (element_glues, 0..) |element_glue, index| {
+                if (index > 0) try buf.appendSlice(allocator, ", ");
+                const element_expr = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ source_expr, index });
+                defer allocator.free(element_expr);
+                try appendVTableGlueExpr(allocator, buf, element_glue, element_expr, self_instance_name);
+            }
+            try buf.appendSlice(allocator, " }");
+        },
+    }
 }
 
 /// Map a primitive Zap type to a well-known ZIR type Ref.
@@ -2763,16 +2883,20 @@ pub const ZirDriver = struct {
         // `share(box) zap_runtime.ProtocolBox` — the single chokepoint the
         // box-local `.protocol_box_share` share lowering calls when a box
         // gains a second owner. Comptime-specialized on the active manager's
-        // reclamation model (three-way, capability-driven — never a manager
-        // name):
-        //   * REFCOUNTED — bump the inner's refcount and return the SAME box;
-        //     the two owners share one refcounted inner that the last drop
-        //     frees. (Identity rebind at the call site.)
-        //   * INDIVIDUAL_NO_REFCOUNT (`Memory.Tracking`, CLONE_ON_SHARE) —
-        //     there is no refcount, so a second owner of the same inner would
-        //     double-free at its individual scope-exit free. Return an
-        //     independent CLONE so each owner frees its own inner exactly once
-        //     (no double-free, no leak).
+        // reclamation model (capability-driven — never a manager name):
+        //   * REFCOUNTED / INDIVIDUAL_NO_REFCOUNT — return an independent
+        //     deep CLONE so each owner owns its inner (and the inner's ARC
+        //     children) exactly once. Cloning — not a cell refcount bump —
+        //     is required for CONSUMING protocol methods (`state :: unique
+        //     Enumerable(element)`): a consuming dispatch moves the inner
+        //     value's interior ownership through the impl (`List.next`
+        //     consumes the list), so a second owner aliasing the same cell
+        //     would observe a consumed interior (use-after-free) or a
+        //     mutated-in-place state (state-transfer cell reuse). A deep
+        //     clone makes every alias's iteration state independent — the
+        //     value-semantics contract of clone-on-share. The box vtable's
+        //     `retain` slot remains the container deep-walk's refcount
+        //     primitive; share-of-a-box-LOCAL is the clone seam.
         //   * BULK_OR_NEVER / TRACED (Arena/NoOp/Leak/GC) — there is no
         //     individual free at all (the manager reclaims in bulk at exit,
         //     never, or via tracing), so a second owner aliasing the same
@@ -2782,10 +2906,7 @@ pub const ZirDriver = struct {
         // `.protocol_box_share` ZIR handler stay uniform: it always rebinds
         // the new owner local to `share(box)`.
         try buf.appendSlice(self.allocator, "pub fn share(box: zap_runtime.ProtocolBox) zap_runtime.ProtocolBox {\n");
-        try buf.appendSlice(self.allocator, "    if (comptime zap_runtime.refcount_v1_active) {\n");
-        try buf.appendSlice(self.allocator, "        retain(box);\n");
-        try buf.appendSlice(self.allocator, "        return box;\n");
-        try buf.appendSlice(self.allocator, "    } else if (comptime zap_runtime.eager_individual_free) {\n");
+        try buf.appendSlice(self.allocator, "    if (comptime zap_runtime.refcount_v1_active or zap_runtime.eager_individual_free) {\n");
         try buf.appendSlice(self.allocator, "        return clone(box);\n");
         try buf.appendSlice(self.allocator, "    } else {\n");
         try buf.appendSlice(self.allocator, "        return box;\n");
@@ -2911,11 +3032,35 @@ pub const ZirDriver = struct {
         // published at the target file's root (`emitFunction` selects
         // `func.local_name` under `current_emit_struct`), so method calls
         // stay `TargetMod.<method>` in both cases.
-        const target_type_ref = if (std.mem.lastIndexOfScalar(u8, inst_def.target_type_name, '.')) |dot_idx| blk: {
+        // A runtime-native container target (`List(i64)`, `Map(Atom, i64)`)
+        // has no file-IS-the-struct type of its own — the boxed inner is
+        // the container's VALUE shape (`?*const zap_runtime.List(i64)`),
+        // rendered from the instance's `target_zig_type`.
+        const target_type_ref = if (inst_def.target_zig_type) |target_zig_type| blk: {
+            var type_buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer type_buf.deinit(self.allocator);
+            try appendZigTypeForVTable(self.allocator, &type_buf, target_zig_type);
+            break :blk try type_buf.toOwnedSlice(self.allocator);
+        } else if (std.mem.lastIndexOfScalar(u8, inst_def.target_type_name, '.')) |dot_idx| blk: {
             const leaf = inst_def.target_type_name[dot_idx + 1 ..];
             break :blk try std.fmt.allocPrint(self.allocator, "TargetMod.{s}", .{leaf});
         } else try self.allocator.dupe(u8, "TargetMod");
         defer self.allocator.free(target_type_ref);
+
+        // Module that publishes the impl's method symbols. Concrete impls
+        // publish in the target's own file (`TargetMod`); parametric-target
+        // impls publish their monomorphized methods in the impl's defining
+        // struct module (`impl_module`).
+        if (inst_def.impl_module) |impl_module| {
+            const impl_import_line = try std.fmt.allocPrint(
+                self.allocator,
+                "const ImplMod = @import(\"{s}\");\n\n",
+                .{impl_module},
+            );
+            defer self.allocator.free(impl_import_line);
+            try buf.appendSlice(self.allocator, impl_import_line);
+        }
+        const impl_module_ref: []const u8 = if (inst_def.impl_module != null) "ImplMod" else "TargetMod";
 
         // Phase 1.2.5.c: per-impl ABI-bridge adapter functions.
         // Each adapter recovers the inner value from the box's
@@ -2951,8 +3096,12 @@ pub const ZirDriver = struct {
             try buf.appendSlice(self.allocator, ") ");
             try appendVTableReturnType(self.allocator, &buf, method.return_type, method.raises);
             try buf.appendSlice(self.allocator, " {\n");
-            // `    const inner: *const <target_type_ref> = @ptrCast(@alignCast(data_ptr.?));`
-            try buf.appendSlice(self.allocator, "    const inner: *const ");
+            // `    const inner: *<const> <target_type_ref> = @ptrCast(@alignCast(data_ptr.?));`
+            // The pointer is MUTABLE when the return glue reuses the
+            // receiver's inner cell (the adapter writes the returned
+            // next state back into the same cell).
+            const glue_reuses_cell = vtableReturnGlueReusesCell(method.return_glue);
+            try buf.appendSlice(self.allocator, if (glue_reuses_cell) "    const inner: *" else "    const inner: *const ");
             try buf.appendSlice(self.allocator, target_type_ref);
             try buf.appendSlice(self.allocator, " = @ptrCast(@alignCast(data_ptr.?));\n");
             // `    return TargetMod.<method_name>(inner.*[, arg0, ...]);`
@@ -2978,20 +3127,60 @@ pub const ZirDriver = struct {
             // calls `TargetMod.<method>__<arity>`, matching the published
             // declaration name. (The earlier assumption that methods were
             // published bare was wrong; `@import("Target").message` has
-            // no such member — only `message__1`.)
-            try buf.appendSlice(self.allocator, "    return TargetMod.");
-            try appendZigIdentifier(self.allocator, &buf, method.method_name);
-            const method_arity_suffix = try std.fmt.allocPrint(self.allocator, "__{d}", .{method.arity});
-            defer self.allocator.free(method_arity_suffix);
-            try buf.appendSlice(self.allocator, method_arity_suffix);
-            try buf.appendSlice(self.allocator, "(inner.*");
+            // no such member — only `message__1`.) A monomorphized
+            // parametric-target impl instead publishes under its
+            // specialization-mangled local symbol in the impl module
+            // (`ImplMod.List_next__i64__1`), carried whole in
+            // `impl_local_symbol`.
+            var call_expr: std.ArrayListUnmanaged(u8) = .empty;
+            defer call_expr.deinit(self.allocator);
+            try call_expr.appendSlice(self.allocator, impl_module_ref);
+            try call_expr.appendSlice(self.allocator, ".");
+            if (method.impl_local_symbol) |impl_local_symbol| {
+                try appendZigIdentifier(self.allocator, &call_expr, impl_local_symbol);
+            } else {
+                try appendZigIdentifier(self.allocator, &call_expr, method.method_name);
+                const method_arity_suffix = try std.fmt.allocPrint(self.allocator, "__{d}", .{method.arity});
+                defer self.allocator.free(method_arity_suffix);
+                try call_expr.appendSlice(self.allocator, method_arity_suffix);
+            }
+            try call_expr.appendSlice(self.allocator, "(inner.*");
             for (method.extra_param_types, 0..) |_, param_index| {
-                try buf.appendSlice(self.allocator, ", ");
+                try call_expr.appendSlice(self.allocator, ", ");
                 const arg_ref = try std.fmt.allocPrint(self.allocator, "arg{d}", .{param_index});
                 defer self.allocator.free(arg_ref);
-                try buf.appendSlice(self.allocator, arg_ref);
+                try call_expr.appendSlice(self.allocator, arg_ref);
             }
-            try buf.appendSlice(self.allocator, ");\n}\n\n");
+            try call_expr.appendSlice(self.allocator, ")");
+
+            if (method.return_glue == .direct and !method.receiver_consuming) {
+                // Fast path — the impl return coerces directly into the
+                // slot and the receiver cell stays owned by the box: the
+                // pre-existing single-expression adapter body (bare-formal
+                // `Callable` protocols keep byte-identical adapters).
+                try buf.appendSlice(self.allocator, "    return ");
+                try buf.appendSlice(self.allocator, call_expr.items);
+                try buf.appendSlice(self.allocator, ";\n}\n\n");
+                continue;
+            }
+
+            // Bridging body. The impl result binds first; reuse positions
+            // write the returned next state back into the receiver's cell
+            // BEFORE the return expression re-wraps that same cell; a
+            // consumed receiver whose cell was NOT reused is released
+            // shallowly (one cell reference, no child walk — the impl call
+            // moved the inner value's ownership out of the cell).
+            try buf.appendSlice(self.allocator, "    const impl_result = ");
+            if (method.raises) try buf.appendSlice(self.allocator, "try ");
+            try buf.appendSlice(self.allocator, call_expr.items);
+            try buf.appendSlice(self.allocator, ";\n");
+            try appendVTableGlueWriteBacks(self.allocator, &buf, method.return_glue, "impl_result");
+            if (method.receiver_consuming and !glue_reuses_cell) {
+                try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.freeAny(std.heap.page_allocator, inner);\n");
+            }
+            try buf.appendSlice(self.allocator, "    return ");
+            try appendVTableGlueExpr(self.allocator, &buf, method.return_glue, "impl_result", type_def.name);
+            try buf.appendSlice(self.allocator, ";\n}\n\n");
         }
 
         // Synthetic `__drop__` adapter. Casts the box's erased

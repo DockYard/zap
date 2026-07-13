@@ -4975,6 +4975,12 @@ const Pipeline = struct {
     /// diagnostic rather than a silent miss. `runMonomorphize` threads it into
     /// `collectAndSpecializeSpawnManagers`.
     spawn_manager_resolver: ?zap.monomorphize.SpawnManagerResolver = null,
+    /// Boxed parametric-target impl specializations recorded by
+    /// `runMonomorphize` (the monomorphizer's Phase B.2) and threaded
+    /// into the IR builder by `runIrLowering` so the protocol-vtable
+    /// populator can emit per-instantiation instances for
+    /// parametric-target impls. See `hir.BoxedImplSpec`.
+    boxed_impl_specs: []const zap.hir.BoxedImplSpec = &.{},
 
     fn init(
         alloc: std.mem.Allocator,
@@ -5259,6 +5265,7 @@ const Pipeline = struct {
             reportMonomorphizeErrors(&self.ctx.diag_engine, result.errors) catch return error.OutOfMemory;
             return self.failWithExisting(error.HirFailed);
         }
+        self.boxed_impl_specs = result.boxed_impl_specs;
 
         // P3-J3: run the per-spawn manager-monomorphization axis (ACTIVATES the
         // P3-J2 mechanism). Recognizes `spawn(f, .{ .manager = X })` sites,
@@ -5314,6 +5321,7 @@ const Pipeline = struct {
         var ir_builder = zap.ir.IrBuilder.init(self.alloc, self.ctx.interner);
         ir_builder.type_store = type_store;
         ir_builder.scope_graph = &self.ctx.collector.graph;
+        ir_builder.boxed_impl_specs = self.boxed_impl_specs;
         defer ir_builder.deinit();
         var program = ir_builder.buildProgram(hir_program) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -5409,6 +5417,7 @@ const Pipeline = struct {
         ir_builder.scope_graph = &self.ctx.collector.graph;
         ir_builder.next_try_id = next_try_id.*;
         ir_builder.known_name_program = known_name_program;
+        ir_builder.boxed_impl_specs = self.boxed_impl_specs;
         defer ir_builder.deinit();
         var program = ir_builder.buildProgram(hir_program) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -5734,9 +5743,11 @@ fn compileHirToIr(
     options: CompileOptions,
     next_try_id: *u32,
     known_name_program: ?*const zap.hir.Program,
+    boxed_impl_specs: []const zap.hir.BoxedImplSpec,
 ) CompileError!Pipeline.IrLoweringResult {
     var pipeline = Pipeline.init(alloc, ctx, options, 0, 0);
     pipeline.defer_render = true;
+    pipeline.boxed_impl_specs = boxed_impl_specs;
     var mod_ir_result = try pipeline.runIrLoweringWithTryIdSeed(hir_program, type_store, next_try_id, known_name_program);
     try pipeline.runCtfeAttributesForStruct(mod_name, &mod_ir_result.program);
     return mod_ir_result;
@@ -6855,6 +6866,7 @@ fn rebuildStagedIr(
     var ir_builder = zap.ir.IrBuilder.init(alloc, interner);
     ir_builder.type_store = shared_store;
     ir_builder.scope_graph = &collector.graph;
+    ir_builder.boxed_impl_specs = mono_result.boxed_impl_specs;
     defer ir_builder.deinit();
     const program = ir_builder.buildProgram(&combined_hir) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -7104,7 +7116,7 @@ fn compileStructsToPreFinalIr(
             .top_functions = &.{},
         };
         per_struct_timer.reset();
-        const mod_lower = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir) catch |err| switch (err) {
+        const mod_lower = compileHirToIr(alloc, ctx, mod_name_str, &single_mod_hir, shared_store, options, &next_try_id, &combined_hir, pipeline.boxed_impl_specs) catch |err| switch (err) {
             error.IrFailed => continue,
             error.OutOfMemory => return error.OutOfMemory,
             else => return err,
@@ -7131,7 +7143,7 @@ fn compileStructsToPreFinalIr(
             .top_functions = combined_hir.top_functions,
             .impls = combined_hir.impls,
         };
-        const mod_lower = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id, &combined_hir) catch |err| switch (err) {
+        const mod_lower = compileHirToIr(alloc, ctx, "top", &top_hir, shared_store, options, &next_try_id, &combined_hir, pipeline.boxed_impl_specs) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.IrFailed => return error.IrFailed,
             else => return err,
