@@ -10497,6 +10497,38 @@ pub const IrBuilder = struct {
         return switchable_type;
     }
 
+    /// True when a freshly-lowered `switch_literal` arm/default body
+    /// terminates in an unconditional ZIR-level noreturn terminator, so the
+    /// arm never yields a value to the branch merge.
+    ///
+    /// The IR convention (established by the Phase E.7 tail-call rewriter and
+    /// consumed by `emitSwitchLiteral`) is: a diverging arm carries
+    /// `result == null`, and the ZIR emitter then resolves the arm's merge
+    /// edge to `unreachable_value` via its own end-noreturn check. Storing a
+    /// local instead is a contract violation: `lowerBlock` on a `raise`-tailed
+    /// body returns the `.ret_raise` HIR expression's dest local, which NO
+    /// instruction ever assigns (the `.ret_raise` lowering emits only the
+    /// stash call — with its own dest — plus the operand-less `ret_raise`
+    /// terminator), so the emitter's `refForLocal` on that phantom local
+    /// fails the whole function's emission.
+    ///
+    /// Deliberately NOT in this list: a body tailed by a *returning*
+    /// `Kernel.recoverable_raise` call (a `raise` lexically inside an
+    /// enclosing `try` body). That tail is a `call_named` — control FALLS
+    /// THROUGH to the merge and the call's own dest local is genuinely
+    /// assigned — so such an arm must keep its result (see
+    /// `RescueArmOutcome` for the full recoverable-vs-noreturn distinction).
+    /// `tail_call`/`switch_return` terminators cannot appear here either:
+    /// they are introduced by the Phase E.7 rewriter AFTER building, and that
+    /// rewriter already nulls the results of the arms it rewrites.
+    fn switchLiteralArmBodyEndsNoReturn(body_instrs: []const Instruction) bool {
+        if (body_instrs.len == 0) return false;
+        return switch (body_instrs[body_instrs.len - 1]) {
+            .ret, .ret_raise, .match_fail, .match_error_return => true,
+            else => false,
+        };
+    }
+
     /// Build the case_block instruction body.
     fn lowerCaseExprBody(self: *IrBuilder, dest: LocalId, scrutinee_local: LocalId, case_data: hir_mod.CaseData) !void {
         // Try to emit a switch for homogeneous integer/bool literals with no guards
@@ -10524,13 +10556,23 @@ pub const IrBuilder = struct {
                     const default_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                     self.current_instrs = saved;
 
+                    // A diverging default (e.g. `_ -> raise ...` lowered to a
+                    // propagating `ret_raise`) yields no merge value; storing
+                    // `body_result` would record the raise expression's
+                    // never-assigned phantom local and fail ZIR emission.
+                    // See `switchLiteralArmBodyEndsNoReturn`.
+                    const default_result: ?LocalId = if (switchLiteralArmBodyEndsNoReturn(default_instrs))
+                        null
+                    else
+                        body_result;
+
                     try self.current_instrs.append(self.allocator, .{
                         .switch_literal = .{
                             .dest = dest,
                             .scrutinee = scrutinee_local,
                             .cases = try lit_cases.toOwnedSlice(self.allocator),
                             .default_instrs = default_instrs,
-                            .default_result = body_result,
+                            .default_result = default_result,
                         },
                     });
                     return;
@@ -10549,10 +10591,21 @@ pub const IrBuilder = struct {
                 const body_instrs = try self.current_instrs.toOwnedSlice(self.allocator);
                 self.current_instrs = saved;
 
+                // A diverging arm (e.g. `raise` lowered to a propagating
+                // `ret_raise`) yields no merge value; storing `body_result`
+                // would record the raise expression's never-assigned phantom
+                // local and fail ZIR emission. With `result == null` the ZIR
+                // emitter resolves this arm's merge edge to
+                // `unreachable_value`. See `switchLiteralArmBodyEndsNoReturn`.
+                const case_result: ?LocalId = if (switchLiteralArmBodyEndsNoReturn(body_instrs))
+                    null
+                else
+                    body_result;
+
                 try lit_cases.append(self.allocator, .{
                     .value = lit_value,
                     .body_instrs = body_instrs,
-                    .result = body_result,
+                    .result = case_result,
                 });
             }
 
