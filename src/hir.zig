@@ -5921,6 +5921,13 @@ pub const HirBuilder = struct {
                         const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
                         if (!(try store_ptr.containsTypeVars(expected_tail_type))) {
                             _ = try self.adoptNumericLiteralType(@constCast(hir_expr), expected_tail_type);
+                            // A structurally-empty list/map literal (`[]`, `%{}`)
+                            // in the tail — bare, nested in a returned composite
+                            // (`{:cont, [], state}`), or produced by one arm of a
+                            // tail `if`/`case` — adopts the declared composite
+                            // return type's element type, so it lowers as
+                            // `List(output)` instead of the `List(i64)` default.
+                            _ = try self.patchEmptyContainerTypesExpr(hir_expr, expected_tail_type);
                         }
                     }
                     try hir_stmts.append(self.allocator, .{ .expr = hir_expr });
@@ -7039,7 +7046,7 @@ pub const HirBuilder = struct {
                 if (case_type_id != types_mod.TypeStore.UNKNOWN) {
                     for (arm_slice) |arm| {
                         if (arm.body.result_type == types_mod.TypeStore.UNKNOWN) {
-                            self.patchEmptyContainerTypes(arm.body, case_type_id);
+                            try self.patchEmptyContainerTypes(arm.body, case_type_id);
                         }
                     }
                 }
@@ -9674,7 +9681,7 @@ pub const HirBuilder = struct {
 
         // Empty list/map literals: the existing helper carries the
         // exact UNKNOWN-to-expected stamping the codegen needs.
-        self.patchEmptyContainerTypesExpr(expr, expected_type);
+        _ = try self.patchEmptyContainerTypesExpr(expr, expected_type);
 
         // Numeric-literal narrowing: a bare `8080` lowers as a
         // default-typed `int_lit` (HIR's `buildExpr` stamps `I64`
@@ -10153,11 +10160,11 @@ pub const HirBuilder = struct {
         return try store_ptr.addType(.{ .list = .{ .element = element_type } });
     }
 
-    fn patchEmptyContainerTypes(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) void {
+    fn patchEmptyContainerTypes(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) types_mod.TypeGraphError!void {
         for (block.stmts) |stmt| {
             switch (stmt) {
-                .expr => |expr| self.patchEmptyContainerTypesExpr(expr, expected_type),
-                .local_set => |ls| self.patchEmptyContainerTypesExpr(ls.value, expected_type),
+                .expr => |expr| _ = try self.patchEmptyContainerTypesExpr(expr, expected_type),
+                .local_set => |ls| _ = try self.patchEmptyContainerTypesExpr(ls.value, expected_type),
                 .function_group => {},
             }
         }
@@ -10167,23 +10174,148 @@ pub const HirBuilder = struct {
         }
     }
 
-    fn patchEmptyContainerTypesExpr(self: *const HirBuilder, expr: *const Expr, expected_type: types_mod.TypeId) void {
+    /// Patch a structurally-empty list/map literal (`[]`, `%{}`) that flows
+    /// into a known composite `expected_type`, taking the EXPECTED element
+    /// type instead of leaving the container `UNKNOWN` — which the IR builder
+    /// (`chooseListElementType`) would otherwise default to `List(i64)` /
+    /// `Map(i64, i64)`. Recurses positionally through tuples, lists, maps, and
+    /// the value-producing tails of `if`/`case`/`block` — the same structural
+    /// recursion `adoptNumericLiteralType` performs for numeric-literal
+    /// widening — so an empty list nested inside a returned composite
+    /// (`{:cont, [], state}` for a `-> {Atom, [output], S}` stage) or produced
+    /// by one arm of an `if`/`case` peer-join adopts the declared element type
+    /// rather than conflicting with a sibling arm's concrete `List(output)`.
+    ///
+    /// Returns true when at least one empty container was patched. When a
+    /// nested patch occurs, the enclosing container/branch/block type is
+    /// restamped so downstream passes (the IR arm-join, the type checker) see
+    /// a type consistent with the patched leaves. The tuple/list/map restamp
+    /// mirrors `adoptNumericLiteralType`'s totality guard: the container only
+    /// adopts the homogeneous `expected_type` when every NON-patched sibling
+    /// already satisfies its expected slot (`nonAdoptingElementSatisfies`), so
+    /// a genuinely-mismatched sibling keeps its own type and is still caught by
+    /// the type checker rather than smuggled through by the restamp.
+    fn patchEmptyContainerTypesExpr(self: *const HirBuilder, expr: *const Expr, expected_type: types_mod.TypeId) types_mod.TypeGraphError!bool {
+        if (expected_type == types_mod.TypeStore.UNKNOWN) return false;
+        if (expected_type >= self.type_store.types.items.len) return false;
         const expected_kind = self.type_store.getType(expected_type);
+        const mut: *Expr = @constCast(expr);
         switch (expr.kind) {
-            .list_init => |elems| {
-                if (elems.len == 0 and expr.type_id == types_mod.TypeStore.UNKNOWN and expected_kind == .list) {
-                    const mut: *Expr = @constCast(expr);
+            .list_init => |elements| {
+                if (expected_kind != .list) return false;
+                if (elements.len == 0) {
+                    if (expr.type_id == types_mod.TypeStore.UNKNOWN) {
+                        mut.type_id = expected_type;
+                        return true;
+                    }
+                    return false;
+                }
+                // Non-empty list: recurse for NESTED empty containers (e.g. an
+                // inner `[]` in `[[], [1]]` flowing into `[[i64]]`) so it
+                // adopts the inner element type.
+                const element_expected = expected_kind.list.element;
+                var patched = false;
+                var all_qualify = true;
+                for (elements) |element| {
+                    if (try self.patchEmptyContainerTypesExpr(element, element_expected)) {
+                        patched = true;
+                    } else if (!(try self.nonAdoptingElementSatisfies(element, element_expected))) {
+                        all_qualify = false;
+                    }
+                }
+                if (patched and all_qualify and expr.type_id == types_mod.TypeStore.UNKNOWN) {
                     mut.type_id = expected_type;
                 }
+                return patched;
             },
             .map_init => |entries| {
-                if (entries.len == 0 and expr.type_id == types_mod.TypeStore.UNKNOWN and expected_kind == .map) {
-                    const mut: *Expr = @constCast(expr);
+                if (expected_kind != .map) return false;
+                if (entries.len == 0) {
+                    if (expr.type_id == types_mod.TypeStore.UNKNOWN) {
+                        mut.type_id = expected_type;
+                        return true;
+                    }
+                    return false;
+                }
+                const key_expected = expected_kind.map.key;
+                const value_expected = expected_kind.map.value;
+                var patched = false;
+                var all_qualify = true;
+                for (entries) |entry| {
+                    if (try self.patchEmptyContainerTypesExpr(entry.key, key_expected)) {
+                        patched = true;
+                    } else if (!(try self.nonAdoptingElementSatisfies(entry.key, key_expected))) {
+                        all_qualify = false;
+                    }
+                    if (try self.patchEmptyContainerTypesExpr(entry.value, value_expected)) {
+                        patched = true;
+                    } else if (!(try self.nonAdoptingElementSatisfies(entry.value, value_expected))) {
+                        all_qualify = false;
+                    }
+                }
+                if (patched and all_qualify and expr.type_id == types_mod.TypeStore.UNKNOWN) {
                     mut.type_id = expected_type;
                 }
+                return patched;
             },
-            else => {},
+            .tuple_init => |elements| {
+                if (expected_kind != .tuple) return false;
+                if (elements.len != expected_kind.tuple.elements.len) return false;
+                var patched = false;
+                var all_qualify = true;
+                for (elements, expected_kind.tuple.elements) |element, element_expected| {
+                    if (try self.patchEmptyContainerTypesExpr(element, element_expected)) {
+                        patched = true;
+                    } else if (!(try self.nonAdoptingElementSatisfies(element, element_expected))) {
+                        all_qualify = false;
+                    }
+                }
+                if (patched and all_qualify) {
+                    mut.type_id = expected_type;
+                }
+                return patched;
+            },
+            .branch => |branch| {
+                var patched = false;
+                if (try self.patchEmptyContainerInBlockTail(branch.then_block, expected_type)) patched = true;
+                if (branch.else_block) |else_block| {
+                    if (try self.patchEmptyContainerInBlockTail(else_block, expected_type)) patched = true;
+                }
+                if (patched and expr.type_id == types_mod.TypeStore.UNKNOWN) mut.type_id = expected_type;
+                return patched;
+            },
+            .case => |case_data| {
+                var patched = false;
+                for (case_data.arms) |arm| {
+                    if (try self.patchEmptyContainerInBlockTail(arm.body, expected_type)) patched = true;
+                }
+                if (patched and expr.type_id == types_mod.TypeStore.UNKNOWN) mut.type_id = expected_type;
+                return patched;
+            },
+            .block => {
+                const patched = try self.patchEmptyContainerInBlockTail(&expr.kind.block, expected_type);
+                if (patched and expr.type_id == types_mod.TypeStore.UNKNOWN) mut.type_id = expected_type;
+                return patched;
+            },
+            else => return false,
         }
+    }
+
+    /// Recurse `patchEmptyContainerTypesExpr` into the value-producing tail
+    /// expression of a block, used by the control-flow arms of
+    /// `patchEmptyContainerTypesExpr` (`branch`, `case`, `block`). When the
+    /// tail patched, the block's `result_type` is restamped to the expected
+    /// type so the IR builder lowers the block at the concrete element type
+    /// (the empty-container analog of `adoptNumericLiteralInBlockTail`).
+    fn patchEmptyContainerInBlockTail(self: *const HirBuilder, block: *const Block, expected_type: types_mod.TypeId) types_mod.TypeGraphError!bool {
+        if (block.stmts.len == 0) return false;
+        const last = block.stmts[block.stmts.len - 1];
+        if (last != .expr) return false;
+        if (try self.patchEmptyContainerTypesExpr(last.expr, expected_type)) {
+            @constCast(block).result_type = expected_type;
+            return true;
+        }
+        return false;
     }
 
     /// Recursively collect case-arm bindings from a match pattern.

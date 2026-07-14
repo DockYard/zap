@@ -11781,6 +11781,61 @@ pub const IrBuilder = struct {
         return tail;
     }
 
+    /// Whether a HIR expression is a bare default-typed numeric literal — an
+    /// `int_lit`/`float_lit` still stamped the placeholder `I64`/`F64`, or a
+    /// negated such literal (`-5`). These are exactly the shapes the
+    /// `int_lit`/`float_lit` lowering emits UNTYPED (a `comptime_int`/
+    /// `comptime_float`, suppressing the concrete `i64`/`f64` ZIR hint so
+    /// straight-line uses stay flexible). A non-default width (`5 :: u8`) or any
+    /// non-literal already lowers to a concrete runtime value.
+    fn isBareDefaultNumericLiteral(expr: *const hir_mod.Expr) bool {
+        return switch (expr.kind) {
+            .int_lit => expr.type_id == types_mod.TypeStore.I64,
+            .float_lit => expr.type_id == types_mod.TypeStore.F64,
+            .unary => |unary| unary.op == .negate and
+                unary.operand.kind == .int_lit and
+                expr.type_id == types_mod.TypeStore.I64,
+            else => false,
+        };
+    }
+
+    /// Concretize a bare comptime numeric literal that becomes a field of a
+    /// runtime aggregate (tuple/list). A default `i64`/`f64` literal is EMITTED
+    /// untyped (a `comptime_int`/`comptime_float`) so straight-line uses stay
+    /// flexible; but as an aggregate field — which may then flow through a
+    /// runtime `if`/`case` merge — a `comptime_int` field makes the WHOLE
+    /// aggregate comptime-only and trips Zig's "value with comptime-only type
+    /// 'comptime_int' depends on runtime control flow". Emit an `@as(i64/f64,
+    /// elem)` (a codegen identity for an already-concrete value, the load-
+    /// bearing concretization for a `comptime_int`/`comptime_float`), mirroring
+    /// `coerceRescueArmTailToJoined`'s unconditional concretize-on-yield. A
+    /// no-op for any non-literal element (already a concrete runtime value).
+    fn concretizeAggregateNumericElement(self: *IrBuilder, local: LocalId, elem: *const hir_mod.Expr) !LocalId {
+        if (!isBareDefaultNumericLiteral(elem)) return local;
+        const zig_type = try typeIdToZigTypeWithStore(elem.type_id, self.type_store);
+        if (zig_type == .i64) {
+            const coerced = self.next_local;
+            self.next_local += 1;
+            try self.current_instrs.append(self.allocator, .{
+                .int_widen = .{ .dest = coerced, .source = local, .dest_type = .i64 },
+            });
+            try self.known_local_types.put(coerced, .i64);
+            try self.local_hir_types.put(coerced, elem.type_id);
+            return coerced;
+        }
+        if (zig_type == .f64) {
+            const coerced = self.next_local;
+            self.next_local += 1;
+            try self.current_instrs.append(self.allocator, .{
+                .float_widen = .{ .dest = coerced, .source = local, .dest_type = .f64 },
+            });
+            try self.known_local_types.put(coerced, .f64);
+            try self.local_hir_types.put(coerced, elem.type_id);
+            return coerced;
+        }
+        return local;
+    }
+
     /// Emit the per-arm owner-drop of a recovered rescue box on a CATCHING
     /// arm's fall-through path: a plain `.release{value=error_local}`. The
     /// box's `protocol_constraint`/`protocol_box` type drives the ZIR backend's
@@ -18264,7 +18319,13 @@ pub const IrBuilder = struct {
                 var elem_zig_types: std.ArrayList(ZigType) = .empty;
                 defer elem_zig_types.deinit(self.allocator);
                 for (elems) |elem| {
-                    const local = try self.lowerExpr(elem);
+                    const raw_local = try self.lowerExpr(elem);
+                    // A bare `comptime_int`/`comptime_float` literal field would
+                    // make this tuple comptime-only, tripping Zig's
+                    // "comptime-only type depends on runtime control flow" once
+                    // the tuple flows through a runtime `if`/`case` merge.
+                    // Concretize such literal fields to their `i64`/`f64` type.
+                    const local = try self.concretizeAggregateNumericElement(raw_local, elem);
                     try locals.append(self.allocator, local);
                     try elem_zig_types.append(self.allocator, self.known_local_types.get(local) orelse .any);
                 }
