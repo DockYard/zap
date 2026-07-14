@@ -3946,6 +3946,21 @@ fn structTypeHasArcManagedField(
         // Enumerable-devirtualization V11 contract); a Callable FIELD is
         // always boxed, so account for it here.
         if (protocolConstraintIsBoxedCallable(type_store, field.type_id)) return true;
+        // A concrete parametric protocol constraint reached as a STRUCT FIELD
+        // (`source :: Enumerable(i64)`, `stage :: Stage(...)`) is ALWAYS a
+        // boxed existential — there is no devirtualized field representation,
+        // exactly as for a boxed `Callable` field above. Its owning
+        // `ProtocolBox` must be deep-released by the enclosing struct's drop,
+        // so the struct owns an ARC value. The type-level `isArcManagedTypeId`
+        // predicate deliberately classifies a bare parametric
+        // `protocol_constraint` PARAM as NOT ARC-managed (the V11
+        // Enumerable-devirtualization contract keys boxed-vs-devirtualized at
+        // the construction-site LOCAL, not the type), but a FIELD is
+        // unambiguously boxed. Without this arm a box-only / box+scalar struct
+        // is misclassified `.trivial`, its param never drops, and the boxed
+        // field LEAKS (invisible under ARC; a `leak summary:` under
+        // `Memory.Tracking`).
+        if (protocolConstraintIsConcreteParametric(type_store, field.type_id)) return true;
     }
     return false;
 }
@@ -17137,17 +17152,73 @@ pub const IrBuilder = struct {
     ) anyerror!LocalId {
         const boxed_local = try self.maybeBoxAsProtocol(value_local, expected_zig_type);
 
-        // Only a boxed `Callable` existential needs the aggregate-owner clone.
-        // A devirtualized `.function` closure (the #201/Gap-E direct path) is
-        // a bare code pointer with no heap inner — nothing to clone or
-        // double-free. A non-`Callable` protocol box (`Error`) reaches owning
-        // aggregates through its own already-correct ownership paths.
+        // A boxed CONCRETE-PARAMETRIC existential stored into an owning
+        // aggregate needs the independent-owner clone-on-share — not just
+        // `Callable`, but every parametric box: `Enumerable(i64)` / `Stage(...)`
+        // stored into a struct field (the Stream `Transform` adapter's
+        // `source` / `stage`, or the `%Adapter{source: next_source, …}`
+        // rebuild in a consuming `next`) are equally boxed existentials whose
+        // aggregate becomes a NEW OWNER. Without the clone the stored box
+        // ALIASES the source's inner; when the source box is separately
+        // released (`.protocol_box_drop`), a clone-on-share manager
+        // (`Memory.Tracking`) frees the inner the aggregate still points at —
+        // a dangling clone-of-freed on the next deep-walk (the store-side
+        // mirror of the consumed-field double-free). Under a refcount manager
+        // the share is an inner refcount bump, so this is correct there too.
+        //
+        // A devirtualized `.function` closure (the #201/Gap-E direct path) is a
+        // bare code pointer with no heap inner — nothing to clone. A BARE
+        // protocol box (`Error`) reaches owning aggregates through its own
+        // already-correct ownership paths and is excluded (it is not
+        // concrete-parametric).
         const boxed_zig = self.known_local_types.get(boxed_local) orelse return boxed_local;
         if (boxed_zig != .protocol_box) return boxed_local;
-        if (!std.mem.eql(u8, self.baseProtocolName(boxed_zig.protocol_box), "Callable")) return boxed_local;
+        const is_owner_clone_box = blk_box: {
+            // Concrete-parametric existential (Enumerable/Stage/Callable) —
+            // keyed on the box's HIR `protocol_constraint` type, never a name.
+            if (self.type_store) |store| {
+                if (self.local_hir_types.get(boxed_local)) |hir_type| {
+                    if (protocolConstraintIsConcreteParametric(store, hir_type)) break :blk_box true;
+                }
+            }
+            // Fallback: recognise `Callable` by its box-family name even when
+            // the HIR `protocol_constraint` type is not carried on the local
+            // (the pre-existing Callable-only contract, preserved exactly).
+            break :blk_box std.mem.eql(u8, self.baseProtocolName(boxed_zig.protocol_box), "Callable");
+        };
+        if (!is_owner_clone_box) return boxed_local;
 
-        // A fresh single-use box (any non-reference expression) moves into the
-        // aggregate; only a reference to an existing binding/param must clone.
+        const is_callable_box = std.mem.eql(u8, self.baseProtocolName(boxed_zig.protocol_box), "Callable");
+
+        // A CONCRETE-PARAMETRIC non-`Callable` box (Enumerable / Stage) stored
+        // into an aggregate is ALWAYS a BORROW of an owner released elsewhere:
+        //   * a struct-FIELD read (`%S{f: x.field}`) — the parent `x` still owns
+        //     the field and re-releases it at its scope-exit whole-struct drop;
+        //   * a pattern-bound dispatch-result element (`%S{f: next_source}`) —
+        //     `next_source` is a borrow of the tuple element the caller releases
+        //     at its `.protocol_box_drop`.
+        // Both need an INDEPENDENT owner materialized IN PLACE (share-rebind the
+        // extraction), NOT the `copy_value`-into-a-fresh-local clone used for a
+        // genuine owner binding below: the extraction is `.trivial`, so a
+        // `copy_value` from it trips ARC verifier V11, and marking the borrow
+        // `.owned` to satisfy V11 leaves a SPURIOUS second owner of the borrowed
+        // inner that the borrow's real owner ALSO frees — a double-free / leak
+        // under a clone-on-share manager (`Memory.Tracking`). The in-place share
+        // turns the borrow itself into the aggregate's independent owner (the
+        // aggregate-store-consumes rule clears its owns bit at the store, so it
+        // gets no scope-exit drop). A FRESH box (call result, literal) already
+        // owns its inner and moves in unchanged.
+        if (!is_callable_box) {
+            return switch (value_expr.kind) {
+                .field_get, .local_get, .param_get, .capture_get => try self.shareBoxExtractionInPlace(boxed_local),
+                else => boxed_local,
+            };
+        }
+
+        // `Callable` (unchanged pre-existing contract): only a genuine owner
+        // BINDING (`g = make_adder(5)`, whose box value may be read again)
+        // clones via `copy_value` + share so the source binding keeps its own
+        // inner; a fresh box or a field read passes through unchanged.
         const is_binding_reference = switch (value_expr.kind) {
             .local_get, .param_get, .capture_get => true,
             else => false,
@@ -17209,6 +17280,105 @@ pub const IrBuilder = struct {
         // the borrowed source's, not a freshly-constructed one.
         try self.boxed_existential_locals.put(self.allocator, clone_local, {});
         return clone_local;
+    }
+
+    /// Partial-move / consumed-box-field clone-on-share. A concrete-parametric
+    /// protocol-box value read out of a STRUCT FIELD (`adapter.source`, typed
+    /// `Enumerable(i64)` / `Stage(...)`) and then CONSUMED — moved into a
+    /// `unique`-receiver protocol dispatch (`Enumerable.next(self.source)`) or
+    /// an `.owned` box parameter — is an UNRETAINED BORROW of the parent
+    /// struct's field. `field_get` does NOT retain a concrete-parametric box
+    /// (`isArcManagedTypeId` deliberately classifies a parametric
+    /// `protocol_constraint` as non-ARC — the V11 Enumerable-devirtualization
+    /// contract — so `emitArcRetainOnAggregateExtract` short-circuits; a BARE
+    /// protocol field IS retained at extraction and is excluded below).
+    ///
+    /// Consuming that borrow steals the parent's SINGLE reference to the box
+    /// inner, which the parent's scope-exit whole-struct drop
+    /// (`ArcRuntime.releaseChildrenAny` → `releaseProtocolBoxValue`) then
+    /// re-releases — a double free (REFCOUNT_V1 `assert(prev > 0)` at
+    /// `arc/manager.zig`), because the compiler does not track partial
+    /// (per-field) moves of a struct value. (The sibling failure mode: when
+    /// the parent is a box-only / box+scalar struct it is misclassified
+    /// `.trivial`, never drops, and its OTHER owned fields LEAK.)
+    ///
+    /// The fix routes the consumed extraction through the SAME manager-adaptive
+    /// clone-on-share (`<Protocol>VTable.share`) that a box STORED into an
+    /// aggregate uses (`boxedCallableAggregateOwnerLocal`) and that
+    /// `ProtocolDispatch.receiver_consuming` documents for "a non-last-use read
+    /// feeding the receiver": under a refcount manager `share` bumps the
+    /// inner's refcount and returns the same box (identity rebind); under a
+    /// clone-on-share manager (`Memory.Tracking`) it returns an INDEPENDENT
+    /// CLONE. Either way the consumed value becomes its OWN owner — the consume
+    /// balances against it and the parent's field stays owned, released exactly
+    /// once by the parent's drop. The clone gets no separate scope-exit drop:
+    /// the `receiver_consuming` liveness rule (`arc_liveness`) — or the
+    /// `.owned`-argument transfer for a consuming function call — clears its
+    /// owns bit at the consume, so the consume is its sole release.
+    ///
+    /// GENERAL over any concrete-parametric protocol box field (Enumerable,
+    /// Stage, a boxed `Callable` field, …); keyed on the `field_get` origin
+    /// plus the concrete-parametric-box type, NEVER on a struct or protocol
+    /// name. A bare-protocol field, a fresh box (call result), a binding/param
+    /// owner, and every non-box value pass through unchanged.
+    fn cloneConsumedBoxFieldExtraction(
+        self: *IrBuilder,
+        value_local: LocalId,
+        value_expr: *const hir_mod.Expr,
+    ) anyerror!LocalId {
+        // Only a value read directly out of a struct FIELD is an unretained
+        // borrow of a parent-owned box. A fresh box (call result), a
+        // binding/param owner, or any other source already owns (or cleanly
+        // transfers) its inner, so the existing move machinery is correct.
+        if (value_expr.kind != .field_get) return value_local;
+
+        // Must be a protocol box at the ZigType level (concrete-parametric
+        // Enumerable/Stage/Callable fields resolve to `.protocol_box`).
+        const value_zig = self.known_local_types.get(value_local) orelse return value_local;
+        if (value_zig != .protocol_box) return value_local;
+
+        // Must be a CONCRETE-PARAMETRIC protocol constraint — precisely the box
+        // fields `field_get` does NOT retain. A BARE protocol field (`Error`)
+        // IS retained at extraction (`isArcManagedTypeId` true), so cloning it
+        // here would over-retain and leak; exclude it.
+        const store = self.type_store orelse return value_local;
+        const value_hir = self.local_hir_types.get(value_local) orelse value_expr.type_id;
+        if (!protocolConstraintIsConcreteParametric(store, value_hir)) return value_local;
+
+        return try self.shareBoxExtractionInPlace(value_local);
+    }
+
+    /// Turn a borrowed protocol-box extraction into a genuine INDEPENDENT owner
+    /// IN PLACE via the manager-adaptive share helper. The `.protocol_box_share`
+    /// retain REBINDS `value_local` to `<Protocol>VTable.share(box)`: a refcount
+    /// bump returning the SAME box under a refcount manager (identity rebind),
+    /// an independent inner CLONE under a clone-on-share manager
+    /// (`Memory.Tracking`). Retaining the extraction in place — rather than
+    /// `copy_value`-ing it into a fresh local — is deliberate: the extraction is
+    /// `.trivial`, so a `copy_value` from it would trip ARC verifier V11
+    /// (`.copy_value` source must be non-`.trivial`), and marking the borrow
+    /// itself `.owned` to satisfy V11 would leave a spurious SECOND owner of the
+    /// borrowed inner that the borrow's real owner also frees (a double-free /
+    /// leak under a clone-on-share manager). The in-place share turns the borrow
+    /// into the sole new owner with no extra dataflow edge. Classifying it
+    /// non-`.trivial` (via `boxed_existential_locals`) makes
+    /// `computeLocalOwnership` treat it `.owned`; the consuming site — a
+    /// `receiver_consuming` dispatch, an `.owned`-argument transfer, or the
+    /// aggregate-store-consumes rule — clears its owns bit at the consume/store,
+    /// so it gets NO separate scope-exit drop and the consume/store is its sole
+    /// release, exactly balancing the share.
+    fn shareBoxExtractionInPlace(self: *IrBuilder, value_local: LocalId) anyerror!LocalId {
+        const value_zig = self.known_local_types.get(value_local) orelse return value_local;
+        if (value_zig != .protocol_box) return value_local;
+        try self.current_instrs.append(self.allocator, .{
+            .retain = .{
+                .value = value_local,
+                .kind = .protocol_box_share,
+                .protocol_name = try cloneBytes(self.allocator, value_zig.protocol_box),
+            },
+        });
+        try self.boxed_existential_locals.put(self.allocator, value_local, {});
+        return value_local;
     }
 
     /// Resolve the BASE protocol name from a vtable-family name carried by
@@ -17558,9 +17728,19 @@ pub const IrBuilder = struct {
                     };
                     const lowered_arg = switch (arg.mode) {
                         .move => blk: {
-                            if (arg_autoboxes) break :blk arg_local;
+                            // Partial-move fix: a concrete-parametric protocol
+                            // box extracted from a struct field and CONSUMED
+                            // here is an unretained borrow of the parent's
+                            // field. Route it through the manager-adaptive
+                            // clone-on-share so the consume owns its own inner
+                            // and does not steal the reference the parent's
+                            // scope-exit whole-struct drop re-releases (the
+                            // boxed-existential-field double-free). A no-op for
+                            // every non-box / non-field-extracted `.move` arg.
+                            const consume_local = try self.cloneConsumedBoxFieldExtraction(arg_local, arg.expr);
+                            if (arg_autoboxes) break :blk consume_local;
                             const should_move_arc = blk_move: {
-                                if (self.owned_transfer_locals.contains(arg_local)) {
+                                if (self.owned_transfer_locals.contains(consume_local)) {
                                     break :blk_move true;
                                 }
                                 const target_ownership_type = self.callTargetExpectedType(call.target, call.args.len, arg_index) orelse arg.expected_type;
@@ -17582,13 +17762,13 @@ pub const IrBuilder = struct {
                                 {
                                     break :blk_move true;
                                 }
-                                break :blk_move self.isArcManagedLocal(arg_local);
+                                break :blk_move self.isArcManagedLocal(consume_local);
                             };
-                            if (!should_move_arc) break :blk arg_local;
+                            if (!should_move_arc) break :blk consume_local;
                             const moved_local = self.next_local;
                             self.next_local += 1;
-                            try self.current_instrs.append(self.allocator, .{ .move_value = .{ .dest = moved_local, .source = arg_local } });
-                            try self.recordMoveValueMetadata(moved_local, arg_local);
+                            try self.current_instrs.append(self.allocator, .{ .move_value = .{ .dest = moved_local, .source = consume_local } });
+                            try self.recordMoveValueMetadata(moved_local, consume_local);
                             break :blk moved_local;
                         },
                         .share => blk: {

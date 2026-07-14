@@ -3970,6 +3970,63 @@ test "CLI script flags: default (no -Dmemory) runs with Memory.ARC" {
     try expectOnlyScriptInDir(&tmp_dir, "memdef.zap");
 }
 
+test "boxed-existential struct field: box-only iterating adapter is leak-free under Memory.Tracking" {
+    // Regression for the boxed-existential-field partial-move defect. A
+    // struct whose ONLY field is a concrete-parametric protocol box
+    // (`source :: Enumerable(i64)`) and which CONSUMES that field via a
+    // `unique`-receiver dispatch (`Enumerable.next(self.source)`) must:
+    //   * be classified ARC-managed (so its param drops — otherwise the box
+    //     LEAKS, invisible under refcount ARC but a `memory leak:` survivor
+    //     under `Memory.Tracking`), AND
+    //   * route the consumed box-field extraction through the clone-on-share
+    //     so the consume does not steal the parent's single reference (which
+    //     the parent's drop would otherwise re-release / double-free).
+    // Both must hold together: the classification alone would turn the leak
+    // into a double free. `Memory.Tracking` is per-allocation leak-checked at
+    // deinit, so it is the manager that OBSERVES the leak — and the manager
+    // can only be selected through the `-Dmemory` CLI flag, which Zest cannot
+    // set, so this coverage lives here rather than in a Zest test.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "box_only.zap",
+        \\pub struct BoxOnly {
+        \\  source :: Enumerable(i64)
+        \\}
+        \\
+        \\pub impl Enumerable(i64) for BoxOnly {
+        \\  pub fn next(holder :: unique BoxOnly) -> {Atom, i64, BoxOnly} {
+        \\    case Enumerable.next(holder.source) {
+        \\      {:done, _, exhausted} -> {:done, 0, %BoxOnly{source: exhausted}}
+        \\      {:cont, item, next_source} -> {:cont, item, %BoxOnly{source: next_source}}
+        \\    }
+        \\  }
+        \\
+        \\  pub fn dispose(holder :: unique BoxOnly) -> Nil {
+        \\    Enumerable.dispose(holder.source)
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  holder = %BoxOnly{source: [7, 8, 9]}
+        \\  collected = Enum.to_list(holder)
+        \\  IO.puts("box-only-count=" <> Integer.to_string(List.length(collected)))
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "box-only-count=3") != null);
+    // No per-allocation leak survivor and no double-free/abort under the
+    // leak-checked manager.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "LEAK:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "reached unreachable") == null);
+}
+
 test "CLI script flags: combined -Doptimize and -Dmemory before the path" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
