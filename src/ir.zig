@@ -3822,6 +3822,40 @@ pub fn protocolConstraintIsBoxedCallable(
     return std.mem.eql(u8, type_store.interner.get(typ.protocol_constraint.protocol_name), "Callable");
 }
 
+/// True when `type_id` is ANY parametric protocol constraint
+/// (`type_params.len > 0`) — `Enumerable(i64)`, `Enumerable(element)`,
+/// `Stage(input, output)`, `Callable({A}, R)` — irrespective of whether its
+/// type arguments are concrete or still carry free type variables.
+///
+/// Used exclusively to classify a protocol-constraint-typed STRUCT FIELD,
+/// which is ALWAYS a boxed `ProtocolBox` existential: a field has no
+/// devirtualized representation (the V11 Enumerable-devirtualization contract
+/// keys boxed-vs-devirtualized at a construction-site LOCAL, never at a field),
+/// so its owning box must be deep-released by the enclosing struct's drop.
+///
+/// This deliberately does NOT require concrete type arguments, unlike
+/// `protocolConstraintIsConcreteParametric`. Zap monomorphizes a generic
+/// struct's BODY by use-site substitution rather than by cloning the struct
+/// DECLARATION, so a parametric adapter
+/// (`struct Transform(element) { source :: Enumerable(element) }`) keeps its
+/// declared field type mentioning the formal `type_var` even for a fully
+/// concrete instantiation (`Transform(i64)`). The declared field type is what
+/// the ARC classifier reads, so gating field ARC-management on type-argument
+/// concreteness misclassifies every parametric-struct instantiation `.trivial`
+/// and LEAKS its boxed field (invisible under ARC; a `leak summary:` under
+/// `Memory.Tracking`) — while the structurally-identical concrete struct is
+/// clean. A parametric-struct boxed field is exactly as boxed as a
+/// concrete-struct one.
+pub fn protocolConstraintIsParametricBoxedField(
+    type_store: *const types_mod.TypeStore,
+    type_id: types_mod.TypeId,
+) bool {
+    if (type_id >= type_store.types.items.len) return false;
+    const typ = type_store.getType(type_id);
+    if (typ != .protocol_constraint) return false;
+    return typ.protocol_constraint.type_params.len > 0;
+}
+
 /// True when `type_id` is a PARAMETRIC protocol constraint whose type
 /// arguments are all concrete (no free type variables) — the shape of a
 /// genuinely-boxed parametric existential after monomorphization
@@ -3939,28 +3973,30 @@ fn structTypeHasArcManagedField(
     const struct_type = type_store.getType(type_id).struct_type;
     for (struct_type.fields) |field| {
         if (isArcManagedTypeIdDepth(type_store, field.type_id, depth + 1)) return true;
-        // FCC unified model: a `fn(A) -> R`-typed field resolves to a boxed
-        // parametric `Callable` existential whose owning `ProtocolBox` must be
-        // deep-released when the enclosing struct drops. The type-level
-        // predicate above intentionally excludes parametric constraints (the
-        // Enumerable-devirtualization V11 contract); a Callable FIELD is
-        // always boxed, so account for it here.
-        if (protocolConstraintIsBoxedCallable(type_store, field.type_id)) return true;
-        // A concrete parametric protocol constraint reached as a STRUCT FIELD
-        // (`source :: Enumerable(i64)`, `stage :: Stage(...)`) is ALWAYS a
-        // boxed existential — there is no devirtualized field representation,
-        // exactly as for a boxed `Callable` field above. Its owning
-        // `ProtocolBox` must be deep-released by the enclosing struct's drop,
-        // so the struct owns an ARC value. The type-level `isArcManagedTypeId`
-        // predicate deliberately classifies a bare parametric
-        // `protocol_constraint` PARAM as NOT ARC-managed (the V11
+        // A parametric protocol-constraint reached as a STRUCT FIELD is ALWAYS
+        // a boxed `ProtocolBox` existential, whether it is a boxed `Callable`
+        // (`fn(A) -> R`), a concrete parametric protocol
+        // (`source :: Enumerable(i64)`, `stage :: Stage(...)`), or a parametric
+        // protocol still carrying the enclosing struct's formal type variable
+        // (`source :: Enumerable(element)` inside `struct P(element)`). There is
+        // no devirtualized field representation: the type-level
+        // `isArcManagedTypeId` predicate above deliberately classifies a bare
+        // parametric `protocol_constraint` PARAM as NOT ARC-managed (the V11
         // Enumerable-devirtualization contract keys boxed-vs-devirtualized at
-        // the construction-site LOCAL, not the type), but a FIELD is
-        // unambiguously boxed. Without this arm a box-only / box+scalar struct
-        // is misclassified `.trivial`, its param never drops, and the boxed
-        // field LEAKS (invisible under ARC; a `leak summary:` under
-        // `Memory.Tracking`).
-        if (protocolConstraintIsConcreteParametric(type_store, field.type_id)) return true;
+        // the construction-site LOCAL, not at a field), but a FIELD is
+        // unambiguously boxed. Its owning `ProtocolBox` must be deep-released by
+        // the enclosing struct's drop, so the struct owns an ARC value.
+        //
+        // This must NOT be gated on the type arguments being concrete
+        // (`protocolConstraintIsConcreteParametric`): Zap monomorphizes a
+        // generic struct's BODY by use-site substitution rather than by cloning
+        // the struct DECLARATION, so a parametric adapter keeps its declared
+        // field type mentioning the formal `type_var` even for a fully concrete
+        // instantiation. Requiring concreteness here misclassified every such
+        // instantiation `.trivial`, its param never dropped, and the boxed field
+        // LEAKED (invisible under ARC; a `leak summary:` under `Memory.Tracking`)
+        // — while the structurally-identical concrete struct was clean.
+        if (protocolConstraintIsParametricBoxedField(type_store, field.type_id)) return true;
     }
     return false;
 }

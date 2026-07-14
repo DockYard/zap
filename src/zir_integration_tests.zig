@@ -4027,6 +4027,148 @@ test "boxed-existential struct field: box-only iterating adapter is leak-free un
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "reached unreachable") == null);
 }
 
+test "boxed-existential struct field: PARAMETRIC iterating adapter is leak-free under Memory.Tracking" {
+    // Regression for the PARAMETRIC boxed-existential-field ARC leak. A generic
+    // struct that stores a boxed-existential protocol field
+    // (`struct P(element) { source :: Enumerable(element) }`) was misclassified
+    // `.trivial` and never dropped, so its boxed field LEAKED under
+    // `Memory.Tracking` — while the byte-identical CONCRETE struct
+    // (`Enumerable(i64)`, the test above) was clean. Root cause: the ARC
+    // classifier (`structTypeHasArcManagedField`) gated a boxed protocol FIELD
+    // on its type argument being concrete, but a generic struct's declared
+    // field type keeps the formal `type_var` even for a fully concrete
+    // instantiation (Zap monomorphizes struct BODIES by use-site substitution,
+    // not by cloning the declaration). The fix classifies ANY parametric
+    // protocol-constraint FIELD as boxed/ARC-managed regardless of
+    // type-argument concreteness.
+    //
+    // This drives THREE untested parametric shapes, each to `:done` (full
+    // drive) AND early-disposed (`Enum.take`, the partial path) — every boxed
+    // field must be released exactly once on both paths:
+    //   * a box-only parametric adapter (the misclassified shape), and
+    //   * a two-boxed-field parametric `Transform` adapter
+    //     (`source :: Enumerable(input)`, `stage :: Stage(input, output)`) with
+    //     a bare `[output]` List buffer and String payloads, applying the stage
+    //     per item.
+    // Parametric inline protocol dispatch on a boxed field is rejected, so
+    // `next`/`dispose` are helper-routed (the concrete-clean inline-reconstruct
+    // shape is unavailable to a parametric adapter). `Memory.Tracking` is the
+    // only manager that OBSERVES the leak and is selectable solely through the
+    // `-Dmemory` CLI flag, which Zest cannot set — so this coverage lives here.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "parametric_box.zap",
+        \\pub struct BoxOnlyP(element) {
+        \\  source :: Enumerable(element)
+        \\
+        \\  fn step(source :: unique Enumerable(element)) -> {Atom, element, BoxOnlyP(element)} {
+        \\    case Enumerable.next(source) {
+        \\      {:done, d, exhausted} -> {:done, d, %BoxOnlyP(element){source: exhausted}}
+        \\      {:cont, item, rest} -> {:cont, item, %BoxOnlyP(element){source: rest}}
+        \\    }
+        \\  }
+        \\
+        \\  fn drop_source(source :: unique Enumerable(element)) -> Nil {
+        \\    Enumerable.dispose(source)
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub impl Enumerable(element) for BoxOnlyP(element) {
+        \\  pub fn next(self :: unique BoxOnlyP(element)) -> {Atom, element, BoxOnlyP(element)} {
+        \\    BoxOnlyP.step(self.source)
+        \\  }
+        \\
+        \\  pub fn dispose(self :: unique BoxOnlyP(element)) -> Nil {
+        \\    BoxOnlyP.drop_source(self.source)
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub protocol Stage(input, output) {
+        \\  fn transform(self :: Stage(input, output), value :: input) -> output
+        \\  fn dispose(self :: unique Stage(input, output)) -> Nil
+        \\}
+        \\
+        \\pub struct PrefixStage {
+        \\  prefix :: String
+        \\}
+        \\
+        \\pub impl Stage(String, String) for PrefixStage {
+        \\  pub fn transform(self :: PrefixStage, value :: String) -> String {
+        \\    self.prefix <> value
+        \\  }
+        \\  pub fn dispose(self :: unique PrefixStage) -> Nil {
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub struct TransformLikeP(input, output) {
+        \\  source :: Enumerable(input)
+        \\  stage :: Stage(input, output)
+        \\  buffer :: [output]
+        \\
+        \\  fn step(source :: unique Enumerable(input), stage :: Stage(input, output), buffer :: [output]) -> {Atom, output, TransformLikeP(input, output)} {
+        \\    case Enumerable.next(source) {
+        \\      {:done, _, exhausted} -> {:done, List.head(buffer), %TransformLikeP(input, output){source: exhausted, stage: stage, buffer: buffer}}
+        \\      {:cont, item, rest} -> {:cont, Stage.transform(stage, item), %TransformLikeP(input, output){source: rest, stage: stage, buffer: buffer}}
+        \\    }
+        \\  }
+        \\
+        \\  fn drop_source(source :: unique Enumerable(input)) -> Nil {
+        \\    Enumerable.dispose(source)
+        \\    nil
+        \\  }
+        \\
+        \\  fn drop_stage(stage :: unique Stage(input, output)) -> Nil {
+        \\    Stage.dispose(stage)
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub impl Enumerable(output) for TransformLikeP(input, output) {
+        \\  pub fn next(self :: unique TransformLikeP(input, output)) -> {Atom, output, TransformLikeP(input, output)} {
+        \\    TransformLikeP.step(self.source, self.stage, self.buffer)
+        \\  }
+        \\
+        \\  pub fn dispose(self :: unique TransformLikeP(input, output)) -> Nil {
+        \\    TransformLikeP.drop_source(self.source)
+        \\    TransformLikeP.drop_stage(self.stage)
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  drained = Enum.to_list(%BoxOnlyP(i64){source: [1, 2, 3]})
+        \\  IO.puts("box-only-count=" <> Integer.to_string(List.length(drained)))
+        \\  taken = Enum.take(%BoxOnlyP(i64){source: [1, 2, 3]}, 1)
+        \\  IO.puts("box-only-take=" <> Integer.to_string(List.length(taken)))
+        \\  tl_drained = Enum.to_list(%TransformLikeP(String, String){source: ["a", "b", "c"], stage: %PrefixStage{prefix: "x-"}, buffer: ["<eos>"]})
+        \\  IO.puts("transform-count=" <> Integer.to_string(List.length(tl_drained)))
+        \\  tl_taken = Enum.take(%TransformLikeP(String, String){source: ["a", "b", "c"], stage: %PrefixStage{prefix: "x-"}, buffer: ["<eos>"]}, 2)
+        \\  IO.puts("transform-take=" <> Integer.to_string(List.length(tl_taken)))
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "box-only-count=3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "box-only-take=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "transform-count=3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "transform-take=2") != null);
+    // No per-allocation leak survivor and no double-free/abort under the
+    // leak-checked manager — the exactly-once release invariant for a boxed
+    // field of a parametric struct, on both the drive-to-done and the
+    // early-dispose path.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "LEAK:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "reached unreachable") == null);
+}
+
 test "CLI script flags: combined -Doptimize and -Dmemory before the path" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
