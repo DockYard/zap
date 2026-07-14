@@ -891,6 +891,21 @@ fn appendVTableReturnType(
     try appendZigTypeForVTable(allocator, buf, zig_type);
 }
 
+/// Compare two Zap module names treating `.` and `_` as equivalent
+/// separators. `ir.Function.struct_name` carries the underscore-mangled
+/// form (`Zest_Runner`) while protocol-vtable instance defs carry the
+/// source-level dotted form (`Zest.Runner`) for their target/impl module
+/// names; both spell the same module.
+fn moduleNamesMatchIgnoringDots(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_char, right_char| {
+        const left_normalized: u8 = if (left_char == '.') '_' else left_char;
+        const right_normalized: u8 = if (right_char == '.') '_' else right_char;
+        if (left_normalized != right_normalized) return false;
+    }
+    return true;
+}
+
 /// True when any boxed position in the glue plan reuses the receiver's
 /// inner cell — the adapter then needs a MUTABLE `inner` pointer for
 /// the write-back.
@@ -2957,6 +2972,50 @@ pub const ZirDriver = struct {
         }
     }
 
+    /// True when the impl function behind one vtable-instance method slot
+    /// carries the `.owned` receiver convention — i.e. the impl call takes
+    /// the boxed inner VALUE's ownership (releases-or-moves its ARC
+    /// children internally). The consuming-dispatch adapter uses this as
+    /// the disposal discriminator for the receiver's cell: an `.owned`
+    /// callee leaves only the cell allocation to reclaim
+    /// (`freeAnyConsumedCell`, no child walk), while a `.trivial` /
+    /// `.borrowed` callee leaves the value itself still owned by the
+    /// adapter (`freeAny`'s model-routed disposal).
+    ///
+    /// Resolution mirrors the adapter's own callee reference: the impl
+    /// function is published in `impl_module` (parametric-target impls'
+    /// monomorphized methods) or the target's own module (concrete impls),
+    /// under `impl_local_symbol` or the `<method>__<arity>` convention.
+    /// Conventions are inferred program-wide before ZIR emission
+    /// (`arc_param_convention.inferConventions`), so `self.program`'s
+    /// function table carries the final answer. An unresolved symbol
+    /// conservatively reports false (the pre-existing `freeAny` disposal).
+    fn implMethodReceiverConventionIsOwned(
+        self: *const ZirDriver,
+        inst_def: ir.ProtocolVTableInstanceDef,
+        method: ir.ProtocolVTableInstanceMethod,
+    ) bool {
+        const program = self.program orelse return false;
+        const module_name: []const u8 = inst_def.impl_module orelse inst_def.target_type_name;
+
+        var local_symbol_buf: [256]u8 = undefined;
+        const local_symbol: []const u8 = method.impl_local_symbol orelse blk: {
+            break :blk std.fmt.bufPrint(&local_symbol_buf, "{s}__{d}", .{
+                method.method_name,
+                method.arity,
+            }) catch return false;
+        };
+
+        for (program.functions) |function| {
+            const function_struct_name = function.struct_name orelse continue;
+            if (!moduleNamesMatchIgnoringDots(function_struct_name, module_name)) continue;
+            if (!std.mem.eql(u8, function.local_name, local_symbol)) continue;
+            return function.param_conventions.len > 0 and
+                function.param_conventions[0] == .owned;
+        }
+        return false;
+    }
+
     /// Emit a synthetic top-level Zig source file for a
     /// `protocol_vtable_instance_def` TypeDef. The file declares
     /// a constant of the corresponding vtable struct type whose
@@ -3167,16 +3226,37 @@ pub const ZirDriver = struct {
             // Bridging body. The impl result binds first; reuse positions
             // write the returned next state back into the receiver's cell
             // BEFORE the return expression re-wraps that same cell; a
-            // consumed receiver whose cell was NOT reused is released
-            // shallowly (one cell reference, no child walk — the impl call
-            // moved the inner value's ownership out of the cell).
+            // consumed receiver whose cell was NOT reused is disposed
+            // according to the impl function's INFERRED receiver
+            // convention — the single source of truth for whether the
+            // impl call took the inner VALUE's ownership:
+            //
+            //   * `.owned` (`List.dispose` consuming its list through
+            //     `:zig.List.release`; a struct impl with ARC children
+            //     that releases-or-moves them internally) — the value's
+            //     ownership went INTO the call, so only the CELL
+            //     allocation remains this adapter's to reclaim.
+            //     `freeAnyConsumedCell` frees it with NO child walk;
+            //     the previous unconditional `freeAny` deep-walked the
+            //     stale cell copy and double-released the consumed
+            //     children (use-after-free under `Memory.Tracking`).
+            //   * `.trivial` / `.borrowed` (a child-free or
+            //     string-only struct state) — the impl only borrowed
+            //     the value, so the adapter still owns it: `freeAny`'s
+            //     model-routed disposal (deep under
+            //     INDIVIDUAL_NO_REFCOUNT, where the cell free is the
+            //     last chance to reclaim the value) remains correct.
             try buf.appendSlice(self.allocator, "    const impl_result = ");
             if (method.raises) try buf.appendSlice(self.allocator, "try ");
             try buf.appendSlice(self.allocator, call_expr.items);
             try buf.appendSlice(self.allocator, ";\n");
             try appendVTableGlueWriteBacks(self.allocator, &buf, method.return_glue, "impl_result");
             if (method.receiver_consuming and !glue_reuses_cell) {
-                try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.freeAny(std.heap.page_allocator, inner);\n");
+                if (self.implMethodReceiverConventionIsOwned(inst_def, method)) {
+                    try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.freeAnyConsumedCell(std.heap.page_allocator, inner);\n");
+                } else {
+                    try buf.appendSlice(self.allocator, "    zap_runtime.ArcRuntime.freeAny(std.heap.page_allocator, inner);\n");
+                }
             }
             try buf.appendSlice(self.allocator, "    return ");
             try appendVTableGlueExpr(self.allocator, &buf, method.return_glue, "impl_result", type_def.name);

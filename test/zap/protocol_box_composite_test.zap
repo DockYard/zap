@@ -41,6 +41,14 @@ pub struct Zap.ProtocolBoxCompositeTest {
     }
   }
 
+  describe("multi-formal boxed parametric protocol") {
+    test("two formals interleaved with a container in one tuple slot dispatch twice") {
+      weaver = Zap.ProtocolBoxCompositeTest.make_label_weaver()
+      total = Zap.ProtocolBoxCompositeTest.weave_twice(weaver)
+      assert(total == 34)
+    }
+  }
+
   fn make_counter_emitter() -> Emitter(i64) {
     %CountingEmitter{current: 7, remaining: 2}
   }
@@ -73,6 +81,27 @@ pub struct Zap.ProtocolBoxCompositeTest {
   fn dispose_emitter_and_return(state :: unique Emitter(element), value :: result) -> result {
     Emitter.finish(state)
     value
+  }
+
+  fn make_label_weaver() -> Weaver(String, i64) {
+    %LabelCounter{label: "tick", counter: 5}
+  }
+
+  fn weave_twice(state :: unique Weaver(String, i64)) -> i64 {
+    case Weaver.weave(state) {
+      {label, values, next_state} -> weave_second(label, values, next_state)
+    }
+  }
+
+  fn weave_second(label :: String, values :: [i64], state :: unique Weaver(String, i64)) -> i64 {
+    case Weaver.weave(state) {
+      {label2, values2, next_state} -> halt_and_sum(label, label2, values, values2, next_state)
+    }
+  }
+
+  fn halt_and_sum(label :: String, label2 :: String, values :: [i64], values2 :: [i64], state :: unique Weaver(String, i64)) -> i64 {
+    Weaver.halt(state)
+    String.length(label) + String.length(label2) + List.head(values) + List.last(values) + List.head(values2) + List.last(values2)
   }
 }
 
@@ -148,6 +177,56 @@ pub impl Emitter(i64) for CountingEmitter {
     """
 
   pub fn finish(_state :: unique CountingEmitter) -> Nil {
+    nil
+  }
+}
+
+@doc = """
+  A MULTI-FORMAL parametric protocol (two type parameters interleaved
+  with a container in one tuple slot). Exercises formal substitution
+  across several formals at once AND the tuple-extraction ownership of
+  a dispatch result that carries an ARC container (`[b]`) NEXT TO the
+  boxed next state — the shape whose box component must not be swept
+  into the sibling container's aggregate-component release.
+  """
+
+pub protocol Weaver(a, b) {
+  fn weave(state :: unique Weaver(a, b)) -> {a, [b], Weaver(a, b)}
+  fn halt(state :: unique Weaver(a, b)) -> Nil
+}
+
+@doc = """
+  Concrete weaver state: a `String` label paired with a counting
+  cursor, so both formals bind to distinct concrete types.
+  """
+
+pub struct LabelCounter {
+  label :: String
+  counter :: i64
+}
+
+@doc = """
+  `Weaver` implementation for `LabelCounter` — each step yields the
+  label, a two-element window over the counter, and the advanced
+  state re-boxed through the consuming receiver's cell.
+  """
+
+pub impl Weaver(String, i64) for LabelCounter {
+  @doc = """
+    Yields the label, the current counter window, and the advanced
+    weaver state.
+    """
+
+  pub fn weave(state :: unique LabelCounter) -> {String, [i64], LabelCounter} {
+    {state.label, [state.counter, state.counter + 1], %LabelCounter{label: state.label, counter: state.counter + 2}}
+  }
+
+  @doc = """
+    Disposes a weaver state. Label counters own no cursor resources,
+    so disposal is a no-op.
+    """
+
+  pub fn halt(_state :: unique LabelCounter) -> Nil {
     nil
   }
 }

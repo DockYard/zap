@@ -9383,6 +9383,86 @@ pub const ArcRuntime = struct {
         dispatcherFreeImpl(allocator, ptr);
     }
 
+    /// Free a boxed protocol existential's inner CELL whose VALUE ownership
+    /// has already been moved out of the cell — the consuming-dispatch
+    /// adapter's disposal primitive. A protocol method with a consuming
+    /// (`unique`) receiver whose impl function carries the `.owned`
+    /// parameter convention takes the inner value's ownership INTO the impl
+    /// call (`List.dispose` releases the list through its primitive; a
+    /// struct impl with ARC children releases-or-moves them through its own
+    /// ARC analysis). After such a call the cell holds a STALE copy of the
+    /// consumed value, so the cell must be reclaimed WITHOUT the child
+    /// deep-walk — walking the stale copy would release children a second
+    /// time (the boxed-`dispose` use-after-free under `Memory.Tracking`).
+    ///
+    /// Model routing:
+    ///   * BULK_OR_NEVER / TRACED — pure elision, exactly like `freeAny`.
+    ///   * REFCOUNT_V1 — delegate to `freeAny`: the side-table cell release
+    ///     is already shallow (dispatched with `deep_walk=null`), so the
+    ///     behavior is identical by construction. (Box inner cells are
+    ///     never inline-header types — they hold either a container's
+    ///     value shape `?*const List(T)`/`?*const Map(K, V)` or a struct
+    ///     value — so `freeAny`'s inline-header deep branch cannot fire.)
+    ///   * INDIVIDUAL_NO_REFCOUNT — reclaim the cell allocation through
+    ///     `core.deallocate` with NO child walk (the one branch where this
+    ///     primitive differs from `freeAny`).
+    pub inline fn freeAnyConsumedCell(allocator: std.mem.Allocator, ptr: anytype) void {
+        if (comptime reclamation_model == .bulk_or_never or reclamation_model == .traced) {
+            // No individual free exists in these models; the manager
+            // reclaims in bulk, never, or via tracing.
+            return;
+        }
+        if (comptime !refcount_v1_active) {
+            return freeConsumedCellNonRefcountedImpl(allocator, ptr);
+        }
+        freeAny(allocator, ptr);
+    }
+
+    /// INDIVIDUAL_NO_REFCOUNT branch of `freeAnyConsumedCell`: return the
+    /// cell allocation to `core.deallocate` with the same clamped size the
+    /// matching `allocAny` requested — and, deliberately, WITHOUT
+    /// `freeAnyNonRefcountedImpl`'s child deep-walk (the cell's value was
+    /// consumed by the impl call; its children are no longer this cell's to
+    /// release). Inline-header container types never appear as box inner
+    /// cell types (the cell holds their VALUE shape, an optional pointer),
+    /// so instantiating this with one is a compile error by design.
+    fn freeConsumedCellNonRefcountedImpl(allocator: std.mem.Allocator, ptr: anytype) void {
+        if (comptime arcPtrIsOptional(@TypeOf(ptr))) {
+            const unwrapped = ptr orelse return;
+            return freeConsumedCellNonRefcountedImpl(allocator, unwrapped);
+        }
+        _ = &allocator;
+        const T = arcPtrChild(@TypeOf(ptr));
+        if (comptime hasInlineArcHeader(T)) {
+            @compileError("freeAnyConsumedCell: inline-header Arc type cannot be a box inner cell: " ++ @typeName(T));
+        }
+        if (active_manager_state.shutdown_complete) {
+            @panic("zap runtime: memory dispatch after shutdown");
+        }
+        ensureMemoryStartup();
+        if (comptime !active_manager_source_available) {
+            if (active_manager_state.core == null) {
+                @panic("zap runtime: freeAnyConsumedCell dispatched with no active memory manager");
+            }
+        }
+        const ctx = currentManagerContext() orelse
+            @panic("zap runtime: freeAnyConsumedCell dispatched with null manager context");
+        // Header-less cell: pass the SAME clamped size the matching
+        // `allocAny` requested (see `nonRefcountedCellSize`) so a tracking
+        // manager pairs alloc/free exactly and `core.deallocate` never sees
+        // a zero size.
+        const size = nonRefcountedCellSize(T);
+        const alignment_bytes = @alignOf(T);
+        const raw: [*]u8 = @ptrCast(@constCast(ptr));
+        if (comptime !active_manager_source_available) {
+            const core = active_manager_state.core orelse
+                @panic("zap runtime: freeAnyConsumedCell dispatched with no active memory manager");
+            core.deallocate(ctx, raw, size, @intCast(alignment_bytes));
+        } else {
+            active_manager.deallocate(ctx, raw, size, @intCast(alignment_bytes));
+        }
+    }
+
     /// Phase 6 lifecycle-pairing dispatcher for `freeAny` under a manager
     /// that does NOT declare REFCOUNT_V1. The matching call to the
     /// non-REFCOUNT_V1 branch of `allocAny` (which routes through

@@ -4487,6 +4487,178 @@ test "rescue: terminal CROSS-FN catch releases the recovered box under Memory.Tr
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
 }
 
+test "boxed consuming dispatch: container inner disposed exactly once under Memory.Tracking" {
+    // Regression (Job 4-R1 gap analysis of the parametric-protocol boxing
+    // commit): a CONSUMING (`unique`-receiver) boxed dispatch whose impl
+    // function carries the `.owned` receiver convention (`List.dispose` /
+    // `Map.dispose` consuming the container through `:zig.*.release`) used to
+    // dispose the receiver's inner cell with `freeAny`, whose
+    // INDIVIDUAL_NO_REFCOUNT branch deep-walks the cell's ARC children. The
+    // impl call had already consumed the inner value, so the walk released
+    // the container a SECOND time — SIGSEGV inside the release walk
+    // (`List.isIterCell` / `Map.release` on freed memory) under
+    // `Memory.Tracking` (masked by slab reuse under `Memory.ARC`). The
+    // adapter now routes `.owned`-receiver disposal through
+    // `freeAnyConsumedCell` (cell reclaim, no child walk).
+    //
+    // Three container shapes cross the broken path: a List(String) state
+    // disposed mid-iteration, a Map({Atom, String}) state disposed
+    // mid-iteration, and a nested List([String]) state (a parametric-target
+    // impl bound through the monomorphizer's BoxedImplSpec table).
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "boxed_container_dispose_tracking.zap",
+        \\pub struct Probe {
+        \\  pub fn list_mid_dispose() -> i64 {
+        \\    strings = ["alpha", "beta", "gamma", "delta"]
+        \\    case Enumerable.next(strings) {
+        \\      {:cont, first, state} -> Probe.dispose_and_measure(first, state)
+        \\      {:done, _, _} -> -1
+        \\    }
+        \\  }
+        \\
+        \\  fn dispose_and_measure(first :: String, state :: unique Enumerable(String)) -> i64 {
+        \\    Enumerable.dispose(state)
+        \\    String.length(first)
+        \\  }
+        \\
+        \\  pub fn map_mid_dispose() -> i64 {
+        \\    entries = %{alpha: "a" <> "1", beta: "b" <> "22", gamma: "c" <> "333"}
+        \\    case Enumerable.next(entries) {
+        \\      {:cont, first, state} -> Probe.dispose_entry_state(first, state)
+        \\      {:done, _, _} -> -1
+        \\    }
+        \\  }
+        \\
+        \\  fn dispose_entry_state(first :: {Atom, String}, state :: unique Enumerable({Atom, String})) -> i64 {
+        \\    Enumerable.dispose(state)
+        \\    case first {
+        \\      {_, text} -> String.length(text)
+        \\    }
+        \\  }
+        \\
+        \\  pub fn nested_mid_dispose() -> i64 {
+        \\    nested = [["x" <> "x"], ["y" <> "yy", "z" <> "zzz"]]
+        \\    case Enumerable.next(nested) {
+        \\      {:cont, inner, state} -> Probe.dispose_nested_state(inner, state)
+        \\      {:done, _, _} -> -1
+        \\    }
+        \\  }
+        \\
+        \\  fn dispose_nested_state(inner :: [String], state :: unique Enumerable([String])) -> i64 {
+        \\    Enumerable.dispose(state)
+        \\    String.length(List.head(inner))
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  IO.puts("list=#{Probe.list_mid_dispose()} map=#{Probe.map_mid_dispose()} nested=#{Probe.nested_mid_dispose()}")
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "boxed-container-dispose-tracking failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    // Clean exit = no SIGSEGV in the release walk. The values pin correct
+    // iteration semantics; the leak markers pin the exactly-once contract's
+    // under-free dual.
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "list=5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "nested=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+}
+
+test "boxed dispatch tuple: excluded box component not swept into aggregate release under Memory.Tracking" {
+    // Regression (Job 4-R1 gap analysis): a MULTI-FORMAL parametric protocol
+    // whose dispatch returns a tuple carrying BOTH an ARC container ([b])
+    // AND the boxed next state (Pairing(a, b)) used to double-claim the box.
+    // The tuple-component-release DISCOVERY pass correctly excluded the box
+    // component (it is a fresh owner in `deep_release_owned_locals`), but the
+    // SCHEDULE pass re-derived membership from ARC-managedness alone — the
+    // list component registered the aggregate, and the box was swept into the
+    // balancing `aggregate_component` release while still moving into the
+    // callee: the next dispatch read a freed cell (SIGSEGV in the adapter
+    // under `Memory.Tracking`; masked by slab reuse under `Memory.ARC`).
+    // `activateExtraction` now honors the discovery pass's exclusion set.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "boxed_multi_formal_tuple_tracking.zap",
+        \\pub protocol Pairing(a, b) {
+        \\  fn step(state :: unique Pairing(a, b)) -> {a, [b], Pairing(a, b)}
+        \\  fn halt(state :: unique Pairing(a, b)) -> Nil
+        \\}
+        \\
+        \\pub struct LabelCounter {
+        \\  label :: String
+        \\  counter :: i64
+        \\}
+        \\
+        \\pub impl Pairing(String, i64) for LabelCounter {
+        \\  pub fn step(state :: unique LabelCounter) -> {String, [i64], LabelCounter} {
+        \\    {state.label, [state.counter, state.counter + 1], %LabelCounter{label: state.label, counter: state.counter + 2}}
+        \\  }
+        \\
+        \\  pub fn halt(_state :: unique LabelCounter) -> Nil {
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub struct Probe {
+        \\  pub fn make() -> Pairing(String, i64) {
+        \\    %LabelCounter{label: "tick", counter: 5}
+        \\  }
+        \\
+        \\  pub fn run() -> i64 {
+        \\    boxed = Probe.make()
+        \\    case Pairing.step(boxed) {
+        \\      {label, values, next_state} -> Probe.second_step(label, values, next_state)
+        \\    }
+        \\  }
+        \\
+        \\  fn second_step(label :: String, values :: [i64], state :: unique Pairing(String, i64)) -> i64 {
+        \\    case Pairing.step(state) {
+        \\      {label2, values2, next_state} ->
+        \\        Probe.halt_and_sum(label, label2, values, values2, next_state)
+        \\    }
+        \\  }
+        \\
+        \\  fn halt_and_sum(label :: String, label2 :: String, values :: [i64], values2 :: [i64], state :: unique Pairing(String, i64)) -> i64 {
+        \\    Pairing.halt(state)
+        \\    String.length(label) + String.length(label2) + List.head(values) + List.last(values) + List.head(values2) + List.last(values2)
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  IO.puts("multi-formal=#{Probe.run()}")
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    if (r.exit_code != 0) {
+        std.debug.print(
+            "boxed-multi-formal-tuple-tracking failed: exit={d}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ r.exit_code, r.stdout, r.stderr },
+        );
+    }
+    // 4 ("tick") + 4 ("tick") + 5 + 6 + 7 + 8 = 34 pins two consecutive
+    // dispatches through the SAME re-wrapped cell plus the halt disposal.
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "multi-formal=34") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+}
+
 // ---- target / cpu scenarios ---------------------------------------
 
 test "CLI script: native default when neither manifest nor -Dtarget set" {

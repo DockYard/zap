@@ -172,6 +172,7 @@ pub fn insertTupleComponentReleases(
         .ownership = ownership,
         .non_arc_aggregates = .empty,
         .extractions_by_aggregate = .empty,
+        .excluded_extractions = .empty,
         .last_use_by_aggregate = .empty,
     };
     defer collector.deinit();
@@ -429,6 +430,17 @@ const ComponentReleaseCollector = struct {
     /// locals (the dest of every `index_get`/`field_get` whose
     /// `object` is the aggregate AND whose own dest is ARC-managed).
     extractions_by_aggregate: std.AutoHashMapUnmanaged(ir.LocalId, std.ArrayListUnmanaged(ir.LocalId)),
+    /// Extracted dest locals the discovery pass EXCLUDED from component
+    /// releases (`hasIndependentExtractionRelease` — a fresh-owner boxed
+    /// existential in `deep_release_owned_locals` with no persistent
+    /// retain). The schedule pass must honor the same exclusion: an
+    /// aggregate registered for ANOTHER component's balancing release
+    /// (a list sitting next to a consumed box in one dispatch-result
+    /// tuple) must not sweep the excluded box into its release set —
+    /// that second release freed the still-live box cell out from under
+    /// the callee it was moved into (the multi-formal parametric-box
+    /// use-after-free).
+    excluded_extractions: std.AutoHashMapUnmanaged(ir.LocalId, void),
     /// For each aggregate dest, every path-sensitive InstructionId
     /// where the aggregate is at last-use. Branches can produce more
     /// than one terminal site for the same aggregate; every such site
@@ -440,6 +452,7 @@ const ComponentReleaseCollector = struct {
         var iter = self.extractions_by_aggregate.valueIterator();
         while (iter.next()) |list_ptr| list_ptr.deinit(self.allocator);
         self.extractions_by_aggregate.deinit(self.allocator);
+        self.excluded_extractions.deinit(self.allocator);
         var last_use_iter = self.last_use_by_aggregate.valueIterator();
         while (last_use_iter.next()) |list_ptr| list_ptr.deinit(self.allocator);
         self.last_use_by_aggregate.deinit(self.allocator);
@@ -477,7 +490,11 @@ const ComponentReleaseCollector = struct {
                     .index_get => |ig| {
                         // Non-ARC aggregate `object` with ARC-managed
                         // extracted `dest` is the canonical destructure-
-                        // then-uniqueness pattern. Record both sides.
+                        // then-uniqueness pattern. Record both sides. An
+                        // independently-released extraction is recorded in
+                        // `excluded_extractions` so the SCHEDULE pass makes
+                        // the same call when the aggregate gets registered
+                        // for a sibling component.
                         if (!ctx.collector.isArcManagedLocal(ig.object) and ctx.collector.isArcManagedLocal(ig.dest)) {
                             const has_independent_release = try ctx.collector.hasIndependentExtractionRelease(ig.dest);
                             if (!has_independent_release) {
@@ -485,6 +502,8 @@ const ComponentReleaseCollector = struct {
                                 const gop = try ctx.collector.extractions_by_aggregate.getOrPut(ctx.collector.allocator, ig.object);
                                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                                 try gop.value_ptr.append(ctx.collector.allocator, ig.dest);
+                            } else {
+                                try ctx.collector.excluded_extractions.put(ctx.collector.allocator, ig.dest, {});
                             }
                         }
                     },
@@ -496,6 +515,8 @@ const ComponentReleaseCollector = struct {
                                 const gop = try ctx.collector.extractions_by_aggregate.getOrPut(ctx.collector.allocator, fg.object);
                                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                                 try gop.value_ptr.append(ctx.collector.allocator, fg.dest);
+                            } else {
+                                try ctx.collector.excluded_extractions.put(ctx.collector.allocator, fg.dest, {});
                             }
                         }
                     },
@@ -667,14 +688,27 @@ const ComponentReleaseCollector = struct {
         instr: ir.Instruction,
         active: *ActiveExtractions,
     ) error{OutOfMemory}!void {
+        // `excluded_extractions` carries the discovery pass's verdict for
+        // extractions with their OWN release path (fresh-owner boxed
+        // existentials). The schedule pass must not re-derive membership
+        // from ARC-managedness alone: an aggregate registered because a
+        // SIBLING component needs a balancing release would otherwise
+        // sweep the excluded box into its release set and double-claim
+        // the one +1 the box owns.
         switch (instr) {
             .index_get => |index_get| {
-                if (self.non_arc_aggregates.contains(index_get.object) and self.isArcManagedLocal(index_get.dest)) {
+                if (self.non_arc_aggregates.contains(index_get.object) and
+                    self.isArcManagedLocal(index_get.dest) and
+                    !self.excluded_extractions.contains(index_get.dest))
+                {
                     try active.add(index_get.object, index_get.dest);
                 }
             },
             .field_get => |field_get| {
-                if (self.non_arc_aggregates.contains(field_get.object) and self.isArcManagedLocal(field_get.dest)) {
+                if (self.non_arc_aggregates.contains(field_get.object) and
+                    self.isArcManagedLocal(field_get.dest) and
+                    !self.excluded_extractions.contains(field_get.dest))
+                {
                     try active.add(field_get.object, field_get.dest);
                 }
             },
