@@ -493,7 +493,7 @@ pub fn exprToCtValue(
             var owner = TemporaryCtValueOwner.init(alloc, store);
             defer owner.deinit();
             try owner.adopt(args);
-            const meta = try metaToList(alloc, store, v.meta, null);
+            const meta = try structExprMetaWithTypeArgs(alloc, interner, store, v.meta, v.type_args, v.type_args_parens_present);
             try owner.adopt(meta);
             return makeTuple3WithOwnedChildren(alloc, store, .{ .atom = "%" }, meta, args, &owner);
         },
@@ -1434,6 +1434,73 @@ fn structRefMetaWithTypeArgs(
     const args_list = try arg_vals.toCtList();
     try pairs.append(try makeKeywordPair(alloc, store, "type_args", args_list));
     return pairs.toCtList();
+}
+
+/// Build the meta-list for a `%` (struct_expr) CtValue node, layering
+/// the instantiation-site `type_args` (e.g. `i64` in `%Box(i64){...}`)
+/// and the `type_args_parens_present` flag on top of the base meta so
+/// both round-trip through quote/unquote. Without this, quoting a body
+/// that contains a parametric struct literal dropped the type
+/// arguments, and the rehydrated `%Adapter{...}` typed as the bare
+/// generic head instead of `Adapter(i64)` — starving monomorphization
+/// of the concrete instantiation (the Zest macro engine hit this when
+/// quoting test bodies driving parametric `Enumerable` adapters through
+/// `Enum`). The parens flag is emitted only for the explicit
+/// empty-parens `%Box(){...}` arity-error shape; a non-empty
+/// `type_args` implies parens on decode. Decoded back by
+/// `ctValueToExpr` for the `%` form.
+fn structExprMetaWithTypeArgs(
+    alloc: Allocator,
+    interner: *const ast.StringInterner,
+    store: *AllocationStore,
+    meta: ast.NodeMeta,
+    type_args: []const *const ast.TypeExpr,
+    type_args_parens_present: bool,
+) error{OutOfMemory}!CtValue {
+    if (type_args.len == 0 and !type_args_parens_present) {
+        return metaToList(alloc, store, meta, null);
+    }
+
+    var pairs = TemporaryCtValueList.init(alloc, store);
+    defer pairs.deinit();
+    try appendMetaKeywordPairs(alloc, store, &pairs, meta, null);
+
+    if (type_args.len > 0) {
+        var arg_vals = TemporaryCtValueList.init(alloc, store);
+        defer arg_vals.deinit();
+        for (type_args) |arg| {
+            try arg_vals.append(try typeExprToCtValue(alloc, interner, store, arg));
+        }
+        const args_list = try arg_vals.toCtList();
+        try pairs.append(try makeKeywordPair(alloc, store, "type_args", args_list));
+    }
+    // Only the explicit-empty-parens form (`%Box(){...}`, an arity
+    // error against a parametric declaration) needs the marker; the
+    // `type_args`-bearing form implies parens on decode, so we omit it
+    // there to keep the common `%Box(i64){...}` encoding minimal.
+    if (type_args_parens_present and type_args.len == 0) {
+        try pairs.append(try makeKeywordPair(alloc, store, "type_args_parens", .{ .bool_val = true }));
+    }
+    return pairs.toCtList();
+}
+
+/// Read the `type_args_parens` boolean keyword the struct_expr encoder
+/// stashes on the meta list (see `structExprMetaWithTypeArgs`). Returns
+/// true only for the explicit-empty-parens `%Box(){...}` shape; the
+/// common `%Box{...}` form omits the marker, and the
+/// `type_args`-bearing `%Box(i64){...}` form recovers the flag from a
+/// non-empty decoded `type_args` at the call site.
+fn structExprParensFlagFromMeta(meta_value: CtValue) bool {
+    if (meta_value != .list) return false;
+    for (meta_value.list.elems) |pair| {
+        if (pair != .tuple or pair.tuple.elems.len != 2) continue;
+        const key = pair.tuple.elems[0];
+        if (key != .atom) continue;
+        if (!std.mem.eql(u8, key.atom, "type_args_parens")) continue;
+        const flag = pair.tuple.elems[1];
+        if (flag == .bool_val) return flag.bool_val;
+    }
+    return false;
 }
 
 /// Convert a block ([]const Stmt) to CtValue.
@@ -2866,6 +2933,16 @@ fn ctValueToExprBudgeted(
                 null;
             errdefer if (update_source) |source| deinitDecodedExpr(alloc, source);
 
+            // Restore the instantiation-site `type_args` and the
+            // explicit-parens flag the encoder stashed on the meta
+            // (see `structExprMetaWithTypeArgs`). Round-tripping without
+            // this dropped `(i64)` from `%Adapter(i64){...}`, so the
+            // rehydrated literal typed as the bare generic head and
+            // starved monomorphization of the concrete instantiation.
+            const type_args = try structRefTypeArgsFromMetaBudgeted(alloc, interner, value.tuple.elems[1], budget);
+            errdefer deinitDecodedTypeExprSlice(alloc, type_args);
+            const type_args_parens_present = type_args.len > 0 or structExprParensFlagFromMeta(value.tuple.elems[1]);
+
             const expr = try alloc.create(ast.Expr);
             errdefer alloc.destroy(expr);
             const name_part_slice = try name_parts.toOwnedSlice(alloc);
@@ -2876,6 +2953,8 @@ fn ctValueToExprBudgeted(
                 .struct_name = .{ .parts = name_part_slice, .span = node_meta.span },
                 .update_source = update_source,
                 .fields = field_slice,
+                .type_args = type_args,
+                .type_args_parens_present = type_args_parens_present,
             } };
             return expr;
         }
