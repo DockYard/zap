@@ -21960,10 +21960,13 @@ comptime {
 // ============================================================
 
 /// Compile-time default-value builder. Mirrors `std.mem.zeroes` but
-/// recurses through aggregates (tuples and structs) instead of bit-zeroing
-/// — so types containing `Term` (a tagged union without a zero variant)
-/// produce a valid default. Used by `List(T).defaultElement` so list
-/// fall-through paths work for heterogeneous keyword-list element types.
+/// recurses through aggregates (tuples, structs, and tagged unions)
+/// instead of bit-zeroing — so types without a bit-zero representation
+/// (`Term`, and any payload-carrying `union(enum)` such as a generic
+/// `Result`/`Option`) still produce a valid default. Used by
+/// `List(T).defaultElement` for the empty/`:done` manufacture path, so a
+/// `List` whose element is such a union (e.g. a `Stage` whose `output` is
+/// a `Result`, driven to completion) has a well-formed default element.
 fn defaultElementOf(comptime T: type) T {
     if (T == Term) return Term{ .nil = {} };
     const ti = @typeInfo(T);
@@ -21974,6 +21977,16 @@ fn defaultElementOf(comptime T: type) T {
                 @field(result, field.name) = defaultElementOf(field.type);
             }
             return result;
+        },
+        .@"union" => |u| {
+            // A tagged union has no bit-zero, so synthesize its first
+            // variant carrying a recursively-defaulted payload. This
+            // generalises the `Term`-`.nil` special-case above to every
+            // union and keeps the default well-formed (correct active
+            // tag + a valid payload) rather than an all-bits-zero value
+            // that `std.mem.zeroes` rejects at comptime.
+            const first = u.fields[0];
+            return @unionInit(T, first.name, defaultElementOf(first.type));
         },
         .optional => return null,
         else => return std.mem.zeroes(T),

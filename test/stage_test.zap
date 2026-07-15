@@ -47,22 +47,17 @@ pub impl Stage(i64, i64) for HaltMarkerStage {
   }
 }
 
-# A fallible stage: passes positive items through, and on the first
-# non-positive item emits a distinguished error value and halts. Errors flow
-# as ordinary emitted output elements, never as raises, and the error is the
-# final element the stream yields.
-#
-# NOTE: the canonical fallible shape makes `output` a `Result` and emits
-# `Result.Error(...)`. A `Result`-*output* stage cannot currently be compiled
-# because a list literal of a generic-union value (`[Result(i64, String).Ok(x)]`)
-# fails ZIR emit — see the campaign report. This stage therefore uses an i64
-# error-sentinel to exercise the same errors-as-values + `:halt`-final-element
-# contract with an output type the code generator supports.
+# A fallible stage: passes positive items through as `Result.Ok`, and on the
+# first non-positive item emits a `Result.Error(...)` carrying a `String`
+# reason and halts. This is the canonical fallibility shape `Stage` documents
+# ("Fallibility is a value, never a raise"): the `output` is a `Result`,
+# errors flow as ordinary emitted output elements — never as raises — and the
+# error is the final element the stream yields.
 pub struct FallibleStage {
 }
 
-pub impl Stage(i64, i64) for FallibleStage {
-  pub fn step(_stage :: unique FallibleStage, item :: i64) -> {Atom, [i64], FallibleStage} {
+pub impl Stage(i64, Result(i64, String)) for FallibleStage {
+  pub fn step(_stage :: unique FallibleStage, item :: i64) -> {Atom, [Result(i64, String)], FallibleStage} {
     if item > 0 {
       FallibleStage.emit_ok(item)
     } else {
@@ -70,16 +65,16 @@ pub impl Stage(i64, i64) for FallibleStage {
     }
   }
 
-  pub fn flush(_stage :: unique FallibleStage) -> [i64] {
-    ([] :: [i64])
+  pub fn flush(_stage :: unique FallibleStage) -> [Result(i64, String)] {
+    ([] :: [Result(i64, String)])
   }
 
-  fn emit_ok(item :: i64) -> {Atom, [i64], FallibleStage} {
-    {:cont, [item], %FallibleStage{}}
+  fn emit_ok(item :: i64) -> {Atom, [Result(i64, String)], FallibleStage} {
+    {:cont, [Result(i64, String).Ok(item)], %FallibleStage{}}
   }
 
-  fn emit_error() -> {Atom, [i64], FallibleStage} {
-    {:halt, [-777], %FallibleStage{}}
+  fn emit_error() -> {Atom, [Result(i64, String)], FallibleStage} {
+    {:halt, [Result(i64, String).Error("non-positive item")], %FallibleStage{}}
   }
 }
 
@@ -191,9 +186,21 @@ pub struct StageTest {
     test("a fallible stage emits an error element and halts as the final element") {
       result = Enum.to_list(Stream.transform([1, 2, -1, 3], %FallibleStage{}))
       assert(List.length(result) == 3)
-      assert(List.head(result) == 1)
-      assert(List.at(result, 1) == 2)
-      assert(List.last(result) == -777)
+      head_ok = case List.head(result) {
+        Result.Ok(value) -> value == 1
+        Result.Error(_) -> false
+      }
+      second_ok = case List.at(result, 1) {
+        Result.Ok(value) -> value == 2
+        Result.Error(_) -> false
+      }
+      last_is_error = case List.last(result) {
+        Result.Ok(_) -> false
+        Result.Error(reason) -> reason == "non-positive item"
+      }
+      assert(head_ok)
+      assert(second_ok)
+      assert(last_is_error)
     }
   }
 

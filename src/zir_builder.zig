@@ -729,6 +729,7 @@ fn appendZigIdentifier(
 /// passes opaque pointers through here, so a partially-typed
 /// signature still compiles).
 fn appendZigTypeForVTable(
+    driver: *const ZirDriver,
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     zig_type: ir.ZigType,
@@ -776,14 +777,33 @@ fn appendZigTypeForVTable(
         // concern, handled by Phase 1.2.5.d).
         .protocol_box => try buf.appendSlice(allocator, "zap_runtime.ProtocolBox"),
         .struct_ref => |name| {
-            // The file-IS-the-struct emission lets us reach a
-            // nominal type by importing its name. Phase 1.2.5.a
-            // does not yet need to disambiguate parametric
-            // specializations because protocol signatures in
-            // 1.2.5.a are limited to bare nominal names.
+            // The file-IS-the-struct emission lets us reach a nominal
+            // type by importing its name. A parametric UNION
+            // specialization (`Result_i64_String`, `Option_i64`),
+            // however, lives as `pub const <Name> = union(enum) {...};`
+            // INSIDE that file-struct, so the union type is one field
+            // deeper: `@import(name).name` — the same form the
+            // `.tagged_union` arm below, `emitStructTypeRef`, and the
+            // container-element path (`emitContainerElementTypeRef`)
+            // all use for the value + type-ref sides. A union spec can
+            // arrive here (rather than as `.tagged_union`) when it is
+            // bound to a generic type parameter — e.g. `EmptyStage(input,
+            // output)` instantiated with `output = Result(i64, String)`.
+            // Rendering it bare would name the WRAPPING file-struct,
+            // whose `List(FileStruct)` is a type DISTINCT from the value
+            // side's `List(Union)` — a mismatch that stays latent until
+            // generic-union list literals actually emit (a `Stage` whose
+            // `output` is a `Result`). Concrete (dotted) unions and
+            // plain structs keep the bare file import.
+            const is_union_specialization = std.mem.indexOf(u8, name, ".") == null and
+                driver.findUnionDef(name) != null;
             try buf.appendSlice(allocator, "@import(\"");
             try buf.appendSlice(allocator, name);
             try buf.appendSlice(allocator, "\")");
+            if (is_union_specialization) {
+                try buf.appendSlice(allocator, ".");
+                try buf.appendSlice(allocator, name);
+            }
         },
         .tagged_union => |name| {
             try buf.appendSlice(allocator, "@import(\"");
@@ -798,12 +818,12 @@ fn appendZigTypeForVTable(
             try buf.appendSlice(allocator, "*const fn (");
             for (fn_type.params, 0..) |param_type, i| {
                 if (i > 0) try buf.appendSlice(allocator, ", ");
-                try appendZigTypeForVTable(allocator, buf, param_type);
+                try appendZigTypeForVTable(driver, allocator, buf, param_type);
             }
             try buf.appendSlice(allocator, ") ");
             // Phase 4 — a raising devirtualized closure's bare-fn-ptr type
             // carries the recoverable-raise error union on its return.
-            try appendVTableReturnType(allocator, buf, fn_type.return_type.*, fn_type.raises);
+            try appendVTableReturnType(driver, allocator, buf, fn_type.return_type.*, fn_type.raises);
         },
         // A Zap tuple renders as a Zig anonymous tuple type
         // `struct { T0, T1, ... }`. This is the representation of a
@@ -831,7 +851,7 @@ fn appendZigTypeForVTable(
                 try buf.appendSlice(allocator, "struct { ");
                 for (elements, 0..) |elem, i| {
                     if (i > 0) try buf.appendSlice(allocator, ", ");
-                    try appendZigTypeForVTable(allocator, buf, elem);
+                    try appendZigTypeForVTable(driver, allocator, buf, elem);
                 }
                 try buf.appendSlice(allocator, " }");
             }
@@ -845,25 +865,25 @@ fn appendZigTypeForVTable(
         // inside a vtable's fn-pointer field type).
         .list => |element_type| {
             try buf.appendSlice(allocator, "?*const zap_runtime.List(");
-            try appendZigTypeForVTable(allocator, buf, element_type.*);
+            try appendZigTypeForVTable(driver, allocator, buf, element_type.*);
             try buf.appendSlice(allocator, ")");
         },
         // A Zap map value is `?*const zap_runtime.Map(K, V)` — the
         // map counterpart of the `.list` arm above.
         .map => |map_type| {
             try buf.appendSlice(allocator, "?*const zap_runtime.Map(");
-            try appendZigTypeForVTable(allocator, buf, map_type.key.*);
+            try appendZigTypeForVTable(driver, allocator, buf, map_type.key.*);
             try buf.appendSlice(allocator, ", ");
-            try appendZigTypeForVTable(allocator, buf, map_type.value.*);
+            try appendZigTypeForVTable(driver, allocator, buf, map_type.value.*);
             try buf.appendSlice(allocator, ")");
         },
         .optional => |inner| {
             try buf.appendSlice(allocator, "?");
-            try appendZigTypeForVTable(allocator, buf, inner.*);
+            try appendZigTypeForVTable(driver, allocator, buf, inner.*);
         },
         .ptr => |pointee| {
             try buf.appendSlice(allocator, "*const ");
-            try appendZigTypeForVTable(allocator, buf, pointee.*);
+            try appendZigTypeForVTable(driver, allocator, buf, pointee.*);
         },
         else => try buf.appendSlice(allocator, "anytype"),
     }
@@ -882,13 +902,14 @@ fn appendZigTypeForVTable(
 /// with the call-site unwrap. A pure (`raises == false`) slot renders the
 /// payload type unchanged — no spurious error union.
 fn appendVTableReturnType(
+    driver: *const ZirDriver,
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
     zig_type: ir.ZigType,
     raises: bool,
 ) std.mem.Allocator.Error!void {
     if (raises) try buf.appendSlice(allocator, "anyerror!");
-    try appendZigTypeForVTable(allocator, buf, zig_type);
+    try appendZigTypeForVTable(driver, allocator, buf, zig_type);
 }
 
 /// Compare two Zap module names treating `.` and `_` as equivalent
@@ -2831,10 +2852,10 @@ pub const ZirDriver = struct {
                 const arg_prefix = try std.fmt.allocPrint(self.allocator, "arg{d}: ", .{param_index});
                 defer self.allocator.free(arg_prefix);
                 try buf.appendSlice(self.allocator, arg_prefix);
-                try appendZigTypeForVTable(self.allocator, &buf, param_zt);
+                try appendZigTypeForVTable(self, self.allocator, &buf, param_zt);
             }
             try buf.appendSlice(self.allocator, ") ");
-            try appendVTableReturnType(self.allocator, &buf, method.return_type, method.raises);
+            try appendVTableReturnType(self, self.allocator, &buf, method.return_type, method.raises);
             try buf.appendSlice(self.allocator, ",\n");
         }
         try buf.appendSlice(self.allocator, "};\n\n");
@@ -2965,10 +2986,10 @@ pub const ZirDriver = struct {
                 const arg_prefix = try std.fmt.allocPrint(self.allocator, "arg{d}: ", .{param_index});
                 defer self.allocator.free(arg_prefix);
                 try buf.appendSlice(self.allocator, arg_prefix);
-                try appendZigTypeForVTable(self.allocator, &buf, param_zt);
+                try appendZigTypeForVTable(self, self.allocator, &buf, param_zt);
             }
             try buf.appendSlice(self.allocator, ") ");
-            try appendVTableReturnType(self.allocator, &buf, method.return_type, method.raises);
+            try appendVTableReturnType(self, self.allocator, &buf, method.return_type, method.raises);
             try buf.appendSlice(self.allocator, " {\n");
             try buf.appendSlice(self.allocator, "    const vt: *const ");
             try buf.appendSlice(self.allocator, type_def.name);
@@ -3125,7 +3146,7 @@ pub const ZirDriver = struct {
         const target_type_ref = if (inst_def.target_zig_type) |target_zig_type| blk: {
             var type_buf: std.ArrayListUnmanaged(u8) = .empty;
             errdefer type_buf.deinit(self.allocator);
-            try appendZigTypeForVTable(self.allocator, &type_buf, target_zig_type);
+            try appendZigTypeForVTable(self, self.allocator, &type_buf, target_zig_type);
             break :blk try type_buf.toOwnedSlice(self.allocator);
         } else if (std.mem.lastIndexOfScalar(u8, inst_def.target_type_name, '.')) |dot_idx| blk: {
             const leaf = inst_def.target_type_name[dot_idx + 1 ..];
@@ -3177,10 +3198,10 @@ pub const ZirDriver = struct {
                 const arg_prefix = try std.fmt.allocPrint(self.allocator, "arg{d}: ", .{param_index});
                 defer self.allocator.free(arg_prefix);
                 try buf.appendSlice(self.allocator, arg_prefix);
-                try appendZigTypeForVTable(self.allocator, &buf, param_zt);
+                try appendZigTypeForVTable(self, self.allocator, &buf, param_zt);
             }
             try buf.appendSlice(self.allocator, ") ");
-            try appendVTableReturnType(self.allocator, &buf, method.return_type, method.raises);
+            try appendVTableReturnType(self, self.allocator, &buf, method.return_type, method.raises);
             try buf.appendSlice(self.allocator, " {\n");
             // `    const inner: *<const> <target_type_ref> = @ptrCast(@alignCast(data_ptr.?));`
             // The pointer is MUTABLE when the return glue reuses the
@@ -4765,6 +4786,23 @@ pub const ZirDriver = struct {
                 if (self.findStructDef(name) != null or self.findStructDef(short_name) != null) {
                     return try self.emitStructTypeRef(name);
                 }
+                // Generic-union specializations (`Result(i64, String)`,
+                // `Option(i64)`, …) live as `union_def` TypeDefs, reached
+                // through the same `emitStructTypeRef` dispatch the union
+                // *value* emission (`.union_init`) uses. A `List`/`Map`
+                // element whose type is such a union must reference that
+                // concrete union type so the container's element type and the
+                // pushed union values resolve to one InternPool type.
+                // Without this arm the ref falls through to `null` and the
+                // list literal fails to emit (`list_init: EmitFailed`) — the
+                // gap that forced fallible stages onto an i64 error-sentinel
+                // instead of the canonical `Result` output. (Payloadless
+                // unions register as `enum_def`s and are handled by the
+                // `findEnumDef` arm above; only payload-carrying unions reach
+                // here.)
+                if (self.findUnionDef(name) != null or self.findUnionDef(short_name) != null) {
+                    return try self.emitStructTypeRef(name);
+                }
                 return null;
             },
             .tagged_union => {
@@ -5705,15 +5743,26 @@ pub const ZirDriver = struct {
                 for (elements) |elem_type| {
                     const before = zir_builder_get_body_inst_count(self.handle);
                     // Snapshot the untracked list before so nested tuple
-                    // decls collected by mapTupleElementType land in
-                    // `support_inst_indices` in emission order.
+                    // decls collected by mapTupleElementType are appended in
+                    // emission order.
                     const untracked_before = self.pending_ret_ty_untracked.items.len;
                     const ref = try self.emitImportedTypeRef(elem_type);
-                    if (self.pending_ret_ty_untracked.items.len > untracked_before) {
-                        for (self.pending_ret_ty_untracked.items[untracked_before..]) |idx| {
-                            try support_inst_indices.append(self.allocator, idx);
-                        }
-                    }
+                    // Capture this element's OWN support instructions FIRST —
+                    // the `@import`/`field_val`/`call_ref`/`typeof` chain a
+                    // list/map/struct element emits into the body — so they
+                    // precede any nested `tuple_decl`s that reference them.
+                    // `mapTupleElementType` emits nested tuple_decls *untracked*
+                    // (they never enter the body-inst count) and records their
+                    // indices in `pending_ret_ty_untracked`; those decls take
+                    // the just-captured support refs (e.g. a `List(T)` `typeof`)
+                    // as their field types, so they MUST come AFTER them in the
+                    // ret_ty body. Appending the untracked decls before their
+                    // operands is exactly what left the inner `List(i64)`
+                    // `typeof` unresolved and panicked Sema's `inst_map.get(i).?`
+                    // for a tuple-returning function whose element is a tuple
+                    // embedding a list (`Transform`'s `{Atom, {[T], i64}, Self}`
+                    // when `output = {[i64], i64}`). This mirrors the order
+                    // `emitTupleParam` already uses on the parameter side.
                     const after = zir_builder_get_body_inst_count(self.handle);
                     if (after > before) {
                         const num_added = after - before;
@@ -5728,6 +5777,11 @@ pub const ZirDriver = struct {
                         while (rev_i > 0) {
                             rev_i -= 1;
                             try support_inst_indices.append(self.allocator, captured.items[rev_i]);
+                        }
+                    }
+                    if (self.pending_ret_ty_untracked.items.len > untracked_before) {
+                        for (self.pending_ret_ty_untracked.items[untracked_before..]) |idx| {
+                            try support_inst_indices.append(self.allocator, idx);
                         }
                     }
                     try tuple_type_refs.append(self.allocator, ref);
