@@ -4364,21 +4364,37 @@ pub const ZirDriver = struct {
                 }
             }
 
-            // ── Step 3.5: Emit fields-only top-level structs ─────────
+            // ── Step 3.5: Emit fields-only / field-less top-level structs
             // The file-IS-the-struct architecture requires every
             // Zap struct that consumers reference via `@import("X")`
             // to have a registered ZIR file. Step 3 covers structs
             // with at least one function (`struct_funcs.contains`),
             // but top-level data structs (e.g. `pub struct Point {
             // x, y }` with no methods) have empty function lists and
-            // are skipped there. Emit a fields-only ZIR file for
-            // each such struct so its `@import` resolves to a
-            // canonical type with this emission's `InternPool.Index`.
+            // are skipped there. Emit a ZIR file for each such struct
+            // so its `@import` resolves to a canonical type with this
+            // emission's `InternPool.Index`.
+            //
+            // A FIELD-LESS struct with no methods (`pub struct
+            // EmptyStage(input, output) {}`, or a concrete
+            // `pub struct ConcreteZero {}`) must be emitted here too:
+            // when it is CONSTRUCTED as a runtime value (`%ConcreteZero{}`)
+            // the emission of the constructing struct references it by
+            // `@import`, so it needs a real (empty) `struct_decl` file —
+            // exactly like a fields-only struct. The non-selective path's
+            // Step-2.5 stub registration does not run under selective
+            // emission (`zap test`), so this is the only site that gives a
+            // constructed field-less struct its module. A field-less struct
+            // used purely as a NAMESPACE and never constructed simply gets
+            // an (empty, harmless) canonical file; the `shouldEmitStruct`
+            // selection gate below still limits emission to referenced
+            // structs under selective compilation.
             if (self.progress) |progress| progress.stage("ZIR: emitting field-only structs", .{});
             for (self.program.?.type_defs) |type_def| {
                 if (type_def.kind != .struct_def) continue;
-                const def = type_def.kind.struct_def;
-                if (def.fields.len == 0) continue;
+                // Both fields-only AND field-less structs are emitted here
+                // (see the block comment above): a constructed field-less
+                // struct needs a real empty `struct_decl` module.
                 // Skip nested types (dotted names) — they're emitted
                 // inside their parent's ZIR by `emitNestedTypeDecl`.
                 if (std.mem.indexOf(u8, type_def.name, ".") != null) continue;

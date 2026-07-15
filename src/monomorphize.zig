@@ -1093,37 +1093,172 @@ const MonomorphContext = struct {
             }
             if (!all_unified) continue;
             const target_type_id = try subs.applyToType(self.store, impl_info.target_type_pattern);
-            if (try containsTypeVar(self.store, target_type_id, self.allocator)) continue;
-
-            var method_specs: std.ArrayListUnmanaged(hir.BoxedImplMethodSpec) = .empty;
-            errdefer method_specs.deinit(self.allocator);
-            var all_methods_resolved = true;
-            for (impl_info.function_group_ids) |method_group_id| {
-                const located = self.locateGroupDefiningStruct(method_group_id) orelse {
-                    all_methods_resolved = false;
-                    break;
-                };
-                const method_spec = (try self.forceBoxedImplMethodSpecialization(located, target_type_id)) orelse {
-                    all_methods_resolved = false;
-                    break;
-                };
-                try method_specs.append(self.allocator, method_spec);
-            }
-            if (!all_methods_resolved) {
-                method_specs.deinit(self.allocator);
+            if (try containsTypeVar(self.store, target_type_id, self.allocator)) {
+                // The impl's target has type PARAMETERS that the protocol
+                // arguments do not determine. A 2-parameter adapter
+                // `ProbeTransform(input, output)` implementing a 1-parameter
+                // `Enumerable(output)` leaves `input` free after binding
+                // `output := i64` — `target_type_id` is `ProbeTransform(input,
+                // i64)`, still parametric. The concrete `input` is fixed only
+                // at the CONSTRUCTION site (`%ProbeTransform(i64, i64){...}`),
+                // which interns a fully-concrete `.applied` struct
+                // instantiation in the TypeStore. Enumerate those concrete
+                // instantiations of the target base that are consistent with
+                // this partial binding and force-specialize each, so a
+                // 2-parameter adapter can be boxed at a `-> Enumerable(output)`
+                // return — the exact `Stream.transform` shape. This is the
+                // only path that reaches an under-determined target; the
+                // previous code skipped the impl outright here.
+                try self.forceBoxedImplForUnderdeterminedTarget(
+                    boxed_impl_specs,
+                    impl_info,
+                    constraint,
+                    mangled_instantiation,
+                    target_type_id,
+                );
                 continue;
             }
 
-            const protocol_arg_type_ids = try self.allocator.dupe(TypeId, constraint.type_params);
-            try boxed_impl_specs.append(self.allocator, .{
-                .protocol_instantiation = try self.allocator.dupe(u8, mangled_instantiation),
-                .protocol_name = constraint.protocol_name,
-                .protocol_arg_type_ids = protocol_arg_type_ids,
-                .target_type_id = target_type_id,
-                .impl_scope_id = impl_info.impl_scope_id,
-                .methods = try method_specs.toOwnedSlice(self.allocator),
-            });
+            try self.appendBoxedImplSpecForTarget(
+                boxed_impl_specs,
+                impl_info,
+                constraint,
+                mangled_instantiation,
+                target_type_id,
+            );
         }
+    }
+
+    /// Force-specialize a parametric-target impl for every concrete
+    /// `.applied` struct instantiation in the store that is consistent with
+    /// `partial_target` — the impl's target after the protocol arguments are
+    /// bound but with the target's remaining (protocol-independent) type
+    /// parameters still free (`ProbeTransform(input, i64)`). Each matching
+    /// concrete instantiation (`ProbeTransform(i64, i64)`,
+    /// `ProbeTransform(String, i64)`, …) yields its own `BoxedImplSpec`.
+    fn forceBoxedImplForUnderdeterminedTarget(
+        self: *MonomorphContext,
+        boxed_impl_specs: *std.ArrayListUnmanaged(hir.BoxedImplSpec),
+        impl_info: hir.ImplInfo,
+        constraint: types_mod.Type.ProtocolConstraintType,
+        mangled_instantiation: []const u8,
+        partial_target: TypeId,
+    ) !void {
+        // The candidate instantiation must be an instantiation of the
+        // impl's EXACT target struct. `unify` alone is NOT a sufficient
+        // filter: protocol-constraint unification is lenient (a struct that
+        // merely satisfies a protocol unifies with the protocol type), so
+        // `unify(ProbeTransform(input, i64), <other applied type>)` can
+        // succeed for unrelated applied types — producing spurious
+        // `BoxedImplSpec`s whose forced method specializations pollute the
+        // whole-program specialization table and corrupt unrelated boxed
+        // (Callable/closure/Enumerable) dispatch. Gate strictly on the
+        // nominal base-struct identity first, then use `unify` only to
+        // confirm the protocol-bound argument slots agree.
+        const target_base_name = self.store.typeToStructName(partial_target, self.interner) orelse return;
+        var seen_targets = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var key_iter = seen_targets.keyIterator();
+            while (key_iter.next()) |key| self.allocator.free(key.*);
+            seen_targets.deinit();
+        }
+        // Snapshot the store length: method specialization below interns
+        // derived TypeIds, and those are never themselves construction-site
+        // instantiations we must scan.
+        const store_snapshot_len = self.store.types.items.len;
+        var candidate_type_id: TypeId = 0;
+        while (candidate_type_id < store_snapshot_len) : (candidate_type_id += 1) {
+            if (self.store.getType(candidate_type_id) != .applied) continue;
+            // Strict nominal identity: same base struct as the impl target.
+            const candidate_base_name = self.store.typeToStructName(candidate_type_id, self.interner) orelse continue;
+            if (!std.mem.eql(u8, candidate_base_name, target_base_name)) continue;
+            // Only fully-concrete instantiations are boxable targets.
+            if (try containsTypeVar(self.store, candidate_type_id, self.allocator)) continue;
+            // Confirm the protocol-bound argument slots agree (excludes
+            // `ProbeTransform(i64, String)` — `output := String` — while
+            // processing `Enumerable(i64)`).
+            var probe_subs = SubstitutionMap.init(self.allocator);
+            defer probe_subs.deinit();
+            if (!(try self.store.unify(partial_target, candidate_type_id, &probe_subs))) continue;
+            // De-duplicate structurally-identical instantiations so the same
+            // (protocol_instantiation, target) spec is not force-specialized
+            // more than once per pass.
+            const candidate_mangled = types_mod.typeIdMangledName(self.allocator, self.store, candidate_type_id) catch continue;
+            if (seen_targets.contains(candidate_mangled)) {
+                self.allocator.free(candidate_mangled);
+                continue;
+            }
+            try seen_targets.put(candidate_mangled, {});
+            try self.appendBoxedImplSpecForTarget(
+                boxed_impl_specs,
+                impl_info,
+                constraint,
+                mangled_instantiation,
+                candidate_type_id,
+            );
+        }
+    }
+
+    /// Specialize the impl's protocol methods for the fully-concrete
+    /// `target_type_id` and append the resulting `BoxedImplSpec`. Silently
+    /// returns without appending when a protocol method cannot be
+    /// specialized (the caller's per-impl skip semantics), so a single
+    /// unspecializable method never poisons the whole pass.
+    fn appendBoxedImplSpecForTarget(
+        self: *MonomorphContext,
+        boxed_impl_specs: *std.ArrayListUnmanaged(hir.BoxedImplSpec),
+        impl_info: hir.ImplInfo,
+        constraint: types_mod.Type.ProtocolConstraintType,
+        mangled_instantiation: []const u8,
+        target_type_id: TypeId,
+    ) !void {
+        var method_specs: std.ArrayListUnmanaged(hir.BoxedImplMethodSpec) = .empty;
+        errdefer method_specs.deinit(self.allocator);
+        var all_methods_resolved = true;
+        for (impl_info.function_group_ids) |method_group_id| {
+            const located = self.locateGroupDefiningStruct(method_group_id) orelse {
+                all_methods_resolved = false;
+                break;
+            };
+            // Only a PROTOCOL method (`next`/`dispose` for `Enumerable`) is a
+            // vtable method that needs a forced `BoxedImplMethodSpec`: the
+            // vtable populator (`emitBoxedParametricTargetInstance`) looks up
+            // spec methods strictly by the protocol's declared method names.
+            // An impl-private HELPER whose first parameter is some OTHER type
+            // — e.g. `step(source :: unique Enumerable(element))` routing
+            // boxed dispatch — is never in the vtable and cannot be bound by
+            // receiver-unification against the target. Such helpers are
+            // specialized TRANSITIVELY when the forced protocol methods'
+            // bodies are scanned to fixpoint (the loop following this pass).
+            // Skip them here rather than rejecting the whole impl: the
+            // previous code force-specialized every `function_group_ids`
+            // entry and failed the entire impl the moment a helper's
+            // substituted signature retained a type variable (its `params[0]`
+            // is a different protocol, so the impl's type variable is never
+            // bound), so a parametric adapter with a boxed-dispatch helper
+            // (the exact `Stream`/`Transform` shape) got NO `BoxedImplSpec`
+            // and could not be boxed at a return/ascription position.
+            if (!self.isProtocolVtableMethod(located.group, impl_info.protocol_name)) continue;
+            const method_spec = (try self.forceBoxedImplMethodSpecialization(located, target_type_id)) orelse {
+                all_methods_resolved = false;
+                break;
+            };
+            try method_specs.append(self.allocator, method_spec);
+        }
+        if (!all_methods_resolved) {
+            method_specs.deinit(self.allocator);
+            return;
+        }
+
+        const protocol_arg_type_ids = try self.allocator.dupe(TypeId, constraint.type_params);
+        try boxed_impl_specs.append(self.allocator, .{
+            .protocol_instantiation = try self.allocator.dupe(u8, mangled_instantiation),
+            .protocol_name = constraint.protocol_name,
+            .protocol_arg_type_ids = protocol_arg_type_ids,
+            .target_type_id = target_type_id,
+            .impl_scope_id = impl_info.impl_scope_id,
+            .methods = try method_specs.toOwnedSlice(self.allocator),
+        });
     }
 
     const LocatedGroup = struct {
@@ -1131,6 +1266,38 @@ const MonomorphContext = struct {
         struct_idx: usize,
         struct_name: []const u8,
     };
+
+    /// True when `group` is one of `protocol_name`'s declared methods (by
+    /// name and arity) — i.e. a PROTOCOL-VTABLE method that the impl
+    /// provides (`next`/`dispose` for `Enumerable`). These are the only
+    /// methods the vtable populator (`emitBoxedParametricTargetInstance`)
+    /// looks up, and the only ones bindable by receiver-unification
+    /// against the concrete target (their first parameter is the target
+    /// type: `self :: unique OneWrap(element)`).
+    ///
+    /// An impl-private HELPER — e.g. `step(source :: unique
+    /// Enumerable(element))`, a boxed-dispatch router whose first
+    /// parameter is a DIFFERENT protocol type — is NOT a protocol method,
+    /// is never in the vtable, and cannot be bound by receiver-unification
+    /// against the target. Helpers are specialized transitively when the
+    /// forced protocol methods' bodies are scanned to fixpoint, so they
+    /// must not be force-specialized here (nor allowed to fail the whole
+    /// impl).
+    fn isProtocolVtableMethod(
+        self: *const MonomorphContext,
+        group: *const hir.FunctionGroup,
+        protocol_name: ast.StringId,
+    ) bool {
+        for (self.program.protocols) |proto| {
+            if (!self.sameName(proto.name, protocol_name)) continue;
+            for (proto.function_names, proto.function_arities) |fn_name, fn_arity| {
+                if (fn_arity != group.arity) continue;
+                if (self.sameName(fn_name, group.name)) return true;
+            }
+            return false;
+        }
+        return false;
+    }
 
     /// Locate a function group and its defining struct module by id.
     fn locateGroupDefiningStruct(self: *const MonomorphContext, group_id: u32) ?LocatedGroup {
