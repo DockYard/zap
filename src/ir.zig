@@ -17246,7 +17246,22 @@ pub const IrBuilder = struct {
         // owns its inner and moves in unchanged.
         if (!is_callable_box) {
             return switch (value_expr.kind) {
-                .field_get, .local_get, .param_get, .capture_get => try self.shareBoxExtractionInPlace(boxed_local),
+                // A struct-FIELD read (`%S{f: x.field}`) borrows a field the
+                // parent `x` still owns and re-releases at its whole-struct
+                // drop; a pattern-bound / re-read LOCAL or a closure CAPTURE is
+                // likewise released by its own owner's scope-exit drop. Each
+                // needs an INDEPENDENT owner materialized in place so the store
+                // and the source-owner's drop do not both free one inner.
+                .field_get, .local_get, .capture_get => try self.shareBoxExtractionInPlace(boxed_local),
+                // A bare `.param_get` is a `unique`/owned box PARAMETER — the
+                // caller transferred sole ownership into this function and it is
+                // MOVED into the aggregate (no other owner re-releases it). It
+                // has NO balancing scope-exit drop, so cloning it here would
+                // materialize a second inner and ORPHAN the moved-in original —
+                // a leak under a clone-on-share manager (`Memory.Tracking`); the
+                // aggregate simply takes the moved box unchanged. (A box read
+                // through an intermediate binding is `.local_get`, handled
+                // above with its balancing drop.)
                 else => boxed_local,
             };
         }

@@ -4237,6 +4237,119 @@ test "boxed-existential struct field: PARAMETRIC iterating adapter is leak-free 
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "reached unreachable") == null);
 }
 
+test "multi-instantiation boxed parametric adapter is leak-free and crash-free under Memory.Tracking" {
+    // Regression for GAP-C: a PARAMETRIC adapter (`Wrap(element)` — a struct
+    // carrying a boxed `Enumerable(element)` field and implementing
+    // `Enumerable(element)` itself) BOXED at MULTIPLE instantiations in one
+    // program (`Enumerable(i64)` AND `Enumerable(String)`) crashed at runtime
+    // in the boxed value's clone/share/drop machinery:
+    //   * default `Memory.ARC`: `reached unreachable` double-free in
+    //     `arcRelease`;
+    //   * `-Dmemory=Memory.Tracking`: SIGSEGV in the box `drop`/`clone`
+    //     adapters (`releaseProtocolBoxInner` -> `freeAnyNonRefcountedImpl`,
+    //     `slabAllocSlot`).
+    //
+    // Two independent triggers, both covered here: (1) two coexisting boxed
+    // instantiations of the same parametric adapter; (2) an ARC-payload
+    // (String) boxed adapter EARLY-DISPOSED via `Enum.take`. Root cause: the
+    // ARC drop-insertion box-retain rewrite classified a `.persistent` box
+    // retain as a genuine new-owner SHARE (`.protocol_box_share`, which CLONES
+    // under a clone-on-share manager) ONLY when the box was bound to a NAMED
+    // local, so a box that is instead MOVE-consumed — copied out of an owned
+    // aggregate (the `{:cont, value, next_state}` tuple) and moved into a
+    // consuming callee (`Enum`'s internal `dispose_and_return`) while the
+    // aggregate slot is also dropped — was wrongly downgraded to a no-op
+    // `.protocol_box_retain`; the alias then double-freed the shared inner.
+    // A sibling defect over-cloned a `unique` box PARAMETER stored into a
+    // struct field (`%Wrap{source: source}`), orphaning the moved-in original
+    // (a leak). Both are fixed so each boxed adapter cell — and its
+    // ARC-managed inner (a `List`/`String` payload, a boxed source field) — is
+    // retained/released exactly once regardless of how many instantiations
+    // coexist.
+    //
+    // `Memory.Tracking` is the per-allocation leak-checked manager that
+    // OBSERVES the leak/double-free and is selectable only through the
+    // `-Dmemory` CLI flag, which Zest cannot set — so this coverage lives here;
+    // the ARC counterpart is the Zest file
+    // `test/zap/multi_instantiation_boxed_adapter_test.zap`.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "multi_inst_box.zap",
+        \\pub struct Wrap(element) {
+        \\  source :: Enumerable(element)
+        \\}
+        \\
+        \\pub impl Enumerable(element) for Wrap(element) {
+        \\  fn step(source :: unique Enumerable(element)) -> {Atom, element, Wrap(element)} {
+        \\    case Enumerable.next(source) {
+        \\      {:done, d, exhausted} -> {:done, d, %Wrap(element){source: exhausted}}
+        \\      {:cont, item, rest} -> {:cont, item, %Wrap(element){source: rest}}
+        \\    }
+        \\  }
+        \\
+        \\  fn drop_source(source :: unique Enumerable(element)) -> Nil {
+        \\    Enumerable.dispose(source)
+        \\    nil
+        \\  }
+        \\
+        \\  pub fn next(self :: unique Wrap(element)) -> {Atom, element, Wrap(element)} {
+        \\    Wrap.step(self.source)
+        \\  }
+        \\
+        \\  pub fn dispose(self :: unique Wrap(element)) -> Nil {
+        \\    Wrap.drop_source(self.source)
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\pub struct H {
+        \\  pub fn wi(source :: unique Enumerable(i64)) -> Enumerable(i64) { %Wrap(i64){source: source} }
+        \\  pub fn ws(source :: unique Enumerable(String)) -> Enumerable(String) { %Wrap(String){source: source} }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  # String (ARC payload) boxed adapter EARLY-DISPOSED via Enum.take,
+        \\  # then an i64 boxed adapter DRAINED to :done — the exact
+        \\  # multi-instantiation coexistence that double-freed / bus-errored.
+        \\  st = Enum.take(H.ws(["a", "b", "c"]), 2)
+        \\  IO.puts("str-take=" <> Integer.to_string(List.length(st)))
+        \\  di = Enum.to_list(H.wi([1, 2, 3]))
+        \\  IO.puts("i64-drain=" <> Integer.to_string(List.length(di)))
+        \\  # i64 early dispose + String drive-to-:done (both instantiations,
+        \\  # both paths).
+        \\  ti = Enum.take(H.wi([10, 20, 30, 40]), 1)
+        \\  IO.puts("i64-take=" <> Integer.to_string(List.length(ti)))
+        \\  ds = Enum.to_list(H.ws(["x", "y"]))
+        \\  IO.puts("str-drain=" <> Integer.to_string(List.length(ds)))
+        \\  # count == 0 early dispose (the consumed collection must still be
+        \\  # disposed, for both instantiations).
+        \\  zi = Enum.take(H.wi([7, 8, 9]), 0)
+        \\  IO.puts("i64-zero=" <> Integer.to_string(List.length(zi)))
+        \\  zs = Enum.take(H.ws(["p", "q"]), 0)
+        \\  IO.puts("str-zero=" <> Integer.to_string(List.length(zs)))
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "str-take=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "i64-drain=3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "i64-take=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "str-drain=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "i64-zero=0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "str-zero=0") != null);
+    // Exactly-once invariant: no per-allocation leak survivor and no
+    // double-free / abort under the leak-checked manager, across BOTH
+    // instantiations and BOTH the drive-to-:done and early-dispose paths.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "LEAK:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "reached unreachable") == null);
+}
+
 test "CLI script flags: combined -Doptimize and -Dmemory before the path" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});

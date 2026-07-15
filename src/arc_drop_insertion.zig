@@ -2545,9 +2545,34 @@ pub fn rewriteProtocolBoxReleases(
     defer binding_targets.deinit(allocator);
     try collectLocalSetValueLocals(allocator, function, &binding_targets);
 
+    // The binding-target set alone under-approximates the genuine new
+    // owners. A box value is ALSO a genuine second owner when it is
+    // MOVE-consumed rather than re-bound: copied out of an owned aggregate
+    // (e.g. the `{:cont, value, next_state}` tuple returned by
+    // `Enumerable.next`) and then MOVED into a consuming callee (a `.move`
+    // call argument such as `Enum`'s internal `dispose_and_return`, or a
+    // receiver-consuming `unique self` dispatch), while the aggregate slot it
+    // was copied from is ALSO dropped at scope exit. The move-consumer frees
+    // the inner and the slot's scope-exit `.protocol_box_drop` frees it too,
+    // so under a clone-on-share manager the retain must CLONE
+    // (`.protocol_box_share`) — exactly as a non-boxed `.persistent` retain
+    // already does via `shareAnyPersistent`. Without this, such a retain was
+    // downgraded to a no-op `.protocol_box_retain`, the "second owner" aliased
+    // the source's inner, and both frees reclaimed the SAME cell (a
+    // double-free under `Memory.Tracking`; slab corruption under refcount ARC
+    // that surfaces as a later allocation crash when a second instantiation of
+    // the parametric adapter is boxed). A value that is only BORROWED (a
+    // `.share`/`.borrow` dispatch/call receiver, e.g. a boxed `Callable`
+    // closure that is called but not consumed) is NEITHER move-consumed NOR a
+    // binding target, so it correctly stays a transient `.protocol_box_retain`
+    // — cloning it there would leak.
+    var move_consumed: std.AutoHashMapUnmanaged(ir.LocalId, void) = .empty;
+    defer move_consumed.deinit(allocator);
+    try collectMoveConsumedLocals(allocator, function, &move_consumed);
+
     for (function.body) |*block_const| {
         const block: *ir.Block = @constCast(block_const);
-        try rewriteProtocolBoxReleasesInStream(allocator, function, @constCast(block.instructions), &binding_targets);
+        try rewriteProtocolBoxReleasesInStream(allocator, function, @constCast(block.instructions), &binding_targets, &move_consumed);
     }
 }
 
@@ -2579,15 +2604,72 @@ fn collectLocalSetValueLocals(
     if (ctx.err) |err| return err;
 }
 
+/// Collect every local whose ownership is TRANSFERRED by a `.move` anywhere in
+/// the function body (walking nested control-flow streams): the `source` of a
+/// `move_value`, a `.move` argument of any call/dispatch, or a
+/// receiver-consuming protocol dispatch's receiver. Used by
+/// `rewriteProtocolBoxReleases` to recognise a `.persistent` box retain whose
+/// value is a genuine SECOND OWNER because a move-consumer frees its inner —
+/// the complement of `collectLocalSetValueLocals` (a value bound to a named
+/// local). A box value that is only BORROWED (a `.share`/`.borrow` receiver)
+/// is neither and stays a transient `.protocol_box_retain`.
+fn collectMoveConsumedLocals(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+) std.mem.Allocator.Error!void {
+    const Ctx = struct {
+        allocator: std.mem.Allocator,
+        out: *std.AutoHashMapUnmanaged(ir.LocalId, void),
+        err: ?std.mem.Allocator.Error = null,
+
+        fn record(self: *@This(), local: ir.LocalId) void {
+            self.out.put(self.allocator, local, {}) catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn recordMoveArgs(self: *@This(), args: []const ir.LocalId, modes: []const ir.ValueMode) void {
+            for (args, 0..) |arg, index| {
+                if (index < modes.len and modes[index] == .move) self.record(arg);
+            }
+        }
+
+        fn visit(self: *@This(), instr: *const ir.Instruction) void {
+            if (self.err != null) return;
+            switch (instr.*) {
+                .move_value => |mv| self.record(mv.source),
+                .call_direct => |c| self.recordMoveArgs(c.args, c.arg_modes),
+                .call_named => |c| self.recordMoveArgs(c.args, c.arg_modes),
+                .call_closure => |c| self.recordMoveArgs(c.args, c.arg_modes),
+                .call_dispatch => |c| self.recordMoveArgs(c.args, c.arg_modes),
+                .call_builtin => |c| self.recordMoveArgs(c.args, c.arg_modes),
+                .try_call_named => |c| self.recordMoveArgs(c.args, c.arg_modes),
+                .protocol_dispatch => |pd| {
+                    self.recordMoveArgs(pd.args, pd.arg_modes);
+                    if (pd.receiver_consuming) self.record(pd.receiver);
+                },
+                else => {},
+            }
+        }
+    };
+
+    var ctx = Ctx{ .allocator = allocator, .out = out };
+    try ir.forEachInstruction(allocator, function, &ctx, Ctx.visit);
+    if (ctx.err) |err| return err;
+}
+
 fn rewriteProtocolBoxReleasesInStream(
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     stream: []ir.Instruction,
     binding_targets: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+    move_consumed: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
 ) std.mem.Allocator.Error!void {
     const Ctx = struct {
         function: *const ir.Function,
         binding_targets: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
+        move_consumed: *const std.AutoHashMapUnmanaged(ir.LocalId, void),
 
         fn visit(self: *@This(), instr: *const ir.Instruction) error{OutOfMemory}!ExplicitWalkControl {
             const instr_ptr: *ir.Instruction = @constCast(instr);
@@ -2638,16 +2720,25 @@ fn rewriteProtocolBoxReleasesInStream(
                     if (ret.kind != .protocol_box_retain and ret.kind != .protocol_box_share) {
                         if (self.function.protocol_box_locals.get(ret.value)) |protocol_name| {
                             // A `.persistent` box retain becomes a genuine
-                            // new-owner SHARE (clone under no-REFCOUNT_V1) ONLY
-                            // when its value is bound to a named local — it
-                            // appears as a `local_set.value`. A `.persistent`
-                            // retain on a box consumed in place is NOT a new
-                            // owner: its scope-exit drop is suppressed as a
-                            // transient, so cloning it would leak. Treat such an
-                            // in-place `.persistent` box retain as a plain
-                            // `.protocol_box_retain`.
+                            // new-owner SHARE (clone under no-REFCOUNT_V1) when
+                            // its value is a real second owner: either bound to
+                            // a named local (a `local_set.value`, e.g.
+                            // `also = add5`) OR MOVE-consumed — moved into a
+                            // consuming callee / receiver-consuming dispatch
+                            // while the aggregate slot it was copied from is
+                            // also dropped (e.g. `next_state` copied out of the
+                            // `{:cont, ...}` tuple and moved into `Enum`'s
+                            // `dispose_and_return`). Both reach a genuine second
+                            // free, so under a clone-on-share manager the retain
+                            // must CLONE — mirroring the non-boxed `.persistent`
+                            // path (`shareAnyPersistent`). A `.persistent`
+                            // retain on a box that is neither (a transient
+                            // borrowed dispatch/call receiver consumed in place,
+                            // its scope-exit drop suppressed) stays a plain
+                            // `.protocol_box_retain`; cloning it would leak.
                             const box_kind: ir.RetainKind = switch (ret.kind) {
-                                .persistent => if (self.binding_targets.contains(ret.value))
+                                .persistent => if (self.binding_targets.contains(ret.value) or
+                                    self.move_consumed.contains(ret.value))
                                     .protocol_box_share
                                 else
                                     .protocol_box_retain,
@@ -2670,7 +2761,7 @@ fn rewriteProtocolBoxReleasesInStream(
 
     var walker = ExplicitInstructionWalker.init(allocator);
     defer walker.deinit();
-    var ctx = Ctx{ .function = function, .binding_targets = binding_targets };
+    var ctx = Ctx{ .function = function, .binding_targets = binding_targets, .move_consumed = move_consumed };
     _ = try walker.walkStream(stream, &ctx, Ctx.visit);
 }
 

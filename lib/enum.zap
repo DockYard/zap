@@ -745,7 +745,7 @@ pub struct Enum {
 
   fn take_next(state :: unique Enumerable(element), count :: i64, accumulator :: [element]) -> [element] {
     if count <= 0 {
-      List.reverse(accumulator)
+      dispose_and_return(state, List.reverse(accumulator))
     } else {
       case Enumerable.next(state) {
         {:done, _, _} -> List.reverse(accumulator)
