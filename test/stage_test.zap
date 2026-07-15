@@ -83,6 +83,43 @@ pub impl Stage(i64, i64) for FallibleStage {
   }
 }
 
+# A stage that PANICS if the driver ever calls `step` after it returned
+# `:halt`, or calls `flush` more than once. Threaded through the pull driver on
+# both the natural-end and early-consumer paths, it turns the "no step after
+# halt, exactly one flush" contract into a checkable runtime property.
+pub struct ContractStage {
+  halted :: Bool
+  flushed :: Bool
+  limit :: i64
+  seen :: i64
+}
+
+pub impl Stage(i64, i64) for ContractStage {
+  pub fn step(stage :: unique ContractStage, item :: i64) -> {Atom, [i64], ContractStage} {
+    ContractStage.decide(stage.halted, stage.flushed, stage.limit, stage.seen, item)
+  }
+
+  pub fn flush(stage :: unique ContractStage) -> [i64] {
+    if stage.flushed {
+      panic("ContractStage flushed twice")
+    } else {
+      ([] :: [i64])
+    }
+  }
+
+  fn decide(halted :: Bool, flushed :: Bool, limit :: i64, seen :: i64, item :: i64) -> {Atom, [i64], ContractStage} {
+    if halted {
+      panic("ContractStage stepped after halt")
+    } else {
+      if seen + 1 >= limit {
+        {:halt, [item], %ContractStage{halted: true, flushed: flushed, limit: limit, seen: seen + 1}}
+      } else {
+        {:cont, [item], %ContractStage{halted: false, flushed: flushed, limit: limit, seen: seen + 1}}
+      }
+    }
+  }
+}
+
 pub struct StageTest {
   use Zest.Case
 
@@ -157,6 +194,20 @@ pub struct StageTest {
       assert(List.head(result) == 1)
       assert(List.at(result, 1) == 2)
       assert(List.last(result) == -777)
+    }
+  }
+
+  describe("driver honours the stage contract") {
+    test("no step after halt and exactly one flush on the natural drive") {
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], %ContractStage{halted: false, flushed: false, limit: 3, seen: 0}))
+      assert(List.length(result) == 3)
+      assert(List.last(result) == 3)
+    }
+
+    test("no step after halt when an early consumer stops the drive") {
+      result = Enum.take(Stream.transform([1, 2, 3, 4, 5], %ContractStage{halted: false, flushed: false, limit: 10, seen: 0}), 2)
+      assert(List.length(result) == 2)
+      assert(List.last(result) == 2)
     }
   }
 

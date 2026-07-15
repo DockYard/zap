@@ -98,7 +98,9 @@ pub struct Stream {
 
   @doc = """
     Lazily yields at most the first `count` elements, then stops — pulling no
-    more from the source than needed.
+    more from the source than needed. A `count` of zero or less yields the
+    empty stream and pulls nothing at all from the source: the source is
+    released without a single element being demanded.
 
     ## Example
 
@@ -107,7 +109,11 @@ pub struct Stream {
     """
 
   pub fn take(source :: unique Enumerable(element), count :: i64) -> Transform(element, element) {
-    Stream.transform(source, %TakeStage(element){count: count})
+    if count <= 0 {
+      Stream.empty_take(source)
+    } else {
+      Stream.transform(source, %TakeStage(element){count: count})
+    }
   }
 
   @doc = """
@@ -238,5 +244,10 @@ pub struct Stream {
     } else {
       count
     }
+  }
+
+  fn empty_take(source :: unique Enumerable(element)) -> Transform(element, element) {
+    Enumerable.dispose(source)
+    %Transform(element, element){source: ([] :: [element]), stage: %EmptyStage(element, element){}, pending: ([] :: [element])}
   }
 }
