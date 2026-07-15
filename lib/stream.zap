@@ -238,6 +238,47 @@ pub struct Stream {
     %Unfold(accumulator, element){seed: initial, generator: generator}
   }
 
+  @doc = """
+    Lazily pairs `left` and `right` element-wise, yielding `{a, b}` tuples. The
+    zip ends as soon as EITHER source is exhausted; the still-live source is
+    then disposed exactly once (the early-termination discipline), so no
+    iteration state is stranded.
+
+    ## Example
+
+        Stream.zip([1, 2, 3], ["a", "b", "c"]) |> Enum.to_list()
+        # => [{1, "a"}, {2, "b"}, {3, "c"}]
+    """
+
+  pub fn zip(left :: unique Enumerable(a), right :: unique Enumerable(b)) -> Zip(a, b) {
+    %Zip(a, b){left: left, right: right}
+  }
+
+  @doc = """
+    Fuses two stages into one: `compose(first, second)` is the `Stage(a, c)`
+    that feeds every output of `first` through `second`. It threads `first`'s
+    intermediate `b` outputs through `second.step` in order, propagates an early
+    halt from either inner stage, and on `flush` drains a buffering `first`
+    (such as `chunk_every`) into `second` before `second` completes.
+
+    Composition lives in `Stream` — the struct namespace built on the `Stage`
+    protocol, mirroring how `Enum` hosts the free functions over `Enumerable` —
+    because a protocol name cannot itself host a namespace function (`Stage.x`
+    resolves through protocol dispatch on `x`'s receiver, never to a static
+    function).
+
+    ## Example
+
+        doubler = %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * value }}
+        big = %FilterStage(i64){predicate: fn(value :: i64) -> Bool { value > 4 }}
+        Stream.transform([1, 2, 3, 4], Stream.compose(doubler, big)) |> Enum.to_list()
+        # => [9, 16]
+    """
+
+  pub fn compose(first :: unique Stage(a, b), second :: unique Stage(b, c)) -> ComposeStage(a, b, c) {
+    %ComposeStage(a, b, c){first: first, second: second, second_halted: false}
+  }
+
   fn check_chunk_size(count :: i64) -> i64 {
     if count < 1 {
       panic("Stream.chunk_every/2 requires a chunk size of at least 1, got " <> Integer.to_string(count))

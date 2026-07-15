@@ -493,4 +493,98 @@ pub struct StreamTest {
       assert(List.last(result) == 3)
     }
   }
+
+  describe("zip") {
+    test("equal-length sources pair element-wise") {
+      result = Enum.to_list(Stream.zip([1, 2, 3], [10, 20, 30]))
+      assert(List.length(result) == 3)
+      first_ok = case List.head(result) { {left, right} -> left == 1 and right == 10 }
+      last_ok = case List.last(result) { {left, right} -> left == 3 and right == 30 }
+      assert(first_ok)
+      assert(last_ok)
+    }
+
+    test("a shorter left source ends the zip at the left's length") {
+      result = Enum.to_list(Stream.zip([1, 2], [10, 20, 30]))
+      assert(List.length(result) == 2)
+      last_ok = case List.last(result) { {left, right} -> left == 2 and right == 20 }
+      assert(last_ok)
+    }
+
+    test("a shorter right source ends the zip at the right's length") {
+      result = Enum.to_list(Stream.zip([1, 2, 3], [10, 20]))
+      assert(List.length(result) == 2)
+      last_ok = case List.last(result) { {left, right} -> left == 2 and right == 20 }
+      assert(last_ok)
+    }
+
+    test("an empty left source yields nothing") {
+      result = Enum.to_list(Stream.zip(([] :: [i64]), [10, 20]))
+      assert(List.length(result) == 0)
+    }
+
+    test("an empty right source yields nothing") {
+      result = Enum.to_list(Stream.zip([1, 2], ([] :: [i64])))
+      assert(List.length(result) == 0)
+    }
+
+    test("zip can pair different element types") {
+      result = Enum.to_list(Stream.zip([1, 2, 3], ["a", "b", "c"]))
+      assert(List.length(result) == 3)
+      first_ok = case List.head(result) { {index, label} -> index == 1 and label == "a" }
+      assert(first_ok)
+    }
+
+    test("zip then take pulls exactly the requested pairs from both sources") {
+      result = Enum.take(Stream.zip(%CountingSource{next_value: 1, budget: 2}, %CountingSource{next_value: 100, budget: 2}), 2)
+      assert(List.length(result) == 2)
+      first_ok = case List.head(result) { {left, right} -> left == 1 and right == 100 }
+      last_ok = case List.last(result) { {left, right} -> left == 2 and right == 101 }
+      assert(first_ok)
+      assert(last_ok)
+    }
+  }
+
+  describe("zip disposes both sources exactly once") {
+    test("a completed String zip is leak-free") {
+      assert_no_leaks {
+        result = Enum.to_list(Stream.zip(["a", "b", "c"], ["x", "y", "z"]))
+        assert(List.length(result) == 3)
+        last_ok = case List.last(result) { {left, right} -> left == "c" and right == "z" }
+        assert(last_ok)
+      }
+    }
+
+    test("a left-terminated zip disposes the still-live right source leak-free") {
+      assert_no_leaks {
+        result = Enum.to_list(Stream.zip(["a", "b"], ["x", "y", "z"]))
+        assert(List.length(result) == 2)
+      }
+    }
+
+    test("a right-terminated zip disposes the still-live left source and drops the pulled value leak-free") {
+      assert_no_leaks {
+        result = Enum.to_list(Stream.zip(["a", "b", "c"], ["x", "y"]))
+        assert(List.length(result) == 2)
+      }
+    }
+
+    test("zip then an early take disposes both sources leak-free") {
+      assert_no_leaks {
+        taken = Enum.take(Stream.zip(["a", "b", "c"], ["x", "y", "z"]), 1)
+        assert(List.length(taken) == 1)
+        head_ok = case List.head(taken) { {left, right} -> left == "a" and right == "x" }
+        assert(head_ok)
+      }
+    }
+
+    test("a String zip driven to completion is fault-free under both managers") {
+      assert_no_memory_faults {
+        result = Enum.to_list(Stream.zip(["one", "two"], ["uno", "dos"]))
+        assert(List.length(result) == 2)
+        last_ok = case List.last(result) { {left, right} -> left == "two" and right == "dos" }
+        assert(last_ok)
+      }
+    }
+  }
 }

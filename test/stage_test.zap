@@ -246,6 +246,87 @@ pub struct StageTest {
     }
   }
 
+  describe("Stream.compose fuses two stages") {
+    test("compose(map, filter) equals filter after map") {
+      composed = Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * value }}, %FilterStage(i64){predicate: fn(value :: i64) -> Bool { value > 4 }})
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4], composed))
+      assert(List.length(result) == 2)
+      assert(List.head(result) == 9)
+      assert(List.last(result) == 16)
+    }
+
+    test("compose drains a buffering first (chunk_every) into second on flush") {
+      composed = Stream.compose(%ChunkEveryStage(i64){count: 2, buffer: ([] :: [i64])}, %MapStage([i64], i64){callback: fn(chunk :: [i64]) -> i64 { List.length(chunk) }})
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], composed))
+      assert(List.length(result) == 3)
+      assert(List.head(result) == 2)
+      assert(List.last(result) == 1)
+    }
+
+    test("compose a length-prefixed framer with a decoder stage") {
+      decoder = %MapStage(Result(String, FramingError), i64){callback: fn(frame :: Result(String, FramingError)) -> i64 { StageTest.decode_frame_length(frame) }}
+      composed = Stream.compose(Framer.length_prefixed(2, 1024), decoder)
+      wire = length_prefixed_frame("abc") <> length_prefixed_frame("de")
+      result = Enum.to_list(Stream.transform([wire], composed))
+      assert(List.length(result) == 2)
+      assert(List.head(result) == 3)
+      assert(List.last(result) == 2)
+    }
+
+    test("a halt in the first stage propagates through the composite") {
+      composed = Stream.compose(%TakeStage(i64){count: 2}, %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 100 }})
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], composed))
+      assert(List.length(result) == 2)
+      assert(List.head(result) == 101)
+      assert(List.last(result) == 102)
+    }
+
+    test("a halt in the second stage propagates through the composite") {
+      composed = Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 100 }}, %TakeStage(i64){count: 2})
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], composed))
+      assert(List.length(result) == 2)
+      assert(List.head(result) == 101)
+      assert(List.last(result) == 102)
+    }
+
+    test("compose is associative on a three-stage pipeline") {
+      left_nested = Stream.compose(Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 1 }}, %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * 2 }}), %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value - 3 }})
+      right_nested = Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 1 }}, Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * 2 }}, %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value - 3 }}))
+      result_left = Enum.to_list(Stream.transform([1, 2, 3], left_nested))
+      result_right = Enum.to_list(Stream.transform([1, 2, 3], right_nested))
+      assert(List.length(result_left) == 3)
+      assert(List.length(result_right) == 3)
+      assert(List.head(result_left) == 1)
+      assert(List.head(result_right) == 1)
+      assert(List.last(result_left) == 5)
+      assert(List.last(result_right) == 5)
+    }
+
+    test("a composed String pipeline halted early is leak-free") {
+      assert_no_leaks {
+        composed = Stream.compose(%MapStage(String, String){callback: fn(value :: String) -> String { value <> "!" }}, %TakeStage(String){count: 2})
+        result = Enum.to_list(Stream.transform(["a", "b", "c", "d"], composed))
+        assert(List.length(result) == 2)
+        assert(List.head(result) == "a!")
+        assert(List.last(result) == "b!")
+      }
+    }
+  }
+
+  # Build a 2-byte big-endian length-prefixed frame for the framer-compose test.
+  fn length_prefixed_frame(payload :: String) -> String {
+    length = String.length(payload)
+    String.from_byte(length / 256) <> String.from_byte(length) <> payload
+  }
+
+  # Decode a framed Result into its payload length, or -1 on a framing error.
+  fn decode_frame_length(frame :: Result(String, FramingError)) -> i64 {
+    case frame {
+      Result.Ok(payload) -> String.length(payload)
+      Result.Error(_error) -> -1
+    }
+  }
+
   fn count_marker(values :: [i64], marker :: i64) -> i64 {
     List.reduce(values, 0, fn(total :: i64, value :: i64) -> i64 {
       if value == marker { total + 1 } else { total }
