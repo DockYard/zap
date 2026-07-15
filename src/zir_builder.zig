@@ -2674,15 +2674,42 @@ pub const ZirDriver = struct {
     /// Convert a type_def name to its emission-namespace form (dots →
     /// underscores) and classify against the current emission. Writes
     /// into `scratch` to avoid a heap allocation on the hot path.
+    ///
+    /// Nesting is keyed on the ORIGINAL name carrying a dot. A dotted name
+    /// (`Owner.Child`) denotes a declaration that lives INSIDE its parent's
+    /// namespace — emitted as a `pub const Child = …` inside the parent's
+    /// ZIR (`.nested`). A dot-free name is always a TOP-LEVEL module: a
+    /// concrete struct or a monomorph specialization (`M2_i64_String`,
+    /// `Option_i64`), emitted as its own file by Steps 3 / 3.5 / 3.6 and
+    /// reached via `@import`. This mirrors the dot-based nested/top-level
+    /// split those emission steps already apply (`indexOf(name, ".")`).
+    ///
+    /// Crucially, a dot-free sibling that merely shares the primary's
+    /// underscore prefix (`M2_i64_String` while emitting the parametric
+    /// head `M2`, which is a struct module because it publishes the
+    /// force-specialized impl method `M2_step__i64_String__2`) must NOT be
+    /// classified `.nested`: nesting it emits a DUPLICATE nominal type
+    /// (`M2.M2_i64_String`) distinct from the sibling's own top-level
+    /// module. A boxed parametric-target impl imports the top-level module
+    /// for its cell while the specialized method's receiver would bind to
+    /// the nested duplicate — a nominal `expected 'M2.M2_i64_String', found
+    /// 'M2_i64_String'` mismatch in the synthesized vtable adapter.
+    /// Treating such a sibling as `.foreign` routes both seams through the
+    /// single canonical `@import("M2_i64_String")` type.
     fn classifyTypeDef(name: []const u8, current_struct: []const u8, scratch: []u8) TypeDefClass {
         if (name.len > scratch.len) return .foreign;
         @memcpy(scratch[0..name.len], name);
+        var has_dot = false;
         for (scratch[0..name.len]) |*ch| {
-            if (ch.* == '.') ch.* = '_';
+            if (ch.* == '.') {
+                ch.* = '_';
+                has_dot = true;
+            }
         }
         const underscore = scratch[0..name.len];
         if (std.mem.eql(u8, underscore, current_struct)) return .primary;
-        if (underscore.len > current_struct.len + 1 and
+        if (has_dot and
+            underscore.len > current_struct.len + 1 and
             std.mem.startsWith(u8, underscore, current_struct) and
             underscore[current_struct.len] == '_')
         {

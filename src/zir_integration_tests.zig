@@ -3950,6 +3950,74 @@ test "CLI script flags: -Dmemory runs under each stdlib manager" {
     }
 }
 
+// A parametric struct implementing a MULTI-parameter protocol, genuinely
+// boxed (passed to a helper whose param is `unique Stage(...)`) and
+// dispatched through the synthesized existential vtable, must run leak-free
+// under `Memory.Tracking`. The boxed inner carries an ARC-managed closure
+// field, so this exercises the vtable `__drop__`/release path on the
+// per-instantiation monomorph cell — the same seam the classifyTypeDef
+// dot-based nested/top-level fix routes through the single canonical
+// `@import("Mapper_i64_String")` type. Pre-fix this program did not even
+// compile (nominal `expected 'Mapper.Mapper_i64_String', found
+// 'Mapper_i64_String'` in the adapter). A surviving allocation prints a
+// `LEAK: ptr=…` line to stderr at exit (see `lib/memory/tracking.zap`), so
+// leak-freedom is a clean exit AND no `LEAK:` survivor line — a
+// process-exit assertion that cannot be expressed from Zap. Value
+// correctness lives in the Zap suite
+// (`test/zap/parametric_multiparam_protocol_box_test.zap`).
+test "boxed parametric multi-param protocol stage: leak-free under Memory.Tracking" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "stage_leak.zap",
+        \\pub protocol Stage(input, output) {
+        \\  fn step(x :: unique Stage(input, output), item :: input) -> {Atom, [output], Stage(input, output)}
+        \\  fn flush(x :: unique Stage(input, output)) -> {Atom, [output]}
+        \\}
+        \\
+        \\pub struct Mapper(input, output) {
+        \\  transform :: fn(input) -> output
+        \\}
+        \\
+        \\pub impl Stage(input, output) for Mapper(input, output) {
+        \\  pub fn step(x :: unique Mapper(input, output), item :: input) -> {Atom, [output], Mapper(input, output)} {
+        \\    {:cont, [x.transform(item)], x}
+        \\  }
+        \\  pub fn flush(x :: unique Mapper(input, output)) -> {Atom, [output]} {
+        \\    {:done, ([] :: [output])}
+        \\  }
+        \\}
+        \\
+        \\pub struct Driver {
+        \\  pub fn drive(stage :: unique Stage(i64, String), first :: i64, second :: i64) -> String {
+        \\    case Stage.step(stage, first) {
+        \\      {_c1, o1, n1} ->
+        \\        case Stage.step(n1, second) {
+        \\          {_c2, o2, n2} ->
+        \\            case Stage.flush(n2) {
+        \\              {_da, o3} -> List.head((o1 <> o2) <> o3)
+        \\            }
+        \\        }
+        \\    }
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  stage = %Mapper(i64, String){transform: fn(v :: i64) -> String { Integer.to_string(v) <> "!" }}
+        \\  result = Driver.drive(stage, 1, 2)
+        \\  IO.puts("stage-leak-ok=" <> result)
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "stage-leak-ok=1!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "LEAK:") == null);
+    try expectOnlyScriptInDir(&tmp_dir, "stage_leak.zap");
+}
+
 test "CLI script flags: default (no -Dmemory) runs with Memory.ARC" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
