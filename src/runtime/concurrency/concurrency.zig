@@ -185,6 +185,8 @@ pub const mailbox = @import("mailbox.zig");
 pub const signal = @import("signal.zig");
 pub const registry = @import("registry.zig");
 pub const blob = @import("blob.zig");
+pub const socket_table = @import("socket_table.zig");
+pub const socket_io = @import("socket_io.zig");
 pub const envelope_pool = @import("envelope_pool.zig");
 pub const timing_wheel = @import("timing_wheel.zig");
 pub const scheduler = @import("scheduler.zig");
@@ -215,6 +217,10 @@ pub const SignalRuntime = signal.SignalRuntime;
 pub const BlobDomain = blob.BlobDomain;
 pub const BlobHandle = blob.BlobHandle;
 pub const BlobLedger = blob.BlobLedger;
+pub const SocketDomain = socket_table.SocketDomain;
+pub const SocketHandle = socket_table.SocketHandle;
+pub const SocketLedger = socket_table.SocketLedger;
+pub const SocketKind = socket_table.SocketKind;
 pub const ProcessRegistry = registry.ProcessRegistry;
 pub const RegistryLiveness = registry.Liveness;
 pub const RegisterOutcome = registry.RegisterOutcome;
@@ -282,6 +288,13 @@ test {
     // registry — THE one sanctioned cross-process share (research.md §6.4
     // regime 2). Its cross-thread stress is the atomic tier's TSan proof.
     _ = blob;
+    // Phase S0: the socket domain — the FOURTH kernel-owned allocation
+    // domain (single-owner, move-only generational handles) + the
+    // per-process socket ledger (`docs/socket-implementation-plan.md`).
+    _ = socket_table;
+    // Phase S0: the portable `std.Io.net` socket-syscall seam (a real
+    // loopback listen/connect/close runs in its tests).
+    _ = socket_io;
     _ = envelope_pool;
     _ = timing_wheel;
     _ = scheduler;

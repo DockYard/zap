@@ -62,6 +62,17 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("zap_active_manager", .{
         .root_source_file = b.path("src/zap_active_manager_stub.zig"),
     });
+    // Phase S0: `runtime.zig`'s `Socket` namespace imports the socket domain
+    // and I/O seam by name (they are registered as sibling struct-source
+    // modules of `zap_runtime` for user binaries — `src/zir_backend.zig`).
+    // The host `zig build test` flow compiles `runtime.zig` as part of the
+    // `zap` module, so provide the same modules here from the real files.
+    mod.addAnonymousImport("zap_socket_table", .{
+        .root_source_file = b.path("src/runtime/concurrency/socket_table.zig"),
+    });
+    mod.addAnonymousImport("zap_socket_io", .{
+        .root_source_file = b.path("src/runtime/concurrency/socket_io.zig"),
+    });
     // -----------------------------------------------------------------------
     // Setup step: download pre-built deps
     // -----------------------------------------------------------------------

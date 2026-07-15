@@ -16,6 +16,14 @@ const progress_mod = @import("progress.zig");
 const zap_symbol_table = @import("zap_symbol_table.zig");
 const diagnostics = @import("diagnostics.zig");
 
+// Phase S0: the socket domain + I/O seam, embedded here so they can be
+// registered as sibling struct-source modules of `zap_runtime` (the
+// always-linked runtime's `Socket` namespace imports them by name). They are
+// self-contained (std only) so they stage cleanly; the concurrency kernel
+// compiles the SAME source files into its own object gate-ON.
+const socket_table_source = @embedFile("runtime/concurrency/socket_table.zig");
+const socket_io_source = @embedFile("runtime/concurrency/socket_io.zig");
+
 // ---------------------------------------------------------------------------
 // Extern declarations for the C-ABI functions in libzig_compiler.a
 // ---------------------------------------------------------------------------
@@ -702,6 +710,32 @@ pub fn createContext(allocator: std.mem.Allocator, options: CompileOptions) Comp
     // Register embedded runtime source if provided.
     if (options.runtime_source) |source| {
         if (zir_compilation_add_struct_source(ctx, "zap_runtime", source.ptr, @intCast(source.len)) != 0) {
+            zir_compilation_destroy(ctx);
+            return error.CompilationFailed;
+        }
+        // Phase S0: the socket domain + I/O seam as sibling struct-source
+        // modules the runtime's `Socket` namespace imports by NAME
+        // (`@import("zap_socket_table")` / `@import("zap_socket_io")`). Both
+        // are self-contained (std only, no relative imports) so they stage
+        // cleanly alongside the always-linked `zap_runtime`, and they emit
+        // nothing unless a program references `Socket` (byte-identity for
+        // non-socket binaries). Gate-ON the kernel object owns the
+        // authoritative copies; these serve the gate-OFF inline path.
+        if (zir_compilation_add_struct_source(
+            ctx,
+            "zap_socket_table",
+            socket_table_source.ptr,
+            @intCast(socket_table_source.len),
+        ) != 0) {
+            zir_compilation_destroy(ctx);
+            return error.CompilationFailed;
+        }
+        if (zir_compilation_add_struct_source(
+            ctx,
+            "zap_socket_io",
+            socket_io_source.ptr,
+            @intCast(socket_io_source.len),
+        ) != 0) {
             zir_compilation_destroy(ctx);
             return error.CompilationFailed;
         }

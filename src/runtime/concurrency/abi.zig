@@ -162,6 +162,13 @@ pub const ZapProcStatus = struct {
     /// forged/re-typed handle, or a release without a matching acquisition).
     /// The runtime surfaces this as a loud panic, never a silent no-op.
     pub const blob_not_owned: i32 = -6;
+    /// A `zap_socket_*` intrinsic was handed a socket handle the calling
+    /// process does not own (its ledger holds no such handle — a
+    /// use-after-close, a forged handle, or a close of a socket it never
+    /// owned). The runtime surfaces this as a loud panic (the stale-handle
+    /// discipline), never a silent no-op. Distinct from the positive
+    /// `socket_io.Reason` codes `zap_socket_connect`/`listen` return.
+    pub const socket_not_owned: i32 = -7;
 };
 
 /// The C-ABI process entry shape `zap_proc_spawn` accepts. `process` is
@@ -717,6 +724,18 @@ const RuntimeState = struct {
     /// `zap_proc_runtime_deinit` (its `deinit` releases the registry's
     /// references and asserts zero live blobs).
     blob_domain: concurrency.BlobDomain,
+    /// The `Socket` allocation domain (Phase S0, `socket_table.zig`): the
+    /// FOURTH kernel-owned allocation domain — single-owner, move-only
+    /// generational socket handles mapping to `{fd, owner, kind, state}`.
+    /// Owned by the runtime (socket state belongs to NEITHER process's
+    /// manager — the third-allocation-domain discipline, applied a fourth
+    /// time), reached by the `zap_socket_*` bridge below, and torn down
+    /// leak-exactly at `zap_proc_runtime_deinit` (its `deinit` asserts zero
+    /// open sockets — every process's socket ledger closed/drained first).
+    /// Unlike `blob_domain` it is NOT shared through `Scheduler.Options`:
+    /// the teardown sweep destructor reaches it through this global, and
+    /// standalone kernel schedulers never open sockets.
+    socket_domain: concurrency.SocketDomain,
     /// The per-spawn manager registry (plan item 3.1/3.3, P3-J3): core
     /// vtables indexed by manager id. Slot 0 is the manifest default (bound by
     /// `zap_proc_bind_manager`); slots 1.. are the distinct `spawn(f, .{
@@ -817,6 +836,21 @@ fn readSeededSchedulerCoreCount() usize {
     const text = std.mem.sliceTo(raw, 0);
     const parsed = std.fmt.parseInt(usize, text, 10) catch return default_core_count;
     return @max(parsed, 1);
+}
+
+/// Read `ZAP_BLOCKING_MAX_THREADS` — the runtime knob for the shared
+/// blocking / dirty-scheduler pool's grow ceiling (Phase S0: the socket
+/// layer's blocking connect/DNS offloads run here). Absent or unparseable
+/// keeps the pool's default (64). Clamped to at least 1.
+fn readBlockingPoolOptions() concurrency.BlockingPool.Options {
+    var options = concurrency.BlockingPool.Options{};
+    if (std.c.getenv("ZAP_BLOCKING_MAX_THREADS")) |raw| {
+        const text = std.mem.sliceTo(raw, 0);
+        if (std.fmt.parseInt(usize, text, 10)) |parsed| {
+            options.max_thread_count = @max(parsed, 1);
+        } else |_| {}
+    }
+    return options;
 }
 
 /// Read `ZAP_DEADLOCK_ACTION` — what the pool does after DETECTING a
@@ -920,6 +954,10 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
         runtime_state.pid_table.deinit();
         return ZapProcStatus.out_of_memory;
     };
+    // Phase S0: the socket domain (infallible init — an empty slot table
+    // that grows on demand). Placed after the blob domain so the cleanup
+    // paths below tear it down in the reverse order they were built.
+    runtime_state.socket_domain = concurrency.SocketDomain.init();
 
     if (readSeededSchedulerSeed()) |seed| {
         // Seeded deterministic M:N backend (P4-J4): a single-threaded,
@@ -938,6 +976,7 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
                 .blob_domain = &runtime_state.blob_domain,
             },
         ) catch {
+            runtime_state.socket_domain.deinit();
             runtime_state.blob_domain.deinit();
             runtime_state.registry.deinit();
             runtime_state.signal_runtime.deinit();
@@ -970,8 +1009,12 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
                     // (default: report to stderr once, keep parking).
                     .deadlock_action = readDeadlockAction(),
                 },
+                // Phase S0: the socket layer's blocking offloads run on this
+                // pool; `ZAP_BLOCKING_MAX_THREADS` tunes its ceiling.
+                .blocking_pool_options = readBlockingPoolOptions(),
             },
         ) catch {
+            runtime_state.socket_domain.deinit();
             runtime_state.blob_domain.deinit();
             runtime_state.registry.deinit();
             runtime_state.signal_runtime.deinit();
@@ -1009,6 +1052,7 @@ fn runtimeInitSeededForTest(seed: u64, core_count: usize) i32 {
         runtime_state.pid_table.deinit();
         return ZapProcStatus.out_of_memory;
     };
+    runtime_state.socket_domain = concurrency.SocketDomain.init();
     const simulator = concurrency.MnSimulator.create(
         backing_allocator,
         &runtime_state.pid_table,
@@ -1021,6 +1065,7 @@ fn runtimeInitSeededForTest(seed: u64, core_count: usize) i32 {
             .blob_domain = &runtime_state.blob_domain,
         },
     ) catch {
+        runtime_state.socket_domain.deinit();
         runtime_state.blob_domain.deinit();
         runtime_state.registry.deinit();
         runtime_state.signal_runtime.deinit();
@@ -1098,6 +1143,12 @@ export fn zap_proc_runtime_deinit() callconv(.c) void {
     // registration is live — `deinit` asserts that (the leak oracle) and frees
     // the slot storage.
     runtime_state.registry.deinit();
+    // Phase S0: every process's socket ledger closed/drained its fds at
+    // teardown (the `socket_sweep_node` drop-list destructor, which runs on
+    // every exit path), so no socket is still open — `deinit` asserts ZERO
+    // open sockets (the socket tier's leak-exactness oracle) and frees the
+    // slot-table segments. Placed before the blob domain (reverse of init).
+    runtime_state.socket_domain.deinit();
     // Every process's blob ledger drained at its teardown and every in-flight
     // blob envelope was reclaimed by the mailbox drains (both above), so the
     // only remaining references are the persistent-term registry's own —
@@ -2106,6 +2157,227 @@ export fn zap_blob_string_concat(
     };
     out_payload.* = runtime_state.blob_domain.payloadPointer(promoted).?;
     return ZapProcStatus.ok;
+}
+
+// ---------------------------------------------------------------------------
+// The drop-list ABI (Phase S0): expose the process drop-list so external
+// (non-heap) resources — starting with socket fds — can register a
+// destructor that runs on EVERY teardown path (normal exit + kill). The
+// mechanism was built in `process.zig`/`scheduler.zig` but never exposed
+// over the C-ABI (only kernel tests reached it). `registerDropResource` is
+// the generic facility; the socket layer's own sweep node registers through
+// the SAME `ProcessContext.registerDropResource` internally
+// (`ensureSocketSweep`), so both the export and the socket path exercise the
+// one drop-list.
+// ---------------------------------------------------------------------------
+
+/// Register `node` (a `*process.DropListNode`, opaque here) on the calling
+/// process's drop-list. Its `destructor` runs LIFO at process teardown — on
+/// normal exit AND on kill — so an external resource is reclaimed on every
+/// exit path. The node is owned by the resource it destroys; the kernel
+/// never allocates or frees it.
+export fn zap_proc_register_drop_resource(process: *anyopaque, node: *anyopaque) callconv(.c) void {
+    contextFromHandle(process).registerDropResource(@ptrCast(@alignCast(node)));
+}
+
+// ---------------------------------------------------------------------------
+// The `zap_socket_*` surface over `socket_table.zig`'s `SocketDomain` + the
+// per-process `SocketLedger` (Phase S0). Disciplines, mirroring the blob
+// surface:
+//
+//   * **Ownership-gated.** `close` verifies the handle against the caller's
+//     socket ledger first — a socket op on a handle this process does not
+//     own is a program bug surfaced as a sentinel (the runtime panics),
+//     never a racy fd operation. The generation-validated domain slot makes
+//     stale/forged handles memory-safe; the ledger gate upgrades that to
+//     "semantically rejected".
+//   * **Offload-iff-kernel-live (Decision D).** `connect` is a BLOCKING
+//     syscall, so gate-ON it offloads onto the blocking pool
+//     (`ProcessContext.blocking`) — the fiber runs the connect off its core,
+//     freeing the core to run peers, then re-attaches. (Gate-OFF this whole
+//     surface is bypassed; `runtime.zig` calls `socket_io` inline.)
+//   * **Crash-safe fd lifetime.** The process's socket-sweep drop-node is
+//     registered on first `connect` (`ensureSocketSweep`); at teardown it
+//     drains the ledger and closes every still-owned fd.
+// ---------------------------------------------------------------------------
+
+/// The blocking-pool request for an offloaded connect: `outcome` is written
+/// on the pool thread (the fiber's stack stays live off-core) and read back
+/// on the core after re-attach.
+const SocketConnectRequest = struct {
+    ip: [4]u8,
+    port: u16,
+    timeout_ms: i64,
+    outcome: concurrency.socket_io.ConnectOutcome,
+};
+
+/// The blocking trampoline (`BlockingOperation`): runs the connect syscall
+/// off-core through the portable `socket_io` seam. The result rides the
+/// request struct, so the opaque return is unused.
+fn socketConnectBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketConnectRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.connectIp4(request.ip, request.port, request.timeout_ms);
+    return null;
+}
+
+/// The socket-sweep drop-list destructor (registered per process on first
+/// `connect`). Runs at teardown on EVERY exit path: it drains the process's
+/// socket ledger, closing each still-owned fd through the `socket_io` seam,
+/// then frees the ledger storage. Reached from the node via
+/// `@fieldParentPtr` (the node is embedded in the PCB, so this only ever
+/// closes THIS process's sockets — never a sibling that reused a slot).
+fn socketSweepDestructor(node: *process_module.DropListNode) void {
+    const pcb: *process_module.ProcessControlBlock = @fieldParentPtr("socket_sweep_node", node);
+    for (pcb.socket_ledger.ownedHandles()) |handle_bits| {
+        if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |fd| {
+            concurrency.socket_io.closeFd(fd);
+        }
+    }
+    pcb.socket_ledger.releaseStorage();
+}
+
+/// Store a failed op's reason as the calling process's socket last-error
+/// (the errno-style per-process slot `lib/socket.zap` reads in the error
+/// arm), and return the invalid handle (`0`) the surface treats as failure.
+fn socketConnectFailed(context: *concurrency.ProcessContext, reason: concurrency.socket_io.Reason) u64 {
+    context.socketLedger().last_error = @intFromEnum(reason);
+    return concurrency.SocketHandle.invalid.toBits();
+}
+
+/// Connect an IPv4 stream socket to `ip0.ip1.ip2.ip3:port`, offloading the
+/// blocking connect onto the pool (Decision D). Returns the new socket
+/// handle bits on success (a live handle is never `0`), recording ownership
+/// in the caller's socket ledger and ensuring the socket-sweep drop-node is
+/// registered. On failure returns `0` and stores the reason in the process's
+/// socket last-error (read by `zap_socket_last_error`, mapped to a
+/// `SocketError` reason atom by the runtime).
+export fn zap_socket_connect(
+    process: *anyopaque,
+    ip0: u8,
+    ip1: u8,
+    ip2: u8,
+    ip3: u8,
+    port: u16,
+    timeout_ms: i64,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    var request = SocketConnectRequest{
+        .ip = .{ ip0, ip1, ip2, ip3 },
+        .port = port,
+        .timeout_ms = timeout_ms,
+        .outcome = undefined,
+    };
+    // Offload the blocking connect off this process's core (Decision D). On a
+    // runtime with no blocking pool this degrades to inline (documented).
+    _ = context.blocking(socketConnectBlockingTrampoline, &request);
+    if (request.outcome.reason != .ok) return socketConnectFailed(context, request.outcome.reason);
+
+    // A client's local ephemeral port is not tracked in S0 (local_port = 0).
+    const handle = runtime_state.socket_domain.open(
+        request.outcome.fd,
+        context.selfPid().toBits(),
+        0,
+        .plain,
+    ) catch {
+        concurrency.socket_io.closeFd(request.outcome.fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.socketLedger().append(handle.toBits()) catch {
+        if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    // Crash-safe fd lifetime: register the sweep drop-node once per process.
+    context.ensureSocketSweep(socketSweepDestructor);
+    return handle.toBits();
+}
+
+/// Bind + listen an IPv4 stream socket on `ip0.ip1.ip2.ip3:port` (port 0 →
+/// an ephemeral port, discoverable via `zap_socket_local_port`). Returns the
+/// listener handle bits on success (recording ownership + the bound port in
+/// the domain slot + registering the sweep node), `0` on failure (reason in
+/// the process last-error). The S0 minimal listener (for a self-contained
+/// loopback exchange); the distinct `Socket.Listener` type + `accept` are
+/// S1/S3.
+export fn zap_socket_listen(
+    process: *anyopaque,
+    ip0: u8,
+    ip1: u8,
+    ip2: u8,
+    ip3: u8,
+    port: u16,
+    backlog: u32,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    const outcome = concurrency.socket_io.listenIp4(.{ ip0, ip1, ip2, ip3 }, port, @intCast(backlog));
+    if (outcome.reason != .ok) return socketConnectFailed(context, outcome.reason);
+
+    const handle = runtime_state.socket_domain.open(
+        outcome.fd,
+        context.selfPid().toBits(),
+        outcome.bound_port,
+        .plain,
+    ) catch {
+        concurrency.socket_io.closeFd(outcome.fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.socketLedger().append(handle.toBits()) catch {
+        if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.ensureSocketSweep(socketSweepDestructor);
+    return handle.toBits();
+}
+
+/// The local (bound) port of a socket the calling process owns, or `-1`
+/// when the handle is not owned / stale (the runtime turns that into a
+/// use-after-close panic).
+export fn zap_socket_local_port(process: *anyopaque, handle_bits: u64) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const port = runtime_state.socket_domain.localPort(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    return @intCast(port);
+}
+
+/// The calling process's socket last-error reason code (the errno-style slot
+/// set by the most recent failed `connect`/`listen`). Read by
+/// `lib/socket.zap` in the error arm, immediately after a `0` handle, to
+/// build the typed `SocketError`.
+export fn zap_socket_last_error(process: *anyopaque) callconv(.c) i32 {
+    return contextFromHandle(process).socketLedger().last_error;
+}
+
+/// Close a socket the calling process owns: verify ownership, recycle the
+/// domain slot (bumping the generation so every outstanding copy of the
+/// handle goes stale), remove it from the ledger, and close the fd. Returns
+/// `ZapProcStatus.ok`, or `socket_not_owned` when the caller's ledger holds
+/// no such handle (a use-after-close or a close of a socket it never owned —
+/// the runtime panics). `close` is a leaf syscall that does not meaningfully
+/// block for a client socket, so it runs inline (not offloaded).
+export fn zap_socket_close(process: *anyopaque, handle_bits: u64) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return ZapProcStatus.socket_not_owned;
+    const fd = runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return ZapProcStatus.socket_not_owned;
+    _ = context.socketLedger().removeOne(handle_bits);
+    concurrency.socket_io.closeFd(fd);
+    return ZapProcStatus.ok;
+}
+
+/// Whether the calling process owns a LIVE socket named by `handle_bits`
+/// (ledger-owned AND generation-valid). The introspection/test surface for
+/// the stale-handle discipline. Returns 1 (live), 0 (stale/closed/forged).
+export fn zap_socket_is_live(process: *anyopaque, handle_bits: u64) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return 0;
+    return if (runtime_state.socket_domain.isLive(concurrency.SocketHandle.fromBits(handle_bits))) 1 else 0;
+}
+
+/// The number of sockets currently open across the whole runtime (the
+/// socket tier's leak-exactness observability surface — returns to baseline
+/// after every process closes/drains).
+export fn zap_socket_live_count() callconv(.c) i64 {
+    return @intCast(runtime_state.socket_domain.statistics().live_socket_count);
 }
 
 /// Terminate the calling process NORMALLY (reason `normal`, P5-J1): the same

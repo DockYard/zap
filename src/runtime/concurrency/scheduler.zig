@@ -321,6 +321,7 @@ const timing_wheel_module = @import("timing_wheel.zig");
 const signal_module = @import("signal.zig");
 const registry_module = @import("registry.zig");
 const blob_module = @import("blob.zig");
+const socket_table = @import("socket_table.zig");
 const trace_module = @import("trace.zig");
 
 const Pid = pid_table_module.Pid;
@@ -1035,6 +1036,33 @@ pub const ProcessContext = struct {
     /// it and teardown drains it).
     pub fn blobLedger(context: *ProcessContext) *blob_module.BlobLedger {
         return &context.record.pcb.blob_ledger;
+    }
+
+    /// This process's socket-ownership ledger (Phase S0 — owner-only, like
+    /// every PCB field; the `zap_socket_*` intrinsics append/verify/remove
+    /// through it and the socket-sweep drop-list destructor drains it,
+    /// closing every still-owned fd, on every exit path).
+    pub fn socketLedger(context: *ProcessContext) *socket_table.SocketLedger {
+        return &context.record.pcb.socket_ledger;
+    }
+
+    /// Ensure this process's socket-sweep drop-list node is registered
+    /// (idempotent). Called by the socket bridge on the process's first
+    /// `Socket.connect`: it installs `destructor` on the embedded
+    /// `socket_sweep_node` and pushes the node onto the drop-list EXACTLY
+    /// ONCE (re-pushing a linked node would corrupt the list), so teardown
+    /// (normal or kill) runs `destructor`, which drains the socket ledger
+    /// and closes every fd the process still owns. The node lives in the
+    /// PCB (process-local), so a process only ever closes ITS OWN sockets.
+    pub fn ensureSocketSweep(
+        context: *ProcessContext,
+        destructor: *const fn (node: *process_module.DropListNode) void,
+    ) void {
+        const pcb = &context.record.pcb;
+        if (pcb.socket_sweep_registered) return;
+        pcb.socket_sweep_node.destructor = destructor;
+        context.registerDropResource(&pcb.socket_sweep_node);
+        pcb.socket_sweep_registered = true;
     }
 
     /// The shared blob domain this scheduler runs over, or null when the

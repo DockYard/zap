@@ -4004,6 +4004,34 @@ const ZapConcurrencyKernel = struct {
         timeout_nanoseconds: u64,
     ) callconv(.c) i32;
     extern fn zap_proc_dead_letter_unexpected(process: *anyopaque) callconv(.c) noreturn;
+    // Phase S0 — the socket domain bridge (`abi.zig`'s `zap_socket_*` +
+    // the newly-exposed generic drop-list registration). Gate-ON only: the
+    // `Socket` namespace's gate-OFF branch never references these (comptime-
+    // eliminated), so a gate-OFF binary links no kernel (Decision D).
+    extern fn zap_proc_register_drop_resource(process: *anyopaque, node: *anyopaque) callconv(.c) void;
+    extern fn zap_socket_connect(
+        process: *anyopaque,
+        ip0: u8,
+        ip1: u8,
+        ip2: u8,
+        ip3: u8,
+        port: u16,
+        timeout_ms: i64,
+    ) callconv(.c) u64;
+    extern fn zap_socket_listen(
+        process: *anyopaque,
+        ip0: u8,
+        ip1: u8,
+        ip2: u8,
+        ip3: u8,
+        port: u16,
+        backlog: u32,
+    ) callconv(.c) u64;
+    extern fn zap_socket_local_port(process: *anyopaque, handle_bits: u64) callconv(.c) i64;
+    extern fn zap_socket_last_error(process: *anyopaque) callconv(.c) i32;
+    extern fn zap_socket_close(process: *anyopaque, handle_bits: u64) callconv(.c) i32;
+    extern fn zap_socket_is_live(process: *anyopaque, handle_bits: u64) callconv(.c) i32;
+    extern fn zap_socket_live_count() callconv(.c) i64;
     // P6-J4 (plan item 6.4): the receive-back-edge arena auto-reset — emitted
     // by the compiler ONLY at receive sites whose iteration closure it proved
     // (`src/receive_reset.zig`); `hibernate` — the BEAM-analogue idle park
@@ -6804,6 +6832,197 @@ pub const BlobRuntime = struct {
             requireCurrentProcessHandle(),
             @as(u64, key_atom),
         );
+    }
+};
+
+/// `:zig.Socket.*` — the runtime bridge for the Zap socket layer (Phase S0
+/// of `docs/socket-implementation-plan.md`), the `Socket` counterpart to
+/// `BlobRuntime`. It embodies the **offload-iff-kernel-live seam**
+/// (Decision D): each op is ONE runtime primitive with a single comptime
+/// branch, NOT a dual backend.
+///
+///   * **gate-ON** (`runtime_concurrency_active`): route through the
+///     kernel's `zap_socket_*` C-ABI, which offloads the blocking connect
+///     onto the blocking pool (off the process's core), owns the socket in
+///     the fourth kernel domain, and closes fds on every teardown path via
+///     the socket-sweep drop-node.
+///   * **gate-OFF**: run the SAME `socket_io` syscalls inline on the single
+///     OS thread over a runtime-local `SocketDomain` singleton — no kernel,
+///     no process, no ledger (`Socket.close` + OS-at-exit reclaim the fds).
+///
+/// The semantics are identical across the branch (a blocking call returning
+/// the same result); only the parking substrate differs. The `socket_io`
+/// and `socket_table` imports are SCOPED INSIDE this struct so a program
+/// that never touches `:zig.Socket.*` never analyzes or emits any of it —
+/// preserving gate-OFF byte-identity for non-socket programs (Zig 0.16 does
+/// not elide top-level imports, but a `pub const` namespace and its
+/// container-scoped imports are analyzed only when referenced).
+pub const Socket = struct {
+    // Registered as sibling struct-source modules by `zir_backend.zig`
+    // alongside `zap_runtime` (like `zap_active_manager`): the always-linked
+    // runtime cannot `@import` sibling FILES (a staged `zap_runtime.zig`
+    // cannot resolve a relative path), so the socket domain + I/O seam are
+    // provided by NAME. They compile into the runtime module ONLY when a
+    // program references `Socket` (this whole namespace is analyzed lazily),
+    // so non-socket gate-OFF binaries stay byte-identical. Gate-ON the
+    // kernel object owns the authoritative copies; here the gate-OFF branch
+    // uses these — one source, two link contexts, no dual backend.
+    const socket_table = @import("zap_socket_table");
+    const socket_io = @import("zap_socket_io");
+
+    // Gate-OFF singletons — instantiated only in a gate-OFF program that
+    // actually opens a socket. `SocketDomain` is the fourth-domain slot
+    // table (single-owner, generation-validated); `gate_off_last_error` is
+    // the errno-style last-failure slot (single OS thread gate-OFF, so a
+    // plain global is race-free — the gate-ON path uses the per-process
+    // ledger slot instead).
+    var gate_off_domain: socket_table.SocketDomain = undefined;
+    var gate_off_domain_ready: bool = false;
+    var gate_off_last_error: i32 = 0;
+
+    fn gateOffDomain() *socket_table.SocketDomain {
+        if (!gate_off_domain_ready) {
+            gate_off_domain = socket_table.SocketDomain.init();
+            gate_off_domain_ready = true;
+        }
+        return &gate_off_domain;
+    }
+
+    /// `Socket.connect`: connect an IPv4 stream socket to
+    /// `a.b.c.d:port`, bounded by `timeout_ms` (Decision E — accepted for
+    /// API shape; enforced by poll-quantum in S1, §6.1). Returns the socket
+    /// handle bits (a live handle is never `0`), or `0` on failure with the
+    /// reason recorded in the process last-error (`Socket.last_error`).
+    pub fn connect(a: i64, b: i64, c: i64, d: i64, port: i64, timeout_ms: i64) u64 {
+        const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
+        const port16: u16 = @intCast(port);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_connect(
+                requireCurrentProcessHandle(),
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                port16,
+                timeout_ms,
+            );
+        } else {
+            const outcome = socket_io.connectIp4(ip, port16, timeout_ms);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, 0, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
+    /// `Socket.listen`: bind + listen an IPv4 stream socket on `a.b.c.d:port`
+    /// (port 0 → an ephemeral port, discoverable via `Socket.local_port`).
+    /// The S0 minimal listener. Returns the handle bits, or `0` on failure
+    /// (reason in the process last-error).
+    pub fn listen(a: i64, b: i64, c: i64, d: i64, port: i64, backlog: i64) u64 {
+        const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
+        const port16: u16 = @intCast(port);
+        const backlog32: u32 = @intCast(backlog);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_listen(
+                requireCurrentProcessHandle(),
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                port16,
+                backlog32,
+            );
+        } else {
+            const outcome = socket_io.listenIp4(ip, port16, @intCast(backlog32));
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, outcome.bound_port, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
+    /// `Socket.local_port`: the local (bound) port of a socket this program
+    /// owns. Panics on a closed/stale handle.
+    pub fn local_port(handle_bits: u64) i64 {
+        if (comptime runtime_concurrency_active) {
+            const port = ZapConcurrencyKernel.zap_socket_local_port(requireCurrentProcessHandle(), handle_bits);
+            if (port < 0) @panic("zap: Socket.local_port on a closed or stale Socket handle");
+            return port;
+        } else {
+            const port = gateOffDomain().localPort(socket_table.SocketHandle.fromBits(handle_bits)) orelse
+                @panic("zap: Socket.local_port on a closed or stale Socket handle");
+            return @intCast(port);
+        }
+    }
+
+    /// `Socket.last_error`: the reason code of this program's most recent
+    /// failed `connect`/`listen` (an errno-style slot; read in the error arm
+    /// immediately after a `0` handle). `lib/socket.zap` maps the code to a
+    /// matchable `SocketError` reason atom.
+    pub fn last_error() i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_last_error(requireCurrentProcessHandle());
+        } else {
+            return gate_off_last_error;
+        }
+    }
+
+    /// `Socket.close`: close a socket this program owns — recycles the
+    /// domain slot (so every outstanding copy of the handle goes stale) and
+    /// closes the fd. Panics on a closed/stale handle (use-after-close).
+    pub fn close(handle_bits: u64) bool {
+        if (comptime runtime_concurrency_active) {
+            const status = ZapConcurrencyKernel.zap_socket_close(requireCurrentProcessHandle(), handle_bits);
+            if (status != 0) @panic(
+                "zap: Socket.close of a socket this process does not own (a closed or stale Socket handle)",
+            );
+            return true;
+        } else {
+            const fd = gateOffDomain().close(socket_table.SocketHandle.fromBits(handle_bits)) orelse
+                @panic("zap: Socket.close of a closed or stale Socket handle");
+            socket_io.closeFd(fd);
+            return true;
+        }
+    }
+
+    /// `Socket.is_live?`: whether `handle_bits` still names an open socket
+    /// this program owns (the stale-handle test surface). Never panics.
+    pub fn is_live(handle_bits: u64) bool {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_is_live(requireCurrentProcessHandle(), handle_bits) != 0;
+        } else {
+            return gateOffDomain().isLive(socket_table.SocketHandle.fromBits(handle_bits));
+        }
+    }
+
+    /// `Socket.live_count`: open sockets across the whole runtime (the
+    /// socket tier's leak-exactness observability surface).
+    pub fn live_count() i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_live_count();
+        } else {
+            return @intCast(gateOffDomain().statistics().live_socket_count);
+        }
+    }
+
+    /// Narrow a Zap `i64` address octet to a byte, panicking on an
+    /// out-of-range value (a malformed `Socket.Address` is a program bug).
+    fn octet(value: i64) u8 {
+        if (value < 0 or value > 255) @panic("zap: Socket address octet out of range (0-255)");
+        return @intCast(value);
     }
 };
 

@@ -93,6 +93,7 @@ const pid_table = @import("pid_table.zig");
 const mailbox_module = @import("mailbox.zig");
 const signal_module = @import("signal.zig");
 const blob_module = @import("blob.zig");
+const socket_table = @import("socket_table.zig");
 
 /// Process identifier — the generational pid of `pid_table.zig` (plan
 /// Phase 1 item 1.2, locked design decision 4): `{slot, generation,
@@ -287,6 +288,18 @@ pub fn defaultIterationHeapReset(manager_state: ?*anyopaque) void {
     _ = manager_state;
 }
 
+/// Placeholder destructor for a PCB's `socket_sweep_node` before the socket
+/// bridge installs the real one (`abi.zig`). The node is NEVER pushed onto
+/// the drop-list while this placeholder is installed — the bridge sets the
+/// real destructor AND registers the node in the same step, and clears the
+/// flag on `init` — so reaching here means the drop-list ran an
+/// unregistered node, a kernel bug.
+fn unregisteredSocketSweepDestructor(node: *DropListNode) void {
+    @branchHint(.cold);
+    _ = node;
+    @panic("socket_sweep_node destructor ran before the socket bridge installed it — kernel bug");
+}
+
 /// A process's manager binding: opaque per-process manager state plus the
 /// dispatch vtable (the plan §3 "manager context" PCB field; the plan
 /// A.2.5 monomorphized hot paths bypass this vtable — it serves cold
@@ -393,6 +406,30 @@ pub const ProcessControlBlock = struct {
     /// the drop-list discipline (research.md §6.5) applied to the one
     /// sanctioned share tier.
     blob_ledger: blob_module.BlobLedger,
+    /// The per-process ledger of owned `Socket` handles (Phase S0,
+    /// `socket_table.zig`): one entry per open socket this process owns.
+    /// Owner-only like `drop_list_head`. Unlike `blob_ledger` (atomic
+    /// refcount), sockets are single-owner and move-only, so teardown must
+    /// CLOSE each still-owned fd — the `socket_sweep_node` drop-list
+    /// destructor (registered at the process's first `Socket.connect`, so
+    /// it runs on EVERY exit path — normal + kill) drains this ledger and
+    /// closes every fd through the I/O seam. Empty at `init`.
+    socket_ledger: socket_table.SocketLedger,
+    /// The process's socket-sweep drop-list node (Phase S0). Registered on
+    /// the drop-list at the first `Socket.connect` (idempotent —
+    /// `socket_sweep_registered`), its destructor drains `socket_ledger`,
+    /// closing every fd the process still owns. Embedded in the PCB
+    /// (process-local, never in the shared domain) so a process's teardown
+    /// only ever closes ITS OWN sockets — never a sibling that reused a
+    /// domain slot. The destructor is installed by the `abi.zig` socket
+    /// bridge (it needs the runtime's socket domain + I/O seam); this field
+    /// is just its stable storage.
+    socket_sweep_node: DropListNode,
+    /// Whether `socket_sweep_node` has been registered on the drop-list
+    /// (registered exactly once per process — re-pushing a linked node
+    /// would corrupt the list). False at `init`; the socket bridge flips it
+    /// true on first registration.
+    socket_sweep_registered: bool,
 
     /// Assemble a PCB IN PLACE — at its final address, which the mailbox
     /// pins from this call on (its empty state references its embedded
@@ -417,6 +454,9 @@ pub const ProcessControlBlock = struct {
         process.signal_state = .{};
         process.registered_name = 0;
         process.blob_ledger = .empty;
+        process.socket_ledger = .empty;
+        process.socket_sweep_node = .{ .destructor = unregisteredSocketSweepDestructor };
+        process.socket_sweep_registered = false;
     }
 
     /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot

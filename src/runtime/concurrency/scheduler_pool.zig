@@ -167,6 +167,12 @@ pub const SchedulerPool = struct {
         /// trace/crash hooks). `work_stealing`, `pool_hooks`, and `global_queue`
         /// are set by the pool and must be left at their defaults here.
         core_options: Scheduler.Options = .{},
+        /// Options for the shared blocking / dirty-scheduler pool (Phase S0:
+        /// the socket layer's blocking connect/DNS offloads onto it, so its
+        /// `max_thread_count` — the hard-64 default — becomes a runtime knob
+        /// here instead of a baked-in `.{}`). Left at defaults gives the
+        /// prior behavior exactly.
+        blocking_pool_options: BlockingPool.Options = .{},
     };
 
     /// Initialize the pool in place over a shared pid table and envelope pool.
@@ -224,7 +230,7 @@ pub const SchedulerPool = struct {
             allocator,
             Scheduler.blockingPoolExecute,
             null,
-            .{},
+            options.blocking_pool_options,
         );
         pool.blocking_handoff = pool.blocking_pool.handoff();
 
