@@ -1354,6 +1354,55 @@ pub const ProtocolBox = extern struct {
 /// named carrier.
 pub const EmptyTuple = struct {};
 
+/// Structural value equality for Zap `==` / `!=` on COMPOSITE (tuple)
+/// operands. Zig's `==` rejects aggregate types outright, and a flat
+/// bytewise compare is wrong for any element that carries a pointer
+/// (a `String` is a `[]const u8` slice; a nested container is a cell
+/// pointer), so equality must recurse structurally:
+///
+///   * `String` (`[]const u8`) compares by CONTENT (`std.mem.eql`),
+///     matching every other string-equality site in the runtime and
+///     the `.string_eq` binop lowering.
+///   * A tuple / struct compares element-wise, recursing so nested
+///     tuples and string elements are handled at any depth.
+///   * An optional compares null-ness, then the payloads.
+///   * Scalars (ints, floats, bools, `Atom`'s `u32`, enum tags) and
+///     opaque pointer-shaped values fall through to Zig's `==` — the
+///     same identity/value semantics they already carry elsewhere.
+///
+/// The two independent `anytype` parameters let the ZIR backend emit
+/// a single `@import("zap_runtime").valuesEqual(lhs, rhs)` call for a
+/// tuple `==`; Zig's comptime resolves the concrete element handling
+/// from each operand's own type. The operands are typed INDEPENDENTLY
+/// (not `b: @TypeOf(a)`) because a comptime-field tuple literal — e.g.
+/// `{1, 2}` has type `struct { comptime i64 = 1, comptime i64 = 2 }` —
+/// carries its element VALUES in its type: coercing `b` to `@TypeOf(a)`
+/// would rewrite `b`'s comptime fields to `a`'s values and make every
+/// literal comparison spuriously equal. Iterating each operand's own
+/// fields compares the real values. The type checker only routes
+/// tuple `==` when the two tuples share arity and element types, so
+/// the field-by-field recursion is well-formed.
+pub fn valuesEqual(a: anytype, b: anytype) bool {
+    const A = @TypeOf(a);
+    if (A == []const u8) return std.mem.eql(u8, a, b);
+    return switch (@typeInfo(A)) {
+        .@"struct" => |struct_info| structural: {
+            inline for (struct_info.fields) |field| {
+                if (!valuesEqual(@field(a, field.name), @field(b, field.name))) {
+                    break :structural false;
+                }
+            }
+            break :structural true;
+        },
+        .optional => optional: {
+            if (a == null and b == null) break :optional true;
+            if (a == null or b == null) break :optional false;
+            break :optional valuesEqual(a.?, b.?);
+        },
+        else => a == b,
+    };
+}
+
 /// Thread-local raise side-channel (Phase 3.a). `Kernel.recoverable_raise`
 /// stashes the raised `Error` value (a `ProtocolBox` fat pointer) here, then
 /// the IR `try_rescue` lowering emits an `error.ZapRaise` return that unwinds

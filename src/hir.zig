@@ -6556,8 +6556,24 @@ pub const HirBuilder = struct {
                                             null
                                         else
                                             self.inferAppliedFromExpectedType(tid);
+                                        //   4. Argument-driven inference.
+                                        //      A bare `Option.Some({1, 2})`
+                                        //      with no explicit type-args and
+                                        //      no expected-type context: unify
+                                        //      the variant's formal payload
+                                        //      against the argument's actual
+                                        //      type to recover the
+                                        //      instantiation (`Option({i64,
+                                        //      i64})`). Under-determined unions
+                                        //      (`Result.Ok` binding only `t`)
+                                        //      return null and keep the bare
+                                        //      template.
+                                        const argument_applied = if (explicit_applied != null or inferred_applied != null)
+                                            null
+                                        else
+                                            try self.inferAppliedFromVariantArgument(tid, v.type_id.?, arg_expr.type_id);
                                         const literal_type_id =
-                                            explicit_applied orelse inferred_applied orelse tid;
+                                            explicit_applied orelse inferred_applied orelse argument_applied orelse tid;
                                         return try self.create(Expr, .{
                                             .kind = .{ .union_init = .{
                                                 .union_type_id = literal_type_id,
@@ -9107,6 +9123,118 @@ pub const HirBuilder = struct {
         if (expected_typ != .applied) return null;
         if (expected_typ.applied.base != declaration_type_id) return null;
         return expected;
+    }
+
+    /// Fourth inference source for a parametric union variant
+    /// constructor call (`Option.Some({1, 2})`) written with NEITHER
+    /// explicit type-args NOR an expected-type context: recover the
+    /// instantiation from the ARGUMENT's actual type by unifying it
+    /// against the variant's formal payload type.
+    ///
+    /// `Option.Some(arg)` binds the sole type param `t` from `arg`'s
+    /// type, yielding `Option(typeof(arg))`. A union whose type params
+    /// are only PARTIALLY determined by this one variant's payload
+    /// (`Result(t, e).Ok(x)` binds `t` but leaves `e` free) returns
+    /// null so the caller keeps the pre-existing bare-template
+    /// fallback — the free params genuinely require context to resolve.
+    ///
+    /// Without this source a bare-context parametric-union
+    /// construction falls to the bare declaration TypeId, which
+    /// carries no instantiation: `populateAppliedSpecializations`
+    /// never emits the per-instantiation `union(enum)`, so
+    /// `union_init` lowers to an anonymous struct and a subsequent
+    /// `case` switch fails with `switch on struct with auto layout`.
+    fn inferAppliedFromVariantArgument(
+        self: *HirBuilder,
+        declaration_type_id: types_mod.TypeId,
+        variant_payload_type_id: types_mod.TypeId,
+        argument_type_id: types_mod.TypeId,
+    ) !?types_mod.TypeId {
+        if (declaration_type_id >= self.type_store.types.items.len) return null;
+        const decl_typ = self.type_store.getType(declaration_type_id);
+        if (decl_typ != .tagged_union) return null;
+        const type_params = decl_typ.tagged_union.type_params;
+        // Concrete (non-parametric) unions keep the bare declaration
+        // TypeId — there is no instantiation to infer.
+        if (type_params.len == 0) return null;
+        // An unresolved / typevar-bearing argument cannot pin a param.
+        if (argument_type_id == types_mod.TypeStore.UNKNOWN) return null;
+        if (argument_type_id >= self.type_store.types.items.len) return null;
+        if (try self.type_store.containsTypeVars(argument_type_id)) return null;
+
+        var subs = types_mod.SubstitutionMap.init(self.allocator);
+        defer subs.deinit();
+        try self.unifyFormalWithActual(variant_payload_type_id, argument_type_id, &subs);
+
+        // Every declared type param must be pinned to a fully
+        // concrete type; otherwise this single variant
+        // under-determines the instantiation and we defer to the
+        // bare-template fallback.
+        const store_ptr: *types_mod.TypeStore = @constCast(self.type_store);
+        const args = try self.allocator.alloc(types_mod.TypeId, type_params.len);
+        for (type_params, 0..) |formal_id, i| {
+            if (formal_id >= self.type_store.types.items.len) return null;
+            const formal_typ = self.type_store.getType(formal_id);
+            if (formal_typ != .type_var) return null;
+            const bound = subs.resolve(formal_typ.type_var) orelse return null;
+            if (try self.type_store.containsTypeVars(bound)) return null;
+            args[i] = bound;
+        }
+        return try store_ptr.addType(.{ .applied = .{
+            .base = declaration_type_id,
+            .args = args,
+        } });
+    }
+
+    /// Structural unification of a FORMAL type (which may mention a
+    /// union/struct's declared `type_var`s) against a concrete ACTUAL
+    /// type, recording each `type_var -> concrete` binding in `subs`.
+    /// A structural shape mismatch (e.g. formal tuple arity differs
+    /// from the actual) is NOT an error — it simply leaves the
+    /// affected params unbound, and the caller's completeness check
+    /// decides whether enough params were pinned. Only allocator
+    /// failure propagates.
+    fn unifyFormalWithActual(
+        self: *HirBuilder,
+        formal_type_id: types_mod.TypeId,
+        actual_type_id: types_mod.TypeId,
+        subs: *types_mod.SubstitutionMap,
+    ) std.mem.Allocator.Error!void {
+        if (formal_type_id >= self.type_store.types.items.len) return;
+        if (actual_type_id >= self.type_store.types.items.len) return;
+        const formal = self.type_store.getType(formal_type_id);
+        switch (formal) {
+            .type_var => |var_id| try subs.bind(var_id, actual_type_id),
+            .tuple => |formal_tuple| {
+                const actual = self.type_store.getType(actual_type_id);
+                if (actual != .tuple) return;
+                const pair_count = @min(formal_tuple.elements.len, actual.tuple.elements.len);
+                for (formal_tuple.elements[0..pair_count], actual.tuple.elements[0..pair_count]) |formal_elem, actual_elem| {
+                    try self.unifyFormalWithActual(formal_elem, actual_elem, subs);
+                }
+            },
+            .list => |formal_list| {
+                const actual = self.type_store.getType(actual_type_id);
+                if (actual != .list) return;
+                try self.unifyFormalWithActual(formal_list.element, actual.list.element, subs);
+            },
+            .map => |formal_map| {
+                const actual = self.type_store.getType(actual_type_id);
+                if (actual != .map) return;
+                try self.unifyFormalWithActual(formal_map.key, actual.map.key, subs);
+                try self.unifyFormalWithActual(formal_map.value, actual.map.value, subs);
+            },
+            .applied => |formal_applied| {
+                const actual = self.type_store.getType(actual_type_id);
+                if (actual != .applied) return;
+                if (formal_applied.base != actual.applied.base) return;
+                const pair_count = @min(formal_applied.args.len, actual.applied.args.len);
+                for (formal_applied.args[0..pair_count], actual.applied.args[0..pair_count]) |formal_arg, actual_arg| {
+                    try self.unifyFormalWithActual(formal_arg, actual_arg, subs);
+                }
+            },
+            else => {},
+        }
     }
 
     /// True iff `type_id` is a `Callable(args, result)` existential.

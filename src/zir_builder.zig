@@ -353,6 +353,7 @@ fn mapBinopTag(op: ir.BinaryOp.Op, result_type: ir.ZigType, overflow_traps: bool
         .gte => @intFromEnum(Zir.Inst.Tag.cmp_gte),
         .bool_and, .bool_or => null,
         .string_eq, .string_neq => null,
+        .tuple_eq, .tuple_neq => null,
         .concat => null,
         .in_list, .in_range => null,
     };
@@ -7519,6 +7520,34 @@ pub const ZirDriver = struct {
 
                     // For string_neq, negate the result
                     if (bo.op == .string_neq) {
+                        ref = zir_builder_emit_bool_not(self.handle, ref);
+                        if (ref == error_ref) return error.EmitFailed;
+                    }
+                    try self.setLocal(bo.dest, ref);
+                } else if (bo.op == .tuple_eq or bo.op == .tuple_neq) {
+                    // Structural tuple comparison via
+                    // @import("zap_runtime").valuesEqual(lhs, rhs). Zig's
+                    // `==` rejects aggregate types, and a bytewise compare
+                    // is wrong for pointer-bearing elements (a `String`
+                    // slice, a nested container), so the generic runtime
+                    // helper recurses element-wise (strings by content,
+                    // nested tuples structurally). The helper's `anytype`
+                    // signature resolves the concrete element handling
+                    // from the operands' comptime type at the call site.
+                    const lhs = try self.refForLocal(bo.lhs);
+                    const rhs = try self.refForLocal(bo.rhs);
+
+                    const rt_import = zir_builder_emit_import(self.handle, "zap_runtime", 11);
+                    if (rt_import == error_ref) return error.EmitFailed;
+                    const values_equal_fn = zir_builder_emit_field_val(self.handle, rt_import, "valuesEqual", 11);
+                    if (values_equal_fn == error_ref) return error.EmitFailed;
+
+                    const call_args = [_]u32{ lhs, rhs };
+                    var ref = zir_builder_emit_call_ref(self.handle, values_equal_fn, &call_args, 2);
+                    if (ref == error_ref) return error.EmitFailed;
+
+                    // For tuple_neq, negate the structural-equality result.
+                    if (bo.op == .tuple_neq) {
                         ref = zir_builder_emit_bool_not(self.handle, ref);
                         if (ref == error_ref) return error.EmitFailed;
                     }

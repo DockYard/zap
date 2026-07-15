@@ -3702,8 +3702,8 @@ pub const Interpreter = struct {
                 }
                 return self.numericOp(lhs, rhs, .rem_op);
             },
-            .eq, .string_eq => return .{ .bool_val = lhs.eqlWithAllocator(self.allocator, rhs) catch |err| return self.traversalFailure(err) },
-            .neq, .string_neq => return .{ .bool_val = !(lhs.eqlWithAllocator(self.allocator, rhs) catch |err| return self.traversalFailure(err)) },
+            .eq, .string_eq, .tuple_eq => return .{ .bool_val = lhs.eqlWithAllocator(self.allocator, rhs) catch |err| return self.traversalFailure(err) },
+            .neq, .string_neq, .tuple_neq => return .{ .bool_val = !(lhs.eqlWithAllocator(self.allocator, rhs) catch |err| return self.traversalFailure(err)) },
             .lt => {
                 const ord = lhs.compare(rhs) orelse {
                     try self.emitError(.type_error, "incomparable types");

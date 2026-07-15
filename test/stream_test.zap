@@ -536,7 +536,7 @@ pub struct StreamTest {
     }
 
     test("zip then take pulls exactly the requested pairs from both sources") {
-      result = Enum.take(Stream.zip(%CountingSource{next_value: 1, budget: 2}, %CountingSource{next_value: 100, budget: 2}), 2)
+      result = Enum.to_list(Stream.take(Stream.zip(%CountingSource{next_value: 1, budget: 2}, %CountingSource{next_value: 100, budget: 2}), 2))
       assert(List.length(result) == 2)
       first_ok = case List.head(result) { {left, right} -> left == 1 and right == 100 }
       last_ok = case List.last(result) { {left, right} -> left == 2 and right == 101 }
@@ -571,7 +571,7 @@ pub struct StreamTest {
 
     test("zip then an early take disposes both sources leak-free") {
       assert_no_leaks {
-        taken = Enum.take(Stream.zip(["a", "b", "c"], ["x", "y", "z"]), 1)
+        taken = Enum.to_list(Stream.take(Stream.zip(["a", "b", "c"], ["x", "y", "z"]), 1))
         assert(List.length(taken) == 1)
         head_ok = case List.head(taken) { {left, right} -> left == "a" and right == "x" }
         assert(head_ok)
@@ -583,6 +583,38 @@ pub struct StreamTest {
         result = Enum.to_list(Stream.zip(["one", "two"], ["uno", "dos"]))
         assert(List.length(result) == 2)
         last_ok = case List.last(result) { {left, right} -> left == "two" and right == "dos" }
+        assert(last_ok)
+      }
+    }
+  }
+
+  # `Stream.dedupe` remembers the previous element as `Option(element)`, so a
+  # tuple element forces the `Option({a, b})` instantiation whose payload used
+  # to render `Some: anytype`. These co-compile with the `Stream.take` over
+  # `Stream.zip`'s tuple output above (same module), which is exactly the
+  # take/map-over-zip + dedupe combination that previously could not co-compile.
+  describe("dedupe over a tuple-element stream") {
+    test("dedupe collapses consecutive equal tuples only") {
+      result = Enum.to_list(Stream.dedupe([{1, 10}, {1, 10}, {2, 20}, {2, 20}, {1, 10}]))
+      assert(List.length(result) == 3)
+      first_ok = case List.head(result) { {left, right} -> left == 1 and right == 10 }
+      last_ok = case List.last(result) { {left, right} -> left == 1 and right == 10 }
+      assert(first_ok)
+      assert(last_ok)
+    }
+
+    test("dedupe of an empty tuple stream is empty") {
+      result = Enum.to_list(Stream.dedupe(([] :: [{i64, i64}])))
+      assert(List.length(result) == 0)
+    }
+
+    test("dedupe over zip's tuple output collapses runs leak-free") {
+      assert_no_leaks {
+        result = Enum.to_list(Stream.dedupe(Stream.zip([1, 1, 2], [10, 10, 20])))
+        assert(List.length(result) == 2)
+        first_ok = case List.head(result) { {left, right} -> left == 1 and right == 10 }
+        last_ok = case List.last(result) { {left, right} -> left == 2 and right == 20 }
+        assert(first_ok)
         assert(last_ok)
       }
     }

@@ -2551,6 +2551,13 @@ pub const BinaryOp = struct {
         neq,
         string_eq,
         string_neq,
+        // Structural equality for COMPOSITE (tuple) operands. Zig's
+        // `==` rejects aggregate types, so these lower to a
+        // `zap_runtime.valuesEqual` call that recurses element-wise
+        // (strings by content, nested tuples structurally). Selected
+        // by `.binary` lowering when both operands are tuples.
+        tuple_eq,
+        tuple_neq,
         lt,
         gt,
         lte,
@@ -6536,6 +6543,25 @@ pub const IrBuilder = struct {
         if (zig_type == .protocol_box) {
             try self.boxed_existential_locals.put(self.allocator, dest, {});
         }
+    }
+
+    /// True when a `==`/`!=` operand is a TUPLE — the value shape Zig's
+    /// `==` refuses. Checks the IR builder's recorded local ZigType
+    /// first (populated for most locals during lowering), then falls
+    /// back to the HIR expression's TypeId in the type store. Used by
+    /// `.binary` lowering to route composite equality through the
+    /// structural `zap_runtime.valuesEqual` helper.
+    fn operandZigTypeIsTuple(
+        self: *const IrBuilder,
+        operand_local: LocalId,
+        operand_type_id: types_mod.TypeId,
+    ) bool {
+        if (self.known_local_types.get(operand_local)) |local_type| {
+            if (local_type == .tuple) return true;
+        }
+        const store = self.type_store orelse return false;
+        if (operand_type_id >= store.types.items.len) return false;
+        return store.getType(operand_type_id) == .tuple;
     }
 
     fn binaryResultZigType(
@@ -17662,6 +17688,14 @@ pub const IrBuilder = struct {
                 const lhs_is_string = if (self.known_local_types.get(lhs)) |t| t == .string else (bin.lhs.type_id == types_mod.TypeStore.STRING);
                 const rhs_is_string = if (self.known_local_types.get(rhs)) |t| t == .string else (bin.rhs.type_id == types_mod.TypeStore.STRING);
                 const is_string_cmp = lhs_is_string or rhs_is_string;
+                // Detect COMPOSITE (tuple) comparison — Zig's `==`
+                // rejects aggregate types, so these route through a
+                // structural `zap_runtime.valuesEqual` call. A string
+                // operand takes precedence (a bare `String` compare is
+                // not a tuple compare).
+                const is_tuple_cmp = !is_string_cmp and
+                    (self.operandZigTypeIsTuple(lhs, bin.lhs.type_id) or
+                        self.operandZigTypeIsTuple(rhs, bin.rhs.type_id));
 
                 const ir_op: BinaryOp.Op = switch (bin.op) {
                     .add => .add,
@@ -17669,8 +17703,8 @@ pub const IrBuilder = struct {
                     .mul => .mul,
                     .div => .div,
                     .rem_op => .rem_op,
-                    .equal => if (is_string_cmp) .string_eq else .eq,
-                    .not_equal => if (is_string_cmp) .string_neq else .neq,
+                    .equal => if (is_string_cmp) .string_eq else if (is_tuple_cmp) .tuple_eq else .eq,
+                    .not_equal => if (is_string_cmp) .string_neq else if (is_tuple_cmp) .tuple_neq else .neq,
                     .less => .lt,
                     .greater => .gt,
                     .less_equal => .lte,
@@ -20465,18 +20499,103 @@ fn nominalNameToImportExpr(
 /// AstGen with "use of undeclared identifier". The `@import` form
 /// resolves in any synthetic module because the fork's
 /// `addStructImpl` wires every Zap struct module as a bidirectional
-/// dep of every other. Non-nominal types pass through `zigTypeToStr`
-/// unchanged (root-cause fix for the `Option(<user struct>)`
-/// miscompile/ICE — concurrency plan item 6.2 follow-on).
+/// dep of every other. Non-nominal SCALAR types pass through
+/// `zigTypeToStr` unchanged (root-cause fix for the `Option(<user
+/// struct>)` miscompile/ICE — concurrency plan item 6.2 follow-on).
+///
+/// COMPOSITE payloads (tuple / list / map / optional, and any
+/// nesting thereof) are rendered recursively as concrete Zig type
+/// expressions rather than collapsing to `zigTypeToStr`'s `anytype`
+/// catch-all — an `anytype` field is invalid inside a synthetic
+/// `union(enum)` (`error: expected type expression, found
+/// 'anytype'`). This mirrors the ZIR backend's
+/// `appendZigTypeForVTable` composite arms so a parametric union
+/// instantiated over a tuple/composite payload (`Option({i64,i64})`,
+/// `Result({a,b}, e)`) lowers to a well-typed tagged union whose
+/// variant payload matches the value the construction site stores
+/// into it. Every element/key/value recurses through this same
+/// function so nested nominals keep their `@import` form at any
+/// depth.
 fn zigTypeToImportableStr(
     allocator: std.mem.Allocator,
     zig_type: ZigType,
 ) std.mem.Allocator.Error![]const u8 {
-    return switch (zig_type) {
-        .struct_ref => |name| nominalNameToImportExpr(allocator, name, false),
-        .tagged_union => |name| nominalNameToImportExpr(allocator, name, true),
-        else => zigTypeToStr(zig_type),
-    };
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try appendImportableZigType(allocator, &buf, zig_type);
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Recursive worker for `zigTypeToImportableStr`. Appends the Zig
+/// type expression for `zig_type` into `buf`. Nominal references
+/// render as `@import` expressions; runtime-native containers render
+/// as their `zap_runtime` value shapes; tuples render as anonymous
+/// Zig tuple structs; scalars fall through to `zigTypeToStr`.
+fn appendImportableZigType(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    zig_type: ZigType,
+) std.mem.Allocator.Error!void {
+    switch (zig_type) {
+        .struct_ref => |name| {
+            const rendered = try nominalNameToImportExpr(allocator, name, false);
+            defer allocator.free(rendered);
+            try buf.appendSlice(allocator, rendered);
+        },
+        .tagged_union => |name| {
+            const rendered = try nominalNameToImportExpr(allocator, name, true);
+            defer allocator.free(rendered);
+            try buf.appendSlice(allocator, rendered);
+        },
+        // A tuple payload renders as an anonymous Zig tuple struct
+        // `struct { T0, T1, ... }`, matching the runtime shape of a
+        // Zap tuple value and the ZIR backend's `.tuple` vtable arm.
+        // The empty tuple maps to the shared `zap_runtime.EmptyTuple`
+        // nominal so distinct emission sites unify (a fresh `struct
+        // {}` gets a distinct identity each time and will not coerce).
+        .tuple => |elements| {
+            if (elements.len == 0) {
+                try buf.appendSlice(allocator, "zap_runtime.EmptyTuple");
+            } else {
+                try buf.appendSlice(allocator, "struct { ");
+                for (elements, 0..) |elem, i| {
+                    if (i > 0) try buf.appendSlice(allocator, ", ");
+                    try appendImportableZigType(allocator, buf, elem);
+                }
+                try buf.appendSlice(allocator, " }");
+            }
+        },
+        // A Zap list value is the runtime flat-buffer cell pointer
+        // `?*const zap_runtime.List(T)`. Recursing on the element (vs
+        // `zigTypeToStr`'s i64/f64-only special cases) makes a list
+        // of ANY element type — including nominal and nested-composite
+        // elements — render correctly instead of degrading to `anytype`.
+        .list => |element_type| {
+            try buf.appendSlice(allocator, "?*const zap_runtime.List(");
+            try appendImportableZigType(allocator, buf, element_type.*);
+            try buf.appendSlice(allocator, ")");
+        },
+        // A Zap map value is `?*const zap_runtime.Map(K, V)`.
+        .map => |map_type| {
+            try buf.appendSlice(allocator, "?*const zap_runtime.Map(");
+            try appendImportableZigType(allocator, buf, map_type.key.*);
+            try buf.appendSlice(allocator, ", ");
+            try appendImportableZigType(allocator, buf, map_type.value.*);
+            try buf.appendSlice(allocator, ")");
+        },
+        // A Zig optional payload renders as `?<inner>`.
+        .optional => |inner| {
+            try buf.appendSlice(allocator, "?");
+            try appendImportableZigType(allocator, buf, inner.*);
+        },
+        // An `Atom` value is an interned `u32` ID at runtime (the
+        // top-level payload path special-cases this before reaching
+        // here; the arm exists so a NESTED atom — e.g. `{Atom, i64}`
+        // — matches the runtime representation rather than falling to
+        // `zigTypeToStr`'s `[]const u8`).
+        .atom => try buf.appendSlice(allocator, "u32"),
+        else => try buf.appendSlice(allocator, zigTypeToStr(zig_type)),
+    }
 }
 
 // ============================================================
