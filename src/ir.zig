@@ -1612,6 +1612,7 @@ fn cloneInstruction(allocator: std.mem.Allocator, instruction: Instruction) Clon
             .args = try clonePlainSlice(LocalId, allocator, value.args),
             .arg_modes = try clonePlainSlice(ValueMode, allocator, value.arg_modes),
             .result_type = try cloneZigType(allocator, value.result_type),
+            .runtime_bridge = value.runtime_bridge,
         } },
         .tail_call => |value| .{ .tail_call = .{
             .name = try cloneBytes(allocator, value.name),
@@ -2640,6 +2641,26 @@ pub const CallBuiltin = struct {
     args: []const LocalId,
     arg_modes: []const ValueMode,
     result_type: ZigType = .any,
+    /// True when this builtin originates from a genuine hand-written
+    /// `:zig.<Mod>.<fn>` runtime bridge (built in the `.builtin` HIR
+    /// target arm) — the call targets the Zig RUNTIME namespace
+    /// (`@import("zap_runtime").<Mod>.<fn>`).
+    ///
+    /// False (the default) marks a builtin synthesized from a
+    /// DEVIRTUALIZED protocol dispatch — a `call_named` whose target
+    /// is a root-level impl function that the ZIR backend rewrites into
+    /// `<UserStruct>.<method>` builtin form (see `zir_builder.zig`'s
+    /// `call_named` handler). That call targets a USER Zap struct
+    /// (`@import("<UserStruct>").<method>`).
+    ///
+    /// The ZIR builder's dotted-name router uses this origin flag —
+    /// instead of a name-collision heuristic — to pick between the two
+    /// import targets. Without it, a genuine `:zig.<Mod>.<fn>` bridge
+    /// whose `<Mod>` COLLIDES with a same-named user struct (the
+    /// sanctioned `:zig.Socket.*` pattern where a `Socket` runtime
+    /// namespace and a `Socket` Zap struct coexist) is misrouted to
+    /// the user struct's ZIR file, which has no such runtime member.
+    runtime_bridge: bool = false,
 };
 
 /// Call a __try function variant. The result is an error union:
@@ -18536,6 +18557,14 @@ pub const IrBuilder = struct {
                                 .args = lowered_args,
                                 .arg_modes = lowered_modes,
                                 .result_type = call_result_type,
+                                // This arm lowers the `.builtin` HIR target,
+                                // which is built ONLY for hand-written
+                                // `:zig.<Mod>.<fn>` bridges — every such call
+                                // targets the Zig runtime namespace. Mark the
+                                // origin so the ZIR router sends it to
+                                // `zap_runtime.<Mod>.<fn>` even when `<Mod>`
+                                // collides with a same-named user struct.
+                                .runtime_bridge = true,
                             },
                         });
                         if (call_result_type != .any and call_result_type != .void) {
@@ -18936,10 +18965,51 @@ pub const IrBuilder = struct {
                 if (fg.object.kind == .nil_lit and self.type_store != null) {
                     const typ = self.type_store.?.getType(fg.object.type_id);
                     if (typ == .tagged_union) {
+                        const union_type_name = self.interner.get(typ.tagged_union.name);
+                        // A MIXED tagged union — one carrying at least one
+                        // payload-bearing variant — is emitted as a real Zig
+                        // `union(enum)` (`appendTaggedUnionTypeDef`'s `has_data`
+                        // branch). A payload-FREE variant of such a union must
+                        // therefore be constructed as a proper tagged-union
+                        // VALUE (`@unionInit(U, "Variant", {})`), NOT as the bare
+                        // `u32` atom id an `enum_literal` lowers to: a `u32` fails
+                        // to unify with the union type (`incompatible types: 'U'
+                        // and 'u32'`). This routes the payload-free variant
+                        // through the void-payload arm of the `.union_init`
+                        // lowering (which the parametric `.applied` unit variant
+                        // — e.g. `Option(i64).None` — already reaches through its
+                        // own union-constructor HIR path). An ALL-unit union is
+                        // instead an `enum_def` represented as a `u32` atom set,
+                        // so it keeps the `enum_literal` path below.
+                        var union_has_payload_variant = false;
+                        for (typ.tagged_union.variants) |variant| {
+                            if (variant.type_id != null) {
+                                union_has_payload_variant = true;
+                                break;
+                            }
+                        }
+                        if (union_has_payload_variant) {
+                            const void_payload_local = self.next_local;
+                            self.next_local += 1;
+                            try self.current_instrs.append(self.allocator, .{ .const_nil = void_payload_local });
+                            try self.current_instrs.append(self.allocator, .{
+                                .union_init = .{
+                                    .dest = dest,
+                                    .union_type = union_type_name,
+                                    .variant_name = self.interner.get(fg.field),
+                                    .value = void_payload_local,
+                                },
+                            });
+                            // Stamp the union's static type on the result so ARC
+                            // and downstream analyses treat the constructed value
+                            // as the union it is, not an untyped atom.
+                            try self.local_hir_types.put(dest, fg.object.type_id);
+                            return dest;
+                        }
                         try self.current_instrs.append(self.allocator, .{
                             .enum_literal = .{
                                 .dest = dest,
-                                .type_name = self.interner.get(typ.tagged_union.name),
+                                .type_name = union_type_name,
                                 .variant = self.interner.get(fg.field),
                             },
                         });

@@ -55,17 +55,17 @@ pub struct TestConcurrency.SocketTest {
       Result.Error(_e) -> false
       Result.Ok(listener) ->
         {
-          port = Socket.local_port(listener)
+          port = SocketListener.local_port(listener)
           TestConcurrency.SocketTest.connect_close(listener, port)
         }
     }
   }
 
-  fn connect_close(listener :: Socket, port :: i64) -> Bool {
+  fn connect_close(listener :: SocketListener, port :: i64) -> Bool {
     case Socket.connect(SocketAddress.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _c = Socket.close(listener)
+          _c = SocketListener.close(listener)
           false
         }
       Result.Ok(client) ->
@@ -73,7 +73,7 @@ pub struct TestConcurrency.SocketTest {
           was_open = Socket.open?(client)
           _c1 = Socket.close(client)
           gone = Socket.open?(client) == false
-          _c2 = Socket.close(listener)
+          _c2 = SocketListener.close(listener)
           was_open and gone
         }
     }

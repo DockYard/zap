@@ -7796,7 +7796,13 @@ pub const ZirDriver = struct {
                                 rest;
                             const builtin_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ mod_prefix, func_base });
                             try self.emitInstruction(.{
-                                .call_builtin = .{ .dest = cn.dest, .name = builtin_name, .args = cn.args, .arg_modes = cn.arg_modes },
+                                // Synthesized from a DEVIRTUALIZED protocol
+                                // dispatch (a `call_named` to a root-level impl
+                                // function), NOT a hand-written `:zig.` bridge.
+                                // `runtime_bridge` stays false so the router
+                                // targets the user struct's ZIR file
+                                // (`@import("<UserStruct>").<method>`).
+                                .call_builtin = .{ .dest = cn.dest, .name = builtin_name, .args = cn.args, .arg_modes = cn.arg_modes, .runtime_bridge = false },
                             });
                             return;
                         }
@@ -8265,7 +8271,9 @@ pub const ZirDriver = struct {
                                 if (ref == error_ref) return error.EmitFailed;
                                 try self.setLocal(cb.dest, ref);
                             }
-                        } else if (self.findStructDef(runtime_mod) != null and !self.currentStructMatches(runtime_mod)) {
+                        } else if (!cb.runtime_bridge and self.findStructDef(runtime_mod) != null and !self.currentStructMatches(runtime_mod)) {
+                            // DEVIRTUALIZED protocol dispatch (never a genuine
+                            // `:zig.` bridge — that carries `runtime_bridge`).
                             // `runtime_mod` names a user-defined struct (not a
                             // runtime module) AND the call crosses out of the
                             // struct currently being emitted. This reaches the
@@ -8284,16 +8292,26 @@ pub const ZirDriver = struct {
                             // module via the file-IS-struct import, exactly as
                             // a regular cross-struct call would.
                             //
-                            // The `!currentStructMatches` guard is essential:
-                            // a struct's OWN `:zig.<Self>.method` body bridge
-                            // (e.g. `lib/range.zap`'s `:zig.Range.reverse`
-                            // inside `Range`, or `:zig.Atom.to_string` inside
-                            // `Atom`) targets the RUNTIME implementation, not
-                            // the Zap module — and emitting `@import("Range")`
+                            // The `!cb.runtime_bridge` guard is what keeps a
+                            // genuine `:zig.<Mod>.<fn>` bridge OFF this path
+                            // even when `<Mod>` collides with a same-named user
+                            // struct. The sanctioned `:zig.Socket.*` pattern
+                            // pairs a `Socket` runtime namespace with a `Socket`
+                            // Zap stdlib struct; without this origin flag, a
+                            // genuine `:zig.Socket.close(handle)` emitted from
+                            // ANOTHER struct (e.g. `SocketListener`) would see
+                            // `findStructDef("Socket") != null` and misroute to
+                            // `@import("Socket").close` (the Zap struct, which
+                            // has no `close`) instead of the runtime. The flag
+                            // is set at the sole `.builtin`-HIR lowering site,
+                            // so it discriminates by ORIGIN rather than by any
+                            // hardcoded struct name.
+                            //
+                            // The `!currentStructMatches` guard remains for the
+                            // devirtualized case: emitting `@import("Range")`
                             // from within `Range`'s own emission would be an
                             // illegal self-import (`no module named 'Range'
-                            // within module 'Range'`). Those self-bridges keep
-                            // the runtime path below.
+                            // within module 'Range'`).
                             const ref = try self.emitCrossStructCall(runtime_mod, func_name, args.items);
                             if (ref == error_ref) return error.EmitFailed;
                             try self.setLocal(cb.dest, ref);

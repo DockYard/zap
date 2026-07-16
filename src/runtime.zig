@@ -740,6 +740,7 @@ pub const BumpSite = enum(u8) {
     vector_sort = 24,
     list_concat_outer = 25,
     misc_slice = 26,
+    socket_recv = 27,
 };
 
 const BUMP_SITE_COUNT: usize = @typeInfo(BumpSite).@"enum".fields.len;
@@ -4032,6 +4033,26 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_socket_close(process: *anyopaque, handle_bits: u64) callconv(.c) i32;
     extern fn zap_socket_is_live(process: *anyopaque, handle_bits: u64) callconv(.c) i32;
     extern fn zap_socket_live_count() callconv(.c) i64;
+    // Phase S1 — the Tier-1 stream op surface.
+    extern fn zap_socket_recv(
+        process: *anyopaque,
+        handle_bits: u64,
+        buf_ptr: [*]u8,
+        buf_len: usize,
+        exact: i32,
+        timeout_ms: i64,
+    ) callconv(.c) i64;
+    extern fn zap_socket_recv_status(process: *anyopaque) callconv(.c) i32;
+    extern fn zap_socket_send(
+        process: *anyopaque,
+        handle_bits: u64,
+        bytes_ptr: [*]const u8,
+        bytes_len: usize,
+        all: i32,
+    ) callconv(.c) i64;
+    extern fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) callconv(.c) i64;
+    extern fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64;
+    extern fn zap_socket_endpoint(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
     // P6-J4 (plan item 6.4): the receive-back-edge arena auto-reset — emitted
     // by the compiler ONLY at receive sites whose iteration closure it proved
     // (`src/receive_reset.zig`); `hibernate` — the BEAM-analogue idle park
@@ -4628,12 +4649,51 @@ fn isBlobHandleStruct(comptime T: type) bool {
     return comptime std.mem.eql(u8, fields[0].name, blob_handle_field_name) and fields[0].type == u64;
 }
 
+/// The reserved field name of a MOVE-ONLY socket handle (`lib/socket.zap`'s
+/// `Socket` / `lib/socket/listener.zap`'s `SocketListener`) — recognized
+/// STRUCTURALLY by field shape, never by struct name, exactly like
+/// `blob_handle_field_name`. A user struct must not declare it (it would opt
+/// that struct into the single-owner, move-only send discipline).
+const socket_handle_field_name = "zap_socket_handle";
+
+/// If `T` is the socket-handle struct shape — exactly one `u64` field named
+/// `zap_socket_handle` — return true. UNLIKE a `Blob` (deeply immutable,
+/// atomic-refcount SHAREABLE, so copy-sendable), a socket is a single-owner,
+/// MOVE-ONLY generational token: two processes reading one fd is a data race
+/// the model forbids (Decision B, `docs/socket-implementation-plan.md`). So a
+/// socket handle is REJECTED by `isWalkerSendable` (never deep-copied into a
+/// message — a plain `Process.send` of a live socket is a compile error) but
+/// ADMITTED at the top level by `isTopLevelSendable` so `Process.send_move`
+/// (which CONSUMES its argument — the use-after-move compile check enforces
+/// single ownership at the surface) can transfer it.
+fn isSocketHandleStruct(comptime T: type) bool {
+    if (@typeInfo(T) != .@"struct") return false;
+    const fields = @typeInfo(T).@"struct".fields;
+    if (fields.len != 1) return false;
+    return comptime std.mem.eql(u8, fields[0].name, socket_handle_field_name) and fields[0].type == u64;
+}
+
+/// The actionable compile error raised when a live socket handle reaches the
+/// COPY-send primitive (`Process.send`). A socket is move-only (Decision B):
+/// copy-sending it would hand two processes the same fd — a data race and a
+/// security hole. The move-send (`Process.send_move`) is the sanctioned
+/// transfer; it consumes the sender's handle.
+fn socketMoveOnlyCopySendError(comptime MessageType: type) noreturn {
+    @compileError(
+        "Process.send: `" ++ @typeName(MessageType) ++ "` is a MOVE-ONLY socket handle and cannot be COPY-sent " ++
+            "(two processes owning one fd is a data race). Transfer it with Process.send_move — the single-owner " ++
+            "move that hands the socket to the receiver.",
+    );
+}
+
 /// Whether `T` is acceptable as a TOP-LEVEL message: any walker-sendable
-/// type, or the blob-handle struct (which travels by atomic pointer share,
-/// not by copy). The send/receive entry points assert THIS predicate;
-/// everything inside the walker recursion asserts plain `isWalkerSendable`.
+/// type, the blob-handle struct (which travels by atomic pointer share, not by
+/// copy), or the socket-handle struct (which travels by MOVE only —
+/// `Process.send_move` — never a copy). The send/receive entry points assert
+/// THIS predicate; everything inside the walker recursion asserts plain
+/// `isWalkerSendable` (which rejects both handle shapes).
 fn isTopLevelSendable(comptime T: type) bool {
-    return isBlobHandleStruct(T) or isWalkerSendable(T);
+    return isBlobHandleStruct(T) or isSocketHandleStruct(T) or isWalkerSendable(T);
 }
 
 /// If `T` is a by-value user-struct message (a plain Zig `struct` value, the
@@ -4650,6 +4710,11 @@ fn walkerStructType(comptime T: type) ?type {
     if (comptime ArcRuntime.isProtocolBox(T)) return null;
     if (comptime ArcRuntime.hasInlineArcHeader(T)) return null;
     if (comptime isBlobHandleStruct(T)) return null;
+    // A socket handle is never deep-copied: it is move-only (single-owner fd),
+    // so `isWalkerSendable` rejects it (a struct field holding a socket makes
+    // the whole struct unsendable) and a plain copy-`send` of one is a compile
+    // error — only `Process.send_move` transfers it.
+    if (comptime isSocketHandleStruct(T)) return null;
     return T;
 }
 
@@ -5345,6 +5410,22 @@ test "message walker: isWalkerSendable vocabulary is locked (N10 send/receive mi
     const StructNestingBlob = struct { count: i64, payload: BlobHandleShape };
     try std.testing.expect(!isWalkerSendable(StructNestingBlob));
     try std.testing.expect(!isTopLevelSendable(StructNestingBlob));
+
+    // The socket handle shape (Decision B): MOVE-ONLY. Like a Blob it is
+    // TOP-LEVEL sendable (via `Process.send_move`) and rejected by the copy
+    // walker (`isWalkerSendable`), so a struct nesting it is unsendable and a
+    // plain copy-`send` of it is a compile error (`socketMoveOnlyCopySendError`,
+    // exercised at the send primitive, not here). The type-checker mirrors the
+    // walker-rejection half (`structTypeIsSocketHandle` in `src/types.zig`).
+    const SocketHandleShape = struct { zap_socket_handle: u64 };
+    try std.testing.expect(isSocketHandleStruct(SocketHandleShape));
+    try std.testing.expect(isTopLevelSendable(SocketHandleShape));
+    try std.testing.expect(!isWalkerSendable(SocketHandleShape));
+    const StructNestingSocket = struct { count: i64, sock: SocketHandleShape };
+    try std.testing.expect(!isWalkerSendable(StructNestingSocket));
+    try std.testing.expect(!isTopLevelSendable(StructNestingSocket));
+    try std.testing.expect(!isSocketHandleStruct(struct { raw: u64 }));
+    try std.testing.expect(!isSocketHandleStruct(struct { zap_socket_handle: i64 }));
     // Shape-exactness: a differently-named or differently-typed single field,
     // or extra fields, are ordinary structs (no accidental opt-in).
     try std.testing.expect(!isBlobHandleStruct(struct { raw: u64 }));
@@ -5867,6 +5948,11 @@ pub const ProcessRuntime = struct {
             return sendBlobMessage(target_pid_bits, @field(message, blob_handle_field_name));
         }
 
+        // A socket handle is MOVE-ONLY (Decision B): copy-sending it would hand
+        // two processes the same fd. Reject at compile time — the move-send
+        // (`Process.send_move`) is the sanctioned transfer.
+        if (comptime isSocketHandleStruct(MessageType)) socketMoveOnlyCopySendError(MessageType);
+
         // Scalar fast-path (incl. atoms as `u32`): a bare bit-copy — the
         // bytes are IDENTICAL to what the walker's scalar arm would emit, so
         // this needs no heap serialization buffer for the hot scalar-send
@@ -6043,6 +6129,26 @@ pub const ProcessRuntime = struct {
                 "zap: Process.send_move of a Blob this process does not own (a released or stale Blob handle)",
             );
             return delivered;
+        }
+
+        // A socket handle MOVE transfers the one-word generational token to the
+        // receiver by bit-copy (a socket is a single `u64`, so the move is a
+        // scalar transfer, never the copy walker — which rejects the socket
+        // shape). The move-only compile check (`Process.send_move` consumes its
+        // argument; a use-after-move is a compile error) enforces single
+        // ownership at the SURFACE; the runtime re-parenting of the kernel
+        // socket-ledger entry to the receiver's process lands in Phase S3
+        // (cross-process handoff). S1's guarantee is the compile-enforced
+        // move-only discipline — copy-send rejected here, move-send permitted.
+        if (comptime isSocketHandleStruct(MessageType)) {
+            var message_storage: MessageType = message;
+            const payload_bytes = std.mem.asBytes(&message_storage);
+            return interpretSendStatus(ZapConcurrencyKernel.zap_proc_send(
+                requireCurrentProcessHandle(),
+                target_pid_bits,
+                payload_bytes.ptr,
+                payload_bytes.len,
+            ));
         }
 
         const typed_message: MessageType = message;
@@ -6835,7 +6941,7 @@ pub const BlobRuntime = struct {
     }
 };
 
-/// `:zig.Socket.*` — the runtime bridge for the Zap socket layer (Phase S0
+/// `:zig.SocketRuntime.*` — the runtime bridge for the Zap socket layer (Phase S0
 /// of `docs/socket-implementation-plan.md`), the `Socket` counterpart to
 /// `BlobRuntime`. It embodies the **offload-iff-kernel-live seam**
 /// (Decision D): each op is ONE runtime primitive with a single comptime
@@ -6857,7 +6963,7 @@ pub const BlobRuntime = struct {
 /// preserving gate-OFF byte-identity for non-socket programs (Zig 0.16 does
 /// not elide top-level imports, but a `pub const` namespace and its
 /// container-scoped imports are analyzed only when referenced).
-pub const Socket = struct {
+pub const SocketRuntime = struct {
     // Registered as sibling struct-source modules by `zir_backend.zig`
     // alongside `zap_runtime` (like `zap_active_manager`): the always-linked
     // runtime cannot `@import` sibling FILES (a staged `zap_runtime.zig`
@@ -7015,6 +7121,202 @@ pub const Socket = struct {
             return ZapConcurrencyKernel.zap_socket_live_count();
         } else {
             return @intCast(gateOffDomain().statistics().live_socket_count);
+        }
+    }
+
+    // -- Phase S1: the Tier-1 stream op surface --------------------------
+
+    /// The gate-OFF errno-style slot for the most recent `recv`'s status
+    /// (gate-ON the per-process ledger slot holds it). Single OS thread
+    /// gate-OFF, so a plain global is race-free.
+    var gate_off_last_recv_status: i32 = 0;
+
+    /// The next-available `recv` buffer size (`byte_count == 0`): a moderate
+    /// chunk, deliberately below the 64 KiB String→Blob promotion threshold so
+    /// stream chunks stay in the ordinary String tier.
+    const default_recv_chunk_len: usize = 16384;
+
+    /// Resolve a handle to its fd in the gate-OFF domain, panicking on a
+    /// closed/stale handle (the single-owner gate-OFF discipline; gate-ON the
+    /// kernel's ledger gate handles ownership).
+    fn gateOffFd(handle_bits: u64) socket_io.Fd {
+        return gateOffDomain().fd(socket_table.SocketHandle.fromBits(handle_bits)) orelse
+            @panic("zap: Socket operation on a closed or stale Socket handle");
+    }
+
+    /// Pack an `AddressV4` as the runtime's endpoint encoding
+    /// (`((((a*256+b)*256+c)*256+d)*65536)+port`, or `-1` when unavailable) —
+    /// the gate-OFF twin of `abi.zig`'s `packEndpoint`.
+    fn packEndpoint(address: socket_io.AddressV4) i64 {
+        if (!address.ok) return -1;
+        const host: i64 = (((@as(i64, address.a) * 256 + address.b) * 256 + address.c) * 256 + address.d);
+        return host * 65536 + @as(i64, address.port);
+    }
+
+    /// `Socket.recv`: receive bytes into a fresh transient String.
+    /// `byte_count == 0` → next-available (up to an internal chunk); `> 0` →
+    /// exactly `byte_count` bytes (`recv_exact`). The buffer lives in the
+    /// runtime String arena (`runtime_arena`) under BOTH gates — a recv chunk
+    /// is a LOCAL transient String read off a fd, exactly like `IO.gets`,
+    /// `File.read`, `Integer.to_string`, and `String.concat` (all `bumpAllocAt`
+    /// / `runtime_arena`), NOT a cross-process message adoption (the one path
+    /// that uses the per-process heap via `containerBufferAlloc`, for bounded
+    /// multi-process reclamation). Routing a recv chunk through the per-process
+    /// heap made it the ONE transient String the `Memory.Tracking` manager
+    /// recorded and — since a bare `String` slice carries no ARC header and is
+    /// never individually freed — then reported as a leak (a memory-exhaustion
+    /// observability defect). The arena is outside every tracked manager, so a
+    /// recv String is leak-exact under `Memory.Tracking` and reclaimed wholesale
+    /// with every other transient String — identical semantics under both gates.
+    /// The CHUNK/CLOSED/FAILED status lands in the per-process slot for the
+    /// immediately-following `Socket.recv_status()` read. Panics on a
+    /// closed/stale/foreign handle.
+    pub fn recv(handle_bits: u64, byte_count: i64, timeout_ms: i64) []const u8 {
+        const exact = byte_count > 0;
+        const buffer_len: usize = if (exact) @intCast(byte_count) else default_recv_chunk_len;
+        if (comptime runtime_concurrency_active) {
+            // Read off-core into a NON-tracked scratch buffer (the kernel recv
+            // offloads onto a blocking-pool thread that must not touch a
+            // per-process manager), then copy the exact bytes into a
+            // right-sized `runtime_arena` allocation on the process's own
+            // fiber. The scratch is `c_allocator` (malloc), outside every
+            // manager, and freed here.
+            const scratch = std.heap.c_allocator.alloc(u8, buffer_len) catch
+                @panic("zap: out of memory allocating a Socket.recv scratch buffer");
+            defer std.heap.c_allocator.free(scratch);
+            const filled = ZapConcurrencyKernel.zap_socket_recv(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                scratch.ptr,
+                buffer_len,
+                if (exact) 1 else 0,
+                timeout_ms,
+            );
+            if (filled < 0) @panic(
+                "zap: Socket.recv on a socket this process does not own (a closed or stale Socket handle)",
+            );
+            const received_len: usize = @intCast(filled);
+            if (received_len == 0) return &.{}; // CLOSED / timeout / failure — no bytes
+            const owned = runtime_arena.allocator().alignedAlloc(u8, .@"1", received_len) catch
+                @panic("zap: out of memory allocating a Socket.recv buffer");
+            recordBump(.socket_recv, received_len);
+            @memcpy(owned[0..received_len], scratch[0..received_len]);
+            return owned[0..received_len];
+        } else {
+            const raw = runtime_arena.allocator().alignedAlloc(u8, .@"1", buffer_len) catch {
+                gate_off_last_recv_status = @intFromEnum(socket_io.Reason.out_of_memory);
+                return &.{};
+            };
+            const outcome = socket_io.recv(gateOffFd(handle_bits), raw, exact, timeout_ms, null);
+            gate_off_last_recv_status = outcome.status;
+            return raw[0..outcome.bytes_filled];
+        }
+    }
+
+    /// `Socket.recv_status`: the status of this program's most recent `recv`
+    /// (`0` = chunk, `-1` = closed/EOF, positive = a failed `Reason` code, `2`
+    /// = idle timeout), read in the arm right after `recv` to build the
+    /// `SocketRecv` union.
+    pub fn recv_status() i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_recv_status(requireCurrentProcessHandle());
+        } else {
+            return gate_off_last_recv_status;
+        }
+    }
+
+    /// `Socket.send`: send ALL of `bytes` (all-or-error), returning the byte
+    /// count committed (`== bytes.len` on success; `< bytes.len` on failure,
+    /// with the reason in the last-error slot). Panics on a foreign handle.
+    pub fn send(handle_bits: u64, bytes: []const u8) i64 {
+        return sendCommon(handle_bits, bytes, true);
+    }
+
+    /// `Socket.send_some`: send whatever the kernel accepts in ONE write
+    /// (explicit partial), returning the bytes written.
+    pub fn send_some(handle_bits: u64, bytes: []const u8) i64 {
+        return sendCommon(handle_bits, bytes, false);
+    }
+
+    fn sendCommon(handle_bits: u64, bytes: []const u8, all: bool) i64 {
+        if (comptime runtime_concurrency_active) {
+            const sent = ZapConcurrencyKernel.zap_socket_send(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                bytes.ptr,
+                bytes.len,
+                if (all) 1 else 0,
+            );
+            if (sent < 0) @panic(
+                "zap: Socket.send on a socket this process does not own (a closed or stale Socket handle)",
+            );
+            return sent;
+        } else {
+            const outcome = if (all)
+                socket_io.send(gateOffFd(handle_bits), bytes)
+            else
+                socket_io.sendSome(gateOffFd(handle_bits), bytes);
+            if (outcome.reason != .ok) gate_off_last_error = @intFromEnum(outcome.reason);
+            return @intCast(outcome.bytes_sent);
+        }
+    }
+
+    /// `Socket.shutdown`: half-close (`how` `0` read / `1` write / `2` both).
+    /// Returns `0` on success or a positive failure `Reason` code. Does NOT
+    /// close the handle — it stays valid after `shutdown(:write)`.
+    pub fn shutdown(handle_bits: u64, how: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            const result = ZapConcurrencyKernel.zap_socket_shutdown(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                @intCast(how),
+            );
+            if (result < 0) @panic(
+                "zap: Socket.shutdown on a socket this process does not own (a closed or stale Socket handle)",
+            );
+            return result;
+        } else {
+            const reason = socket_io.shutdownFd(gateOffFd(handle_bits), @intCast(how));
+            return if (reason == .ok) 0 else @intFromEnum(reason);
+        }
+    }
+
+    /// `Socket.accept`: accept one connection from a listening socket. Returns
+    /// the accepted socket's handle bits (never `0`) or `0` on failure (reason
+    /// in the last-error slot). The accepted socket is owned by this program.
+    pub fn accept(listener_bits: u64) u64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_accept(requireCurrentProcessHandle(), listener_bits);
+        } else {
+            const outcome = socket_io.accept(gateOffFd(listener_bits), null);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, outcome.peer.port, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
+    /// `Socket.endpoint`: the packed IPv4 endpoint of a socket this program
+    /// owns — `kind == 0` local (`getsockname`), else peer (`getpeername`) — or
+    /// `-1` when unavailable. `lib/socket.zap` unpacks it into a
+    /// `SocketAddress`.
+    pub fn endpoint(handle_bits: u64, kind: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_endpoint(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                @intCast(kind),
+            );
+        } else {
+            const fd = gateOffFd(handle_bits);
+            const address = if (kind == 0) socket_io.localAddress(fd) else socket_io.peerAddress(fd);
+            return packEndpoint(address);
         }
     }
 

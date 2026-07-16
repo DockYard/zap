@@ -462,4 +462,58 @@ pub struct UnionTest {
   fn maybe_is_present(value :: CatchallShape(i64) | nil) -> Bool {
     value != nil
   }
+
+  # ----------------------------------------------------------------------
+  # Regression: a PAYLOAD-FREE variant MIXED with payload-carrying variants in
+  # a NON-parametric union.
+  #
+  # A mixed union (≥1 payload variant) lowers to a real Zig `union(enum)`, so a
+  # payload-free variant of it MUST construct a proper tagged-union VALUE
+  # (`@unionInit(U, "V", {})`), not the bare `u32` atom id an all-unit enum
+  # union uses. Before the fix, constructing the payload-free variant emitted a
+  # `u32` that failed to unify with the union type (`incompatible types: 'U' and
+  # 'u32'`) — both as a function's direct return and as one arm of a `case`
+  # whose OTHER arm builds a payload variant. This is the exact shape
+  # `SocketRecv.Closed` (payload-free EOF) needs. The exhaustive-match guarantee
+  # is unaffected: every variant, payload-free included, must still be covered.
+  pub union Mixed3 {
+    Chunk :: String
+    Closed
+    Failed :: i64
+  }
+
+  fn mixed3_make(selector :: i64) -> Mixed3 {
+    case selector == 0 {
+      true -> Mixed3.Chunk("data")
+      false -> Mixed3.Closed
+    }
+  }
+
+  fn mixed3_direct() -> Mixed3 {
+    Mixed3.Closed
+  }
+
+  fn mixed3_classify(value :: Mixed3) -> String {
+    case value {
+      Mixed3.Chunk(bytes) -> bytes
+      Mixed3.Closed -> "closed"
+      Mixed3.Failed(_code) -> "failed"
+    }
+  }
+
+  describe("mixed union with a payload-free variant") {
+    test("construct payload-free in one arm of a branching case, then match") {
+      assert(mixed3_classify(mixed3_make(0)) == "data")
+      assert(mixed3_classify(mixed3_make(1)) == "closed")
+    }
+
+    test("construct payload-free as a direct return, then match") {
+      assert(mixed3_classify(mixed3_direct()) == "closed")
+    }
+
+    test("payload-carrying variants still round-trip alongside the payload-free one") {
+      assert(mixed3_classify(Mixed3.Chunk("hello")) == "hello")
+      assert(mixed3_classify(Mixed3.Failed(7)) == "failed")
+    }
+  }
 }

@@ -517,8 +517,16 @@ pub const SocketLedger = struct {
     /// following (non-yielding) error arm to build the typed `SocketError`.
     /// A `socket_io.Reason` value (0 = ok / none).
     last_error: i32,
+    /// The status of this process's most recent `recv` (Phase S1): `0` =
+    /// CHUNK (bytes were delivered), `-1` = CLOSED (clean EOF), a positive
+    /// `socket_io.Reason` code = FAILED (`2` = idle timeout). Like
+    /// `last_error` it is a per-process errno-style slot the socket bridge
+    /// writes when a `recv` completes and `lib/socket.zap` reads in the
+    /// immediately-following (non-yielding) arm to build the `SocketRecv`
+    /// union — race-free across green-process preemption.
+    last_recv_status: i32,
 
-    pub const empty = SocketLedger{ .entries = null, .entry_count = 0, .capacity = 0, .last_error = 0 };
+    pub const empty = SocketLedger{ .entries = null, .entry_count = 0, .capacity = 0, .last_error = 0, .last_recv_status = 0 };
 
     const initial_capacity: u32 = 8;
 

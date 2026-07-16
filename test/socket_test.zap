@@ -31,8 +31,8 @@ pub struct SocketTest {
       case Socket.listen(SocketAddress.loopback(0), 8) {
         Result.Ok(listener) ->
           {
-            port = Socket.local_port(listener)
-            _closed = Socket.close(listener)
+            port = SocketListener.local_port(listener)
+            _closed = SocketListener.close(listener)
             assert(port > 0)
           }
         Result.Error(_e) ->
@@ -46,8 +46,8 @@ pub struct SocketTest {
       case Socket.listen(SocketAddress.loopback(0), 1) {
         Result.Ok(listener) ->
           {
-            port = Socket.local_port(listener)
-            _closed = Socket.close(listener)
+            port = SocketListener.local_port(listener)
+            _closed = SocketListener.close(listener)
             # The port is now bound to nothing; a connect must return a
             # typed `Result.Error(SocketError)`, never an `Ok` or a crash.
             assert(SocketTest.connect_refused?(port))
@@ -65,17 +65,17 @@ pub struct SocketTest {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) ->
         {
-          port = Socket.local_port(listener)
+          port = SocketListener.local_port(listener)
           SocketTest.connect_phase(listener, port)
         }
     }
   }
 
-  fn connect_phase(listener :: Socket, port :: i64) -> Atom {
+  fn connect_phase(listener :: SocketListener, port :: i64) -> Atom {
     case Socket.connect(SocketAddress.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _closed = Socket.close(listener)
+          _closed = SocketListener.close(listener)
           :connect_failed
         }
       Result.Ok(client) ->
@@ -83,7 +83,7 @@ pub struct SocketTest {
           open_before = Socket.open?(client)
           _c1 = Socket.close(client)
           open_after = Socket.open?(client)
-          _c2 = Socket.close(listener)
+          _c2 = SocketListener.close(listener)
           both = open_before and (open_after == false)
           case both {
             true -> :ok

@@ -2380,6 +2380,220 @@ export fn zap_socket_live_count() callconv(.c) i64 {
     return @intCast(runtime_state.socket_domain.statistics().live_socket_count);
 }
 
+// ---------------------------------------------------------------------------
+// The Tier-1 stream op surface (Phase S1). Every BLOCKING leaf offloads onto
+// the blocking pool (Decision D — off the process's core), captures the
+// process's `pending_kill` atom on-core so the poll-quantum leaf is kill-
+// responsive (§6.1), and is ownership-gated against the caller's ledger. The
+// socket is resolved to its fd on-core (before the offload); the pool thread
+// touches only the fd + the caller's pre-allocated buffer (the parked fiber's
+// own memory), never the domain or the ledger.
+// ---------------------------------------------------------------------------
+
+/// A `recv`'s blocking request: the fd, the caller-owned destination buffer
+/// (allocated on-core in `runtime.zig`), the exact/timeout parameters, and the
+/// kill flag — filled in by the poll-quantum leaf off-core.
+const SocketRecvRequest = struct {
+    fd: concurrency.socket_io.Fd,
+    buffer: []u8,
+    exact: bool,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    outcome: concurrency.socket_io.RecvOutcome,
+};
+
+fn socketRecvBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketRecvRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.recv(
+        request.fd,
+        request.buffer,
+        request.exact,
+        request.timeout_ms,
+        request.kill_flag,
+    );
+    return null;
+}
+
+/// Receive into the caller-owned buffer `buf_ptr[0..buf_len]`, offloading the
+/// poll-quantum-bounded read off-core (Decision D). `exact != 0` accumulates
+/// `buf_len` bytes (`recv_exact`); `exact == 0` returns after the first
+/// non-empty read (next-available). Records the CHUNK/CLOSED/FAILED status in
+/// the caller's ledger (`zap_socket_recv_status`) and returns the byte count
+/// deposited (`>= 0`), or `-1` when the caller does not own a live handle (a
+/// use-after-close / foreign-handle program bug the runtime turns into a
+/// panic). NEVER closes the socket — a timeout leaves it usable.
+export fn zap_socket_recv(
+    process: *anyopaque,
+    handle_bits: u64,
+    buf_ptr: [*]u8,
+    buf_len: usize,
+    exact: i32,
+    timeout_ms: i64,
+) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    var request = SocketRecvRequest{
+        .fd = fd,
+        .buffer = buf_ptr[0..buf_len],
+        .exact = exact != 0,
+        .timeout_ms = timeout_ms,
+        .kill_flag = context.pendingKillFlag(),
+        .outcome = undefined,
+    };
+    _ = context.blocking(socketRecvBlockingTrampoline, &request);
+    context.socketLedger().last_recv_status = request.outcome.status;
+    return @intCast(request.outcome.bytes_filled);
+}
+
+/// The status of the caller's most recent `recv` (`0` chunk / `-1` closed /
+/// positive `Reason` code failed) — the per-process slot `lib/socket.zap`
+/// reads to build the `SocketRecv` union.
+export fn zap_socket_recv_status(process: *anyopaque) callconv(.c) i32 {
+    return contextFromHandle(process).socketLedger().last_recv_status;
+}
+
+/// A `send`/`send_some`'s blocking request.
+const SocketSendRequest = struct {
+    fd: concurrency.socket_io.Fd,
+    bytes: []const u8,
+    all: bool,
+    outcome: concurrency.socket_io.SendOutcome,
+};
+
+fn socketSendBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketSendRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = if (request.all)
+        concurrency.socket_io.send(request.fd, request.bytes)
+    else
+        concurrency.socket_io.sendSome(request.fd, request.bytes);
+    return null;
+}
+
+/// Send `bytes_ptr[0..bytes_len]`, offloading the blocking write off-core.
+/// `all != 0` is all-or-error (`Socket.send`); `all == 0` is one write
+/// (`Socket.send_some`). Records the failure reason in the caller's ledger
+/// (`zap_socket_last_error`) and returns the byte count committed (`>= 0`), or
+/// `-1` when the caller does not own a live handle (panic at the surface).
+export fn zap_socket_send(
+    process: *anyopaque,
+    handle_bits: u64,
+    bytes_ptr: [*]const u8,
+    bytes_len: usize,
+    all: i32,
+) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    var request = SocketSendRequest{
+        .fd = fd,
+        .bytes = bytes_ptr[0..bytes_len],
+        .all = all != 0,
+        .outcome = undefined,
+    };
+    _ = context.blocking(socketSendBlockingTrampoline, &request);
+    if (request.outcome.reason != .ok)
+        context.socketLedger().last_error = @intFromEnum(request.outcome.reason);
+    return @intCast(request.outcome.bytes_sent);
+}
+
+/// Half-close the socket (`Socket.shutdown`): `how` is `0` read / `1` write /
+/// `2` both. Runs inline (a fast leaf syscall, not a blocking wait). Returns
+/// `0` on success, `-1` when the caller does not own the handle, or a positive
+/// `Reason` code on failure. Does NOT recycle the domain slot — the handle
+/// stays valid after `shutdown(:write)` for the graceful handshake.
+export fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    const reason = concurrency.socket_io.shutdownFd(fd, how);
+    if (reason != .ok) return @intFromEnum(reason);
+    return 0;
+}
+
+/// An `accept`'s blocking request.
+const SocketAcceptRequest = struct {
+    fd: concurrency.socket_io.Fd,
+    kill_flag: ?*std.atomic.Value(bool),
+    outcome: concurrency.socket_io.AcceptOutcome,
+};
+
+fn socketAcceptBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketAcceptRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.accept(request.fd, request.kill_flag);
+    return null;
+}
+
+/// Accept a connection from a listening socket, offloading the blocking accept
+/// off-core (kill-responsive). Registers the accepted fd as a NEW handle owned
+/// by the caller (appended to its ledger, sweep node ensured — the accepted
+/// socket inherits crash-safe fd lifetime), and returns its handle bits, or
+/// `0` on failure (reason in the caller's ledger). `-1`-style not-owned is
+/// reported as `0` with `last_error` unset-to-owned? No — see below.
+export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    // A non-owned / stale listener is a program bug: surface it as the invalid
+    // handle with a sentinel reason the runtime turns into a panic.
+    if (!context.socketLedger().contains(listener_bits)) {
+        context.socketLedger().last_error = @intFromEnum(concurrency.socket_io.Reason.other);
+        return concurrency.SocketHandle.invalid.toBits();
+    }
+    const listener_fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(listener_bits)) orelse {
+        context.socketLedger().last_error = @intFromEnum(concurrency.socket_io.Reason.other);
+        return concurrency.SocketHandle.invalid.toBits();
+    };
+    var request = SocketAcceptRequest{
+        .fd = listener_fd,
+        .kill_flag = context.pendingKillFlag(),
+        .outcome = undefined,
+    };
+    _ = context.blocking(socketAcceptBlockingTrampoline, &request);
+    if (request.outcome.reason != .ok) return socketConnectFailed(context, request.outcome.reason);
+
+    const handle = runtime_state.socket_domain.open(
+        request.outcome.fd,
+        context.selfPid().toBits(),
+        request.outcome.peer.port,
+        .plain,
+    ) catch {
+        concurrency.socket_io.closeFd(request.outcome.fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.socketLedger().append(handle.toBits()) catch {
+        if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.ensureSocketSweep(socketSweepDestructor);
+    return handle.toBits();
+}
+
+/// The peer (`kind != 0`) or local (`kind == 0`) IPv4 endpoint of a socket the
+/// caller owns, packed as `((((a*256+b)*256+c)*256+d)*65536)+port` (an
+/// i64-safe ≤ 2^48 value), or `-1` when unavailable (unbound/unconnected,
+/// non-IPv4, or a handle the caller does not own). The runtime unpacks it into
+/// a `SocketAddress` with plain integer division (no bitwise ops in Zap).
+export fn zap_socket_endpoint(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    const address = if (kind == 0)
+        concurrency.socket_io.localAddress(fd)
+    else
+        concurrency.socket_io.peerAddress(fd);
+    return packEndpoint(address);
+}
+
+/// Pack an `AddressV4` as `((((a*256+b)*256+c)*256+d)*65536)+port` or `-1`.
+fn packEndpoint(address: concurrency.socket_io.AddressV4) i64 {
+    if (!address.ok) return -1;
+    const host: i64 = (((@as(i64, address.a) * 256 + address.b) * 256 + address.c) * 256 + address.d);
+    return host * 65536 + @as(i64, address.port);
+}
+
 /// Terminate the calling process NORMALLY (reason `normal`, P5-J1): the same
 /// clean exit as returning from its entry. A linked non-trapping process is NOT
 /// killed; a trapping linked/monitoring process receives `{'EXIT', Self, normal}`

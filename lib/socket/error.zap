@@ -34,4 +34,52 @@
 pub error SocketError {
   reason :: Atom = :unknown
   bytes_sent :: i64 = 0
+
+  @doc = """
+    Maps a runtime failure reason code to its matchable `SocketError` reason
+    atom (the open POSIX/`getaddrinfo`-modeled set). Shared by `from_code` and
+    the `send` path (which also carries `bytes_sent`).
+
+    The runtime-code → typed-error mapping lives HERE, on the error it
+    produces (not on `Socket`), so both `Socket` and the distinct
+    `SocketListener` build typed failures from a runtime reason code WITHOUT
+    either op-surface having to call into the other (a `Socket ↔ SocketListener`
+    mutual dependency the codegen cannot yet resolve). Kept in Zap so the code →
+    atom mapping is testable and the matchable reason set lives with the
+    language. As an ordinary member of the network-gated `SocketError` error,
+    it is covered by the declaration's `@available_on(:network)` gate.
+
+    ## Examples
+
+        SocketError.reason_from_code(1)   # => :econnrefused
+    """
+
+  pub fn reason_from_code(code :: i64) -> Atom {
+    case code {
+      1 -> :econnrefused
+      2 -> :etimedout
+      3 -> :ehostunreach
+      4 -> :enetunreach
+      5 -> :econnreset
+      6 -> :eaddrinuse
+      7 -> :eaddrnotavail
+      8 -> :emfile
+      9 -> :eacces
+      10 -> :enetdown
+      11 -> :enomem
+      _ -> :unknown
+    }
+  }
+
+  @doc = """
+    Maps a runtime failure reason code to a typed `SocketError`.
+
+    ## Examples
+
+        SocketError.from_code(1)   # => %SocketError{reason: :econnrefused}
+    """
+
+  pub fn from_code(code :: i64) -> SocketError {
+    %SocketError{reason: SocketError.reason_from_code(code)}
+  }
 }

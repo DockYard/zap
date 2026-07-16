@@ -1046,6 +1046,17 @@ pub const ProcessContext = struct {
         return &context.record.pcb.socket_ledger;
     }
 
+    /// A pointer to this process's `pending_kill` atomic — the kill-
+    /// responsiveness seam for the socket layer's poll-quantum blocking
+    /// leaves (Phase S1, §6.1). A `recv`/`accept` offloaded onto the blocking
+    /// pool captures this pointer on-core, then polls it once per quantum so a
+    /// blocked leaf yields promptly to teardown instead of pinning a pool
+    /// thread until the peer speaks. The record is pinned for the process's
+    /// lifetime, so the pointer is stable across the offload.
+    pub fn pendingKillFlag(context: *ProcessContext) *std.atomic.Value(bool) {
+        return &context.record.pending_kill;
+    }
+
     /// Ensure this process's socket-sweep drop-list node is registered
     /// (idempotent). Called by the socket bridge on the process's first
     /// `Socket.connect`: it installs `destructor` on the embedded

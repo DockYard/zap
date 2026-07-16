@@ -2547,6 +2547,15 @@ pub const TypeChecker = struct {
         const typ = self.store.getType(type_id);
         return switch (typ) {
             .opaque_type => .unique,
+            // A MOVE-ONLY socket handle (`Socket`/`SocketListener`, reserved
+            // `zap_socket_handle` field — Decision B) defaults to `.unique`
+            // ownership so passing it to `Process.send_move`'s consuming
+            // (`unique`) parameter MOVES it (marks the binding moved), making a
+            // later use — including a copy-`send` or a `Socket.close` after the
+            // move — a use-after-move compile error. Ordinary `.shared`-parameter
+            // socket ops (`send`/`recv`/`close`) merely READ the handle and do
+            // not consume it, so normal single-owner use is unaffected.
+            .struct_type => |struct_type| if (self.structTypeIsSocketHandle(struct_type)) .unique else .shared,
             else => .shared,
         };
     }
@@ -5641,9 +5650,17 @@ pub const TypeChecker = struct {
 
     fn caseClausesContainTaggedUnionVariant(clauses: []const ast.CaseClause, variant_name: ast.StringId) bool {
         for (clauses) |clause| {
-            if (clause.pattern.* != .literal) continue;
-            if (clause.pattern.literal != .atom) continue;
-            if (clause.pattern.literal.atom.value == variant_name) return true;
+            // A variant is covered by EITHER an atom-literal pattern (a
+            // payload-free variant written bare) OR a qualified constructor
+            // pattern `Union.Variant(...)` — the `.tagged_union_variant` shape
+            // used to match payload-carrying variants. Both forms are
+            // recognized by `patternCoversTaggedUnionVariant`; delegating to it
+            // keeps the generic enum-exhaustiveness check (which fires for a
+            // NON-parametric `.tagged_union` scrutinee) in agreement with the
+            // `receive`-path coverage check, so a case over a non-parametric
+            // union matched entirely with constructor patterns is no longer a
+            // spurious non-exhaustive error.
+            if (patternCoversTaggedUnionVariant(clause.pattern, variant_name)) return true;
         }
         return false;
     }
@@ -5745,6 +5762,32 @@ pub const TypeChecker = struct {
         return field.type_id == TypeStore.U64;
     }
 
+    /// Whether `struct_type` is the MOVE-ONLY socket-handle shape — exactly one
+    /// `u64` field named `zap_socket_handle` (`lib/socket.zap`'s `Socket` /
+    /// `lib/socket/listener.zap`'s `SocketListener`) — the type-checker mirror
+    /// of `runtime.zig`'s `isSocketHandleStruct`, recognized STRUCTURALLY by
+    /// field shape, never by struct name (Decision B). A socket is single-owner
+    /// and move-only: unlike a `Blob` (atomic-refcount shareable) it can NEVER
+    /// be copy-walked into a message (a plain `Process.send` of one is a compile
+    /// error at the send primitive) — so the sendability walk rejects it at
+    /// EVERY depth (top-level and nested), and it defaults to `.unique`
+    /// ownership so `Process.send_move` consumes it and a use-after-move is a
+    /// compile error.
+    fn structTypeIsSocketHandle(self: *const TypeChecker, struct_type: Type.StructType) bool {
+        if (struct_type.fields.len != 1) return false;
+        const field = struct_type.fields[0];
+        if (!std.mem.eql(u8, self.store.interner.get(field.name), "zap_socket_handle")) return false;
+        return field.type_id == TypeStore.U64;
+    }
+
+    /// Whether `type_id` is a MOVE-ONLY socket-handle struct (`Socket`/
+    /// `SocketListener`). Drives the `.unique` ownership default that makes
+    /// `Process.send_move` consume the handle (use-after-move → compile error).
+    fn typeIsSocketHandle(self: *const TypeChecker, type_id: TypeId) bool {
+        const typ = self.store.getType(type_id);
+        return typ == .struct_type and self.structTypeIsSocketHandle(typ.struct_type);
+    }
+
     /// Whether `type_id` is a walker-sendable message type — the type-checker
     /// mirror of `runtime.zig`'s `isWalkerSendable` (the two are kept a mirror
     /// image by construction so send and receive agree): a scalar
@@ -5798,6 +5841,12 @@ pub const TypeChecker = struct {
                 // mirror excludes it from `walkerStructType` for the same
                 // reason).
                 if (depth > 0 and self.structTypeIsBlobHandle(struct_type)) return false;
+                // A MOVE-ONLY socket handle is NEVER copy-walkable — at ANY
+                // depth (unlike a `Blob`, which is top-level-sendable): a socket
+                // cannot be copy-sent OR copy-received (Decision B), mirroring
+                // the runtime's `walkerStructType` returning null for the socket
+                // shape (the N10 send/receive mirror).
+                if (self.structTypeIsSocketHandle(struct_type)) return false;
                 for (struct_type.fields) |field| {
                     if (!try self.typeIsWalkerSendableBudgeted(
                         field.type_id,

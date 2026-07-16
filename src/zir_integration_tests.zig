@@ -6611,6 +6611,62 @@ test "ZIR concurrency: Process.send_move of a Map consumes it too — use-after-
     );
 }
 
+test "ZIR concurrency: a live Socket is MOVE-ONLY — a plain copy-Process.send is a compile error (Phase S1, Decision B)" {
+    // A `Socket`/`SocketListener` is a single-owner, move-only generational
+    // handle (`docs/socket-implementation-plan.md`, Decision B): the reserved
+    // `zap_socket_handle` field is recognized STRUCTURALLY (like `zap_blob_handle`)
+    // and the type is rejected from the deep-copy send walker
+    // (`runtime.zig` `walkerStructType`/`isWalkerSendable`) while admitted at the
+    // top level only for the MOVE send (`isTopLevelSendable`). So a plain
+    // `Process.send` (the COPY primitive) of a live socket — which would hand two
+    // processes the same fd, a data race — is a compile error at the send
+    // primitive (`socketMoveOnlyCopySendError`). The sanctioned transfer is
+    // `Process.send_move` (which consumes the handle). WRITTEN, not run here
+    // (`zig build zir-test` is driven separately).
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    case Socket.listen(SocketAddress.loopback(0), 1) {
+        \\      Result.Ok(listener) -> {
+        \\        echo = (Pid.of(Process.self()) :: Pid(SocketListener))
+        \\        _sent = Process.send(echo, listener)
+        \\        _closed = SocketListener.close(listener)
+        \\        0
+        \\      }
+        \\      Result.Error(_e) -> 0
+        \\    }
+        \\  }
+        \\}
+    ,
+        "MOVE-ONLY socket handle",
+    );
+}
+
+test "ZIR concurrency: a Socket move-sends cleanly — Process.send_move of a socket compiles (Phase S1, Decision B)" {
+    // The move-only counterpart of the copy-send rejection above: a socket is
+    // TOP-LEVEL sendable via `Process.send_move` (the move primitive
+    // `send_message_moved`, which `isTopLevelSendable` admits for the socket
+    // handle shape). `send_move` transfers the one-word handle to the receiver;
+    // this pins that the sanctioned transfer path COMPILES (the copy path does
+    // not). WRITTEN, not run here.
+    var result = try compileAndRunGatedConcurrency(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    case Socket.listen(SocketAddress.loopback(0), 1) {
+        \\      Result.Ok(listener) -> {
+        \\        echo = (Pid.of(Process.self()) :: Pid(SocketListener))
+        \\        _sent = Process.send_move(echo, listener)
+        \\        0
+        \\      }
+        \\      Result.Error(_e) -> 0
+        \\    }
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
 test "ZIR concurrency: Process.receive_raw rejects an unsendable payload type token" {
     // `String` is outside the Phase-2 sendable set (fixed-size scalars);
     // the raw-receive token macro has no clause for it, so an unsendable
