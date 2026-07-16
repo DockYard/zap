@@ -448,6 +448,27 @@ pub const ProcessControlBlock = struct {
     /// `socket_table.no_pending_socket_fd` (`-1`) when none. Owner/handoff-
     /// ordered like `socket_ledger`; never touched by two threads at once.
     socket_pending_fd: socket_table.Fd,
+    /// This process's PRIVATE arena for received-chunk bytes (the HIGH-4
+    /// recv-lifetime fix). A `Socket.recv` chunk is a transient `String` the
+    /// process reads off a socket; before this it copied into the process-
+    /// GLOBAL, program-lifetime `runtime_arena`, which is grow-only (never
+    /// reset), so a long-lived connection accumulated EVERY byte it ever
+    /// received — a peer-controlled, unbounded memory-exhaustion DoS. Routing
+    /// recv chunks into THIS per-process arena instead binds their lifetime to
+    /// the OWNING PROCESS: they are wholesale-reclaimed when the process exits
+    /// (cleanly or by crash/kill — `deinit` at teardown), so a
+    /// process-per-connection server (the idiomatic topology) reclaims each
+    /// connection's chunks at that connection's process death rather than
+    /// holding them for the whole program's life. The recv leaf reads DIRECTLY
+    /// into a buffer grown from this arena (no intermediate scratch — the
+    /// HIGH-1 recv-scratch-on-kill leak is structurally gone), off-core during
+    /// the blocking offload where THIS process is parked and only the pool
+    /// thread touches its PCB (exclusive access, the scheduler-local invariant),
+    /// so no lock is needed. Backed by `c_allocator`. Empty at `init` (no
+    /// allocation until the first recv). Cross-process sends deep-copy the bytes
+    /// into the receiver's own heap, so a sent chunk survives this arena's
+    /// teardown as an independent copy.
+    socket_recv_arena: std.heap.ArenaAllocator,
 
     /// Assemble a PCB IN PLACE — at its final address, which the mailbox
     /// pins from this call on (its empty state references its embedded
@@ -476,6 +497,7 @@ pub const ProcessControlBlock = struct {
         process.socket_sweep_node = .{ .destructor = unregisteredSocketSweepDestructor };
         process.socket_sweep_registered = false;
         process.socket_pending_fd = socket_table.no_pending_socket_fd;
+        process.socket_recv_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     }
 
     /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot

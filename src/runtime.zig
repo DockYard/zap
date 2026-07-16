@@ -4037,10 +4037,9 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_socket_recv(
         process: *anyopaque,
         handle_bits: u64,
-        buf_ptr: [*]u8,
-        buf_len: usize,
-        exact: i32,
+        byte_count: i64,
         timeout_ms: i64,
+        out_chunk_ptr: *?[*]const u8,
     ) callconv(.c) i64;
     extern fn zap_socket_recv_status(process: *anyopaque) callconv(.c) i32;
     extern fn zap_socket_send(
@@ -7156,61 +7155,69 @@ pub const SocketRuntime = struct {
 
     /// `Socket.recv`: receive bytes into a fresh transient String.
     /// `byte_count == 0` → next-available (up to an internal chunk); `> 0` →
-    /// exactly `byte_count` bytes (`recv_exact`). The buffer lives in the
-    /// runtime String arena (`runtime_arena`) under BOTH gates — a recv chunk
-    /// is a LOCAL transient String read off a fd, exactly like `IO.gets`,
-    /// `File.read`, `Integer.to_string`, and `String.concat` (all `bumpAllocAt`
-    /// / `runtime_arena`), NOT a cross-process message adoption (the one path
-    /// that uses the per-process heap via `containerBufferAlloc`, for bounded
-    /// multi-process reclamation). Routing a recv chunk through the per-process
-    /// heap made it the ONE transient String the `Memory.Tracking` manager
-    /// recorded and — since a bare `String` slice carries no ARC header and is
-    /// never individually freed — then reported as a leak (a memory-exhaustion
-    /// observability defect). The arena is outside every tracked manager, so a
-    /// recv String is leak-exact under `Memory.Tracking` and reclaimed wholesale
-    /// with every other transient String — identical semantics under both gates.
+    /// exactly `byte_count` bytes (`recv_exact`).
+    ///
+    /// GATE-ON, the chunk lives in the receiving PROCESS'S PRIVATE recv arena
+    /// (`ProcessControlBlock.socket_recv_arena`), read DIRECTLY off the fd into
+    /// a buffer grown from that arena by the off-core leaf (no intermediate
+    /// scratch — the HIGH-1 recv-scratch-on-kill leak is structurally gone).
+    /// This binds a recv chunk's lifetime to its owning process: it is
+    /// wholesale-reclaimed at that process's teardown (clean exit OR crash/
+    /// kill), so a long-lived connection no longer accumulates every byte it
+    /// ever received into the program-global, program-lifetime `runtime_arena`
+    /// (the prior behaviour — a peer-controlled unbounded memory-exhaustion
+    /// DoS). The recv arena is a raw `c_allocator` arena OUTSIDE every manager,
+    /// so a recv String stays leak-exact under `Memory.Tracking` (never recorded
+    /// by a tracked manager, exactly like every other transient String), without
+    /// recreating the header-less-slice false positive that routing through the
+    /// per-process manager heap (`containerBufferAlloc`) would.
+    ///
+    /// GATE-OFF (single-thread scripts, no processes) the chunk lives in
+    /// `runtime_arena` as before — but now right-sized: the leaf grows toward
+    /// bytes actually received and shrinks the buffer to what arrived, so a
+    /// next-available read no longer wastes a full 16 KiB chunk and a
+    /// `recv_exact` no longer pre-allocates a peer-supplied `byte_count` up
+    /// front (MED-3).
+    ///
     /// The CHUNK/CLOSED/FAILED status lands in the per-process slot for the
     /// immediately-following `Socket.recv_status()` read. Panics on a
     /// closed/stale/foreign handle.
     pub fn recv(handle_bits: u64, byte_count: i64, timeout_ms: i64) []const u8 {
-        const exact = byte_count > 0;
-        const buffer_len: usize = if (exact) @intCast(byte_count) else default_recv_chunk_len;
         if (comptime runtime_concurrency_active) {
-            // Read off-core into a NON-tracked scratch buffer (the kernel recv
-            // offloads onto a blocking-pool thread that must not touch a
-            // per-process manager), then copy the exact bytes into a
-            // right-sized `runtime_arena` allocation on the process's own
-            // fiber. The scratch is `c_allocator` (malloc), outside every
-            // manager, and freed here.
-            const scratch = std.heap.c_allocator.alloc(u8, buffer_len) catch
-                @panic("zap: out of memory allocating a Socket.recv scratch buffer");
-            defer std.heap.c_allocator.free(scratch);
+            // The leaf allocates + grows the buffer from the process's own recv
+            // arena off-core and returns the chunk's backing pointer here; the
+            // status rides the per-process ledger slot.
+            var chunk_ptr: ?[*]const u8 = null;
             const filled = ZapConcurrencyKernel.zap_socket_recv(
                 requireCurrentProcessHandle(),
                 handle_bits,
-                scratch.ptr,
-                buffer_len,
-                if (exact) 1 else 0,
+                byte_count,
                 timeout_ms,
+                &chunk_ptr,
             );
             if (filled < 0) @panic(
                 "zap: Socket.recv on a socket this process does not own (a closed or stale Socket handle)",
             );
             const received_len: usize = @intCast(filled);
-            if (received_len == 0) return &.{}; // CLOSED / timeout / failure — no bytes
-            const owned = runtime_arena.allocator().alignedAlloc(u8, .@"1", received_len) catch
-                @panic("zap: out of memory allocating a Socket.recv buffer");
+            if (received_len == 0) return &.{}; // CLOSED / timeout / OOM — no bytes
             recordBump(.socket_recv, received_len);
-            @memcpy(owned[0..received_len], scratch[0..received_len]);
-            return owned[0..received_len];
+            return chunk_ptr.?[0..received_len];
         } else {
-            const raw = runtime_arena.allocator().alignedAlloc(u8, .@"1", buffer_len) catch {
+            const exact_target: usize = if (byte_count > 0) @intCast(byte_count) else 0;
+            const outcome = socket_io.recv(
+                runtime_arena.allocator(),
+                gateOffFd(handle_bits),
+                exact_target,
+                default_recv_chunk_len,
+                timeout_ms,
+                null,
+            ) catch {
                 gate_off_last_recv_status = @intFromEnum(socket_io.Reason.out_of_memory);
                 return &.{};
             };
-            const outcome = socket_io.recv(gateOffFd(handle_bits), raw, exact, timeout_ms, null);
             gate_off_last_recv_status = outcome.status;
-            return raw[0..outcome.bytes_filled];
+            recordBump(.socket_recv, outcome.bytes_filled);
+            return outcome.buffer[0..outcome.bytes_filled];
         }
     }
 

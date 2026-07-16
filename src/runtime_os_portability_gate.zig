@@ -495,6 +495,7 @@ const kernel_files = [_]KernelFile{
     .{ .name = "deterministic_mn.zig", .source = @embedFile("runtime/concurrency/deterministic_mn.zig") },
     .{ .name = "introspection.zig", .source = @embedFile("runtime/concurrency/introspection.zig") },
     .{ .name = "crash_report.zig", .source = @embedFile("runtime/concurrency/crash_report.zig") },
+    .{ .name = "socket_io.zig", .source = @embedFile("runtime/concurrency/socket_io.zig") },
 };
 
 /// An enumerated, documented per-OS seam permitted in a kernel production body.
@@ -551,6 +552,61 @@ const kernel_seam_allowlist = [_]KernelSeam{
         \\syscall, no libc) — the monotonic clock the park-timeout math needs.
         \\macOS uses its own `os_sync`-aligned clock; both are per-OS primitives
         \\by nature, the same posture as the futex layer.
+        ,
+    },
+    .{
+        .file = "socket_io.zig",
+        .needles = &.{
+            // The posix socket syscalls (the seam's whole purpose): the
+            // non-blocking connect + poll-quantum recv/send + half-close +
+            // endpoint resolution.
+            "std.posix.system.socket",
+            "std.posix.system.close",
+            "std.posix.system.fcntl",
+            "std.posix.system.connect",
+            "std.posix.system.send",
+            "std.posix.system.getsockopt",
+            "std.posix.system.getsockname",
+            "std.posix.system.getpeername",
+            "std.posix.poll",
+            "std.posix.errno",
+            // The posix socket constant/type namespaces the syscalls above
+            // reference (address families, socket types, fcntl/poll/socket-
+            // option flags, and the sockaddr/pollfd/errno-enum types).
+            "std.posix.AF",
+            "std.posix.SOCK",
+            "std.posix.IPPROTO",
+            "std.posix.O",
+            "std.posix.F.",
+            "std.posix.MSG",
+            "std.posix.POLL",
+            "std.posix.SOL",
+            "std.posix.SO.",
+            "std.posix.sockaddr",
+            "std.posix.socklen_t",
+            "std.posix.fd_t",
+            "std.posix.pollfd",
+            "std.posix.E",
+            // The per-OS monotonic clock (`monotonicMillis`) the poll-quantum
+            // deadline math reads — posix `clock_gettime` + the wasi arm.
+            "std.c.timespec",
+            "std.c.clock_gettime",
+            "std.c.CLOCK",
+            "std.os.wasi",
+        },
+        .reason =
+        \\`socket_io.zig` IS the socket syscall seam (Decision C) — the ONE
+        \\place the socket layer performs I/O — so per-OS socket calls are its
+        \\whole purpose, exactly like `futex.zig` is the parking seam. The
+        \\fork's portable `std.Io.net` cannot express the poll-quantum timeout
+        \\(`ConnectOptions.timeout` is a TODO-panic), so the posix path issues
+        \\the raw `socket`/`fcntl`/`connect`/`poll`/`send`/`getsockopt`/
+        \\`getsockname`/`getpeername` syscalls directly, bounded by a
+        \\`clock_gettime` monotonic deadline; the poll-less Windows/wasi arms
+        \\keep the blocking portable path with the timeout a documented no-op.
+        \\The needles enumerate exactly those primitives — a NEW, unrelated
+        \\per-OS call here (e.g. `std.posix.fork`, `std.os.linux.*`) matches no
+        \\needle and fails the gate, so whole-file trust is NOT implied.
         ,
     },
 };
@@ -621,6 +677,7 @@ test "concurrency kernel has no raw std.c/std.posix/std.os calls outside the enu
     var stack_pool_seam_hits: usize = 0;
     var abi_seam_hits: usize = 0;
     var scheduler_seam_hits: usize = 0;
+    var socket_io_seam_hits: usize = 0;
 
     for (kernel_files) |file| {
         const result = try scanKernelFile(allocator, file);
@@ -653,6 +710,7 @@ test "concurrency kernel has no raw std.c/std.posix/std.os calls outside the enu
         if (std.mem.eql(u8, file.name, "stack_pool.zig")) stack_pool_seam_hits = result.seam_hits;
         if (std.mem.eql(u8, file.name, "abi.zig")) abi_seam_hits = result.seam_hits;
         if (std.mem.eql(u8, file.name, "scheduler.zig")) scheduler_seam_hits = result.seam_hits;
+        if (std.mem.eql(u8, file.name, "socket_io.zig")) socket_io_seam_hits = result.seam_hits;
     }
 
     try std.testing.expectEqual(@as(usize, 0), total_violations);
@@ -664,6 +722,10 @@ test "concurrency kernel has no raw std.c/std.posix/std.os calls outside the enu
     try std.testing.expect(stack_pool_seam_hits > 0);
     try std.testing.expect(abi_seam_hits > 0);
     try std.testing.expect(scheduler_seam_hits > 0);
+    // `socket_io.zig` is the socket syscall seam: it must show MANY per-OS
+    // hits (its whole body is socket/poll/clock primitives). A zero here means
+    // the embed or the allowlist silently stopped matching.
+    try std.testing.expect(socket_io_seam_hits > 0);
 }
 
 test "kernel gate fires on a planted raw call and allowlists an enumerated seam + the test section" {

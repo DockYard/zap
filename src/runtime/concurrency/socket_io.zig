@@ -218,7 +218,7 @@ fn connectIp4Posix(ip: [4]u8, port: u16, timeout_ms: i64, kill_flag: ?*std.atomi
     // Absolute monotonic deadline (HIGH-3): read once, recompute `deadline -
     // now` each quantum so the timeout holds regardless of poll wake pattern.
     const has_deadline = timeout_ms > 0;
-    const deadline_ms: i64 = if (has_deadline) monotonicMillis() + timeout_ms else 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
     while (true) {
         if (kill_flag) |flag| {
             if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0 };
@@ -358,41 +358,90 @@ fn monotonicMillis() i64 {
     }
 }
 
-/// The outcome of a `recv`: a stable, gate-crossing status plus the number of
-/// bytes deposited in the caller's buffer.
+/// Compute the ABSOLUTE monotonic deadline for a `timeout_ms > 0` relative
+/// timeout, SATURATING at `maxInt(i64)` instead of overflowing. Only reached
+/// with `timeout_ms > 0` (the `has_deadline` guard at each call site). A
+/// pathological program-supplied `timeout_ms` near `maxInt(i64)` would make
+/// the naive `monotonicMillis() + timeout_ms` overflow i64 — undefined
+/// behavior in ReleaseFast, a loud panic in ReleaseSafe (the checkedTimeout
+/// hardening; it is program-supplied, not remote). The saturating add (`+|`)
+/// clamps to `maxInt(i64)`, so a huge timeout degrades to "effectively no
+/// deadline" (the deadline never elapses within the process's life) rather
+/// than a crash — the same validated-narrowing posture as `checkedPort`/
+/// `checkedBacklog` (MED-4), applied to the deadline arithmetic.
+fn checkedDeadline(now_ms: i64, timeout_ms: i64) i64 {
+    return now_ms +| timeout_ms;
+}
+
+/// The outcome of a `recv`: a stable, gate-crossing status, the buffer the
+/// bytes were read into (allocated + grown from the caller's `allocator`; the
+/// caller owns it), and how many of its bytes are the received chunk.
 ///
-///   * `status == 0` — a CHUNK: `bytes_filled >= 1` bytes are in the buffer.
+///   * `status == 0` — a CHUNK: `bytes_filled >= 1` bytes are in `buffer`.
 ///   * `status == -1` — CLOSED: clean EOF (`recv()==0`), the footgun the
 ///     `SocketRecv.Closed` constructor turns into an exhaustive-`case` arm.
 ///   * `status > 0` — FAILED: the value is a `Reason` code (`timed_out == 2`
 ///     is the idle-timeout case), which the runtime maps to a `SocketError`
 ///     reason atom.
+///
+/// `buffer` is exactly `bytes_filled` bytes (recv shrinks it to what actually
+/// arrived on the way out — no over-allocation is handed back), so the chunk
+/// is `buffer[0..bytes_filled]` and `buffer.ptr` is the chunk's backing.
 pub const RecvOutcome = struct {
     status: i32,
+    buffer: []u8,
     bytes_filled: usize,
 };
 
 const recv_status_chunk: i32 = 0;
 const recv_status_closed: i32 = -1;
 
-/// Receive into `buffer` with poll-quantum bounding. When `exact` is true the
-/// leaf accumulates until `buffer.len` bytes have arrived (the `recv_exact`
-/// semantics — a short read ending in EOF returns CLOSED); when false it
-/// returns after the first non-empty read (next-available). `timeout_ms <= 0`
-/// means "no deadline" (the leaf still wakes each quantum to honour a kill).
-/// `kill_flag`, when non-null, is the owning process's `pending_kill` atomic.
+/// The initial buffer capacity for an `exact` (recv_exact) read: the buffer
+/// starts here and grows GEOMETRICALLY toward the peer-supplied `exact_target`
+/// only as bytes ACTUALLY arrive (MED-3). A 4-byte length prefix decoding to a
+/// 4 GiB `exact_target` therefore allocates ~16 KiB up front — never the full
+/// speculative target — and a peer that sends only a few KiB before stalling
+/// forces only a few KiB of allocation. Sized to the next-available chunk so a
+/// small frame needs no growth at all.
+const recv_exact_initial_capacity: usize = 16384;
+
+/// Receive bytes with poll-quantum bounding, allocating and GROWING the
+/// destination buffer from `allocator` as bytes arrive. `exact_target > 0`
+/// accumulates exactly that many bytes (`recv_exact`) — the buffer starts at
+/// `recv_exact_initial_capacity` and doubles toward `exact_target` only as far
+/// as the bytes RECEIVED require, so a peer's large length prefix cannot force
+/// a large speculative allocation up front (MED-3). `exact_target == 0` is
+/// next-available: one read into `next_available_capacity`, then the buffer is
+/// SHRUNK to what arrived (no 16 KiB tail wasted). `timeout_ms <= 0` means "no
+/// deadline" (the leaf still wakes each quantum to honour a kill). `kill_flag`,
+/// when non-null, is the owning process's `pending_kill` atomic.
 ///
-/// BLOCKS on the calling thread (a blocking-pool worker gate-ON, the single
-/// OS thread gate-OFF). Never closes the fd — a timeout leaves the socket
-/// fully usable.
+/// The returned `RecvOutcome.buffer` is owned by `allocator` and is exactly
+/// `bytes_filled` bytes. BLOCKS on the calling thread (a blocking-pool worker
+/// gate-ON, the single OS thread gate-OFF). Never closes the fd — a timeout
+/// leaves the socket fully usable. Returns `error.OutOfMemory` if the buffer
+/// cannot be allocated/grown (nothing is leaked — the partial buffer is freed).
 pub fn recv(
+    allocator: std.mem.Allocator,
     fd: Fd,
-    buffer: []u8,
-    exact: bool,
+    exact_target: usize,
+    next_available_capacity: usize,
     timeout_ms: i64,
     kill_flag: ?*std.atomic.Value(bool),
-) RecvOutcome {
-    if (buffer.len == 0) return .{ .status = recv_status_chunk, .bytes_filled = 0 };
+) error{OutOfMemory}!RecvOutcome {
+    const exact = exact_target > 0;
+    // Initial capacity FOLLOWS the receive shape, never the peer's speculative
+    // target: an exact read starts at the growth floor (capped by the target
+    // when the target is smaller); a next-available read uses the moderate
+    // chunk size. `@max(_, 1)` keeps a valid non-empty allocation even for a
+    // degenerate zero request.
+    const initial_capacity: usize = if (exact)
+        @max(@min(exact_target, recv_exact_initial_capacity), 1)
+    else
+        @max(next_available_capacity, 1);
+    var buffer = try allocator.alloc(u8, initial_capacity);
+    errdefer allocator.free(buffer);
+
     const the_io = io();
     const handle = fdFromBits(fd);
     var filled: usize = 0;
@@ -404,10 +453,10 @@ pub fn recv(
     // An absolute deadline cannot be dribble-defeated (a `.ready` poll no
     // longer needs accounting because `now` moves on its own).
     const has_deadline = timeout_ms > 0;
-    const deadline_ms: i64 = if (has_deadline) monotonicMillis() + timeout_ms else 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
     while (true) {
         if (kill_flag) |flag| {
-            if (flag.load(.acquire)) return .{ .status = recv_status_closed, .bytes_filled = filled };
+            if (flag.load(.acquire)) return try shrinkRecv(allocator, buffer, recv_status_closed, filled);
         }
         var quantum: i32 = poll_quantum_ms;
         if (has_deadline) {
@@ -417,29 +466,52 @@ pub fn recv(
             // pulled `filled` bytes off the socket, and dropping them would
             // desync a framed stream. The caller surfaces them as
             // `SocketRecv.TimedOut(partial)` so no bytes are lost.
-            if (remaining <= 0) return .{ .status = @intFromEnum(Reason.timed_out), .bytes_filled = filled };
+            if (remaining <= 0) return try shrinkRecv(allocator, buffer, @intFromEnum(Reason.timed_out), filled);
             if (remaining < quantum) quantum = @intCast(remaining);
         }
         switch (waitReadable(handle, quantum)) {
             .timeout => continue, // re-check deadline + kill (no manual accounting)
-            .failed => return .{ .status = @intFromEnum(Reason.other), .bytes_filled = filled },
+            .failed => return try shrinkRecv(allocator, buffer, @intFromEnum(Reason.other), filled),
             .ready => {},
         }
         var iovec = [1][]u8{buffer[filled..]};
         const read_count = the_io.vtable.netRead(the_io.userdata, handle, iovec[0..]) catch |err|
-            return .{ .status = @intFromEnum(mapReadError(err)), .bytes_filled = filled };
+            return try shrinkRecv(allocator, buffer, @intFromEnum(mapReadError(err)), filled);
         if (read_count == 0) {
             // Clean EOF. For an exact read that already saw bytes, the stream
             // ended mid-frame — still CLOSED (the caller asked for N and the
             // peer is done); the partial `filled` is reported so a caller can
             // observe how much arrived before the close.
-            return .{ .status = recv_status_closed, .bytes_filled = filled };
+            return try shrinkRecv(allocator, buffer, recv_status_closed, filled);
         }
         filled += read_count;
-        if (!exact) return .{ .status = recv_status_chunk, .bytes_filled = filled };
-        if (filled >= buffer.len) return .{ .status = recv_status_chunk, .bytes_filled = filled };
-        // Exact but not yet full — keep pulling within the same deadline.
+        if (!exact) return try shrinkRecv(allocator, buffer, recv_status_chunk, filled);
+        if (filled >= exact_target) return try shrinkRecv(allocator, buffer, recv_status_chunk, filled);
+        // Exact but not yet complete. If the buffer is full, GROW it toward the
+        // target — geometric doubling capped at `exact_target`, so allocation
+        // tracks bytes received (MED-3), never the peer's speculative prefix.
+        if (filled >= buffer.len) {
+            const grown_capacity = @min(buffer.len *| 2, exact_target);
+            buffer = try allocator.realloc(buffer, grown_capacity);
+        }
     }
+}
+
+/// Shrink `buffer` to exactly `filled` bytes (reclaiming any grow/next-
+/// available over-allocation — for an arena this resizes the tail in place;
+/// for a general allocator it frees the excess) and package the recv outcome.
+/// A zero-length result frees the buffer entirely and returns an empty slice.
+/// The shrink is a NARROWING realloc, which cannot fail; the `catch` keeps the
+/// original (larger) buffer if an allocator ever refuses, still returning a
+/// correct `bytes_filled`-length chunk view.
+fn shrinkRecv(allocator: std.mem.Allocator, buffer: []u8, status: i32, filled: usize) error{OutOfMemory}!RecvOutcome {
+    if (filled == 0) {
+        allocator.free(buffer);
+        return .{ .status = status, .buffer = &.{}, .bytes_filled = 0 };
+    }
+    if (filled == buffer.len) return .{ .status = status, .buffer = buffer, .bytes_filled = filled };
+    const shrunk = allocator.realloc(buffer, filled) catch buffer;
+    return .{ .status = status, .buffer = shrunk, .bytes_filled = filled };
 }
 
 /// The outcome of a `send`: `ok` on full delivery, else a mapped reason, with
@@ -529,7 +601,7 @@ fn sendImplPosix(fd: Fd, bytes: []const u8, all: bool, timeout_ms: i64, kill_fla
 
     var sent: usize = 0;
     const has_deadline = timeout_ms > 0;
-    const deadline_ms: i64 = if (has_deadline) monotonicMillis() + timeout_ms else 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
     while (sent < bytes.len) {
         if (kill_flag) |flag| {
             // Killed mid-send: break out promptly so the pool thread returns
@@ -592,6 +664,16 @@ pub const AcceptOutcome = struct {
     peer: AddressV4,
 };
 
+/// Test-only injection seam for the deterministic post-`netAccept` kill test.
+/// `accept` invokes this hook (when non-null) IMMEDIATELY after `netAccept`
+/// returns a connection and BEFORE the post-accept kill re-check, so a test
+/// can flip the `kill_flag` precisely inside that window — landing execution
+/// in the close-on-kill branch every run, which the timing-racing test lands
+/// only occasionally. Guarded by `comptime builtin.is_test`, so it and its
+/// call site are DEAD CODE (fully elided) in every shipped binary — zero
+/// production cost, no reachable seam.
+var test_after_accept_hook: ?*const fn () void = null;
+
 /// Accept one connection from a listening socket, blocking (poll-quantum
 /// bounded, kill-checked) until one arrives.
 pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
@@ -611,6 +693,11 @@ pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
         const accept_options: net.Server.AcceptOptions = if (net.Server.AcceptOptions == void) {} else .{};
         const accepted = the_io.vtable.netAccept(the_io.userdata, listen_handle, accept_options) catch |err|
             return .{ .reason = mapAcceptError(err), .fd = 0, .peer = AddressV4.none };
+        // Test-only: flip the kill flag exactly inside the post-accept window
+        // (comptime-dead in production — see `test_after_accept_hook`).
+        if (comptime builtin.is_test) {
+            if (test_after_accept_hook) |hook| hook();
+        }
         // A kill that landed WHILE we were blocked accepting (between the
         // top-of-loop check and this connection arriving): close the
         // just-accepted fd HERE, on the pool thread, rather than handing a live
@@ -963,6 +1050,55 @@ test "socket_io: accept never orphans a just-accepted fd under a racing kill (OS
     try testing.expectEqual(baseline, countOpenFds());
 }
 
+test "socket_io: accept DETERMINISTICALLY closes a just-accepted fd when a kill lands in the post-netAccept window" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // The racing test above lands in the post-`netAccept` close-on-kill branch
+    // only occasionally (the window between `netAccept` returning a connection
+    // and the kill re-check is tiny). This test lands there EVERY run via the
+    // `test_after_accept_hook` injection seam: the kill flag starts false (so
+    // the top-of-loop check passes and `netAccept` proceeds), then the hook —
+    // invoked immediately after `netAccept` returns, before the post-accept
+    // check — flips it true, so control enters the branch deterministically and
+    // the just-accepted fd MUST be closed inside `accept`, with a non-`.ok`
+    // reason and a zero fd (never handed back to a tearing-down process).
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    // Queue a connection so `netAccept` returns a real fd on the first poll.
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+
+    // A hook that flips the test-owned kill flag inside the post-accept window.
+    const Injector = struct {
+        var flag_ptr: *std.atomic.Value(bool) = undefined;
+        fn flipKill() void {
+            flag_ptr.store(true, .release);
+        }
+    };
+    var kill_flag = std.atomic.Value(bool).init(false);
+    Injector.flag_ptr = &kill_flag;
+    test_after_accept_hook = Injector.flipKill;
+    defer test_after_accept_hook = null;
+
+    // Baseline AFTER the queued connection exists: `accept` will `netAccept`
+    // (opening the server-side fd), the hook flips the kill, and the branch
+    // closes that fd — so the OS fd count returns exactly to this baseline.
+    const before = countOpenFds();
+    const outcome = accept(listener.fd, &kill_flag);
+    const after = countOpenFds();
+
+    // The branch fired: the just-accepted fd was closed inside `accept`.
+    try testing.expectEqual(Reason.other, outcome.reason);
+    try testing.expectEqual(@as(Fd, 0), outcome.fd);
+    try testing.expect(!outcome.peer.ok);
+    // The kill flag was in fact observed as set (the hook ran).
+    try testing.expect(kill_flag.load(.acquire));
+    // The server-side fd `netAccept` opened was closed by the branch — no leak.
+    try testing.expectEqual(before, after);
+}
+
 test "socket_io: loopback listen + connect + close round-trips on an ephemeral port" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -1012,24 +1148,25 @@ test "socket_io: accept + full-duplex send/recv echo, binary-safe payload, then 
     try testing.expectEqual(Reason.ok, sent.reason);
     try testing.expectEqual(payload.len, sent.bytes_sent);
 
-    var recv_buffer: [64]u8 = undefined;
-    const received = recv(accepted.fd, recv_buffer[0..payload.len], true, 5000, null);
+    const received = try recv(testing.allocator, accepted.fd, payload.len, 0, 5000, null);
+    defer testing.allocator.free(received.buffer);
     try testing.expectEqual(@as(i32, recv_status_chunk), received.status);
     try testing.expectEqual(payload.len, received.bytes_filled);
-    try testing.expectEqualSlices(u8, payload[0..], recv_buffer[0..payload.len]);
+    try testing.expectEqualSlices(u8, payload[0..], received.buffer[0..received.bytes_filled]);
 
     // Server → client the other way (full duplex on one connection, no split).
     const reply = send(accepted.fd, "pong", 0, null);
     try testing.expectEqual(Reason.ok, reply.reason);
-    var reply_buffer: [16]u8 = undefined;
-    const got_reply = recv(client.fd, reply_buffer[0..], false, 5000, null);
+    const got_reply = try recv(testing.allocator, client.fd, 0, 16, 5000, null);
+    defer testing.allocator.free(got_reply.buffer);
     try testing.expectEqual(@as(i32, recv_status_chunk), got_reply.status);
-    try testing.expectEqualSlices(u8, "pong", reply_buffer[0..got_reply.bytes_filled]);
+    try testing.expectEqualSlices(u8, "pong", got_reply.buffer[0..got_reply.bytes_filled]);
 
     // Half-close: client shuts down its write side; the server reads EOF
     // (CLOSED), and the client handle stays valid (graceful handshake).
     try testing.expectEqual(Reason.ok, shutdownFd(client.fd, 1));
-    const eof = recv(accepted.fd, recv_buffer[0..], false, 5000, null);
+    const eof = try recv(testing.allocator, accepted.fd, 0, 64, 5000, null);
+    defer testing.allocator.free(eof.buffer);
     try testing.expectEqual(@as(i32, recv_status_closed), eof.status);
     try testing.expectEqual(@as(usize, 0), eof.bytes_filled);
 
@@ -1054,15 +1191,16 @@ test "socket_io: recv idle-timeout returns timed_out WITHOUT closing the socket"
 
     // Nothing was sent — the recv must time out (never hang), reporting the
     // timed_out reason, and the socket must still be usable afterwards.
-    var recv_buffer: [16]u8 = undefined;
-    const timed = recv(accepted.fd, recv_buffer[0..], false, 150, null);
+    const timed = try recv(testing.allocator, accepted.fd, 0, 16, 150, null);
+    defer testing.allocator.free(timed.buffer);
     try testing.expectEqual(@as(i32, @intFromEnum(Reason.timed_out)), timed.status);
 
     // Prove the socket survived the timeout: a subsequent send/recv works.
     _ = send(client.fd, "after", 0, null);
-    const after = recv(accepted.fd, recv_buffer[0..], false, 5000, null);
+    const after = try recv(testing.allocator, accepted.fd, 0, 16, 5000, null);
+    defer testing.allocator.free(after.buffer);
     try testing.expectEqual(@as(i32, recv_status_chunk), after.status);
-    try testing.expectEqualSlices(u8, "after", recv_buffer[0..after.bytes_filled]);
+    try testing.expectEqualSlices(u8, "after", after.buffer[0..after.bytes_filled]);
 }
 
 test "socket_io: send to a peer that never reads TIMES OUT (slowloris-send), never blocks forever" {
@@ -1096,8 +1234,8 @@ test "socket_io: send to a peer that never reads TIMES OUT (slowloris-send), nev
 
     // A timeout does NOT close the fd — the handle stays valid (Erlang
     // semantics). Draining on the peer lets a further send proceed.
-    var drain: [65536]u8 = undefined;
-    _ = recv(accepted.fd, drain[0..], false, 1000, null);
+    const drained = try recv(testing.allocator, accepted.fd, 0, 65536, 1000, null);
+    testing.allocator.free(drained.buffer);
     try testing.expect(localAddress(client.fd).ok);
 }
 
@@ -1156,20 +1294,87 @@ test "socket_io: recv_exact idle-timeout holds against a dribbling peer (monoton
     // Ask for 200 bytes with a 300ms idle deadline. New code: the deadline
     // fires at ~300ms having read far fewer than 200 (a partial); old code:
     // never times out under the continuous dribble and reads on for seconds.
-    var buffer: [200]u8 = undefined;
+    const exact_target: usize = 200;
     const before_ms = monotonicMillis();
-    const outcome = recv(accepted.fd, buffer[0..], true, 300, null);
+    const outcome = try recv(testing.allocator, accepted.fd, exact_target, 0, 300, null);
+    defer testing.allocator.free(outcome.buffer);
     const elapsed_ms = monotonicMillis() - before_ms;
 
     stop.store(true, .release);
     thread.join();
 
     try testing.expectEqual(@as(i32, @intFromEnum(Reason.timed_out)), outcome.status);
-    try testing.expect(outcome.bytes_filled < buffer.len); // a PARTIAL, not the whole frame
+    try testing.expect(outcome.bytes_filled < exact_target); // a PARTIAL, not the whole frame
     try testing.expect(outcome.bytes_filled >= 1); // some dribbled bytes were consumed
     try testing.expect(elapsed_ms < 2000); // bounded by the 300ms deadline, not the dribble length
 
     // The partial bytes are NOT lost — they are surfaced in `bytes_filled`
     // (MED-1), so a caller can resume a framed read without desync.
-    for (buffer[0..outcome.bytes_filled]) |byte| try testing.expectEqual(@as(u8, 'x'), byte);
+    for (outcome.buffer[0..outcome.bytes_filled]) |byte| try testing.expectEqual(@as(u8, 'x'), byte);
+}
+
+test "socket_io: recv_exact allocation FOLLOWS received bytes, not the peer's speculative target (MED-3)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+    const accepted = accept(listener.fd, null);
+    try testing.expectEqual(Reason.ok, accepted.reason);
+    defer closeFd(accepted.fd);
+
+    // The peer sends a tiny amount then EOFs, but the reader asks for a HUGE
+    // exact frame (as if a 4-byte length prefix decoded to ~1 GiB). The old
+    // code allocated the full `exact_target` UP FRONT — a 4-byte → 1 GiB
+    // amplification. The new code grows only toward bytes RECEIVED, so it never
+    // allocates more than the growth floor here. Proven by backing recv with a
+    // SMALL fixed arena (64 KiB): a 1 GiB up-front allocation would fail it, so
+    // success is proof the allocation stayed bounded to what actually arrived.
+    var backing: [64 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(backing[0..]);
+
+    const payload = "prefix-said-a-gig";
+    try testing.expectEqual(Reason.ok, send(client.fd, payload, 0, null).reason);
+    try testing.expectEqual(Reason.ok, shutdownFd(client.fd, 1)); // EOF after the few bytes
+
+    const huge_target: usize = 1 << 30; // 1 GiB — far beyond the 64 KiB backing
+    const outcome = try recv(fixed.allocator(), accepted.fd, huge_target, 0, 5000, null);
+    // Mid-frame EOF (peer done before `huge_target`) → CLOSED, with the partial
+    // bytes surfaced; the buffer is shrunk to exactly what arrived.
+    try testing.expectEqual(@as(i32, recv_status_closed), outcome.status);
+    try testing.expectEqual(payload.len, outcome.bytes_filled);
+    try testing.expectEqual(payload.len, outcome.buffer.len); // no speculative slack
+    try testing.expectEqualSlices(u8, payload, outcome.buffer[0..outcome.bytes_filled]);
+}
+
+test "socket_io: next-available recv SHRINKS the buffer to what arrived (no over-allocation)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+    const accepted = accept(listener.fd, null);
+    try testing.expectEqual(Reason.ok, accepted.reason);
+    defer closeFd(accepted.fd);
+
+    // A next-available read reserves a moderate chunk (here 65536) but the peer
+    // sends only a few bytes: the returned buffer is SHRUNK to exactly those
+    // bytes, so the 64 KiB reservation is not handed back (and, for an arena,
+    // the tail is reclaimed). The old code returned the full 16 KiB slice's
+    // backing wasted into the never-reset arena.
+    const payload = "tiny";
+    try testing.expectEqual(Reason.ok, send(client.fd, payload, 0, null).reason);
+
+    const outcome = try recv(testing.allocator, accepted.fd, 0, 65536, 5000, null);
+    defer testing.allocator.free(outcome.buffer);
+    try testing.expectEqual(@as(i32, recv_status_chunk), outcome.status);
+    try testing.expectEqual(payload.len, outcome.bytes_filled);
+    try testing.expectEqual(payload.len, outcome.buffer.len); // shrunk, not 65536
+    try testing.expectEqualSlices(u8, payload, outcome.buffer[0..outcome.bytes_filled]);
 }

@@ -1529,6 +1529,24 @@ export fn zap_proc_envelope_free(envelope_handle: *anyopaque) callconv(.c) void 
 export fn zap_proc_receive_iteration_reset(process: *anyopaque) callconv(.c) void {
     const context = contextFromHandle(process);
     context.record.pcb.manager.iterationHeapReset();
+    // Reclaim the process's received-chunk arena at the SAME proven iteration-
+    // closure point (the HIGH-4 per-chunk bound). The compiler emits this
+    // intrinsic ONLY where it proved no allocation reachable here was made since
+    // the process's first proven receive — a guarantee that COVERS any recv
+    // chunk from a prior iteration exactly as it covers a manager-heap cell: a
+    // still-live recv chunk is a heap-possible local live across the receive
+    // site, which FAILS the closure proof and suppresses the emission, so a
+    // recv-arena reference can never outlive this reset. (Chunks that escaped
+    // the process were deep-copied at the send/Blob boundary, never aliased.)
+    // Resetting here is therefore sound by the SAME proof that authorises the
+    // manager-heap reset above — and it makes a receive-loop server that reads
+    // and discards socket chunks hold O(chunk) memory for the life of the
+    // connection instead of O(total received): `.retain_capacity` reuses the
+    // arena's backing each loop, so RSS stays FLAT. Manager-independent (the
+    // recv arena is a raw arena, not the manager heap), so this bounds recv
+    // memory under EVERY manager — including the default refcounted ARC, whose
+    // per-cell free never sees a header-less String slice.
+    _ = context.record.pcb.socket_recv_arena.reset(.retain_capacity);
 }
 
 /// Bytes currently held by the CALLING process's own heap, per its manager's
@@ -2439,61 +2457,92 @@ export fn zap_socket_live_count() callconv(.c) i64 {
 // own memory), never the domain or the ledger.
 // ---------------------------------------------------------------------------
 
-/// A `recv`'s blocking request: the fd, the caller-owned destination buffer
-/// (allocated on-core in `runtime.zig`), the exact/timeout parameters, and the
-/// kill flag — filled in by the poll-quantum leaf off-core.
+/// The next-available `recv` buffer size (`byte_count == 0`): a moderate chunk,
+/// deliberately below the 64 KiB String→Blob promotion threshold so stream
+/// chunks stay in the ordinary String tier. The exact-read growth floor lives
+/// in `socket_io.recv` (`recv_exact_initial_capacity`).
+const socket_recv_next_available_capacity: usize = 16384;
+
+/// A `recv`'s blocking request: the per-process recv-arena ALLOCATOR the leaf
+/// grows the destination buffer from (the HIGH-4 recv-lifetime fix — captured
+/// on-core, so the arena pointer is stable across the offload), the fd, the
+/// receive shape (`exact_target > 0` = recv_exact; `0` = next-available), the
+/// timeout, and the kill flag. The leaf allocates + grows the buffer off-core
+/// into `outcome`; `outcome` is `null` iff the allocation failed (OOM).
 const SocketRecvRequest = struct {
+    allocator: std.mem.Allocator,
     fd: concurrency.socket_io.Fd,
-    buffer: []u8,
-    exact: bool,
+    exact_target: usize,
     timeout_ms: i64,
     kill_flag: ?*std.atomic.Value(bool),
-    outcome: concurrency.socket_io.RecvOutcome,
+    outcome: ?concurrency.socket_io.RecvOutcome,
 };
 
 fn socketRecvBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
     const request: *SocketRecvRequest = @ptrCast(@alignCast(operation_argument.?));
+    // Read DIRECTLY into a buffer grown from the process's private recv arena
+    // (no intermediate scratch — HIGH-1 recv-scratch-on-kill is structurally
+    // gone: a killed process's partial recv buffer is reclaimed wholesale with
+    // the arena at teardown, never leaked). `catch null` surfaces OOM to the
+    // on-core caller. Off-core arena access is exclusive here (the owning
+    // process is parked `.blocking`; only this pool thread touches its PCB).
     request.outcome = concurrency.socket_io.recv(
+        request.allocator,
         request.fd,
-        request.buffer,
-        request.exact,
+        request.exact_target,
+        socket_recv_next_available_capacity,
         request.timeout_ms,
         request.kill_flag,
-    );
+    ) catch null;
     return null;
 }
 
-/// Receive into the caller-owned buffer `buf_ptr[0..buf_len]`, offloading the
-/// poll-quantum-bounded read off-core (Decision D). `exact != 0` accumulates
-/// `buf_len` bytes (`recv_exact`); `exact == 0` returns after the first
-/// non-empty read (next-available). Records the CHUNK/CLOSED/FAILED status in
-/// the caller's ledger (`zap_socket_recv_status`) and returns the byte count
-/// deposited (`>= 0`), or `-1` when the caller does not own a live handle (a
-/// use-after-close / foreign-handle program bug the runtime turns into a
-/// panic). NEVER closes the socket — a timeout leaves it usable.
+/// Receive into a buffer grown from the calling process's PRIVATE recv arena
+/// (the HIGH-4 recv-lifetime fix), offloading the poll-quantum-bounded read
+/// off-core (Decision D). `byte_count > 0` accumulates exactly that many bytes
+/// (`recv_exact`, allocation growing toward the target only as bytes ARRIVE —
+/// MED-3); `byte_count == 0` returns after the first non-empty read (next-
+/// available). Records the CHUNK/CLOSED/FAILED status in the caller's ledger
+/// (`zap_socket_recv_status`), writes the chunk's backing pointer to
+/// `out_chunk_ptr` (null when zero bytes), and returns the byte count deposited
+/// (`>= 0`), or `-1` when the caller does not own a live handle (a use-after-
+/// close / foreign-handle program bug the runtime turns into a panic). The
+/// chunk lives in the process's recv arena — valid until the process's own
+/// teardown, and reclaimed wholesale there. NEVER closes the socket — a timeout
+/// leaves it usable.
 export fn zap_socket_recv(
     process: *anyopaque,
     handle_bits: u64,
-    buf_ptr: [*]u8,
-    buf_len: usize,
-    exact: i32,
+    byte_count: i64,
     timeout_ms: i64,
+    out_chunk_ptr: *?[*]const u8,
 ) callconv(.c) i64 {
     const context = contextFromHandle(process);
+    out_chunk_ptr.* = null;
     if (!context.socketLedger().contains(handle_bits)) return -1;
     const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
         return -1;
     var request = SocketRecvRequest{
+        // Captured on-core: the arena pointer (`&pcb.socket_recv_arena`) is
+        // stable across the offload (the PCB is pinned), and the leaf's
+        // off-core access to it is exclusive (this process is parked).
+        .allocator = context.socketRecvArena().allocator(),
         .fd = fd,
-        .buffer = buf_ptr[0..buf_len],
-        .exact = exact != 0,
+        .exact_target = if (byte_count > 0) @intCast(byte_count) else 0,
         .timeout_ms = timeout_ms,
         .kill_flag = context.pendingKillFlag(),
-        .outcome = undefined,
+        .outcome = null,
     };
     _ = context.blocking(socketRecvBlockingTrampoline, &request);
-    context.socketLedger().last_recv_status = request.outcome.status;
-    return @intCast(request.outcome.bytes_filled);
+    if (request.outcome) |outcome| {
+        context.socketLedger().last_recv_status = outcome.status;
+        out_chunk_ptr.* = if (outcome.bytes_filled == 0) null else outcome.buffer.ptr;
+        return @intCast(outcome.bytes_filled);
+    }
+    // OOM growing the recv buffer off-core: report it as a failed recv (the
+    // partial buffer, if any, was freed by `socket_io.recv` on its error path).
+    context.socketLedger().last_recv_status = @intFromEnum(concurrency.socket_io.Reason.out_of_memory);
+    return 0;
 }
 
 /// The status of the caller's most recent `recv` (`0` chunk / `-1` closed /

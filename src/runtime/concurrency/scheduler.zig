@@ -1060,6 +1060,20 @@ pub const ProcessContext = struct {
         return &context.record.pcb.socket_pending_fd;
     }
 
+    /// This process's PRIVATE received-chunk arena (the HIGH-4 recv-lifetime
+    /// fix — `ProcessControlBlock.socket_recv_arena`). The socket bridge reads
+    /// chunk bytes off a fd DIRECTLY into a buffer grown from this arena, so a
+    /// recv chunk's lifetime is bound to the owning process (wholesale-reclaimed
+    /// at teardown) instead of the program-global `runtime_arena`. Captured
+    /// on-core before the blocking offload; the pool thread grows it off-core
+    /// while THIS process is parked `.blocking` (exclusive PCB access — the
+    /// scheduler-local invariant), so no lock is needed. The record (hence the
+    /// PCB) is pinned for the process's lifetime, so the pointer is stable
+    /// across the offload.
+    pub fn socketRecvArena(context: *ProcessContext) *std.heap.ArenaAllocator {
+        return &context.record.pcb.socket_recv_arena;
+    }
+
     /// A pointer to this process's `pending_kill` atomic — the kill-
     /// responsiveness seam for the socket layer's poll-quantum blocking
     /// leaves (Phase S1, §6.1). A `recv`/`accept` offloaded onto the blocking
@@ -4407,6 +4421,19 @@ pub const Scheduler = struct {
         // teardown below is immaterial; the ledger's storage itself is
         // freed here.
         pcb.blob_ledger.releaseAllOwned(scheduler.options.blob_domain);
+
+        // (4c) Wholesale-reclaim this process's received-chunk arena (the
+        // HIGH-4 recv-lifetime fix). Every `Socket.recv` chunk the process read
+        // lives here, not in the program-global `runtime_arena`, so a killed or
+        // exited process frees ALL the bytes it ever received in one `deinit` —
+        // bounding recv memory to the owning process's life instead of the
+        // program's. Unconditional (independent of the socket-sweep drop node,
+        // which may not be registered) and safe on an unused (empty) arena. The
+        // offload that grows it always completes BEFORE teardown (a kill during
+        // a blocking offload is deferred to re-attach — native code is never
+        // interrupted), so no pool thread races this free. Re-initialised by
+        // `ProcessControlBlock.init` when the PCB is next reused.
+        pcb.socket_recv_arena.deinit();
 
         // (5) Close the mailbox to cross-core senders and wait out every send
         // that passed lookup before the unregister above (the P4 PCB-lifetime

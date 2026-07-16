@@ -182,13 +182,17 @@ pub struct TestConcurrency.SocketStreamTest {
   }
 
   # A MULTI-RECV loop over one connection — the recv-String reclamation gate
-  # (Phase S1 gap fix). Each `recv` returns a fresh transient String; a
-  # long-lived connection performs many recvs, so a per-recv leak would be a
-  # memory-exhaustion DoS. The recv String is allocated from the runtime String
-  # arena (like `IO.gets`/`File.read`/`String.concat`), NOT the per-process
-  # message-adoption heap, so it is LEAK-EXACT under `Memory.Tracking`: this
-  # test drives 32 recvs and, run under `-Dmemory=Memory.Tracking`, must report
-  # ZERO leaks. `Socket.live_count` returns to baseline (no fd leak either).
+  # (HIGH-4). Each `recv` returns a fresh transient String; a long-lived
+  # connection performs many recvs, so a per-recv leak would be a memory-
+  # exhaustion DoS. The recv String now lives in the receiving PROCESS'S PRIVATE
+  # recv arena (bound to the process's lifetime, wholesale-reclaimed at its
+  # teardown), NOT the program-global `runtime_arena` it used to accumulate in
+  # forever. That arena is a raw arena OUTSIDE every manager (like the old
+  # `runtime_arena` path), so a recv String is still LEAK-EXACT under
+  # `Memory.Tracking` — never recorded by a tracked manager, so no header-less-
+  # slice false positive: this test drives 32 recvs and, run under
+  # `-Dmemory=Memory.Tracking`, must report ZERO leaks. `Socket.live_count`
+  # returns to baseline (no fd leak either).
   fn many_recvs() -> i64 {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> -1

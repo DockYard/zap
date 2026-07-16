@@ -306,7 +306,8 @@ pub struct Socket {
     available; `> 0` is `recv_exact`; `timeout_ms` bounds each pull. The status
     read must IMMEDIATELY follow the receive (a non-yielding per-process slot),
     so the two `:zig` calls are paired with nothing between. A timeout decodes
-    to `Failed(:etimedout)` and never closes the socket.
+    to `TimedOut(partial)` — carrying any bytes already consumed off the socket
+    — and never closes the socket.
     """
 
   @available_on(:network)
