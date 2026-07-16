@@ -10,8 +10,10 @@ pub struct SocketStreamTest {
   #   * `recv_exact` reads exactly N bytes;
   #   * `shutdown(:write)` half-closes: the peer reads `SocketRecv.Closed` (EOF)
   #     while the writer's handle stays valid (graceful handshake);
-  #   * an idle `recv` timeout yields `Failed(:etimedout)` and leaves the socket
-  #     OPEN and usable (Erlang semantics — timeout never closes);
+  #   * an idle `recv` timeout yields `TimedOut(partial)` and leaves the socket
+  #     OPEN and usable (Erlang semantics — timeout never closes); a
+  #     `recv_exact` that times out mid-frame SURFACES the already-consumed
+  #     partial bytes (no desync — MED-1) so a follow-up recv stays aligned;
   #   * `Socket.chunks` streams: a `for` comprehension consumes a bounded
   #     loopback stream to EOF (folding the byte total); `Enum.take` early-exits
   #     and `dispose` releases only the iterator state (the fd stays open — a
@@ -81,6 +83,7 @@ pub struct SocketStreamTest {
           true -> :ok
           false -> :mismatch
         }
+      SocketRecv.TimedOut(_partial) -> :unexpected_timeout
       SocketRecv.Closed -> :unexpected_eof
       SocketRecv.Failed(_e) -> :recv_failed
     }
@@ -145,6 +148,7 @@ pub struct SocketStreamTest {
   fn classify_eof(received :: SocketRecv) -> Atom {
     case received {
       SocketRecv.Chunk(_bytes) -> :unexpected_data
+      SocketRecv.TimedOut(_partial) -> :unexpected_timeout
       SocketRecv.Closed -> :closed
       SocketRecv.Failed(_e) -> :failed
     }
@@ -202,12 +206,11 @@ pub struct SocketStreamTest {
   fn classify_timeout(received :: SocketRecv) -> Atom {
     case received {
       SocketRecv.Chunk(_bytes) -> :unexpected_data
+      # A next-available idle timeout is now the dedicated TimedOut variant
+      # (empty partial — nothing was read before the deadline), NOT Failed.
+      SocketRecv.TimedOut(_partial) -> :timeout
       SocketRecv.Closed -> :unexpected_eof
-      SocketRecv.Failed(error) ->
-        case error.reason == :etimedout {
-          true -> :timeout
-          false -> :wrong_reason
-        }
+      SocketRecv.Failed(_e) -> :wrong_reason
     }
   }
 
@@ -417,6 +420,78 @@ pub struct SocketStreamTest {
     }
   }
 
+  # ---- recv_exact timeout surfaces the partial bytes (MED-1, no desync) -----
+
+  fn partial_on_timeout() -> Atom {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> :listen_failed
+      Result.Ok(listener) -> SocketStreamTest.partial_after_listen(listener)
+    }
+  }
+
+  fn partial_after_listen(listener :: SocketListener) -> Atom {
+    port = SocketListener.local_port(listener)
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) ->
+        {
+          _l = SocketListener.close(listener)
+          :connect_failed
+        }
+      Result.Ok(client) -> SocketStreamTest.partial_after_connect(listener, client)
+    }
+  }
+
+  fn partial_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+    case Socket.accept(listener) {
+      Result.Error(_e) ->
+        {
+          _c = Socket.close(client)
+          _l = SocketListener.close(listener)
+          :accept_failed
+        }
+      Result.Ok(server) -> SocketStreamTest.partial_exchange(listener, client, server)
+    }
+  }
+
+  fn partial_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+    # Client sends only 3 of the 10 bytes the server's recv_exact will demand.
+    _sent = Socket.send(client, "abc")
+    # recv_exact(10) consumes the 3 available bytes, then times out waiting for
+    # the missing 7. The 3 consumed bytes MUST be surfaced (TimedOut), not
+    # silently dropped — dropping them would desync the next framed read.
+    partial_ok = case Socket.recv_exact(server, 10, 200) {
+      SocketRecv.TimedOut(partial) ->
+        case partial == "abc" {
+          true -> :ok
+          false -> :wrong_partial
+        }
+      SocketRecv.Chunk(_b) -> :unexpected_full
+      SocketRecv.Closed -> :unexpected_eof
+      SocketRecv.Failed(_e) -> :unexpected_failure
+    }
+    # The remaining bytes arrive; a follow-up recv_exact sees the ALIGNED
+    # remainder ("defghij"), proving the partial was surfaced, not re-consumed.
+    _more = Socket.send(client, "defghij")
+    aligned = case Socket.recv_exact(server, 7, 5000) {
+      SocketRecv.Chunk(bytes) ->
+        case bytes == "defghij" {
+          true -> :ok
+          false -> :misaligned
+        }
+      SocketRecv.TimedOut(_p) -> :unexpected_timeout
+      SocketRecv.Closed -> :unexpected_eof
+      SocketRecv.Failed(_e) -> :recv_failed
+    }
+    _c1 = Socket.close(server)
+    _c2 = Socket.close(client)
+    _c3 = SocketListener.close(listener)
+    passed = (partial_ok == :ok) and (aligned == :ok)
+    case passed {
+      true -> :ok
+      false -> :partial_failed
+    }
+  }
+
   # ------------------------------------------------------------------------
 
   describe("Socket Tier-1 streams (gate-OFF)") {
@@ -432,9 +507,15 @@ pub struct SocketStreamTest {
       assert(Socket.live_count() == base)
     }
 
-    test("idle recv timeout yields :etimedout and leaves the socket usable") {
+    test("idle recv timeout yields TimedOut and leaves the socket usable") {
       base = Socket.live_count()
       assert(SocketStreamTest.timeout_keeps_open() == :ok)
+      assert(Socket.live_count() == base)
+    }
+
+    test("recv_exact idle timeout surfaces the partial bytes (no desync); a follow-up recv is aligned") {
+      base = Socket.live_count()
+      assert(SocketStreamTest.partial_on_timeout() == :ok)
       assert(Socket.live_count() == base)
     }
 

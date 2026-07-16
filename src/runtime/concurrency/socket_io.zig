@@ -134,25 +134,116 @@ fn fdFromBits(bits: Fd) net.Socket.Handle {
 // Operations
 // ---------------------------------------------------------------------------
 
-/// Connect an IPv4 stream socket to `ip:port`. Returns the connected fd or
-/// a mapped reason. This function BLOCKS on the calling thread; the caller
-/// decides whether that thread is a blocking-pool worker (gate-ON) or the
-/// single OS thread (gate-OFF).
+/// Connect an IPv4 stream socket to `ip:port`, bounded by `timeout_ms` and
+/// the owning process's `kill_flag`. Returns the connected fd or a mapped
+/// reason. This function BLOCKS on the calling thread; the caller decides
+/// whether that thread is a blocking-pool worker (gate-ON) or the single OS
+/// thread (gate-OFF).
 ///
-/// `timeout_ms` (≤ 0 → no timeout) is accepted so the Tier-1 API shape is
-/// in place from S0 (Decision E — per-call relative timeouts, NEVER
-/// `SO_*TIMEO`). Its ENFORCEMENT is deferred to S1's poll-quantum bounding
-/// (§6.1): the fork's `ConnectOptions.timeout` is a `TODO`-panic
-/// (`netConnectIpPosix`), so it cannot be used, and poll-quantum connect
-/// bounding is S1 scope (the campaign's v1 spans S0–S7). S0's exit gate is
-/// loopback, which connects instantly, so the param is not yet load-bearing;
-/// passing it through keeps the surface stable across the S1 mechanism swap.
-pub fn connectIp4(ip: [4]u8, port: u16, timeout_ms: i64) ConnectOutcome {
-    _ = timeout_ms; // S0: accepted for API shape; enforced by poll-quantum in S1 (§6.1).
-    const address = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
-    const stream = address.connect(io(), .{ .mode = .stream, .timeout = .none }) catch |err|
-        return .{ .reason = mapConnectError(err), .fd = 0 };
-    return .{ .reason = .ok, .fd = fdToBits(stream.socket.handle) };
+/// `timeout_ms` (≤ 0 → no deadline) is a per-call RELATIVE timeout, enforced
+/// by the same poll-quantum loop `recv`/`send` use — NEVER `SO_*TIMEO`
+/// (Decision E, §6.1). A blocking `connect(2)` to a black-hole address blocks
+/// on the OS default (~127 s) with the owning process UNKILLABLE and a pool
+/// thread pinned; instead we do a NON-BLOCKING connect (set `O_NONBLOCK`,
+/// `connect` → `EINPROGRESS`) and poll `POLL.OUT` in `poll_quantum_ms`
+/// quanta, re-checking an ABSOLUTE monotonic deadline and the `kill_flag`
+/// each quantum, then read `SO_ERROR` on wake to learn the outcome and
+/// restore blocking mode. A timeout does NOT leak the fd (it is closed on the
+/// error path); a live connected fd is never `0`.
+///
+/// The fork's portable `IpAddress.connect` cannot do this (its
+/// `ConnectOptions.timeout` is a `TODO`-panic in `netConnectIpPosix`), so the
+/// posix path issues the socket syscalls directly — legitimate here because
+/// this file IS the socket syscall seam (per-OS calls are its whole purpose,
+/// exactly like `waitReadable`/`nameAddress`). The poll-less targets
+/// (Windows/wasi — not in v1 run scope) keep the blocking `IpAddress.connect`
+/// with the timeout a documented no-op, the same posture `waitReadable` takes.
+pub fn connectIp4(ip: [4]u8, port: u16, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        // Poll-less targets (not in v1 run scope): blocking connect, the
+        // timeout/kill a documented no-op — `timeout_ms`/`kill_flag` remain
+        // "used" via the comptime-dead posix path below (no discard needed,
+        // exactly like `waitReadable`'s params on these targets).
+        const address = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
+        const stream = address.connect(io(), .{ .mode = .stream, .timeout = .none }) catch |err|
+            return .{ .reason = mapConnectError(err), .fd = 0 };
+        return .{ .reason = .ok, .fd = fdToBits(stream.socket.handle) };
+    }
+    return connectIp4Posix(ip, port, timeout_ms, kill_flag);
+}
+
+/// The posix non-blocking connect (see `connectIp4`). Creates the socket,
+/// flips it to `O_NONBLOCK`, issues the connect, and polls `POLL.OUT` in
+/// deadline-and-kill-bounded quanta until `SO_ERROR` reports the outcome,
+/// then restores blocking mode so the returned fd is compatible with the
+/// poll-then-read `recv`/`send` (which keep the fd blocking).
+fn connectIp4Posix(ip: [4]u8, port: u16, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
+    const socket_rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    if (std.posix.errno(socket_rc) != .SUCCESS) return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0 };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+    var connected = false;
+    defer if (!connected) {
+        _ = std.posix.system.close(handle);
+    };
+
+    // Flip to non-blocking so `connect` returns EINPROGRESS instead of
+    // blocking the pool thread on the OS connect timeout.
+    const nonblock_bit: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    const original_flags_rc = std.posix.system.fcntl(handle, std.posix.F.GETFL, @as(usize, 0));
+    if (std.posix.errno(original_flags_rc) != .SUCCESS) return .{ .reason = .other, .fd = 0 };
+    const original_flags: usize = @intCast(original_flags_rc);
+    if (std.posix.errno(std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags | nonblock_bit)) != .SUCCESS)
+        return .{ .reason = .other, .fd = 0 };
+
+    var address = std.mem.zeroInit(std.posix.sockaddr.in, .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @as(u32, @bitCast(ip)), // [a,b,c,d] in memory == network byte order
+    });
+    const address_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    const connect_rc = std.posix.system.connect(handle, @ptrCast(&address), address_len);
+    switch (std.posix.errno(connect_rc)) {
+        .SUCCESS => {
+            // Connected immediately (common on loopback). Restore blocking.
+            _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags);
+            connected = true;
+            return .{ .reason = .ok, .fd = fdToBits(handle) };
+        },
+        // In progress — poll for completion below. (`EWOULDBLOCK` == `EAGAIN`
+        // on posix, so it is covered by `.AGAIN`.)
+        .INPROGRESS, .INTR, .AGAIN => {},
+        else => |connect_errno| return .{ .reason = mapConnectErrno(connect_errno), .fd = 0 },
+    }
+
+    // Absolute monotonic deadline (HIGH-3): read once, recompute `deadline -
+    // now` each quantum so the timeout holds regardless of poll wake pattern.
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) monotonicMillis() + timeout_ms else 0;
+    while (true) {
+        if (kill_flag) |flag| {
+            if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0 };
+        }
+        var quantum: i32 = poll_quantum_ms;
+        if (has_deadline) {
+            const remaining = deadline_ms - monotonicMillis();
+            if (remaining <= 0) return .{ .reason = .timed_out, .fd = 0 };
+            if (remaining < quantum) quantum = @intCast(remaining);
+        }
+        switch (waitWritable(handle, quantum)) {
+            .timeout => continue, // re-check deadline + kill
+            .failed => return .{ .reason = .other, .fd = 0 },
+            .ready => {},
+        }
+        // Writable (or POLLERR/POLLHUP): `SO_ERROR` carries the verdict.
+        const pending = soError(handle);
+        if (pending == 0) {
+            _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags);
+            connected = true;
+            return .{ .reason = .ok, .fd = fdToBits(handle) };
+        }
+        if (pending < 0) return .{ .reason = .other, .fd = 0 };
+        return .{ .reason = mapConnectErrno(@enumFromInt(pending)), .fd = 0 };
+    }
 }
 
 /// Bind + listen an IPv4 stream socket on `ip:port` (port 0 → an ephemeral
@@ -207,6 +298,55 @@ pub fn closeFd(fd: Fd) void {
 /// long before the leaf re-checks the deadline and the kill flag.
 const poll_quantum_ms: i32 = 100;
 
+/// Monotonic milliseconds from an arbitrary epoch — the timeout clock for the
+/// poll-quantum loops (`recv`/`send`/`connect`). Read ONCE at entry to form an
+/// absolute deadline, then re-read each quantum, so the deadline advances with
+/// wall time regardless of the poll wake pattern.
+///
+/// This closes the slowloris idle-timeout hole (HIGH-3): the prior loop summed
+/// `poll_quantum_ms` onto an elapsed counter ONLY on a full-quantum `.timeout`
+/// poll, so a peer dribbling one byte every sub-quantum kept every poll
+/// `.ready`, the counter never advanced, and the `timeout_ms` deadline was
+/// never reached — pinning a pool thread forever. An absolute monotonic
+/// deadline cannot be defeated that way.
+///
+/// Comptime-branched across this socket seam's three backends exactly like
+/// `waitReadable`/`nameAddress` (this file IS the socket syscall seam, so
+/// per-OS calls are its purpose): posix `clock_gettime(CLOCK_MONOTONIC)`,
+/// Windows `QueryPerformanceCounter`/`QueryPerformanceFrequency`, wasi
+/// `clock_time_get(CLOCK_MONOTONIC)`. On the poll-less targets the timeout is
+/// a documented no-op (`waitReadable`/`waitWritable` return `.ready`), so the
+/// clock is only load-bearing on posix, but all three compile for every
+/// cross-target build.
+fn monotonicMillis() i64 {
+    switch (comptime builtin.os.tag) {
+        .windows => {
+            const kernel32 = struct {
+                extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.winapi) i32;
+                extern "kernel32" fn QueryPerformanceFrequency(frequency: *i64) callconv(.winapi) i32;
+            };
+            var counter: i64 = 0;
+            var frequency: i64 = 0;
+            _ = kernel32.QueryPerformanceCounter(&counter);
+            _ = kernel32.QueryPerformanceFrequency(&frequency);
+            if (frequency <= 0) return 0;
+            // counter / frequency = seconds; scale to ms in 128-bit to avoid overflow.
+            return @intCast(@divTrunc(@as(i128, counter) * 1000, @as(i128, frequency)));
+        },
+        .wasi => {
+            var timestamp: std.os.wasi.timestamp_t = 0;
+            _ = std.os.wasi.clock_time_get(.MONOTONIC, 1, &timestamp);
+            return @intCast(timestamp / std.time.ns_per_ms);
+        },
+        else => {
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+            return @as(i64, @intCast(ts.sec)) * 1000 +
+                @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+        },
+    }
+}
+
 /// The outcome of a `recv`: a stable, gate-crossing status plus the number of
 /// bytes deposited in the caller's buffer.
 ///
@@ -245,27 +385,32 @@ pub fn recv(
     const the_io = io();
     const handle = fdFromBits(fd);
     var filled: usize = 0;
-    // Elapsed time is tracked by SUMMING the quantum spent on each poll-timeout
-    // iteration (each `.timeout` consumed exactly `quantum` ms) — no monotonic
-    // clock is needed, which keeps this portable across the embedded std
-    // (`std.time.Timer` is not in every bundled std). A `.ready` iteration
-    // returns immediately, so its sub-quantum wait never needs accounting.
-    var elapsed_ms: i64 = 0;
+    // ABSOLUTE monotonic deadline (HIGH-3): read the clock once and recompute
+    // `deadline - now` each quantum. The prior loop summed `quantum` onto an
+    // elapsed counter ONLY on a `.timeout` poll, so a peer dribbling one byte
+    // per sub-quantum kept every poll `.ready`, never advanced the counter,
+    // and defeated the `timeout_ms` deadline — pinning a pool thread forever.
+    // An absolute deadline cannot be dribble-defeated (a `.ready` poll no
+    // longer needs accounting because `now` moves on its own).
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) monotonicMillis() + timeout_ms else 0;
     while (true) {
         if (kill_flag) |flag| {
             if (flag.load(.acquire)) return .{ .status = recv_status_closed, .bytes_filled = filled };
         }
         var quantum: i32 = poll_quantum_ms;
-        if (timeout_ms > 0) {
-            const remaining = timeout_ms - elapsed_ms;
+        if (has_deadline) {
+            const remaining = deadline_ms - monotonicMillis();
+            // On timeout the already-consumed `filled` bytes ride out on the
+            // outcome (MED-1): a `recv_exact` that timed out mid-frame has
+            // pulled `filled` bytes off the socket, and dropping them would
+            // desync a framed stream. The caller surfaces them as
+            // `SocketRecv.TimedOut(partial)` so no bytes are lost.
             if (remaining <= 0) return .{ .status = @intFromEnum(Reason.timed_out), .bytes_filled = filled };
             if (remaining < quantum) quantum = @intCast(remaining);
         }
         switch (waitReadable(handle, quantum)) {
-            .timeout => {
-                elapsed_ms += quantum; // this quantum's full wait elapsed
-                continue; // re-check deadline + kill
-            },
+            .timeout => continue, // re-check deadline + kill (no manual accounting)
             .failed => return .{ .status = @intFromEnum(Reason.other), .bytes_filled = filled },
             .ready => {},
         }
@@ -295,32 +440,118 @@ pub const SendOutcome = struct {
 };
 
 /// Send ALL of `bytes` or report the failure with the committed byte count
-/// (all-or-error, `Socket.send`). Blocking writes park in the kernel, so
-/// backpressure is automatic. An empty payload succeeds trivially.
-pub fn send(fd: Fd, bytes: []const u8) SendOutcome {
-    const the_io = io();
-    const handle = fdFromBits(fd);
-    var sent: usize = 0;
-    while (sent < bytes.len) {
-        const written = writeOnce(the_io, handle, bytes[sent..]) catch |err|
-            return .{ .reason = mapWriteError(err), .bytes_sent = sent };
-        if (written == 0) return .{ .reason = .connection_reset, .bytes_sent = sent };
-        sent += written;
-    }
-    return .{ .reason = .ok, .bytes_sent = bytes.len };
+/// (all-or-error, `Socket.send`), bounded by `timeout_ms` and the owning
+/// process's `kill_flag`. An empty payload succeeds trivially.
+///
+/// A bare `while (sent < len) netWrite` loop (the prior implementation) blocks
+/// FOREVER on a peer that accepts and never reads (slowloris-on-send): the OS
+/// send buffer fills, `netWrite` blocks, the owning process becomes UNKILLABLE
+/// and a blocking-pool thread is pinned → pool exhaustion, a runtime-wide DoS
+/// (HIGH-2). This routes through the SAME poll-quantum + `kill_flag` loop
+/// `recv` uses, polling `POLL.OUT`: each quantum re-checks the absolute
+/// monotonic deadline and the kill flag, so a stalled send times out
+/// (`timeout_ms > 0`) or yields promptly to teardown — and NEVER closes the fd
+/// (Decision E — a timeout leaves the socket usable, never `SO_SNDTIMEO`).
+pub fn send(fd: Fd, bytes: []const u8, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
+    return sendImpl(fd, bytes, true, timeout_ms, kill_flag);
 }
 
 /// Send whatever the kernel accepts in ONE write (explicit partial send —
-/// `Socket.send_some`). Returns the bytes actually written (`>= 1` on success
-/// for a non-empty payload); the caller decides how to handle a short write.
-pub fn sendSome(fd: Fd, bytes: []const u8) SendOutcome {
+/// `Socket.send_some`), bounded by `timeout_ms` and `kill_flag` exactly like
+/// `send`. Returns the bytes actually written (`>= 1` on success for a
+/// non-empty payload); the caller decides how to handle a short write.
+pub fn sendSome(fd: Fd, bytes: []const u8, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
     if (bytes.len == 0) return .{ .reason = .ok, .bytes_sent = 0 };
-    const the_io = io();
+    return sendImpl(fd, bytes, false, timeout_ms, kill_flag);
+}
+
+/// The shared poll-quantum-bounded write loop behind `send`/`sendSome`. When
+/// `all` is true it loops until every byte is written (or a deadline/kill/error
+/// intervenes); when false it returns after the first accepted write (the
+/// `send_some` single-write semantics).
+fn sendImpl(fd: Fd, bytes: []const u8, all: bool, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        // Poll-less targets (not in v1 run scope): the original blocking
+        // `netWrite` loop; the timeout/kill are a documented no-op (like
+        // `connect`). `timeout_ms`/`kill_flag` stay "used" via the comptime-dead
+        // posix path below (no discard, like `waitWritable`'s params there).
+        const the_io = io();
+        const handle = fdFromBits(fd);
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            const written = writeOnce(the_io, handle, bytes[sent..]) catch |err|
+                return .{ .reason = mapWriteError(err), .bytes_sent = sent };
+            if (written == 0) return .{ .reason = .connection_reset, .bytes_sent = sent };
+            sent += written;
+            if (!all) return .{ .reason = .ok, .bytes_sent = sent };
+        }
+        return .{ .reason = .ok, .bytes_sent = bytes.len };
+    }
+    return sendImplPosix(fd, bytes, all, timeout_ms, kill_flag);
+}
+
+/// The posix poll-quantum send loop. CRITICAL: the fd is flipped to
+/// `O_NONBLOCK` for the duration (restored on exit), so each `send` places only
+/// what currently fits (or returns `EAGAIN`) and returns immediately. A blocking
+/// `write`/`sendmsg` of a large payload blocks until the ENTIRE payload is
+/// queued — it does NOT return after merely filling the buffer (unlike `read`,
+/// which returns the bytes already available). So poll-then-BLOCKING-write would
+/// still pin the pool thread on a peer that accepts and never reads: `POLL.OUT`
+/// only reports "≥1 byte of room", after which a blocking write of the remaining
+/// megabytes blocks waiting for the peer to drain. (`MSG_DONTWAIT` alone is
+/// unreliable on macOS, so `O_NONBLOCK` is the portable mechanism.) Non-blocking
+/// writes make the per-quantum deadline and `kill_flag` checks always run
+/// (HIGH-2). The blocking mode is RESTORED on every exit path, so `recv`'s
+/// poll-then-blocking-read (safe — a read returns available bytes) is unaffected.
+fn sendImplPosix(fd: Fd, bytes: []const u8, all: bool, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
     const handle = fdFromBits(fd);
-    const written = writeOnce(the_io, handle, bytes) catch |err|
-        return .{ .reason = mapWriteError(err), .bytes_sent = 0 };
-    if (written == 0) return .{ .reason = .connection_reset, .bytes_sent = 0 };
-    return .{ .reason = .ok, .bytes_sent = written };
+    const flags: u32 = std.posix.MSG.NOSIGNAL; // no SIGPIPE; O_NONBLOCK gives non-blocking
+
+    // Flip to non-blocking for the send, restore the original mode on exit.
+    const nonblock_bit: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    const original_flags_rc = std.posix.system.fcntl(handle, std.posix.F.GETFL, @as(usize, 0));
+    if (std.posix.errno(original_flags_rc) != .SUCCESS) return .{ .reason = .other, .bytes_sent = 0 };
+    const original_flags: usize = @intCast(original_flags_rc);
+    if (std.posix.errno(std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags | nonblock_bit)) != .SUCCESS)
+        return .{ .reason = .other, .bytes_sent = 0 };
+    defer _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags);
+
+    var sent: usize = 0;
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) monotonicMillis() + timeout_ms else 0;
+    while (sent < bytes.len) {
+        if (kill_flag) |flag| {
+            // Killed mid-send: break out promptly so the pool thread returns
+            // and the process tears down. `bytes_sent` reports the boundary.
+            if (flag.load(.acquire)) return .{ .reason = .other, .bytes_sent = sent };
+        }
+        var quantum: i32 = poll_quantum_ms;
+        if (has_deadline) {
+            const remaining = deadline_ms - monotonicMillis();
+            if (remaining <= 0) return .{ .reason = .timed_out, .bytes_sent = sent };
+            if (remaining < quantum) quantum = @intCast(remaining);
+        }
+        switch (waitWritable(handle, quantum)) {
+            .timeout => continue, // re-check deadline + kill
+            .failed => return .{ .reason = .other, .bytes_sent = sent },
+            .ready => {},
+        }
+        const chunk = bytes[sent..];
+        const rc = std.posix.system.send(handle, @ptrCast(chunk.ptr), chunk.len, flags);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                const written: usize = @intCast(rc);
+                if (written == 0) return .{ .reason = .connection_reset, .bytes_sent = sent };
+                sent += written;
+                if (!all) return .{ .reason = .ok, .bytes_sent = sent }; // send_some: one write
+            },
+            // Buffer filled between the poll and the send, or interrupted —
+            // re-poll (the deadline/kill are re-checked at the loop top).
+            .AGAIN, .INTR => {},
+            else => |send_errno| return .{ .reason = mapSendErrno(send_errno), .bytes_sent = sent },
+        }
+    }
+    return .{ .reason = .ok, .bytes_sent = bytes.len };
 }
 
 /// Half-close (`Socket.shutdown`): `how` is `0` = read, `1` = write, `2` =
@@ -426,6 +657,80 @@ fn waitReadable(handle: net.Socket.Handle, quantum_ms: i32) ReadyState {
     }};
     const ready_count = std.posix.poll(poll_fds[0..], quantum_ms) catch return .failed;
     return if (ready_count == 0) .timeout else .ready;
+}
+
+/// Wait up to `quantum_ms` for `handle` to become WRITABLE (send buffer has
+/// room) or to report a connect/hangup/error — the `POLL.OUT` twin of
+/// `waitReadable`, used by the send loop and the non-blocking connect. `poll`
+/// reports `POLLERR`/`POLLHUP` in `revents` unconditionally, so a failed
+/// connect or a reset peer wakes the poll as `.ready`; the caller then reads
+/// `SO_ERROR` (connect) or observes the write error (send). On the poll-less
+/// targets this reports `.ready` so the blocking write simply blocks — the
+/// quantum timeout is a documented no-op there, never a correctness break.
+fn waitWritable(handle: net.Socket.Handle, quantum_ms: i32) ReadyState {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .ready;
+    }
+    var poll_fds = [1]std.posix.pollfd{.{
+        .fd = handle,
+        .events = std.posix.POLL.OUT,
+        .revents = 0,
+    }};
+    const ready_count = std.posix.poll(poll_fds[0..], quantum_ms) catch return .failed;
+    return if (ready_count == 0) .timeout else .ready;
+}
+
+/// Read a connecting socket's pending `SO_ERROR` (the completed connect's
+/// verdict): `0` = connected, a positive errno = the connect failure, `-1` =
+/// `getsockopt` itself failed. Posix-only (the non-blocking connect path).
+fn soError(handle: net.Socket.Handle) i32 {
+    var pending: i32 = 0;
+    var length: std.posix.socklen_t = @sizeOf(i32);
+    const rc = std.posix.system.getsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&pending), &length);
+    if (std.posix.errno(rc) != .SUCCESS) return -1;
+    return pending;
+}
+
+/// Map a `socket(2)` creation failure errno to a stable `Reason`.
+fn mapSocketCreateErrno(rc: anytype) Reason {
+    return switch (std.posix.errno(rc)) {
+        .MFILE, .NFILE => .fd_quota_exceeded,
+        .ACCES, .PERM => .access_denied,
+        .NOMEM, .NOBUFS => .out_of_memory,
+        else => .other,
+    };
+}
+
+/// Map a non-blocking `send(2)` errno to a stable `Reason` (the same set
+/// `mapWriteError` produces for the `netWrite` fallback path).
+fn mapSendErrno(err: std.posix.E) Reason {
+    return switch (err) {
+        .PIPE, .CONNRESET => .connection_reset,
+        .NETDOWN => .network_down,
+        .NETUNREACH => .network_unreachable,
+        .HOSTUNREACH => .host_unreachable,
+        .ACCES => .access_denied,
+        .NOBUFS, .NOMEM => .out_of_memory,
+        else => .other,
+    };
+}
+
+/// Map a `connect(2)` / `SO_ERROR` errno to a stable `Reason` (the same set
+/// `mapConnectError` produces for the portable-connect fallback path).
+fn mapConnectErrno(err: std.posix.E) Reason {
+    return switch (err) {
+        .CONNREFUSED => .connection_refused,
+        .TIMEDOUT => .timed_out,
+        .HOSTUNREACH => .host_unreachable,
+        .NETUNREACH => .network_unreachable,
+        .NETDOWN => .network_down,
+        .CONNRESET => .connection_reset,
+        .ADDRNOTAVAIL => .address_unavailable,
+        .ADDRINUSE => .address_in_use,
+        .ACCES, .PERM => .access_denied,
+        .NOMEM, .NOBUFS => .out_of_memory,
+        else => .other,
+    };
 }
 
 /// One `netWrite` of `bytes` (no header, no splat). Returns bytes accepted.
@@ -547,7 +852,7 @@ test "socket_io: loopback listen + connect + close round-trips on an ephemeral p
     try testing.expect(listener.bound_port != 0);
     defer closeFd(listener.fd);
 
-    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
     try testing.expectEqual(Reason.ok, client.reason);
     closeFd(client.fd);
 }
@@ -561,7 +866,7 @@ test "socket_io: connect to a closed port fails (not .ok), never hangs" {
     const dead_port = listener.bound_port;
     closeFd(listener.fd);
 
-    const client = connectIp4(.{ 127, 0, 0, 1 }, dead_port, 1000);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, dead_port, 1000, null);
     try testing.expect(client.reason != .ok);
 }
 
@@ -572,7 +877,7 @@ test "socket_io: accept + full-duplex send/recv echo, binary-safe payload, then 
     try testing.expectEqual(Reason.ok, listener.reason);
     defer closeFd(listener.fd);
 
-    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
     try testing.expectEqual(Reason.ok, client.reason);
     defer closeFd(client.fd);
 
@@ -584,7 +889,7 @@ test "socket_io: accept + full-duplex send/recv echo, binary-safe payload, then 
 
     // Binary-safe payload: embedded NUL and a non-UTF-8 byte (0xFF).
     const payload = [_]u8{ 'h', 'i', 0, 0xFF, 'z' };
-    const sent = send(client.fd, payload[0..]);
+    const sent = send(client.fd, payload[0..], 0, null);
     try testing.expectEqual(Reason.ok, sent.reason);
     try testing.expectEqual(payload.len, sent.bytes_sent);
 
@@ -595,7 +900,7 @@ test "socket_io: accept + full-duplex send/recv echo, binary-safe payload, then 
     try testing.expectEqualSlices(u8, payload[0..], recv_buffer[0..payload.len]);
 
     // Server → client the other way (full duplex on one connection, no split).
-    const reply = send(accepted.fd, "pong");
+    const reply = send(accepted.fd, "pong", 0, null);
     try testing.expectEqual(Reason.ok, reply.reason);
     var reply_buffer: [16]u8 = undefined;
     const got_reply = recv(client.fd, reply_buffer[0..], false, 5000, null);
@@ -621,7 +926,7 @@ test "socket_io: recv idle-timeout returns timed_out WITHOUT closing the socket"
     const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
     try testing.expectEqual(Reason.ok, listener.reason);
     defer closeFd(listener.fd);
-    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
     try testing.expectEqual(Reason.ok, client.reason);
     defer closeFd(client.fd);
     const accepted = accept(listener.fd, null);
@@ -635,8 +940,117 @@ test "socket_io: recv idle-timeout returns timed_out WITHOUT closing the socket"
     try testing.expectEqual(@as(i32, @intFromEnum(Reason.timed_out)), timed.status);
 
     // Prove the socket survived the timeout: a subsequent send/recv works.
-    _ = send(client.fd, "after");
+    _ = send(client.fd, "after", 0, null);
     const after = recv(accepted.fd, recv_buffer[0..], false, 5000, null);
     try testing.expectEqual(@as(i32, recv_status_chunk), after.status);
     try testing.expectEqualSlices(u8, "after", recv_buffer[0..after.bytes_filled]);
+}
+
+test "socket_io: send to a peer that never reads TIMES OUT (slowloris-send), never blocks forever" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+    // The peer ACCEPTS but NEVER reads — the OS send buffer fills and a bare
+    // blocking `netWrite` loop would pin this thread forever (HIGH-2).
+    const accepted = accept(listener.fd, null);
+    try testing.expectEqual(Reason.ok, accepted.reason);
+    defer closeFd(accepted.fd);
+
+    // A payload far larger than any socket send buffer, so it cannot drain.
+    const payload = try std.heap.page_allocator.alloc(u8, 8 * 1024 * 1024);
+    defer std.heap.page_allocator.free(payload);
+    @memset(payload, 0);
+
+    const before_ms = monotonicMillis();
+    const outcome = send(client.fd, payload, 300, null);
+    const elapsed_ms = monotonicMillis() - before_ms;
+
+    // It TIMED OUT (never hung) with a partial byte count, promptly.
+    try testing.expectEqual(Reason.timed_out, outcome.reason);
+    try testing.expect(outcome.bytes_sent < payload.len);
+    try testing.expect(elapsed_ms < 4000); // ~300ms deadline, never ~forever
+
+    // A timeout does NOT close the fd — the handle stays valid (Erlang
+    // semantics). Draining on the peer lets a further send proceed.
+    var drain: [65536]u8 = undefined;
+    _ = recv(accepted.fd, drain[0..], false, 1000, null);
+    try testing.expect(localAddress(client.fd).ok);
+}
+
+test "socket_io: connect to a black-hole address is timeout-bounded, never the ~127s OS default" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737) — routable-looking but a black hole:
+    // the SYN goes unanswered. A blocking connect would hang on the OS default
+    // (~127s) with the process unkillable; the non-blocking + poll-quantum
+    // connect must return PROMPTLY. Whether the environment black-holes the SYN
+    // (→ :etimedout) or rejects it immediately (→ a prompt error), the invariant
+    // is the same: an ERROR returned well under the OS default (HIGH-2).
+    const before_ms = monotonicMillis();
+    const outcome = connectIp4(.{ 192, 0, 2, 1 }, 80, 250, null);
+    const elapsed_ms = monotonicMillis() - before_ms;
+
+    try testing.expect(outcome.reason != .ok);
+    try testing.expect(elapsed_ms < 5000); // never ~127s
+}
+
+test "socket_io: recv_exact idle-timeout holds against a dribbling peer (monotonic deadline), surfacing the partial" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+    const accepted = accept(listener.fd, null);
+    try testing.expectEqual(Reason.ok, accepted.reason);
+    defer closeFd(accepted.fd);
+
+    // A background thread dribbles ONE byte every ~20ms (< the 100ms poll
+    // quantum), so EVERY poll wakes `.ready`. The old summed-quantum counter
+    // only advanced on a `.timeout` poll, so it never advanced here and the
+    // deadline was NEVER reached — an unbounded pin. The absolute monotonic
+    // deadline fires on wall time regardless of the wake pattern.
+    const Dribbler = struct {
+        fd: Fd,
+        stop: *std.atomic.Value(bool),
+        fn run(self: @This()) void {
+            var n: usize = 0;
+            while (n < 400 and !self.stop.load(.acquire)) : (n += 1) {
+                const one = [_]u8{'x'};
+                const out = send(self.fd, one[0..], 0, null);
+                if (out.reason != .ok) break;
+                var ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Dribbler.run, .{Dribbler{ .fd = client.fd, .stop = &stop }});
+
+    // Ask for 200 bytes with a 300ms idle deadline. New code: the deadline
+    // fires at ~300ms having read far fewer than 200 (a partial); old code:
+    // never times out under the continuous dribble and reads on for seconds.
+    var buffer: [200]u8 = undefined;
+    const before_ms = monotonicMillis();
+    const outcome = recv(accepted.fd, buffer[0..], true, 300, null);
+    const elapsed_ms = monotonicMillis() - before_ms;
+
+    stop.store(true, .release);
+    thread.join();
+
+    try testing.expectEqual(@as(i32, @intFromEnum(Reason.timed_out)), outcome.status);
+    try testing.expect(outcome.bytes_filled < buffer.len); // a PARTIAL, not the whole frame
+    try testing.expect(outcome.bytes_filled >= 1); // some dribbled bytes were consumed
+    try testing.expect(elapsed_ms < 2000); // bounded by the 300ms deadline, not the dribble length
+
+    // The partial bytes are NOT lost — they are surfaced in `bytes_filled`
+    // (MED-1), so a caller can resume a framed read without desync.
+    for (buffer[0..outcome.bytes_filled]) |byte| try testing.expectEqual(@as(u8, 'x'), byte);
 }

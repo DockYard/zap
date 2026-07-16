@@ -279,10 +279,14 @@ pub struct Socket {
   @doc = """
     Receives with an idle TIMEOUT: exactly `byte_count` bytes (or next-
     available when `byte_count` is `0`), waiting at most `timeout_ms`
-    milliseconds (`0` = no deadline). On timeout returns `Failed(%SocketError{
-    reason: :etimedout})` and — the Erlang guarantee — leaves the socket OPEN
-    and usable (a later `recv` resumes). The timeout is enforced by a
-    `poll(2)`-quantum loop in the runtime, NEVER `SO_RCVTIMEO` (§6.1).
+    milliseconds (`0` = no deadline). On timeout returns `TimedOut(partial)` —
+    carrying any bytes ALREADY consumed off the socket (a `recv_exact` that
+    timed out mid-frame; empty for a next-available timeout) so a framed reader
+    never desyncs (MED-1) — and, the Erlang guarantee, leaves the socket OPEN
+    and usable (a later `recv` resumes with `partial` prepended). The timeout
+    is enforced by an ABSOLUTE-monotonic-deadline `poll(2)`-quantum loop in the
+    runtime, NEVER `SO_RCVTIMEO` (§6.1), so a byte-dribbling peer cannot defeat
+    it.
 
     ## Examples
 
@@ -315,9 +319,11 @@ pub struct Socket {
 
   @doc = """
     Decodes a `recv` status code + bytes into the EOF-safe `SocketRecv` union:
-    `0` = a data `Chunk`, a negative status = clean `Closed` (EOF), a positive
-    status = a `Failed` reason (`2` = idle timeout). Split out so the decode is
-    a plain Bool cascade (no integer-literal case arm).
+    `0` = a data `Chunk`, a negative status = clean `Closed` (EOF), status `2`
+    = an idle `TimedOut(partial)` (the `bytes` are the already-consumed prefix,
+    surfaced so a framed reader never desyncs — MED-1), any other positive
+    status = a `Failed` reason. Split out so the decode is a plain Bool cascade
+    (no integer-literal case arm).
     """
 
   @available_on(:network)
@@ -328,7 +334,11 @@ pub struct Socket {
       false ->
         case status < 0 {
           true -> SocketRecv.Closed
-          false -> SocketRecv.Failed(SocketError.from_code(status))
+          false ->
+            case status == 2 {
+              true -> SocketRecv.TimedOut(bytes)
+              false -> SocketRecv.Failed(SocketError.from_code(status))
+            }
         }
     }
   }
@@ -372,18 +382,15 @@ pub struct Socket {
     received = Socket.recv(socket, byte_count, timeout_ms)
     case received {
       SocketRecv.Chunk(bytes) -> SocketRecvBlob.Chunk(Blob.create(bytes))
+      SocketRecv.TimedOut(partial) -> SocketRecvBlob.TimedOut(Blob.create(partial))
       SocketRecv.Closed -> SocketRecvBlob.Closed
       SocketRecv.Failed(error) -> SocketRecvBlob.Failed(error)
     }
   }
 
   @doc = """
-    Sends ALL of `bytes` or fails (`send/2`, all-or-error). Blocking writes
-    park the fiber until the OS accepts the bytes, so backpressure is
-    automatic. Returns `Result.Ok(byte_count)` on full delivery, or
-    `Result.Error(%SocketError{..., bytes_sent: n})` reporting how much of the
-    payload committed before the failure (the Erlang `RestData` lesson — no
-    silent partial-send loss). Binary-safe. Panics on a stale handle.
+    Sends ALL of `bytes` or fails (`send/2`, all-or-error), with NO send
+    deadline (`timeout_ms = 0`). Identical to `send/3` with a `0` timeout.
 
     ## Examples
 
@@ -393,8 +400,32 @@ pub struct Socket {
   @available_on(:network)
 
   pub fn send(socket :: Socket, bytes :: String) -> Result(i64, SocketError) {
+    Socket.send(socket, bytes, 0)
+  }
+
+  @doc = """
+    Sends ALL of `bytes` or fails (`send/3`, all-or-error), waiting at most
+    `timeout_ms` milliseconds (`0` = no deadline). The write is bounded by a
+    `poll(2)`-quantum loop, NEVER `SO_SNDTIMEO` (Decision E): a peer that
+    accepts and never reads (slowloris-on-send) can no longer block the send
+    forever — it times out and the socket stays OPEN (a timeout never closes
+    it), and under the concurrency runtime the send stays kill-responsive so it
+    can never pin a blocking-pool thread. Returns `Result.Ok(byte_count)` on
+    full delivery, or `Result.Error(%SocketError{..., bytes_sent: n})`
+    reporting how much of the payload committed before the failure or timeout
+    (the Erlang `RestData` lesson — no silent partial-send loss). Binary-safe.
+    Panics on a stale handle.
+
+    ## Examples
+
+        Socket.send(socket, big_payload, 5000)   # send, 5s deadline
+    """
+
+  @available_on(:network)
+
+  pub fn send(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, SocketError) {
     total = String.length(bytes)
-    sent = :zig.SocketRuntime.send(socket.zap_socket_handle, bytes)
+    sent = :zig.SocketRuntime.send(socket.zap_socket_handle, bytes, timeout_ms)
     case sent == total {
       true -> Result(i64, SocketError).Ok(sent)
       false -> Result(i64, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(:zig.SocketRuntime.last_error()), bytes_sent: sent})
@@ -413,14 +444,27 @@ pub struct Socket {
   @available_on(:network)
 
   pub fn send_all(socket :: Socket, bytes :: String) -> Result(i64, SocketError) {
-    Socket.send(socket, bytes)
+    Socket.send(socket, bytes, 0)
+  }
+
+  @doc = """
+    The all-or-error send under its `send_all` name with a `timeout_ms`
+    deadline (identical to `send/3`).
+
+    ## Examples
+
+        Socket.send_all(socket, payload, 5000)
+    """
+
+  @available_on(:network)
+
+  pub fn send_all(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, SocketError) {
+    Socket.send(socket, bytes, timeout_ms)
   }
 
   @doc = """
     Sends whatever the kernel accepts in ONE write (`send_some/2`, explicit
-    partial). Returns `Result.Ok(bytes_written)` — which MAY be fewer than
-    `String.length(bytes)`, and the caller decides how to handle the short
-    write — or `Result.Error(error)`. Panics on a stale handle.
+    partial), with NO deadline. Identical to `send_some/3` with a `0` timeout.
 
     ## Examples
 
@@ -430,7 +474,27 @@ pub struct Socket {
   @available_on(:network)
 
   pub fn send_some(socket :: Socket, bytes :: String) -> Result(i64, SocketError) {
-    written = :zig.SocketRuntime.send_some(socket.zap_socket_handle, bytes)
+    Socket.send_some(socket, bytes, 0)
+  }
+
+  @doc = """
+    Sends whatever the kernel accepts in ONE write (`send_some/3`, explicit
+    partial), waiting at most `timeout_ms` milliseconds (`0` = no deadline) for
+    the socket to become writable — the same poll-quantum, kill-responsive
+    bounding `send/3` uses (a single stalled write cannot pin a pool thread).
+    Returns `Result.Ok(bytes_written)` — which MAY be fewer than
+    `String.length(bytes)`, and the caller decides how to handle the short
+    write — or `Result.Error(error)`. Panics on a stale handle.
+
+    ## Examples
+
+        Socket.send_some(socket, payload, 5000)
+    """
+
+  @available_on(:network)
+
+  pub fn send_some(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, SocketError) {
+    written = :zig.SocketRuntime.send_some(socket.zap_socket_handle, bytes, timeout_ms)
     case written > 0 {
       true -> Result(i64, SocketError).Ok(written)
       false ->
@@ -590,6 +654,10 @@ pub struct Socket {
           {:halt, halted} -> Result(acc, SocketError).Ok(halted)
           {_other, fallthrough} -> Result(acc, SocketError).Ok(fallthrough)
         }
+      # A next-available fold pull carries no partial (byte_count 0 reads
+      # nothing on timeout), so an idle timeout ends the fold as an Error —
+      # its documented mid-stream boundedness.
+      SocketRecv.TimedOut(_partial) -> Result(acc, SocketError).Error(%SocketError{reason: :etimedout})
       SocketRecv.Closed -> Result(acc, SocketError).Ok(acc)
       SocketRecv.Failed(error) -> Result(acc, SocketError).Error(error)
     }

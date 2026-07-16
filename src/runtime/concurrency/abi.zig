@@ -2208,15 +2208,19 @@ const SocketConnectRequest = struct {
     ip: [4]u8,
     port: u16,
     timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
     outcome: concurrency.socket_io.ConnectOutcome,
 };
 
 /// The blocking trampoline (`BlockingOperation`): runs the connect syscall
-/// off-core through the portable `socket_io` seam. The result rides the
-/// request struct, so the opaque return is unused.
+/// off-core through the portable `socket_io` seam. The poll-quantum connect
+/// leaf observes `kill_flag` (the process's `pending_kill`, captured on-core)
+/// once per quantum, so a connect to a black-hole address yields promptly to
+/// teardown instead of pinning a pool thread on the OS default (~127s). The
+/// result rides the request struct, so the opaque return is unused.
 fn socketConnectBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
     const request: *SocketConnectRequest = @ptrCast(@alignCast(operation_argument.?));
-    request.outcome = concurrency.socket_io.connectIp4(request.ip, request.port, request.timeout_ms);
+    request.outcome = concurrency.socket_io.connectIp4(request.ip, request.port, request.timeout_ms, request.kill_flag);
     return null;
 }
 
@@ -2265,6 +2269,9 @@ export fn zap_socket_connect(
         .ip = .{ ip0, ip1, ip2, ip3 },
         .port = port,
         .timeout_ms = timeout_ms,
+        // Capture the process's `pending_kill` on-core so the poll-quantum
+        // connect leaf stays kill-responsive off-core (HIGH-2).
+        .kill_flag = context.pendingKillFlag(),
         .outcome = undefined,
     };
     // Offload the blocking connect off this process's core (Decision D). On a
@@ -2454,34 +2461,43 @@ export fn zap_socket_recv_status(process: *anyopaque) callconv(.c) i32 {
     return contextFromHandle(process).socketLedger().last_recv_status;
 }
 
-/// A `send`/`send_some`'s blocking request.
+/// A `send`/`send_some`'s blocking request: the fd, the caller-owned payload,
+/// the all-or-error flag, the per-call `timeout_ms`, and the kill flag — the
+/// poll-quantum write leaf observes both off-core.
 const SocketSendRequest = struct {
     fd: concurrency.socket_io.Fd,
     bytes: []const u8,
     all: bool,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
     outcome: concurrency.socket_io.SendOutcome,
 };
 
 fn socketSendBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
     const request: *SocketSendRequest = @ptrCast(@alignCast(operation_argument.?));
     request.outcome = if (request.all)
-        concurrency.socket_io.send(request.fd, request.bytes)
+        concurrency.socket_io.send(request.fd, request.bytes, request.timeout_ms, request.kill_flag)
     else
-        concurrency.socket_io.sendSome(request.fd, request.bytes);
+        concurrency.socket_io.sendSome(request.fd, request.bytes, request.timeout_ms, request.kill_flag);
     return null;
 }
 
-/// Send `bytes_ptr[0..bytes_len]`, offloading the blocking write off-core.
-/// `all != 0` is all-or-error (`Socket.send`); `all == 0` is one write
-/// (`Socket.send_some`). Records the failure reason in the caller's ledger
-/// (`zap_socket_last_error`) and returns the byte count committed (`>= 0`), or
-/// `-1` when the caller does not own a live handle (panic at the surface).
+/// Send `bytes_ptr[0..bytes_len]`, offloading the poll-quantum-bounded write
+/// off-core (Decision D). `all != 0` is all-or-error (`Socket.send`); `all ==
+/// 0` is one write (`Socket.send_some`). `timeout_ms` (`0` = no deadline)
+/// bounds a stalled write against a peer that never reads (slowloris-on-send,
+/// HIGH-2); the process's `pending_kill` (captured on-core) is observed each
+/// quantum so the send is kill-responsive. Records the failure reason in the
+/// caller's ledger (`zap_socket_last_error`) and returns the byte count
+/// committed (`>= 0`), or `-1` when the caller does not own a live handle
+/// (panic at the surface). NEVER closes the socket — a timeout leaves it usable.
 export fn zap_socket_send(
     process: *anyopaque,
     handle_bits: u64,
     bytes_ptr: [*]const u8,
     bytes_len: usize,
     all: i32,
+    timeout_ms: i64,
 ) callconv(.c) i64 {
     const context = contextFromHandle(process);
     if (!context.socketLedger().contains(handle_bits)) return -1;
@@ -2491,6 +2507,8 @@ export fn zap_socket_send(
         .fd = fd,
         .bytes = bytes_ptr[0..bytes_len],
         .all = all != 0,
+        .timeout_ms = timeout_ms,
+        .kill_flag = context.pendingKillFlag(),
         .outcome = undefined,
     };
     _ = context.blocking(socketSendBlockingTrampoline, &request);

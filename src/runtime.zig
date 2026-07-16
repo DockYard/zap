@@ -4049,6 +4049,7 @@ const ZapConcurrencyKernel = struct {
         bytes_ptr: [*]const u8,
         bytes_len: usize,
         all: i32,
+        timeout_ms: i64,
     ) callconv(.c) i64;
     extern fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) callconv(.c) i64;
     extern fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64;
@@ -7001,7 +7002,7 @@ pub const SocketRuntime = struct {
     /// reason recorded in the process last-error (`Socket.last_error`).
     pub fn connect(a: i64, b: i64, c: i64, d: i64, port: i64, timeout_ms: i64) u64 {
         const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
-        const port16: u16 = @intCast(port);
+        const validated_port = checkedPort(port);
         if (comptime runtime_concurrency_active) {
             return ZapConcurrencyKernel.zap_socket_connect(
                 requireCurrentProcessHandle(),
@@ -7009,11 +7010,11 @@ pub const SocketRuntime = struct {
                 ip[1],
                 ip[2],
                 ip[3],
-                port16,
+                validated_port,
                 timeout_ms,
             );
         } else {
-            const outcome = socket_io.connectIp4(ip, port16, timeout_ms);
+            const outcome = socket_io.connectIp4(ip, validated_port, timeout_ms, null);
             if (outcome.reason != .ok) {
                 gate_off_last_error = @intFromEnum(outcome.reason);
                 return 0;
@@ -7033,8 +7034,8 @@ pub const SocketRuntime = struct {
     /// (reason in the process last-error).
     pub fn listen(a: i64, b: i64, c: i64, d: i64, port: i64, backlog: i64) u64 {
         const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
-        const port16: u16 = @intCast(port);
-        const backlog32: u32 = @intCast(backlog);
+        const port16: u16 = checkedPort(port);
+        const backlog32: u32 = checkedBacklog(backlog);
         if (comptime runtime_concurrency_active) {
             return ZapConcurrencyKernel.zap_socket_listen(
                 requireCurrentProcessHandle(),
@@ -7225,20 +7226,24 @@ pub const SocketRuntime = struct {
         }
     }
 
-    /// `Socket.send`: send ALL of `bytes` (all-or-error), returning the byte
-    /// count committed (`== bytes.len` on success; `< bytes.len` on failure,
-    /// with the reason in the last-error slot). Panics on a foreign handle.
-    pub fn send(handle_bits: u64, bytes: []const u8) i64 {
-        return sendCommon(handle_bits, bytes, true);
+    /// `Socket.send`: send ALL of `bytes` (all-or-error) bounded by
+    /// `timeout_ms` (`0` = no deadline), returning the byte count committed
+    /// (`== bytes.len` on success; `< bytes.len` on failure/timeout, with the
+    /// reason in the last-error slot). The write is poll-quantum-bounded and
+    /// kill-responsive (a stalled send against a non-reading peer times out or
+    /// yields to teardown, never pins a pool thread — HIGH-2); a timeout NEVER
+    /// closes the socket. Panics on a foreign handle.
+    pub fn send(handle_bits: u64, bytes: []const u8, timeout_ms: i64) i64 {
+        return sendCommon(handle_bits, bytes, true, timeout_ms);
     }
 
     /// `Socket.send_some`: send whatever the kernel accepts in ONE write
-    /// (explicit partial), returning the bytes written.
-    pub fn send_some(handle_bits: u64, bytes: []const u8) i64 {
-        return sendCommon(handle_bits, bytes, false);
+    /// (explicit partial) bounded by `timeout_ms`, returning the bytes written.
+    pub fn send_some(handle_bits: u64, bytes: []const u8, timeout_ms: i64) i64 {
+        return sendCommon(handle_bits, bytes, false, timeout_ms);
     }
 
-    fn sendCommon(handle_bits: u64, bytes: []const u8, all: bool) i64 {
+    fn sendCommon(handle_bits: u64, bytes: []const u8, all: bool, timeout_ms: i64) i64 {
         if (comptime runtime_concurrency_active) {
             const sent = ZapConcurrencyKernel.zap_socket_send(
                 requireCurrentProcessHandle(),
@@ -7246,6 +7251,7 @@ pub const SocketRuntime = struct {
                 bytes.ptr,
                 bytes.len,
                 if (all) 1 else 0,
+                timeout_ms,
             );
             if (sent < 0) @panic(
                 "zap: Socket.send on a socket this process does not own (a closed or stale Socket handle)",
@@ -7253,9 +7259,9 @@ pub const SocketRuntime = struct {
             return sent;
         } else {
             const outcome = if (all)
-                socket_io.send(gateOffFd(handle_bits), bytes)
+                socket_io.send(gateOffFd(handle_bits), bytes, timeout_ms, null)
             else
-                socket_io.sendSome(gateOffFd(handle_bits), bytes);
+                socket_io.sendSome(gateOffFd(handle_bits), bytes, timeout_ms, null);
             if (outcome.reason != .ok) gate_off_last_error = @intFromEnum(outcome.reason);
             return @intCast(outcome.bytes_sent);
         }
@@ -7324,6 +7330,31 @@ pub const SocketRuntime = struct {
     /// out-of-range value (a malformed `Socket.Address` is a program bug).
     fn octet(value: i64) u8 {
         if (value < 0 or value > 255) @panic("zap: Socket address octet out of range (0-255)");
+        return @intCast(value);
+    }
+
+    /// The largest listen backlog the runtime accepts. The OS caps the
+    /// effective backlog at `somaxconn` regardless; this bound rejects a
+    /// nonsensical/overflowing request cleanly (and stays well within the
+    /// `u31` the `socket_io` seam takes) rather than truncating it.
+    const max_backlog: i64 = 65535;
+
+    /// Narrow a Zap `i64` port to a `u16`, panicking on an out-of-range value
+    /// (a malformed port is a program bug) — the range-checked twin of
+    /// `octet`. Guards the `@intCast(port)` that would otherwise silently
+    /// truncate a `> 65535` port in ReleaseFast and panic opaquely in
+    /// ReleaseSafe (MED-4).
+    fn checkedPort(value: i64) u16 {
+        if (value < 0 or value > 65535) @panic("zap: Socket port out of range (0-65535)");
+        return @intCast(value);
+    }
+
+    /// Narrow a Zap `i64` listen backlog to a `u32`, panicking on an
+    /// out-of-range value — the range-checked twin of `octet`. Guards the
+    /// `@intCast(backlog)` that would otherwise truncate/panic on an
+    /// out-of-range backlog (MED-4).
+    fn checkedBacklog(value: i64) u32 {
+        if (value < 0 or value > max_backlog) @panic("zap: Socket backlog out of range (0-65535)");
         return @intCast(value);
     }
 };

@@ -2670,6 +2670,46 @@ test "CLI script: exit code is propagated (panic -> non-zero)" {
     try std.testing.expect(r.exit_code != 0);
 }
 
+// MED-4: `Socket.listen`/`connect` range-validate the Zap `i64` port and
+// backlog at the runtime boundary (the `checkedPort`/`checkedBacklog` guards,
+// symmetric with `octet`), rejecting an out-of-range value with a loud panic
+// instead of an UNCHECKED `@intCast` that would truncate in ReleaseFast /
+// panic opaquely in ReleaseSafe. A panic exits non-zero with the guard message
+// on stderr — a process-level assertion that cannot be expressed from Zap.
+test "CLI script: Socket.listen with an out-of-range backlog is rejected cleanly (panics, non-zero exit)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "socket_backlog.zap",
+        \\fn main(_args :: [String]) -> u8 {
+        \\  _r = Socket.listen(SocketAddress.loopback(0), 999999999)
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "backlog out of range") != null);
+}
+
+test "CLI script: Socket.listen with an out-of-range port is rejected cleanly (panics, non-zero exit)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "socket_port.zap",
+        \\fn main(_args :: [String]) -> u8 {
+        \\  _r = Socket.listen(SocketAddress.loopback(70000), 8)
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expect(r.exit_code != 0);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "port out of range") != null);
+}
+
 test "CLI script: exit code is propagated (normal -> zero)" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
