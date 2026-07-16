@@ -325,6 +325,7 @@ fn verifyTailCallRewritability(
         const branch_dest: ir.LocalId = switch (branch) {
             .if_expr => |ie| ie.dest,
             .switch_literal => |sl| sl.dest,
+            .case_block => |cb| cb.dest,
             else => continue,
         };
         // Must be immediately followed by a matching ret. The
@@ -350,7 +351,78 @@ fn verifyTailCallRewritability(
                 }
                 try verifyArmTailCallRewritten(function, struct_index, sl.default_instrs, sl.default_result);
             },
+            .case_block => |cb| {
+                // Phase E.7c: descend the decision tree (`pre_instrs`,
+                // recursing `guard_block` bodies) and each non-flat arm.
+                // Every `case_break` leaf stands in tail position (the
+                // whole construct feeds the function's `ret`), so a
+                // residual self-recursive `call_named` producing a
+                // leaf's value must have been collapsed to `tail_call`
+                // by `tryRewriteTailThroughBranch`'s `.case_block` arm.
+                try verifyCaseBreakLeavesTailCallRewritten(function, struct_index, cb.pre_instrs);
+                for (cb.arms) |arm| {
+                    try verifyArmTailCallRewritten(function, struct_index, arm.body_instrs, arm.result);
+                }
+                try verifyArmTailCallRewritten(function, struct_index, cb.default_instrs, cb.default_result);
+            },
             else => unreachable,
+        }
+    }
+}
+
+/// Phase E.7c structural V6 for `case_block`: descend a decision-tree
+/// instruction stream — recursing into `guard_block` bodies (the tree's
+/// branching structure) — and, at each `case_break` value marker (always
+/// the trailing instruction of the leaf stream it terminates), flag a
+/// self-recursive `.call_named` whose result IS the leaf's value.
+///
+/// Because the enclosing `case_block` is in confirmed tail position (its
+/// `dest` feeds the function's `ret`), every `case_break` leaf value is
+/// the function's return value, so such a call stands in tail position
+/// and `tryRewriteTailThroughBranch`'s `.case_block` arm should have
+/// collapsed it into a `tail_call`. A residue — because some pass
+/// introduced a non-tail-mappable instruction blocking the rewrite, or
+/// because the rewriter's gate did not fire — would execute as unbounded
+/// stack-growing recursion; surface it at compile time. Scanning the
+/// whole leaf body (not just the tail-mappable-adjacent slot) is what
+/// lets this catch a self-call separated from its `case_break` by a
+/// non-tail-mappable instruction.
+///
+/// Mirrors `verifyArmTailCallRewritten` (call_named-only, matching the
+/// existing structural check's scope) but adapted to the `case_break`
+/// leaf convention. `call_direct` self-recursion is out of scope here
+/// exactly as it is for the `if_expr` / `switch_literal` structural
+/// check.
+fn verifyCaseBreakLeavesTailCallRewritten(
+    function: *const ir.Function,
+    enclosing_branch_index: usize,
+    stream: []const ir.Instruction,
+) VerifyError!void {
+    // Recurse into guard_block bodies — the decision tree nests its
+    // leaves inside them.
+    for (stream) |instr| {
+        if (instr == .guard_block) {
+            try verifyCaseBreakLeavesTailCallRewritten(function, enclosing_branch_index, instr.guard_block.body);
+        }
+    }
+
+    if (stream.len == 0) return;
+    const last = stream[stream.len - 1];
+    if (last != .case_break) return;
+    const leaf_value = last.case_break.value orelse return;
+
+    // Scan the leaf body (everything before the `case_break` marker) for
+    // a self-recursive `call_named` whose dest is the leaf's value.
+    const leaf_body = stream[0 .. stream.len - 1];
+    for (leaf_body, 0..) |instr, instr_index| {
+        switch (instr) {
+            .call_named => |cn| {
+                if (cn.dest == leaf_value and std.mem.eql(u8, cn.name, function.name)) {
+                    emitStructuralTailCallDiagnostic(function, enclosing_branch_index, instr_index);
+                    return error.ArcInvariantViolation;
+                }
+            },
+            else => {},
         }
     }
 }
@@ -2113,6 +2185,98 @@ test "arc_verifier: structural V6 silent when arm tail call already rewritten to
     var function = try buildTestFunction(
         allocator,
         "test_v6_rewritten",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    try verifyFunctionStandalone(allocator, &function);
+}
+
+test "arc_verifier: rejects unrewritten case_break-leaf tail-call inside case_block (V6 Phase E.7c)" {
+    var guard = SuppressDiagnostics.init();
+    defer guard.deinit();
+    // Phase E.7c structural V6: a self-recursive `.call_named` whose
+    // result is a `case_break` leaf's value, inside a `case_block` whose
+    // `dest` feeds the function's `ret`, is in tail position. A non-tail-
+    // mappable instruction (`.struct_init`) between the call and the
+    // `case_break` blocks `tryRewriteTailThroughBranch`, so the residue
+    // must be flagged: scanning the whole leaf body (not just the tail
+    // slot) is what catches this.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const fields = [_]ir.StructFieldInit{
+        .{ .name = "f", .value = 0 },
+    };
+    const cont_leaf = [_]ir.Instruction{
+        .{ .call_named = .{ .dest = 1, .name = "test_v6_case", .args = &.{}, .arg_modes = &.{} } },
+        .{ .struct_init = .{ .dest = 3, .type_name = "T", .fields = &fields } },
+        .{ .case_break = .{ .value = 1 } },
+    };
+    const pre_instrs = [_]ir.Instruction{
+        .{ .guard_block = .{ .condition = 2, .body = &cont_leaf } },
+        .{ .match_fail = .{ .message = "no matching case clause" } },
+    };
+    const instrs = [_]ir.Instruction{
+        .{ .case_block = .{
+            .dest = 1,
+            .pre_instrs = &pre_instrs,
+            .arms = &.{},
+            .default_instrs = &.{},
+            .default_result = null,
+        } },
+        .{ .ret = .{ .value = 1 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_case",
+        &instrs,
+        &ownership,
+        &conventions,
+        .trivial,
+    );
+    defer freeTestFunction(allocator, &function);
+
+    const result = verifyFunctionStandalone(allocator, &function);
+    try testing.expectError(error.ArcInvariantViolation, result);
+}
+
+test "arc_verifier: structural V6 silent on case_block base + rewritten leaves (Phase E.7c)" {
+    // Positive control: a `case_block` in tail position whose recursive
+    // leaf is already a `tail_call` and whose base leaf's `case_break`
+    // value is NOT a self-call. V6 must accept it — no residual self
+    // `call_named` feeds any leaf.
+    const allocator = testing.allocator;
+    const ownership = [_]ir.OwnershipClass{ .owned, .owned, .owned, .owned };
+    const conventions = [_]ir.ParamConvention{};
+    const done_leaf = [_]ir.Instruction{
+        .{ .local_get = .{ .dest = 3, .source = 1 } },
+        .{ .case_break = .{ .value = 3 } },
+    };
+    const cont_leaf = [_]ir.Instruction{
+        .{ .tail_call = .{ .name = "test_v6_case_ok", .args = &.{} } },
+    };
+    const pre_instrs = [_]ir.Instruction{
+        .{ .guard_block = .{ .condition = 10, .body = &done_leaf } },
+        .{ .guard_block = .{ .condition = 11, .body = &cont_leaf } },
+        .{ .match_fail = .{ .message = "no matching case clause" } },
+    };
+    const instrs = [_]ir.Instruction{
+        .{ .case_block = .{
+            .dest = 2,
+            .pre_instrs = &pre_instrs,
+            .arms = &.{},
+            .default_instrs = &.{},
+            .default_result = null,
+        } },
+        .{ .ret = .{ .value = 2 } },
+    };
+    var function = try buildTestFunction(
+        allocator,
+        "test_v6_case_ok",
         &instrs,
         &ownership,
         &conventions,

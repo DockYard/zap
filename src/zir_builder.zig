@@ -1208,7 +1208,22 @@ pub const ZirDriver = struct {
     /// from `loopify_slots[i]`, and `tail_call` to self stores the new
     /// args back into the same slots and emits `repeat`. `null` outside
     /// loopification.
+    ///
+    /// A "direct" slot (see `loopify_slot_direct`) is the exception: for a
+    /// comptime-only parameter — a non-capturing closure passed at an
+    /// `anytype` position, whose `@TypeOf` is a BARE `fn(...)` value that
+    /// has no runtime storage and cannot back a mutable stack slot — the
+    /// corresponding entry `loopify_slots[i]` holds the original param
+    /// value Ref directly (not an `alloc` pointer). Such a parameter is
+    /// loop-invariant (the self-recursion threads the same comptime
+    /// callback every iteration — you cannot select a comptime `fn` at
+    /// runtime), so `param_get` reads the entry value and `tail_call`
+    /// skips its store.
     loopify_slots: ?[]u32 = null,
+    /// Parallel to `loopify_slots`: `true` at index `i` when that slot is a
+    /// DIRECT (no-storage, loop-invariant) comptime-`fn` parameter rather
+    /// than an `alloc`-backed mutable slot. See `loopify_slots`.
+    loopify_slot_direct: ?[]bool = null,
     /// P2-J6 layer-2 bare back-edge poll (plan item 2.5). When the current
     /// function is emitted loopified and the `runtime_concurrency` gate is
     /// ON, this holds the pointer Ref of the loop-local `u32` reduction
@@ -1233,6 +1248,17 @@ pub const ZirDriver = struct {
     /// `emitBackedgeSafepointSeed` from `backedgePollUnrollFactor`'s
     /// loop-shape decision; reset by `endLoopification`.
     loopify_backedge_unroll: u32 = 1,
+    /// Part-2c recv-memory back-edge gate. When the current function is emitted
+    /// loopified and the `runtime_concurrency` gate is ON, this holds the Ref of
+    /// the calling process's recv-arena pointer (`?*anyopaque` from
+    /// `Kernel.recvArenaSeedPtr()`), resolved ONCE in the loop preheader (the
+    /// pointer is loop-invariant — a fiber runs its whole loop as one process and
+    /// the PCB is pinned). The back-edge references it to test the loop-carried
+    /// slots against the recv arena (`Kernel.recvGateStep`) and conditionally
+    /// reset it (`Kernel.recvArenaResetIfUnaliased`) — bounding a streaming
+    /// `Socket.fold`/`Enum.reduce_while` to O(chunk) without a use-after-free.
+    /// `null` outside such a loop (and always with the gate OFF — zero emission).
+    loopify_recv_arena_ref: ?u32 = null,
     /// Nesting depth of capture contexts (case/switch/if-else bodies).
     /// When > 0, struct_init_typed can't be used because struct_init_field_type
     /// instructions (emitted via addInst) don't enter captured bodies.
@@ -6394,6 +6420,11 @@ pub const ZirDriver = struct {
             if (self.runtime_concurrency) {
                 const unroll_factor = self.backedgePollUnrollFactor(func);
                 try self.emitBackedgeSafepointSeed(unroll_factor);
+                // Part-2c: resolve the calling process's recv-arena pointer ONCE
+                // here (loop-invariant), so the back-edge recv-memory gate reads
+                // and conditionally resets it without a per-iteration
+                // current-process lookup. See `emitRecvArenaBackedgeGate`.
+                try self.emitRecvArenaSeed();
             }
             self.beginCapture();
             loopify_capture_open = true;
@@ -6448,6 +6479,12 @@ pub const ZirDriver = struct {
             // is analyzed by that branch and never reaches the loop header.
             // A no-op when no counter was seeded (gate OFF or an allocating
             // loop).
+            // Part-2c recv-memory back-edge gate: bound a now-loopified
+            // fold/reduce PULL loop's per-process recv arena. Emitted at the
+            // loop-body top level (same placement contract as the poll) so it
+            // runs on the iterating path once per back-edge. Gate-ON only; a
+            // no-op self-gate for every loop whose process never received.
+            try self.emitRecvArenaBackedgeGate();
             try self.emitBackedgeSafepointPoll();
             try self.emitRepeat();
             var body_len: u32 = 0;
@@ -6473,29 +6510,65 @@ pub const ZirDriver = struct {
     /// captures-prepended layouts (where `param_refs` is wider than
     /// `func.params`) still get a slot per ZIR param.
     fn beginLoopification(self: *ZirDriver, func: ir.Function) !void {
-        _ = func;
         const num_params = self.param_refs.items.len;
         if (num_params == 0) return;
 
         var slots = try self.allocator.alloc(u32, num_params);
         errdefer self.allocator.free(slots);
+        var direct = try self.allocator.alloc(bool, num_params);
+        errdefer self.allocator.free(direct);
+
+        // `param_refs` may be wider than `func.params` — a closure's
+        // captures are prepended (see `emitFunction`). A `param_ref` at
+        // index `i` corresponds to `func.params[i - capture_count]` for
+        // `i >= capture_count`.
+        const capture_count: usize = if (num_params > func.params.len)
+            num_params - func.params.len
+        else
+            0;
 
         for (self.param_refs.items, 0..) |param_ref, i| {
+            // A non-capturing closure parameter lowers to an `anytype`
+            // param and is invoked with a comptime-known BARE `fn(...)`
+            // value. `@TypeOf(param)` is that bare `fn` type, which has
+            // no runtime storage — `alloc` of it is illegal Zig
+            // ("variable of type 'fn (...) ...' must be const or
+            // comptime"). Such a parameter is loop-invariant: the
+            // self-recursion carries the same comptime callback every
+            // iteration. Give it a DIRECT slot (the entry value Ref, no
+            // storage); `param_get` reads it and `tail_call` skips its
+            // store.
+            const is_comptime_fn_param = blk: {
+                if (i < capture_count) break :blk false;
+                const param_index = i - capture_count;
+                if (param_index >= func.params.len) break :blk false;
+                break :blk std.meta.activeTag(func.params[param_index].type_expr) == .function;
+            };
+            if (is_comptime_fn_param) {
+                slots[i] = param_ref;
+                direct[i] = true;
+                continue;
+            }
             const type_ref = zir_builder_emit_typeof(self.handle, param_ref);
             if (type_ref == error_ref) return error.EmitFailed;
             const slot_ref = try self.emitAllocMut(type_ref);
             if (zir_builder_emit_store(self.handle, slot_ref, param_ref) != 0)
                 return error.EmitFailed;
             slots[i] = slot_ref;
+            direct[i] = false;
         }
         self.loopify_slots = slots;
+        self.loopify_slot_direct = direct;
     }
 
     fn endLoopification(self: *ZirDriver) void {
         if (self.loopify_slots) |slots| self.allocator.free(slots);
+        if (self.loopify_slot_direct) |direct| self.allocator.free(direct);
         self.loopify_slots = null;
+        self.loopify_slot_direct = null;
         self.loopify_safepoint_slot = null;
         self.loopify_backedge_unroll = 1;
+        self.loopify_recv_arena_ref = null;
     }
 
     /// Emit a `zap_runtime.Kernel.<name>(args...)` call — the P2-J6 layer-2
@@ -6649,6 +6722,59 @@ pub const ZirDriver = struct {
         _ = try self.emitKernelCall("procBackedgePoll", &.{slot});
     }
 
+    /// Part-2c preheader emission: resolve the calling process's recv-arena
+    /// pointer ONCE (`Kernel.recvArenaSeedPtr()` → `?*anyopaque`) and stash its
+    /// Ref in `loopify_recv_arena_ref`. Emitted before the `loop` capture so it
+    /// runs on loop ENTRY, not per iteration; the pointer is loop-invariant (a
+    /// fiber runs its whole loop as one process, and the PCB is address-pinned),
+    /// so the back-edge reuses it. Only reached under the `runtime_concurrency`
+    /// gate (the caller guards it); OFF builds emit nothing.
+    fn emitRecvArenaSeed(self: *ZirDriver) BuildError!void {
+        // No loop-carried slots (zero-param loopified shell) → nothing the gate
+        // could alias-test, so skip the preheader resolution entirely.
+        if (self.loopify_slots == null) return;
+        const arena_ref = try self.emitKernelCall("recvArenaSeedPtr", &.{});
+        self.loopify_recv_arena_ref = arena_ref;
+    }
+
+    /// Part-2c back-edge emission: bound a now-loopified fold/reduce PULL loop's
+    /// per-process recv arena. For each heap-possible loop-carried slot, fold a
+    /// runtime aliasing test into a boolean gate
+    /// (`Kernel.recvGateStep(arena, prev, value)`), then reset the recv arena to
+    /// O(chunk) unless any slot aliases it
+    /// (`Kernel.recvArenaResetIfUnaliased(arena, gate)`). The reset is suppressed
+    /// whenever a live loop-carried value points into the arena — the no-UAF
+    /// invariant — and the per-slot probes fold to comptime-nothing for scalar
+    /// loop-carried values, so a scalar-accumulator fold (the HIGH-4 DoS case)
+    /// resets every iteration and stays RSS-flat while an aliasing/aggregate
+    /// accumulator conservatively retains its chunks. See `runtime.zig`'s
+    /// `Kernel` recv-memory-gate section for the full soundness argument.
+    ///
+    /// Emitted at the loop-body top level (NOT inside a branch) so it is reached
+    /// once per back-edge on the iterating path, exactly like the safepoint poll.
+    /// A DIRECT slot (a loop-invariant comptime-`fn` callback with no runtime
+    /// storage) is skipped — it cannot reference the arena and cannot be loaded.
+    fn emitRecvArenaBackedgeGate(self: *ZirDriver) BuildError!void {
+        const arena_ref = self.loopify_recv_arena_ref orelse return;
+        const slots = self.loopify_slots orelse return;
+
+        var gate_ref = zir_builder_emit_bool(self.handle, false);
+        if (gate_ref == error_ref) return error.EmitFailed;
+
+        for (slots, 0..) |slot_ref, i| {
+            // Skip DIRECT slots: a comptime-`fn` param holds a bare `fn` value
+            // with no storage (an `emitLoad` on it is illegal), and a function
+            // value can never alias the recv arena.
+            if (self.loopify_slot_direct) |direct| {
+                if (i < direct.len and direct[i]) continue;
+            }
+            const value_ref = try self.emitLoad(slot_ref);
+            gate_ref = try self.emitKernelCall("recvGateStep", &.{ arena_ref, gate_ref, value_ref });
+        }
+
+        _ = try self.emitKernelCall("recvArenaResetIfUnaliased", &.{ arena_ref, gate_ref });
+    }
+
     /// Resolve the per-iteration value of param `index` when emitting
     /// the body of a loopified function. Returns a fresh `load` from
     /// the param's mutable stack slot — never the entry-scope param
@@ -6660,6 +6786,12 @@ pub const ZirDriver = struct {
     fn loopifyLoadParam(self: *ZirDriver, index: u32) BuildError!u32 {
         const slots = self.loopify_slots orelse return error.EmitFailed;
         if (index >= slots.len) return error.EmitFailed;
+        // A DIRECT slot holds the entry param value Ref itself (a
+        // loop-invariant comptime-`fn` param with no runtime storage) —
+        // return it without a load.
+        if (self.loopify_slot_direct) |direct| {
+            if (index < direct.len and direct[index]) return slots[index];
+        }
         return try self.emitLoad(slots[index]);
     }
 
@@ -7457,10 +7589,15 @@ pub const ZirDriver = struct {
                 // Loopification: load the param's per-iteration value
                 // from its stack slot. Each `param_get` emits a fresh
                 // `load`; LLVM's mem2reg merges them into a single
-                // phi at the loop header.
+                // phi at the loop header. `loopifyLoadParam` reads a
+                // DIRECT slot (a loop-invariant comptime-`fn` param) as
+                // its raw entry value with NO load — such a slot holds a
+                // bare `fn` value, not an `alloc` pointer, so an
+                // `emitLoad` on it would fail ("expected pointer, found
+                // fn(...)").
                 if (self.loopify_slots) |slots| {
                     if (pg.index < slots.len) {
-                        const loaded = try self.emitLoad(slots[pg.index]);
+                        const loaded = try self.loopifyLoadParam(pg.index);
                         try self.setLocal(pg.dest, loaded);
                         try self.markParamDerivedClosureLocal(pg.dest);
                         try self.markDestructiveScrutineeIfApplicable(pg);
@@ -8375,6 +8512,13 @@ pub const ZirDriver = struct {
                     // turns into the loop back-edge.
                     for (arg_refs.items, 0..) |arg_ref, i| {
                         if (i >= slots.len) break;
+                        // A DIRECT slot (loop-invariant comptime-`fn`
+                        // param) has no mutable storage — the callee
+                        // receives the same comptime callback, so there
+                        // is nothing to commit. Skip its store.
+                        if (self.loopify_slot_direct) |direct| {
+                            if (i < direct.len and direct[i]) continue;
+                        }
                         if (zir_builder_emit_store(self.handle, slots[i], arg_ref) != 0)
                             return error.EmitFailed;
                     }

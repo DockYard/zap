@@ -3988,6 +3988,11 @@ const ZapConcurrencyKernel = struct {
         extra_length: usize,
         out_payload: *?[*]const u8,
     ) callconv(.c) i32;
+    // Part-2c recv-memory back-edge gate: the calling process's private recv
+    // arena (`&pcb.socket_recv_arena`) erased to `*anyopaque`, or null off a
+    // process. The `Kernel.recvArena*` helpers cast it back to a
+    // `*std.heap.ArenaAllocator` and read/reset it directly.
+    extern fn zap_socket_current_recv_arena() callconv(.c) ?*anyopaque;
     extern fn zap_proc_exit(process: *anyopaque) callconv(.c) noreturn;
     extern fn zap_proc_yield_check(process: *anyopaque) callconv(.c) void;
     /// `Process.blocking` (P4-J3): run `operation` on the blocking / dirty-
@@ -17474,6 +17479,170 @@ pub const Kernel = struct {
             return;
         }
         @atomicStore(u32, &ZapConcurrencyKernel.zap_proc_reductions_remaining, n - stride, .monotonic);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part-2c recv-memory back-edge gate (bounds the fold/reduce PULL loop's
+    // per-process recv arena so a now-loopified fold does not grow O(total
+    // bytes) — the HIGH-4 DoS that Part 1's TCO would otherwise reopen).
+    //
+    // `Socket.fold`/`Enum.reduce_while` pull chunks through `:zig.SocketRuntime
+    // .recv`, which grows the process's PRIVATE recv arena (`ProcessControlBlock
+    // .socket_recv_arena`, a raw `c_allocator`-backed `ArenaAllocator`). That
+    // arena is reclaimed only at process teardown or at the mailbox-`receive`
+    // back-edge (`zap_proc_receive_iteration_reset`) — NEITHER fires on the
+    // `SocketRuntime.recv` pull path. Once Part 1 lets a fold stream indefinitely
+    // with a constant stack, the arena would grow without bound.
+    //
+    // The fix: at EVERY loopified loop's back-edge (emitted broadly, gate-ON —
+    // `src/zir_builder.zig`), reset the recv arena to O(chunk) — but ONLY when no
+    // live loop-carried value points into it (resetting under a live alias is a
+    // use-after-free, strictly WORSE than the leak). The reset is DYNAMICALLY
+    // GATED, not statically proven: the callback is opaque and may return the raw
+    // chunk (`{:cont, bytes}`), so `acc'` may alias the arena — a static closure
+    // proof cannot discharge that for an arbitrary callback. A runtime aliasing
+    // probe (`ArenaAllocator.ownsPtr`) is the sound discharge.
+    //
+    // Soundness (no UAF): the previous chunk `bytes` is DEAD at the back-edge
+    // (the `tail_call` threads `continued`/`acc'`, not `bytes`), so freeing the
+    // arena is safe UNLESS a loop-carried value aliases it. The probe suppresses
+    // the reset whenever ANY reachable `[]const u8` in a loop-carried value lies
+    // in the arena, and conservatively suppresses whenever a loop-carried value
+    // is a heap aggregate the shallow probe cannot enumerate (a List/Map header,
+    // a tagged union). A recv chunk's bytes are reachable, in Zap's type system,
+    // ONLY through a `[]const u8` String slice, so probing every reachable slice
+    // (plus suppress-on-unknown) covers every alias. Over-suppression is a missed
+    // reclamation (memory grows for a program that genuinely retains chunks),
+    // never a UAF. The `acc <> bytes` concat lands in the STRING arena
+    // (`String.concat`), never the recv arena, so it correctly resets.
+    //
+    // Cost: the arena pointer is loop-INVARIANT (a fiber runs its whole loop as
+    // one process; the PCB is address-pinned), so it is resolved ONCE in the
+    // loop preheader (`recvArenaSeedPtr`) and the back-edge pays, for a loop
+    // whose process never touched a socket, a single `used_list == null` load +
+    // not-taken branch (`recvArenaResetIfUnaliased`). The per-slot probes fold to
+    // comptime-nothing for scalar loop-carried values. Gate OFF: nothing emitted.
+    // -----------------------------------------------------------------------
+
+    /// Resolve the calling process's recv-arena pointer ONCE, in a loopified
+    /// loop's preheader. The pointer is loop-invariant (see the section doc), so
+    /// the back-edge reuses it without a per-iteration current-process lookup.
+    /// `null` off a process quantum (the back-edge gate then no-ops).
+    pub inline fn recvArenaSeedPtr() ?*anyopaque {
+        if (comptime !runtime_concurrency_active) return null;
+        return ZapConcurrencyKernel.zap_socket_current_recv_arena();
+    }
+
+    /// Whether `addr` lies within the recv arena's live backing buffers. Fast
+    /// self-gate first: an arena that never allocated (every non-socket loop)
+    /// owns nothing, answered by one `used_list`/`free_list` load.
+    inline fn recvArenaOwnsPtr(arena_opaque: ?*anyopaque, addr: usize) bool {
+        const opaque_ptr = arena_opaque orelse return false;
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(opaque_ptr));
+        if (arena.state.used_list == null and arena.state.free_list == null) return false;
+        return arena.ownsPtr(addr);
+    }
+
+    /// Whether `T` is a pointer-free SCALAR leaf: a value of `T` cannot itself be
+    /// a live readable pointer into memory (in Zap's type system a recv chunk is
+    /// referenced only through a `[]const u8` String slice, never smuggled into a
+    /// scalar). Used to decide, for a slice/pointer, whether the probe can reason
+    /// about the pointee/element precisely or must conservatively suppress: a
+    /// scalar-leaf pointee/element carries no further pins, so testing the
+    /// slice/pointer address is exhaustive; ANY non-scalar-leaf pointee/element
+    /// (a struct, a heap aggregate like a `List`/`Map` cell whose element storage
+    /// is slot-based and NOT a comptime field, a nested slice, a union, an
+    /// opaque) can hold String pins the shallow probe cannot enumerate, so the
+    /// reset is suppressed. Comptime; a pure type predicate.
+    fn typeIsScalarLeaf(comptime T: type) bool {
+        return switch (@typeInfo(T)) {
+            .int, .comptime_int, .float, .comptime_float, .bool, .void, .null, .undefined, .noreturn, .@"enum", .enum_literal, .error_set, .type => true,
+            else => false,
+        };
+    }
+
+    /// Whether `value` (a loop-carried local) pins recv-arena memory, so the
+    /// back-edge reset must be suppressed. Sound over-approximation — see the
+    /// section doc for the UAF argument. Precise for comptime-enumerable shapes
+    /// (scalars, structs/tuples, arrays, optionals, byte/scalar slices);
+    /// conservatively suppresses for shapes it cannot enumerate (heap-pointer
+    /// aggregates, tagged unions, opaques).
+    fn recvArenaValueAliases(arena_opaque: ?*anyopaque, value: anytype) bool {
+        const T = @TypeOf(value);
+        return switch (@typeInfo(T)) {
+            // Pointer-free leaves: a recv chunk is referenced only through a
+            // []const u8 slice, so a value holding no slice/pointer never pins.
+            .int, .comptime_int, .float, .comptime_float, .bool, .void, .null, .undefined, .noreturn, .@"enum", .enum_literal, .error_set, .type => false,
+
+            .pointer => |p| switch (p.size) {
+                // A slice — the shape a String takes. A scalar-element slice
+                // (`[]const u8` String, or any `[]scalar`) carries no per-element
+                // pins, so testing the slice's data pointer against the arena is
+                // exhaustive. A non-scalar-element slice (`[]const String`, …) can
+                // hold pins the probe cannot enumerate per element → suppress.
+                .slice => if (comptime typeIsScalarLeaf(p.child))
+                    recvArenaOwnsPtr(arena_opaque, @intFromPtr(value.ptr))
+                else
+                    true,
+                // A single/many/c pointer. A scalar pointee (`*i64`, `[*]const u8`)
+                // means the only pin risk is the pointer's own target, so test the
+                // address. A NON-scalar pointee — a heap aggregate like a
+                // `List`/`Map`/`Vector` cell (whose element storage is slot-based,
+                // NOT a comptime field), or a boxed struct/union — can reference
+                // arena bytes through runtime structure the shallow probe cannot
+                // follow, so conservatively suppress.
+                else => if (comptime typeIsScalarLeaf(p.child))
+                    recvArenaOwnsPtr(arena_opaque, @intFromPtr(value))
+                else
+                    true,
+            },
+
+            // Comptime-enumerable aggregates: recurse and test every field /
+            // element precisely (a {tag, String} tuple aliases iff its String
+            // field does).
+            .@"struct" => |s| blk: {
+                inline for (s.fields) |field| {
+                    if (recvArenaValueAliases(arena_opaque, @field(value, field.name))) break :blk true;
+                }
+                break :blk false;
+            },
+            .array => blk: {
+                inline for (value) |elem| {
+                    if (recvArenaValueAliases(arena_opaque, elem)) break :blk true;
+                }
+                break :blk false;
+            },
+            .optional => if (value) |present| recvArenaValueAliases(arena_opaque, present) else false,
+
+            // A tagged union: reading an inactive field is UB and some variant
+            // may carry a String, so suppress. Anything else the probe cannot
+            // see into (opaque/fn/frame/error_union/anyframe): suppress.
+            else => true,
+        };
+    }
+
+    /// One step of the back-edge aliasing fold: `prev OR value pins the recv
+    /// arena`. Threaded across the loop-carried slots (`prev` starts `false`),
+    /// short-circuiting once any slot aliases. Folds to comptime-`prev` for a
+    /// scalar `value`, so an all-scalar loop's per-slot probes vanish.
+    pub inline fn recvGateStep(arena_opaque: ?*anyopaque, prev: bool, value: anytype) bool {
+        if (comptime !runtime_concurrency_active) return prev;
+        if (prev) return true;
+        return recvArenaValueAliases(arena_opaque, value);
+    }
+
+    /// Reset the recv arena to O(chunk) at a loopified loop's back-edge UNLESS a
+    /// loop-carried value aliases it (`aliased`, computed by `recvGateStep`). The
+    /// self-gate — `used_list == null`, one load + not-taken branch — makes every
+    /// loop whose process never received pay essentially nothing. `.retain_capacity`
+    /// reuses the backing buffer, so a streaming fold's RSS stays FLAT.
+    pub inline fn recvArenaResetIfUnaliased(arena_opaque: ?*anyopaque, aliased: bool) void {
+        if (comptime !runtime_concurrency_active) return;
+        if (aliased) return;
+        const opaque_ptr = arena_opaque orelse return;
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(opaque_ptr));
+        if (arena.state.used_list == null) return;
+        _ = arena.reset(.retain_capacity);
     }
 
     /// Generic string conversion used by string interpolation. Strings

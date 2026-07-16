@@ -6707,6 +6707,217 @@ test "ZIR concurrency: a Socket move-sends cleanly — Process.send_move of a so
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR concurrency: Socket.fold recv-arena back-edge gate is UAF-safe across every accumulator aliasing shape (Pass 2c Part 2)" {
+    // The soundness gate for the Part-2c recv-memory bound: the loopified
+    // `Socket.fold` back-edge resets the process recv arena to O(chunk) UNLESS a
+    // live loop-carried value points into it. Resetting under a live alias is a
+    // use-after-free — strictly worse than the leak it fixes — so this pins that
+    // EVERY accumulator aliasing shape either survives byte-exact (the gate
+    // suppressed the reset) or is correctly copied out of the arena (the reset
+    // fired). A feeder process streams a distinctive first chunk (marker prefix)
+    // then many DISTINCT filler chunks over loopback; each shape folds and
+    // self-verifies:
+    //   * alias  — accumulator IS the raw chunk (`{:cont, bytes}`): a direct
+    //     recv-arena alias the probe MUST catch → suppress; final = last chunk,
+    //     verified all-filler (never marker-clobbered).
+    //   * tuple  — `{tag, String}` retaining the FIRST chunk across every
+    //     iteration: the struct holds an aliasing String → suppress; a wrongful
+    //     reset would let later recvs clobber the retained chunk's marker prefix.
+    //   * concat — `acc <> bytes` lands in the STRING arena, never the recv arena
+    //     → the reset FIRES; the full concatenation must be byte-exact.
+    //   * list   — `[bytes | acc]`, a heap `List` cell (slot-based element
+    //     storage the shallow probe cannot enumerate) → suppress; the retained
+    //     first chunk's marker must survive to the end.
+    // Every shape prints `<shape>=PASS`; `main` returns 0 iff all pass. Byte-exact
+    // survival of a retained chunk IS the use-after-free detector (a clobbered
+    // chunk reads wrong bytes). WRITTEN, not run here.
+    var result = try compileAndRunGatedConcurrency(
+        \\pub struct TestProg {
+        \\  fn fillers() -> i64 { 150 }
+        \\  fn marker() -> String { "FIRSTCHUNK_MARKER" }
+        \\  fn first_chunk() -> String { TestProg.marker() <> String.repeat("_", 8175) }
+        \\  fn filler() -> String { String.repeat("FILLERFILLERZZZZ", 512) }
+        \\
+        \\  pub fn main() -> u8 {
+        \\    r_alias = TestProg.run_shape(:alias)
+        \\    r_tuple = TestProg.run_shape(:tuple)
+        \\    r_concat = TestProg.run_shape(:concat)
+        \\    r_list = TestProg.run_shape(:list)
+        \\    IO.puts("alias=" <> TestProg.atom_str(r_alias))
+        \\    IO.puts("tuple=" <> TestProg.atom_str(r_tuple))
+        \\    IO.puts("concat=" <> TestProg.atom_str(r_concat))
+        \\    IO.puts("list=" <> TestProg.atom_str(r_list))
+        \\    all_pass = (r_alias == :pass) and (r_tuple == :pass) and (r_concat == :pass) and (r_list == :pass)
+        \\    case all_pass {
+        \\      true -> 0
+        \\      false -> 1
+        \\    }
+        \\  }
+        \\
+        \\  fn atom_str(a :: Atom) -> String {
+        \\    case a {
+        \\      :pass -> "PASS"
+        \\      _ -> "FAIL"
+        \\    }
+        \\  }
+        \\
+        \\  fn run_shape(shape :: Atom) -> Atom {
+        \\    case Socket.listen(SocketAddress.loopback(0), 8) {
+        \\      Result.Ok(listener) -> TestProg.shape_after_listen(shape, listener)
+        \\      Result.Error(_e) -> :listen_failed
+        \\    }
+        \\  }
+        \\
+        \\  fn shape_after_listen(shape :: Atom, listener :: SocketListener) -> Atom {
+        \\    port = SocketListener.local_port(listener)
+        \\    feeder_bits = Process.spawn(&TestProg.feeder_entry/0)
+        \\    _s = Process.send(Process.pid(i64, feeder_bits), port)
+        \\    case Socket.accept(listener) {
+        \\      Result.Ok(server) -> TestProg.shape_fold(shape, listener, server)
+        \\      Result.Error(_e) -> :accept_failed
+        \\    }
+        \\  }
+        \\
+        \\  fn shape_fold(shape :: Atom, listener :: SocketListener, server :: Socket) -> Atom {
+        \\    verdict = case shape {
+        \\      :alias -> TestProg.fold_alias(server)
+        \\      :tuple -> TestProg.fold_tuple(server)
+        \\      :concat -> TestProg.fold_concat(server)
+        \\      _ -> TestProg.fold_list(server)
+        \\    }
+        \\    _c = Socket.close(server)
+        \\    _l = SocketListener.close(listener)
+        \\    verdict
+        \\  }
+        \\
+        \\  fn cont_alias(_acc :: String, bytes :: String) -> {Atom, String} {
+        \\    {:cont, bytes}
+        \\  }
+        \\
+        \\  fn fold_alias(server :: Socket) -> Atom {
+        \\    case Socket.fold(server, "", 30000, &TestProg.cont_alias/2) {
+        \\      Result.Ok(last) -> TestProg.check_all_filler(last)
+        \\      Result.Error(_e) -> :fold_error
+        \\    }
+        \\  }
+        \\
+        \\  fn cont_tuple(acc :: {Atom, String}, bytes :: String) -> {Atom, {Atom, String}} {
+        \\    case acc {
+        \\      {:got, saved} -> {:cont, {:got, saved}}
+        \\      {_tag, _e} -> {:cont, {:got, bytes}}
+        \\    }
+        \\  }
+        \\
+        \\  fn fold_tuple(server :: Socket) -> Atom {
+        \\    result = Socket.fold(server, {:pending, ""}, 30000, &TestProg.cont_tuple/2)
+        \\    case result {
+        \\      Result.Ok(pair) -> TestProg.check_tuple(pair)
+        \\      Result.Error(_e) -> :fold_error
+        \\    }
+        \\  }
+        \\
+        \\  fn check_tuple(pair :: {Atom, String}) -> Atom {
+        \\    case pair {
+        \\      {:got, saved} -> TestProg.marker_verdict(String.starts_with?(saved, TestProg.marker()))
+        \\      {_t, _s} -> :fail_no_chunk
+        \\    }
+        \\  }
+        \\
+        \\  fn marker_verdict(ok :: Bool) -> Atom {
+        \\    case ok {
+        \\      true -> :pass
+        \\      false -> :fail_marker_clobbered
+        \\    }
+        \\  }
+        \\
+        \\  fn cont_concat(acc :: String, bytes :: String) -> {Atom, String} {
+        \\    {:cont, acc <> bytes}
+        \\  }
+        \\
+        \\  fn fold_concat(server :: Socket) -> Atom {
+        \\    case Socket.fold(server, "", 30000, &TestProg.cont_concat/2) {
+        \\      Result.Ok(all) -> TestProg.check_concat(all)
+        \\      Result.Error(_e) -> :fold_error
+        \\    }
+        \\  }
+        \\
+        \\  fn cont_list(acc :: List(String), bytes :: String) -> {Atom, List(String)} {
+        \\    {:cont, [bytes | acc]}
+        \\  }
+        \\
+        \\  fn fold_list(server :: Socket) -> Atom {
+        \\    case Socket.fold(server, ["__seed__"], 30000, &TestProg.cont_list/2) {
+        \\      Result.Ok(chunks) -> TestProg.check_list(chunks)
+        \\      Result.Error(_e) -> :fold_error
+        \\    }
+        \\  }
+        \\
+        \\  fn check_all_filler(s :: String) -> Atom {
+        \\    ok = String.length(s) > 0 and String.contains?(s, "FILLERFILLERZZZZ") and (String.contains?(s, "FIRSTCHUNK") == false)
+        \\    case ok {
+        \\      true -> :pass
+        \\      false -> :fail_alias_content
+        \\    }
+        \\  }
+        \\
+        \\  fn check_concat(all :: String) -> Atom {
+        \\    expected_len = 8192 + TestProg.fillers() * 8192
+        \\    ok = String.length(all) == expected_len and String.starts_with?(all, TestProg.marker()) and String.ends_with?(all, "FILLERFILLERZZZZ")
+        \\    case ok {
+        \\      true -> :pass
+        \\      false -> :fail_concat
+        \\    }
+        \\  }
+        \\
+        \\  fn check_list(chunks :: List(String)) -> Atom {
+        \\    reversed = Enum.reverse(chunks)
+        \\    case reversed {
+        \\      [_seed | rest] -> TestProg.check_list_first(rest)
+        \\      [] -> :fail_list_empty
+        \\    }
+        \\  }
+        \\
+        \\  fn check_list_first(rest :: List(String)) -> Atom {
+        \\    case rest {
+        \\      [first_recv | _tail] -> TestProg.marker_verdict(String.starts_with?(first_recv, TestProg.marker()))
+        \\      [] -> :fail_list_empty
+        \\    }
+        \\  }
+        \\
+        \\  fn feeder_entry() -> Nil {
+        \\    port = Process.receive_raw(i64)
+        \\    case Socket.connect(SocketAddress.loopback(port), 5000) {
+        \\      Result.Ok(client) -> TestProg.feed(client)
+        \\      Result.Error(_e) -> nil
+        \\    }
+        \\  }
+        \\
+        \\  fn feed(client :: Socket) -> Nil {
+        \\    _f = Socket.send(client, TestProg.first_chunk())
+        \\    TestProg.feed_loop(client, TestProg.filler(), TestProg.fillers())
+        \\    _c = Socket.close(client)
+        \\    nil
+        \\  }
+        \\
+        \\  fn feed_loop(client :: Socket, chunk :: String, remaining :: i64) -> Nil {
+        \\    case remaining {
+        \\      0 -> nil
+        \\      _ -> {
+        \\        _s = Socket.send(client, chunk)
+        \\        TestProg.feed_loop(client, chunk, remaining - 1)
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    );
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "alias=PASS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "tuple=PASS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "concat=PASS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "list=PASS") != null);
+}
+
 test "ZIR concurrency: Process.receive_raw rejects an unsendable payload type token" {
     // `String` is outside the Phase-2 sendable set (fixed-size scalars);
     // the raw-receive token macro has no clause for it, so an unsendable

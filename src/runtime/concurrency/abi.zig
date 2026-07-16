@@ -2552,6 +2552,29 @@ export fn zap_socket_recv_status(process: *anyopaque) callconv(.c) i32 {
     return contextFromHandle(process).socketLedger().last_recv_status;
 }
 
+/// The CALLING process's private recv-arena pointer (`&pcb.socket_recv_arena`,
+/// a `*std.heap.ArenaAllocator`) erased to `*anyopaque` — `null` when no
+/// process quantum is running (the driver thread) or the runtime is not
+/// initialized. Ambient-lookup companion to `zap_proc_current`, specialized to
+/// the recv arena so the Part-2c recv-memory back-edge gate resolves the arena
+/// in ONE call rather than a `zap_proc_current` + `socketRecvArena` pair.
+///
+/// The gate (`src/zir_builder.zig` loopify preheader → the `zap_runtime.Kernel
+/// .recvArena*` helpers) calls this ONCE per loop entry: the pointer is
+/// loop-invariant because a fiber runs its whole loopified loop as a single
+/// process and the PCB is address-pinned for the process's lifetime, so a
+/// per-iteration current-process lookup is unnecessary. The Kernel then reads
+/// the arena's emptiness and probes loop-carried String pointers against its
+/// live buffers (`ArenaAllocator.ownsPtr`) directly off this pointer. Bounded
+/// to the concurrency runtime (the recv arena exists gate-ON only); gate-OFF
+/// builds never emit a call to it.
+export fn zap_socket_current_recv_arena() callconv(.c) ?*anyopaque {
+    if (!runtime_initialized) return null;
+    const core = concurrency.Scheduler.currentThreadScheduler() orelse return null;
+    const context = core.currentProcessContext() orelse return null;
+    return @ptrCast(context.socketRecvArena());
+}
+
 /// A `send`/`send_some`'s blocking request: the fd, the caller-owned payload,
 /// the all-or-error flag, the per-call `timeout_ms`, and the kill flag — the
 /// poll-quantum write leaf observes both off-core.

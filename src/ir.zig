@@ -9325,13 +9325,13 @@ pub const IrBuilder = struct {
         const call_instr = body[call_index - 1];
 
         // Phase E.7b: NESTED structural tail position. When the arm's
-        // last instruction is itself an `if_expr` / `switch_literal`
-        // whose `dest` is this arm's result, the recursion may sit one
-        // (or more) branch levels deeper — `arm body -> inner arm ->
-        // recursive call -> inner dest -> outer arm result -> outer
-        // dest -> ret` is still a genuine tail position on every CFG
-        // path. Recurse through `tryRewriteTailThroughBranch` (mutual
-        // recursion with this function handles arbitrary nesting
+        // last instruction is itself an `if_expr` / `switch_literal` /
+        // `case_block` whose `dest` is this arm's result, the recursion
+        // may sit one (or more) branch levels deeper — `arm body ->
+        // inner arm -> recursive call -> inner dest -> outer arm result
+        // -> outer dest -> ret` is still a genuine tail position on
+        // every CFG path. Recurse through `tryRewriteTailThroughBranch`
+        // (mutual recursion with this function handles arbitrary nesting
         // depth). Without this, a tail self-call nested two branch
         // levels deep (e.g. fannkuch's `rotate_loop`: `if i == last {
         // .. } else { if count != 0 { .. } else { ..recurse.. } }`)
@@ -9339,11 +9339,24 @@ pub const IrBuilder = struct {
         // `arc_drop_insertion.dropsForTerminator` to drain owned-dead
         // locals in that arm, so every owned reference whose last use
         // feeds a borrowing wrapper leaks one +1 per arm execution.
+        //
+        // Phase E.7c adds `.case_block` to the gate: a `case` on a
+        // tuple/tagged-union/atom/struct scrutinee lowers to a
+        // `case_block` whose leaves are `case_break` value markers.
+        // `reduce_while_next`'s `case Enumerable.next(..) { .. -> case
+        // callback(..) { {:cont, ..} -> reduce_while_next(..) .. } }`
+        // is exactly this shape: the OUTER `:cont` arm's `case_break`
+        // value is defined by the INNER `case_block`, so the self-call
+        // sits two case levels deep. Recursing through the nested
+        // `case_block` here (and in `tryRewriteTailThroughBranch`'s
+        // `.case_block` arm) is what lets the deep leaf collapse to a
+        // `tail_call`.
+        //
         // The strict `call_index == body.len` gate mirrors the outer
         // structural rewrite: no tail-mappable instructions may sit
         // between the nested branch and the arm's end, so the branch
         // value provably IS the arm result, untouched.
-        if (call_index == body.len and (call_instr == .if_expr or call_instr == .switch_literal)) {
+        if (call_index == body.len and (call_instr == .if_expr or call_instr == .switch_literal or call_instr == .case_block)) {
             if (try self.tryRewriteTailThroughBranch(call_instr, return_value.?, func_name, enclosing_function_id)) |rewritten_branch| {
                 var nested_body: std.ArrayList(Instruction) = .empty;
                 try nested_body.appendSlice(self.allocator, body[0 .. body.len - 1]);
@@ -9435,6 +9448,156 @@ pub const IrBuilder = struct {
             .tail_call = .{ .name = sh.tail_name, .args = substituted_args },
         });
         return .{ .instrs = try new_body.toOwnedSlice(self.allocator), .rewritten = true };
+    }
+
+    /// Phase E.7c: descend a `case_block` decision-tree instruction
+    /// stream, rewriting each `case_break` leaf that stands in tail
+    /// position into a `tail_call` (self-recursion) or a `ret`
+    /// (genuine base case).
+    ///
+    /// A `case` on a tuple / tagged-union / atom / struct scrutinee
+    /// lowers to a `case_block` whose `pre_instrs` hold the full
+    /// decision tree: a nest of `guard_block`s (the branching
+    /// structure) whose success leaves each end in a `case_break{value
+    /// = V}` marker — the value the arm contributes to the construct's
+    /// `dest`. The decision-tree lowering guarantees a `case_break` is
+    /// always the LAST instruction of the (sub-)stream it terminates,
+    /// and there is at most one per stream (siblings live inside their
+    /// own `guard_block` bodies). This walk therefore:
+    ///
+    ///   1. copies the stream, recursing into every `guard_block` body
+    ///      (nested leaves), and
+    ///   2. rewrites the single trailing `case_break` leaf, if present.
+    ///
+    /// A leaf is rewritten by stripping its `case_break` marker and
+    /// handing the remaining leaf body to `rewriteTailCallsInBody` with
+    /// the marker's value as the "return value". That reuses the exact
+    /// tail-mappable walk-back, Phase E.8 orphan-share handling, and
+    /// E.7b nested-branch recursion (through the extended gate, so a
+    /// leaf whose value is defined by ANOTHER nested `case_block` /
+    /// `if_expr` / `switch_literal` recurses correctly — the
+    /// `reduce_while_next` case-of-case shape). When that rewrite
+    /// fires, the leaf body already ends in a `tail_call` (or a self-
+    /// terminating nested branch), so the `case_break` marker is
+    /// dropped.
+    ///
+    /// A leaf that does NOT self-recurse is a genuine base case; its
+    /// `case_break{value = V}` is rewritten to `ret V` — the
+    /// `case_break`-leaf analogue of `appendRetToBody`'s push-the-outer-
+    /// `ret` transformation for `if_expr` / `switch_literal` arms. This
+    /// makes the arm noreturn so the whole construct type-merges
+    /// uniformly under both musttail and loopify lowering. The base-
+    /// case conversion runs unconditionally during the walk, but the
+    /// caller (`tryRewriteTailThroughBranch`'s `.case_block` arm)
+    /// DISCARDS the entire rewritten stream when `rewritten == false`
+    /// (no leaf self-recursed), leaving the original `case_block`
+    /// byte-identical. This keeps the rewrite additive: a `case` with
+    /// no self-tail-recursion is never touched.
+    ///
+    /// Returns the rebuilt stream and whether any leaf collapsed into a
+    /// `tail_call`. Explicit error set: part of the
+    /// `rewriteTailCallsInBody` / `tryRewriteTailThroughBranch` mutual-
+    /// recursion cluster; every failure path is allocator-rooted.
+    fn rewriteCaseTreeStream(
+        self: *IrBuilder,
+        stream: []const Instruction,
+        func_name: []const u8,
+        enclosing_function_id: FunctionId,
+    ) error{OutOfMemory}!TailCallRewrite {
+        var out: std.ArrayList(Instruction) = .empty;
+        errdefer out.deinit(self.allocator);
+        var any_rewritten = false;
+
+        // Pass 1: copy the stream, recursing into `guard_block` bodies
+        // (the decision tree's branching structure holds all non-tail
+        // leaves).
+        for (stream) |instr| {
+            switch (instr) {
+                .guard_block => |gb| {
+                    const rewritten_body = try self.rewriteCaseTreeStream(gb.body, func_name, enclosing_function_id);
+                    if (rewritten_body.rewritten) any_rewritten = true;
+                    try out.append(self.allocator, .{ .guard_block = .{
+                        .condition = gb.condition,
+                        .body = rewritten_body.instrs,
+                    } });
+                },
+                .union_switch => |us| {
+                    // A `union_switch` (the IR a `case` on a TAGGED-UNION
+                    // scrutinee lowers its dispatch to) is a branching node of
+                    // the decision tree, exactly like `guard_block` — its
+                    // per-variant `cases[].body_instrs` (and the catch-all
+                    // `else_instrs`) are each a decision sub-stream ending in a
+                    // `case_break` leaf (or a nested branch feeding one). Recurse
+                    // into every case body and the `else` prong so a tail-self-
+                    // call the frontend buries inside a union arm is reached and
+                    // rewritten, just as it is inside a `guard_block`.
+                    //
+                    // Without this descent the walker copied the `union_switch`
+                    // undescended (the old `else` arm), so a self-tail-call under
+                    // a union match — e.g. `Socket.fold_loop`'s
+                    // `case received { SocketRecv.Chunk(bytes) -> ... ->
+                    // Socket.fold_loop(...) }`, whose recursive arm sits in the
+                    // `Chunk` variant's body — stayed a `call_direct` and never
+                    // loopified (unbounded stack). This completes the "tagged-
+                    // union" coverage this pass documents; it is additive (the
+                    // enclosing `case_block` caller discards the whole rewritten
+                    // stream when no leaf self-recursed, so a union match with no
+                    // tail-self-call is left byte-identical) and reuses the same
+                    // leaf machinery, so no `union_switch`-specific tail logic is
+                    // introduced.
+                    var new_cases: std.ArrayList(UnionCase) = .empty;
+                    errdefer new_cases.deinit(self.allocator);
+                    for (us.cases) |union_case| {
+                        const rewritten_body = try self.rewriteCaseTreeStream(union_case.body_instrs, func_name, enclosing_function_id);
+                        if (rewritten_body.rewritten) any_rewritten = true;
+                        var case_copy = union_case;
+                        case_copy.body_instrs = rewritten_body.instrs;
+                        try new_cases.append(self.allocator, case_copy);
+                    }
+                    const rewritten_else = if (us.has_else) blk: {
+                        const rewritten_else_body = try self.rewriteCaseTreeStream(us.else_instrs, func_name, enclosing_function_id);
+                        if (rewritten_else_body.rewritten) any_rewritten = true;
+                        break :blk rewritten_else_body.instrs;
+                    } else us.else_instrs;
+                    var union_copy = us;
+                    union_copy.cases = try new_cases.toOwnedSlice(self.allocator);
+                    union_copy.else_instrs = rewritten_else;
+                    try out.append(self.allocator, .{ .union_switch = union_copy });
+                },
+                else => try out.append(self.allocator, instr),
+            }
+        }
+
+        // Pass 2: rewrite the trailing `case_break` leaf, if this stream
+        // is itself a success leaf (or a default-success arm). A
+        // `case_break` is always the stream's final instruction.
+        if (out.items.len > 0 and out.items[out.items.len - 1] == .case_break) {
+            if (out.items[out.items.len - 1].case_break.value) |leaf_value| {
+                // The leaf body is everything before the `case_break`
+                // marker. `rewriteTailCallsInBody` performs the tail-
+                // mappable walk-back, E.8 orphan-share handling, and
+                // E.7b nested-branch recursion against it.
+                const leaf_body = out.items[0 .. out.items.len - 1];
+                const rewritten_leaf = try self.rewriteTailCallsInBody(leaf_body, leaf_value, func_name, enclosing_function_id);
+                if (rewritten_leaf.rewritten) {
+                    // Self-recursive (directly or via a nested branch):
+                    // the rewritten body already ends in a `tail_call`
+                    // (or a self-terminating nested branch). Drop the
+                    // `case_break` — the tail_call/branch is the
+                    // terminator. `rewritten_leaf.instrs` is a fresh
+                    // allocation independent of `out`, so releasing
+                    // `out`'s backing array here is safe (the nested
+                    // guard_block body slices it references are owned
+                    // separately and remain live through the copy).
+                    out.deinit(self.allocator);
+                    return .{ .instrs = rewritten_leaf.instrs, .rewritten = true };
+                }
+                // Genuine base case: `case_break(V)` -> `ret V`.
+                out.items[out.items.len - 1] = .{ .ret = .{ .value = leaf_value } };
+            }
+        }
+
+        return .{ .instrs = try out.toOwnedSlice(self.allocator), .rewritten = any_rewritten };
     }
 
     /// Phase E.7: rewrite an `if_expr` / `switch_literal` whose `dest`
@@ -9555,6 +9718,71 @@ pub const IrBuilder = struct {
                     .dest = sl.dest,
                     .scrutinee = sl.scrutinee,
                     .cases = try new_cases.toOwnedSlice(self.allocator),
+                    .default_instrs = final_default,
+                    .default_result = null,
+                } };
+            },
+            .case_block => |cb| {
+                // Phase E.7c: structural tail-call through a `case_block`
+                // — the IR every `case` on a tuple / tagged-union / atom
+                // / struct scrutinee lowers to. Gated exactly like
+                // `if_expr` / `switch_literal`: the construct's `dest`
+                // must be the value the outer `ret` consumes, or the
+                // arms are not in tail position and the rewrite is
+                // unsound (the non-tail hazard — a `case`-self-call
+                // whose result flows on must stay a plain `call_named`).
+                if (cb.dest != dest_local) return null;
+
+                // Flat form (the ONLY shape the frontend's case lowering
+                // produces): the decision tree lives in `pre_instrs`
+                // with `case_break` value markers at its leaves.
+                const rewritten_pre = try self.rewriteCaseTreeStream(cb.pre_instrs, func_name, enclosing_function_id);
+                var any_rewritten = rewritten_pre.rewritten;
+
+                // Non-flat form (`arms` / `default_instrs` carry
+                // `result` merge values like `switch_literal`; produced
+                // only by direct IR construction, never by the frontend
+                // — `arms` and `default_instrs` are empty slices for a
+                // lowered `case_block`). Mirror the `switch_literal` arm
+                // handling for parity so a hand-built or future non-flat
+                // `case_block` is rewritten identically.
+                var rewrite_results: std.ArrayList(TailCallRewrite) = .empty;
+                defer rewrite_results.deinit(self.allocator);
+                for (cb.arms) |arm| {
+                    const r = try self.rewriteTailCallsInBody(arm.body_instrs, arm.result, func_name, enclosing_function_id);
+                    if (r.rewritten) any_rewritten = true;
+                    try rewrite_results.append(self.allocator, r);
+                }
+                const new_default = try self.rewriteTailCallsInBody(cb.default_instrs, cb.default_result, func_name, enclosing_function_id);
+                if (new_default.rewritten) any_rewritten = true;
+
+                // Additive: if no leaf self-recursed, leave the original
+                // `case_block` byte-identical (discard the walk output).
+                if (!any_rewritten) return null;
+
+                var new_arms: std.ArrayList(IrCaseArm) = .empty;
+                for (cb.arms, 0..) |arm, idx| {
+                    const r = rewrite_results.items[idx];
+                    const final_body = if (r.rewritten)
+                        r.instrs
+                    else
+                        try self.appendRetToBody(arm.body_instrs, arm.result);
+                    try new_arms.append(self.allocator, .{
+                        .cond_instrs = arm.cond_instrs,
+                        .condition = arm.condition,
+                        .body_instrs = final_body,
+                        .result = null,
+                    });
+                }
+                const final_default = if (new_default.rewritten)
+                    new_default.instrs
+                else
+                    try self.appendRetToBody(cb.default_instrs, cb.default_result);
+
+                return Instruction{ .case_block = .{
+                    .dest = cb.dest,
+                    .pre_instrs = rewritten_pre.instrs,
+                    .arms = try new_arms.toOwnedSlice(self.allocator),
                     .default_instrs = final_default,
                     .default_result = null,
                 } };
@@ -21457,6 +21685,217 @@ test "rewriteTailCalls walks past borrow_value/copy_value/move_value/retain trai
     try std.testing.expect(saw_retain);
     try std.testing.expect(preserved_non_arg_release);
     try std.testing.expect(dropped_arg_release);
+}
+
+/// Test-only recursive scanner over an instruction stream (descending
+/// every child sub-stream via `forEachChildStream`), counting the
+/// `tail_call`s, self-recursive `call_named`s (by name), and `ret`s.
+/// Used by the Phase E.7c `case_block` tail-call tests, which must
+/// assert on instructions buried inside `case_block.pre_instrs` and
+/// nested `guard_block` bodies.
+const TailCallScanForTest = struct {
+    self_name: []const u8,
+    tail_calls: usize = 0,
+    self_call_named: usize = 0,
+    rets: usize = 0,
+    case_blocks: usize = 0,
+
+    fn scan(self: *TailCallScanForTest, instrs: []const Instruction) void {
+        for (instrs) |*instr| {
+            switch (instr.*) {
+                .tail_call => self.tail_calls += 1,
+                .call_named => |cn| {
+                    if (std.mem.eql(u8, cn.name, self.self_name)) self.self_call_named += 1;
+                },
+                .ret => self.rets += 1,
+                .case_block => self.case_blocks += 1,
+                else => {},
+            }
+            forEachChildStream(instr, self, visitChild);
+        }
+    }
+
+    fn visitChild(self: *TailCallScanForTest, child: ChildStream) void {
+        self.scan(child.stream);
+    }
+};
+
+test "rewriteTailCalls collapses a case_block case_break leaf into tail_call (Phase E.7c)" {
+    // A `case` on a tuple/tagged scrutinee lowers to a flat `case_block`
+    // whose `pre_instrs` are the decision tree: per-tag `guard_block`s
+    // whose success leaves each end in a `case_break{value}` marker. The
+    // recursive arm's `case_break` value is defined by a self-recursive
+    // `call_named`; the rewriter must collapse `[call + case_break]` into
+    // a `tail_call`, and rewrite the base arm's `case_break(V)` into
+    // `ret V` so the whole construct is self-terminating and the outer
+    // `ret` is dropped.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    const done_body = try alloc.alloc(Instruction, 2);
+    done_body[0] = .{ .local_get = .{ .dest = 50, .source = 1 } };
+    done_body[1] = .{ .case_break = .{ .value = 50 } };
+
+    const cont_body = try alloc.alloc(Instruction, 2);
+    cont_body[0] = .{ .call_named = .{ .dest = 60, .name = "step", .args = &.{}, .arg_modes = &.{} } };
+    cont_body[1] = .{ .case_break = .{ .value = 60 } };
+
+    const pre = try alloc.alloc(Instruction, 3);
+    pre[0] = .{ .guard_block = .{ .condition = 10, .body = done_body } };
+    pre[1] = .{ .guard_block = .{ .condition = 11, .body = cont_body } };
+    pre[2] = .{ .match_fail = .{ .message = "no matching case clause" } };
+
+    const instrs = try alloc.alloc(Instruction, 2);
+    instrs[0] = .{ .case_block = .{ .dest = 100, .pre_instrs = pre, .arms = &.{}, .default_instrs = &.{}, .default_result = null } };
+    instrs[1] = .{ .ret = .{ .value = 100 } };
+
+    const params = try alloc.alloc(Param, 0);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", 0, params, .void);
+
+    var scan = TailCallScanForTest{ .self_name = "step" };
+    scan.scan(rewritten);
+
+    // Exactly one tail_call (the :cont leaf), no residual self call_named.
+    try std.testing.expectEqual(@as(usize, 1), scan.tail_calls);
+    try std.testing.expectEqual(@as(usize, 0), scan.self_call_named);
+    // The base leaf's case_break became `ret 50` (exactly one ret).
+    try std.testing.expectEqual(@as(usize, 1), scan.rets);
+    // The outer `ret` was subsumed: the rewritten stream is the single
+    // self-terminating case_block.
+    try std.testing.expectEqual(@as(usize, 1), rewritten.len);
+    try std.testing.expect(rewritten[0] == .case_block);
+}
+
+test "rewriteTailCalls collapses a nested case-of-case tail call (Phase E.7c)" {
+    // The `reduce_while_next` shape: `case Enumerable.next(..) { {:done}
+    // -> acc; {:cont, ..} -> case callback(..) { {:cont, ..} ->
+    // reduce_while_next(..); {:halt, ..} -> dispose(..) } }`. The OUTER
+    // :cont arm's `case_break` value is defined by the INNER `case_block`,
+    // so the self-call sits two case levels deep. The rewriter must
+    // recurse through the nested case_block (E.7b gate + case_block arm),
+    // collapse the inner :cont self-call to a tail_call, convert the
+    // inner :halt (a call to a DIFFERENT function) base leaf to `ret`,
+    // and leave the outer base :done leaf as `ret`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    // Inner case_block (dest = 200): recursive :cont + non-self :halt.
+    const inner_cont = try alloc.alloc(Instruction, 2);
+    inner_cont[0] = .{ .call_named = .{ .dest = 60, .name = "step", .args = &.{}, .arg_modes = &.{} } };
+    inner_cont[1] = .{ .case_break = .{ .value = 60 } };
+
+    const inner_halt = try alloc.alloc(Instruction, 2);
+    inner_halt[0] = .{ .call_named = .{ .dest = 70, .name = "dispose", .args = &.{}, .arg_modes = &.{} } };
+    inner_halt[1] = .{ .case_break = .{ .value = 70 } };
+
+    const inner_pre = try alloc.alloc(Instruction, 3);
+    inner_pre[0] = .{ .guard_block = .{ .condition = 20, .body = inner_cont } };
+    inner_pre[1] = .{ .guard_block = .{ .condition = 21, .body = inner_halt } };
+    inner_pre[2] = .{ .match_fail = .{ .message = "no matching case clause" } };
+
+    // Outer :done base leaf.
+    const done_body = try alloc.alloc(Instruction, 2);
+    done_body[0] = .{ .local_get = .{ .dest = 50, .source = 1 } };
+    done_body[1] = .{ .case_break = .{ .value = 50 } };
+
+    // Outer :cont leaf: the inner case_block feeds the outer case_break.
+    const cont_body = try alloc.alloc(Instruction, 2);
+    cont_body[0] = .{ .case_block = .{ .dest = 200, .pre_instrs = inner_pre, .arms = &.{}, .default_instrs = &.{}, .default_result = null } };
+    cont_body[1] = .{ .case_break = .{ .value = 200 } };
+
+    const outer_pre = try alloc.alloc(Instruction, 3);
+    outer_pre[0] = .{ .guard_block = .{ .condition = 10, .body = done_body } };
+    outer_pre[1] = .{ .guard_block = .{ .condition = 11, .body = cont_body } };
+    outer_pre[2] = .{ .match_fail = .{ .message = "no matching case clause" } };
+
+    const instrs = try alloc.alloc(Instruction, 2);
+    instrs[0] = .{ .case_block = .{ .dest = 100, .pre_instrs = outer_pre, .arms = &.{}, .default_instrs = &.{}, .default_result = null } };
+    instrs[1] = .{ .ret = .{ .value = 100 } };
+
+    const params = try alloc.alloc(Param, 0);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", 0, params, .void);
+
+    var scan = TailCallScanForTest{ .self_name = "step" };
+    scan.scan(rewritten);
+
+    // Exactly one tail_call (the inner :cont self-call), no residual self
+    // call_named to "step".
+    try std.testing.expectEqual(@as(usize, 1), scan.tail_calls);
+    try std.testing.expectEqual(@as(usize, 0), scan.self_call_named);
+    // The non-self "dispose" call is preserved as a base-case value.
+    var dispose_scan = TailCallScanForTest{ .self_name = "dispose" };
+    dispose_scan.scan(rewritten);
+    try std.testing.expectEqual(@as(usize, 1), dispose_scan.self_call_named);
+    // Both case_blocks survive (outer + inner); the outer `ret` is dropped.
+    try std.testing.expectEqual(@as(usize, 2), scan.case_blocks);
+    try std.testing.expectEqual(@as(usize, 1), rewritten.len);
+    try std.testing.expect(rewritten[0] == .case_block);
+}
+
+test "rewriteTailCalls leaves a NON-tail case_block self-call untouched (Phase E.7c)" {
+    // Hazard: a `case` whose value flows ON (into further computation,
+    // not directly into `ret`) is NOT in tail position. Its self-call
+    // must stay a plain `call_named` — rewriting it to `tail_call` would
+    // turn genuine non-tail recursion into an infinite loop. The strict
+    // dest/adjacency gate must hold for `case_block` exactly as for
+    // `if_expr` / `switch_literal`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    const done_body = try alloc.alloc(Instruction, 2);
+    done_body[0] = .{ .local_get = .{ .dest = 50, .source = 1 } };
+    done_body[1] = .{ .case_break = .{ .value = 50 } };
+
+    const cont_body = try alloc.alloc(Instruction, 2);
+    cont_body[0] = .{ .call_named = .{ .dest = 60, .name = "step", .args = &.{}, .arg_modes = &.{} } };
+    cont_body[1] = .{ .case_break = .{ .value = 60 } };
+
+    const pre = try alloc.alloc(Instruction, 3);
+    pre[0] = .{ .guard_block = .{ .condition = 10, .body = done_body } };
+    pre[1] = .{ .guard_block = .{ .condition = 11, .body = cont_body } };
+    pre[2] = .{ .match_fail = .{ .message = "no matching case clause" } };
+
+    // The case_block's dest (100) flows into a binary_op (101 = 100 + 1),
+    // whose result is returned — so the case is NOT in tail position.
+    const instrs = try alloc.alloc(Instruction, 3);
+    instrs[0] = .{ .case_block = .{ .dest = 100, .pre_instrs = pre, .arms = &.{}, .default_instrs = &.{}, .default_result = null } };
+    instrs[1] = .{ .binary_op = .{ .dest = 101, .op = .add, .lhs = 100, .rhs = 1 } };
+    instrs[2] = .{ .ret = .{ .value = 101 } };
+
+    const params = try alloc.alloc(Param, 0);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", 0, params, .void);
+
+    var scan = TailCallScanForTest{ .self_name = "step" };
+    scan.scan(rewritten);
+
+    // No tail_call created; the self call_named is preserved verbatim.
+    try std.testing.expectEqual(@as(usize, 0), scan.tail_calls);
+    try std.testing.expectEqual(@as(usize, 1), scan.self_call_named);
+    // The case_block, binary_op, and final ret are all preserved.
+    try std.testing.expectEqual(@as(usize, 3), rewritten.len);
+    try std.testing.expect(rewritten[0] == .case_block);
+    try std.testing.expect(rewritten[2] == .ret);
+    // The base leaf's case_break was NOT converted to a ret (the whole
+    // construct is untouched), so the only ret is the top-level one.
+    try std.testing.expectEqual(@as(usize, 1), scan.rets);
 }
 
 test "rewriteTailCalls bails out on non-tail-mappable trailing instruction (Phase E.6)" {
