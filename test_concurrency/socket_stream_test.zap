@@ -325,6 +325,33 @@ pub struct TestConcurrency.SocketStreamTest {
     nil
   }
 
+  # A worker that BLOCKS in `Socket.accept` with no incoming connection — the
+  # only way out is a kill. `accept` offloads onto the blocking pool and polls
+  # its kill_flag each poll quantum (HIGH-1 kill-responsiveness); a regression
+  # would pin the pool thread forever and leave the process UNKILLABLE, hanging
+  # the parent's `await_signal`. The listener fd is reclaimed on the kill path
+  # by the drop-list sweep (live_count returns to baseline).
+  pub fn stalled_acceptor_entry() -> Nil {
+    _result = TestConcurrency.SocketStreamTest.stalled_acceptor_run()
+    nil
+  }
+
+  fn stalled_acceptor_run() -> Atom {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) ->
+        {
+          _n = Process.send(:socket_accept_kill_parent, :stalled)
+          :listen_failed
+        }
+      Result.Ok(listener) ->
+        {
+          _n = Process.send(:socket_accept_kill_parent, :stalled)
+          _blocked = Socket.accept(listener)
+          :accepted
+        }
+    }
+  }
+
   describe("Socket Tier-1 streams under the concurrency kernel (gate-ON)") {
     test("a process stalled in a slowloris send is KILLABLE (send is kill-responsive off-core)") {
       _named = Process.register(:socket_send_kill_parent)
@@ -354,6 +381,23 @@ pub struct TestConcurrency.SocketStreamTest {
       _down = Process.await_signal()
       assert(Socket.live_count() == base)
       _unreg = Process.unregister(:socket_connect_kill_parent)
+    }
+
+    test("a process blocked in accept with no connection is KILLABLE (accept is kill-responsive off-core)") {
+      _named = Process.register(:socket_accept_kill_parent)
+      base = Socket.live_count()
+      pair = Process.spawn_monitor(&TestConcurrency.SocketStreamTest.stalled_acceptor_entry/0)
+      _ack = receive Atom {
+        _stalled -> :ok
+      }
+      # The worker is blocked in `accept` with nothing to accept. Killing it must
+      # tear it down PROMPTLY (this returns only if accept yielded to the kill);
+      # a regression would hang here forever. Every fd (the listener) is
+      # reclaimed on the kill path.
+      _killed = Process.kill(pair.0)
+      _down = Process.await_signal()
+      assert(Socket.live_count() == base)
+      _unreg = Process.unregister(:socket_accept_kill_parent)
     }
 
     test("binary-safe echo roundtrip offloaded off-core, leak-exact") {

@@ -1046,6 +1046,20 @@ pub const ProcessContext = struct {
         return &context.record.pcb.socket_ledger;
     }
 
+    /// A pointer to this process's in-flight-offload fd slot
+    /// (`ProcessControlBlock.socket_pending_fd`) — the teardown-visible
+    /// reclamation seam for a socket fd produced by an offloaded connect/
+    /// accept (the HIGH-1 fix). The socket bridge captures this pointer
+    /// on-core before the offload; the blocking-pool thread records the
+    /// produced fd through it as its final act before re-attach, the fiber
+    /// continuation clears it on promotion, and the socket-sweep destructor
+    /// closes whatever fd is still parked here if a kill skipped the
+    /// continuation. The record (hence the PCB) is pinned for the process's
+    /// lifetime, so the pointer is stable across the offload.
+    pub fn socketPendingFdSlot(context: *ProcessContext) *socket_table.Fd {
+        return &context.record.pcb.socket_pending_fd;
+    }
+
     /// A pointer to this process's `pending_kill` atomic — the kill-
     /// responsiveness seam for the socket layer's poll-quantum blocking
     /// leaves (Phase S1, §6.1). A `recv`/`accept` offloaded onto the blocking

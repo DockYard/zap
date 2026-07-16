@@ -2209,6 +2209,11 @@ const SocketConnectRequest = struct {
     port: u16,
     timeout_ms: i64,
     kill_flag: ?*std.atomic.Value(bool),
+    /// The process's teardown-visible pending-fd slot (HIGH-1). The pool
+    /// thread records a just-connected fd here as its FINAL act before
+    /// re-attach, so a kill that skips the fiber continuation still reclaims
+    /// the fd via the socket-sweep. Captured on-core (the PCB is pinned).
+    pending_fd_slot: *concurrency.socket_io.Fd,
     outcome: concurrency.socket_io.ConnectOutcome,
 };
 
@@ -2221,6 +2226,15 @@ const SocketConnectRequest = struct {
 fn socketConnectBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
     const request: *SocketConnectRequest = @ptrCast(@alignCast(operation_argument.?));
     request.outcome = concurrency.socket_io.connectIp4(request.ip, request.port, request.timeout_ms, request.kill_flag);
+    // HIGH-1: record a just-produced fd in the process's teardown-visible
+    // pending slot BEFORE re-attach (this pool-thread write happens-before the
+    // re-attach handoff edge that the core's continuation OR the kill teardown
+    // reads after). If a kill lands before the continuation promotes the fd
+    // into the domain+ledger, the socket-sweep closes it from this slot. Only a
+    // successful connect yields a live fd; a failure leaves the slot untouched
+    // (still `no_pending_socket_fd`), and the transient fd was already closed on
+    // this thread by `connectIp4`'s own error/kill path.
+    if (request.outcome.reason == .ok) request.pending_fd_slot.* = request.outcome.fd;
     return null;
 }
 
@@ -2232,6 +2246,20 @@ fn socketConnectBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c)
 /// closes THIS process's sockets — never a sibling that reused a slot).
 fn socketSweepDestructor(node: *process_module.DropListNode) void {
     const pcb: *process_module.ProcessControlBlock = @fieldParentPtr("socket_sweep_node", node);
+    // HIGH-1: an fd produced by an in-flight connect/accept offload but NOT yet
+    // promoted into the domain+ledger (a kill skipped the fiber continuation)
+    // is parked in `socket_pending_fd`. Close it here — the ONLY reclamation
+    // path for it, since it is invisible to the domain (`domain.open` never
+    // ran). Cleared to `no_pending_socket_fd` so a later run cannot double-close
+    // it, and so the normal path (which clears it on promotion) leaves nothing
+    // for the sweep. Done BEFORE the ledger drain (order is immaterial — a
+    // promoted fd is in the ledger and the slot is `-1`; an un-promoted fd is in
+    // the slot and NOT the ledger — the two sets are disjoint, so no fd is
+    // closed twice).
+    if (pcb.socket_pending_fd != concurrency.socket_table.no_pending_socket_fd) {
+        concurrency.socket_io.closeFd(pcb.socket_pending_fd);
+        pcb.socket_pending_fd = concurrency.socket_table.no_pending_socket_fd;
+    }
     for (pcb.socket_ledger.ownedHandles()) |handle_bits| {
         if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |fd| {
             concurrency.socket_io.closeFd(fd);
@@ -2272,13 +2300,29 @@ export fn zap_socket_connect(
         // Capture the process's `pending_kill` on-core so the poll-quantum
         // connect leaf stays kill-responsive off-core (HIGH-2).
         .kill_flag = context.pendingKillFlag(),
+        // Capture the teardown-visible pending-fd slot on-core (HIGH-1): the
+        // pool thread records the connected fd here so a kill that skips the
+        // continuation below still reclaims it via the socket-sweep.
+        .pending_fd_slot = context.socketPendingFdSlot(),
         .outcome = undefined,
     };
+    // Register the socket-sweep drop-node BEFORE the offload (HIGH-1): the pool
+    // thread may park a fd in the pending slot during the offload, and a kill
+    // during the offload runs the drop-list — so the sweep node MUST already be
+    // on the list, even on the process's very first connect (idempotent).
+    context.ensureSocketSweep(socketSweepDestructor);
     // Offload the blocking connect off this process's core (Decision D). On a
     // runtime with no blocking pool this degrades to inline (documented).
     _ = context.blocking(socketConnectBlockingTrampoline, &request);
     if (request.outcome.reason != .ok) return socketConnectFailed(context, request.outcome.reason);
 
+    // Promotion (the fiber continuation the kill teardown skips): we are back
+    // on-core with the fd, so PROMOTE it into the domain+ledger and clear the
+    // pending slot FIRST — from here the fd lives in the ledger, so the sweep
+    // must NOT also close it from the slot (that would be a double-close). No
+    // kill can interpose between the clear and the ledger append: this is
+    // straight-line on-core code with no safepoint/yield.
+    request.pending_fd_slot.* = concurrency.socket_table.no_pending_socket_fd;
     // A client's local ephemeral port is not tracked in S0 (local_port = 0).
     const handle = runtime_state.socket_domain.open(
         request.outcome.fd,
@@ -2293,8 +2337,6 @@ export fn zap_socket_connect(
         if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
         return socketConnectFailed(context, .out_of_memory);
     };
-    // Crash-safe fd lifetime: register the sweep drop-node once per process.
-    context.ensureSocketSweep(socketSweepDestructor);
     return handle.toBits();
 }
 
@@ -2536,21 +2578,32 @@ export fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) c
 const SocketAcceptRequest = struct {
     fd: concurrency.socket_io.Fd,
     kill_flag: ?*std.atomic.Value(bool),
+    /// The process's teardown-visible pending-fd slot (HIGH-1) — see
+    /// `SocketConnectRequest.pending_fd_slot`.
+    pending_fd_slot: *concurrency.socket_io.Fd,
     outcome: concurrency.socket_io.AcceptOutcome,
 };
 
 fn socketAcceptBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
     const request: *SocketAcceptRequest = @ptrCast(@alignCast(operation_argument.?));
     request.outcome = concurrency.socket_io.accept(request.fd, request.kill_flag);
+    // HIGH-1: park a just-accepted fd in the process's teardown-visible slot
+    // before re-attach, so a kill skipping the continuation still reclaims it
+    // via the socket-sweep. Only a successful accept yields a live fd (accept's
+    // own post-accept kill check already closed the fd on the pool thread when
+    // it observed the kill, returning a non-`.ok` reason).
+    if (request.outcome.reason == .ok) request.pending_fd_slot.* = request.outcome.fd;
     return null;
 }
 
 /// Accept a connection from a listening socket, offloading the blocking accept
 /// off-core (kill-responsive). Registers the accepted fd as a NEW handle owned
 /// by the caller (appended to its ledger, sweep node ensured — the accepted
-/// socket inherits crash-safe fd lifetime), and returns its handle bits, or
-/// `0` on failure (reason in the caller's ledger). `-1`-style not-owned is
-/// reported as `0` with `last_error` unset-to-owned? No — see below.
+/// socket inherits crash-safe fd lifetime), and returns its handle bits. On
+/// failure returns the invalid handle with the reason recorded in the caller's
+/// ledger `last_error`; a non-owned/stale listener is surfaced the same way
+/// (the runtime turns its sentinel reason into a panic — a program bug, not
+/// a recoverable error).
 export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64 {
     const context = contextFromHandle(process);
     // A non-owned / stale listener is a program bug: surface it as the invalid
@@ -2566,11 +2619,19 @@ export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c
     var request = SocketAcceptRequest{
         .fd = listener_fd,
         .kill_flag = context.pendingKillFlag(),
+        // Teardown-visible pending-fd slot (HIGH-1); see `zap_socket_connect`.
+        .pending_fd_slot = context.socketPendingFdSlot(),
         .outcome = undefined,
     };
+    // Register the socket-sweep drop-node BEFORE the offload (HIGH-1) so a kill
+    // during the accept reclaims a just-accepted fd parked in the pending slot.
+    context.ensureSocketSweep(socketSweepDestructor);
     _ = context.blocking(socketAcceptBlockingTrampoline, &request);
     if (request.outcome.reason != .ok) return socketConnectFailed(context, request.outcome.reason);
 
+    // Promotion (the continuation a kill teardown skips): clear the pending slot
+    // FIRST so the fd is not double-closed once it lives in the ledger.
+    request.pending_fd_slot.* = concurrency.socket_table.no_pending_socket_fd;
     const handle = runtime_state.socket_domain.open(
         request.outcome.fd,
         context.selfPid().toBits(),
@@ -2584,7 +2645,6 @@ export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c
         if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
         return socketConnectFailed(context, .out_of_memory);
     };
-    context.ensureSocketSweep(socketSweepDestructor);
     return handle.toBits();
 }
 
@@ -3440,6 +3500,154 @@ test "abi: each spawned process gets its own private context, wholesale-freed le
     try testing.expectEqual(process_count, TestManagerCore.deinit_total.load(.monotonic));
     try testing.expectEqual(@as(usize, 0), TestManagerCore.live_context_count.load(.monotonic));
     try testing.expectEqual(@as(usize, 0), TestManagerCore.live_bytes_total.load(.monotonic));
+}
+
+// -- socket fd lifecycle: the offloaded-op kill-orphan (HIGH-1) ---------------
+//
+// These use OS-level fd accounting — not `Socket.live_count` — because the leak
+// they guard is INVISIBLE to the domain: an fd produced by an offloaded
+// connect/accept but killed BEFORE the fiber continuation registers it into the
+// domain (`domain.open` never ran) is an orphaned OS fd the domain never
+// counted. `fcntl(F_GETFD)` sees the raw OS fd directly.
+
+/// Count currently-open fds in the low fd range (posix). `fcntl(F_GETFD)`
+/// succeeds for an open fd, fails `EBADF` for a closed one — an exact open-fd
+/// count for before/after leak accounting.
+fn abiCountOpenFds() usize {
+    switch (comptime builtin.os.tag) {
+        .windows, .wasi => return 0,
+        else => {
+            var count: usize = 0;
+            var fd: std.posix.fd_t = 0;
+            while (fd < 4096) : (fd += 1) {
+                const rc = std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0));
+                if (std.posix.errno(rc) == .SUCCESS) count += 1;
+            }
+            return count;
+        },
+    }
+}
+
+/// Whether a specific fd is currently open in the OS (posix).
+fn abiFdIsOpen(fd: concurrency.socket_io.Fd) bool {
+    switch (comptime builtin.os.tag) {
+        .windows, .wasi => return false,
+        else => {
+            const rc = std.posix.system.fcntl(@intCast(fd), std.posix.F.GETFD, @as(usize, 0));
+            return std.posix.errno(rc) == .SUCCESS;
+        },
+    }
+}
+
+const SocketPendingProbe = struct {
+    /// The real fd the parker opened and parked in its PCB pending slot, or
+    /// `-1` when the listen failed. Written before the parker parks.
+    fd: std.atomic.Value(concurrency.socket_io.Fd) = .init(-2),
+    /// Bumped once the parker has opened + stashed + is about to park.
+    opened: std.atomic.Value(usize) = .init(0),
+};
+
+/// Simulates the state a kill-during-offload leaves: a process that produced a
+/// real socket fd on the (would-be) pool thread and recorded it in its PCB
+/// pending slot (exactly what `socket*BlockingTrampoline` does before
+/// re-attach), registered the socket-sweep node (as the on-core pre-offload
+/// step does), but was torn down BEFORE the fiber continuation could promote
+/// the fd into the domain+ledger. Only the teardown socket-sweep can reclaim
+/// the fd. Parks so the test can kill it in that exact state.
+fn socketPendingParkerEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *SocketPendingProbe = @ptrCast(@alignCast(argument.?));
+    const context = contextFromHandle(process);
+    const listen_outcome = concurrency.socket_io.listenIp4(.{ 127, 0, 0, 1 }, 0, 1);
+    if (listen_outcome.reason == .ok) {
+        // Park the produced fd in the teardown-visible slot WITHOUT promoting it
+        // into the domain (no `domain.open`) — invisible to `live_count`.
+        context.socketPendingFdSlot().* = listen_outcome.fd;
+        probe.fd.store(listen_outcome.fd, .release);
+    } else {
+        probe.fd.store(-1, .release);
+    }
+    // The socket-sweep node is registered before the (would-be) offload.
+    context.ensureSocketSweep(socketSweepDestructor);
+    _ = probe.opened.fetchAdd(1, .release);
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    _ = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    @panic("the parked socket-pending worker must never receive a message");
+}
+
+test "abi: a killed process reclaims its in-flight (un-promoted) socket fd — HIGH-1 offload-orphan fix" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    var runtime_live = true;
+    defer if (runtime_live) zap_proc_runtime_deinit();
+    TestManagerCore.resetAccounting();
+    bindTestManager();
+
+    const fd_baseline = abiCountOpenFds();
+    const live_baseline = runtime_state.socket_domain.statistics().live_socket_count;
+
+    var probe = SocketPendingProbe{};
+    const parker_bits = zap_proc_spawn(socketPendingParkerEntry, &probe);
+    try testing.expect(parker_bits != concurrency.Pid.invalid.toBits());
+    const driver_bits = zap_proc_spawn(immediateExitEntry, null);
+    try testing.expect(driver_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(driver_bits));
+
+    // The parker opened a REAL fd and parked it in its PCB pending slot without
+    // promoting it into the domain (HIGH-1's window). It is OPEN in the OS…
+    try testing.expectEqual(@as(usize, 1), probe.opened.load(.acquire));
+    const pending_fd = probe.fd.load(.acquire);
+    try testing.expect(pending_fd >= 0);
+    try testing.expect(abiFdIsOpen(pending_fd));
+    // …the OS sees exactly one more fd…
+    try testing.expectEqual(fd_baseline + 1, abiCountOpenFds());
+    // …yet `live_count` is UNCHANGED — the leak is invisible to the domain,
+    // which is exactly why OS-level accounting is required to catch it.
+    try testing.expectEqual(live_baseline, runtime_state.socket_domain.statistics().live_socket_count);
+
+    // Program shutdown KILLS the parker. Its teardown drop-list runs the
+    // socket-sweep, which MUST close the un-promoted pending fd — the HIGH-1
+    // reclamation. (Without the sweep closing the pending slot the fd stays
+    // open here and this test fails.)
+    zap_proc_runtime_deinit();
+    runtime_live = false;
+
+    try testing.expect(!abiFdIsOpen(pending_fd)); // fcntl → EBADF: reclaimed
+    try testing.expectEqual(fd_baseline, abiCountOpenFds()); // back to baseline
+}
+
+test "abi: repeated kill-during-offload cycles never accumulate fds (no fd-exhaustion DoS)" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    // Many cycles of "produce an in-flight fd, then KILL before promotion". If
+    // any cycle orphaned its fd, the OS fd count would climb monotonically — a
+    // supervisor/attacker-driven kill loop exhausting the process's fds. The
+    // fd count instead returns to a fixed baseline every cycle.
+    const cycles: usize = 40;
+    var baseline: usize = 0;
+    var cycle: usize = 0;
+    while (cycle < cycles) : (cycle += 1) {
+        try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+        bindTestManager();
+
+        var probe = SocketPendingProbe{};
+        const parker_bits = zap_proc_spawn(socketPendingParkerEntry, &probe);
+        try testing.expect(parker_bits != concurrency.Pid.invalid.toBits());
+        const driver_bits = zap_proc_spawn(immediateExitEntry, null);
+        try testing.expect(driver_bits != concurrency.Pid.invalid.toBits());
+        try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(driver_bits));
+        try testing.expect(probe.fd.load(.acquire) >= 0);
+
+        // Deinit kills the parked worker; the socket-sweep closes its pending fd.
+        zap_proc_runtime_deinit();
+
+        // Capture the baseline after the first full cycle (any one-time runtime
+        // fd is now accounted); every later cycle must return to it — no
+        // accumulation.
+        if (cycle == 0) baseline = abiCountOpenFds();
+        try testing.expectEqual(baseline, abiCountOpenFds());
+    }
 }
 
 test "abi: a killed process's live allocations are wholesale-freed at teardown (crash-teardown leak-exactness)" {

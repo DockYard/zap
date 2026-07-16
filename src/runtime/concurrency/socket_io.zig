@@ -237,6 +237,17 @@ fn connectIp4Posix(ip: [4]u8, port: u16, timeout_ms: i64, kill_flag: ?*std.atomi
         // Writable (or POLLERR/POLLHUP): `SO_ERROR` carries the verdict.
         const pending = soError(handle);
         if (pending == 0) {
+            // Connected — but if a kill became visible right as the connect
+            // completed (the "succeeds exactly at kill" residual race, HIGH-1),
+            // do NOT hand the live fd back to a tearing-down process. Leaving
+            // `connected` false makes the `defer` close the transient fd here on
+            // the pool thread, so it never reaches the fiber continuation (which
+            // the kill teardown would skip, orphaning the fd). The pending-fd
+            // teardown slot in `abi.zig` remains the backstop for a kill that
+            // becomes visible only after this check but before re-attach.
+            if (kill_flag) |flag| {
+                if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0 };
+            }
             _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags);
             connected = true;
             return .{ .reason = .ok, .fd = fdToBits(handle) };
@@ -600,6 +611,24 @@ pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
         const accept_options: net.Server.AcceptOptions = if (net.Server.AcceptOptions == void) {} else .{};
         const accepted = the_io.vtable.netAccept(the_io.userdata, listen_handle, accept_options) catch |err|
             return .{ .reason = mapAcceptError(err), .fd = 0, .peer = AddressV4.none };
+        // A kill that landed WHILE we were blocked accepting (between the
+        // top-of-loop check and this connection arriving): close the
+        // just-accepted fd HERE, on the pool thread, rather than handing a live
+        // connection back to a process that is tearing down (HIGH-1). Without
+        // this, a connection arriving mid-accept returns an fd regardless of a
+        // pending kill; the fiber continuation that would register it into the
+        // domain+ledger is then skipped by the kill teardown, orphaning the fd.
+        // Closing on kill-observed is the accept twin of `recv`/`connect`'s
+        // per-quantum kill-responsiveness. (The teardown-visible pending-fd
+        // slot in `abi.zig` is the backstop for the residual race where the
+        // kill becomes visible only AFTER this check but before re-attach.)
+        if (kill_flag) |flag| {
+            if (flag.load(.acquire)) {
+                var accepted_handle = accepted.handle;
+                the_io.vtable.netClose(the_io.userdata, (&accepted_handle)[0..1]);
+                return .{ .reason = .other, .fd = 0, .peer = AddressV4.none };
+            }
+        }
         const peer = switch (accepted.address) {
             .ip4 => |ip4| AddressV4{ .a = ip4.bytes[0], .b = ip4.bytes[1], .c = ip4.bytes[2], .d = ip4.bytes[3], .port = ip4.port, .ok = true },
             .ip6 => AddressV4.none,
@@ -843,6 +872,96 @@ fn mapListenError(err: net.IpAddress.ListenError) Reason {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+/// Count currently-open fds in the low fd range (posix; `0` on the poll-less
+/// targets, whose socket tests early-return). `fcntl(F_GETFD)` succeeds for an
+/// open fd and fails with `EBADF` for a closed one, so scanning a bounded range
+/// yields an EXACT open-fd count for OS-level before/after leak accounting —
+/// the only way to see a fd leak that is invisible to the domain's
+/// `live_count` (an fd orphaned before it ever reaches the domain). The 4096
+/// bound is far above any fd a loopback socket test allocates.
+fn countOpenFds() usize {
+    switch (comptime builtin.os.tag) {
+        .windows, .wasi => return 0,
+        else => {
+            var count: usize = 0;
+            var fd: std.posix.fd_t = 0;
+            while (fd < 4096) : (fd += 1) {
+                const rc = std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(usize, 0));
+                if (std.posix.errno(rc) == .SUCCESS) count += 1;
+            }
+            return count;
+        },
+    }
+}
+
+test "socket_io: accept observes a pending kill at the top of the quantum and returns promptly without consuming a queued connection" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    // Queue a connection so `accept` COULD immediately produce an fd if it ran.
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+
+    // Kill already pending: accept must observe it at the top of the loop and
+    // return WITHOUT accepting — the queued connection stays in the kernel
+    // backlog (dropped when the listener closes), no new fd is created.
+    var kill_flag = std.atomic.Value(bool).init(true);
+    const before = countOpenFds();
+    const outcome = accept(listener.fd, &kill_flag);
+    const after = countOpenFds();
+
+    try testing.expectEqual(Reason.other, outcome.reason);
+    try testing.expectEqual(@as(Fd, 0), outcome.fd);
+    try testing.expectEqual(before, after);
+}
+
+test "socket_io: accept never orphans a just-accepted fd under a racing kill (OS fd count stable across many cycles)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // A background thread flips the kill shortly after `accept` begins, so the
+    // flip races the connection's arrival: on some iterations the kill wins at
+    // the top of the loop (no accept), on some AFTER `netAccept` (the
+    // post-accept close-on-kill path), on some `accept` wins outright (returns
+    // a live fd the caller closes). NO path may orphan a fd — proven by the
+    // OS-level fd count returning to baseline after every cycle.
+    const KillSetter = struct {
+        flag: *std.atomic.Value(bool),
+        fn run(setter: @This()) void {
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            setter.flag.store(true, .release);
+        }
+    };
+
+    const baseline = countOpenFds();
+    var iteration: usize = 0;
+    while (iteration < 64) : (iteration += 1) {
+        const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+        try testing.expectEqual(Reason.ok, listener.reason);
+        const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+        try testing.expectEqual(Reason.ok, client.reason);
+
+        var kill_flag = std.atomic.Value(bool).init(false);
+        const setter = try std.Thread.spawn(.{}, KillSetter.run, .{KillSetter{ .flag = &kill_flag }});
+        const outcome = accept(listener.fd, &kill_flag);
+        setter.join();
+
+        // `.ok` → accept won the race; the caller owns and closes the fd.
+        // `.other` → accept closed any just-accepted fd itself (post-accept
+        // kill) or never accepted (top-of-loop kill). Either way, no orphan.
+        if (outcome.reason == .ok) closeFd(outcome.fd);
+        closeFd(client.fd);
+        closeFd(listener.fd);
+    }
+
+    // Across 64 kill-racing accept cycles the OS fd count is UNCHANGED — an
+    // attacker's accept+kill loop cannot exhaust the process's fds.
+    try testing.expectEqual(baseline, countOpenFds());
+}
 
 test "socket_io: loopback listen + connect + close round-trips on an ephemeral port" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;

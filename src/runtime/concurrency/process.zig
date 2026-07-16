@@ -430,6 +430,24 @@ pub const ProcessControlBlock = struct {
     /// would corrupt the list). False at `init`; the socket bridge flips it
     /// true on first registration.
     socket_sweep_registered: bool,
+    /// An fd produced by an IN-FLIGHT blocking connect/accept offload, held
+    /// here for teardown reclamation (the HIGH-1 fd-lifecycle fix). connect/
+    /// accept create the fd on the blocking-pool thread and only register it
+    /// into the socket domain + `socket_ledger` in the fiber CONTINUATION that
+    /// runs after the offload re-attaches. But a kill of a `.blocking` process
+    /// tears it down WITHOUT resuming that continuation, so a fd produced right
+    /// before the kill would never reach the ledger and the socket-sweep would
+    /// never see it — an orphaned OS fd (a fd-exhaustion DoS under a kill
+    /// loop). To close that gap the pool thread records the produced fd HERE
+    /// (its FINAL act before re-attach — safe: the process is parked
+    /// `.blocking`, no core touches the PCB, and the write is ordered before
+    /// the re-attach handoff), the continuation PROMOTES it into the
+    /// domain+ledger and clears this slot, and the socket-sweep destructor
+    /// CLOSES whatever fd is still parked here — exactly-once reclamation on
+    /// every exit path (normal, timeout, kill, crash) with no double-close.
+    /// `socket_table.no_pending_socket_fd` (`-1`) when none. Owner/handoff-
+    /// ordered like `socket_ledger`; never touched by two threads at once.
+    socket_pending_fd: socket_table.Fd,
 
     /// Assemble a PCB IN PLACE — at its final address, which the mailbox
     /// pins from this call on (its empty state references its embedded
@@ -457,6 +475,7 @@ pub const ProcessControlBlock = struct {
         process.socket_ledger = .empty;
         process.socket_sweep_node = .{ .destructor = unregisteredSocketSweepDestructor };
         process.socket_sweep_registered = false;
+        process.socket_pending_fd = socket_table.no_pending_socket_fd;
     }
 
     /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot

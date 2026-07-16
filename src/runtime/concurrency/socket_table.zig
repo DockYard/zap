@@ -98,6 +98,17 @@ pub const SocketHandle = packed struct(u64) {
 /// it — so it names no per-OS type and stays portable.
 pub const Fd = i64;
 
+/// Sentinel for a process's in-flight-offload fd slot
+/// (`ProcessControlBlock.socket_pending_fd`): NO fd is currently held there.
+/// A live socket fd is always non-negative (a posix `fd_t` is `>= 0`; a
+/// Windows `SOCKET` is never `~0` for a live socket), so `-1` is an
+/// unambiguous "empty". The slot holds an fd produced by an offloaded
+/// connect/accept BETWEEN the pool thread producing it and the fiber
+/// continuation promoting it into this domain + the process ledger; if a kill
+/// lands in that window the teardown socket-sweep closes whatever fd is still
+/// parked here (the `abi.zig` HIGH-1 reclamation discipline).
+pub const no_pending_socket_fd: Fd = -1;
+
 /// What kind of socket a handle names. Reserved from S0 so the layout is
 /// stable when TLS lands (S4/S5): a TLS session lives behind the SAME
 /// handle type, distinguished by this tag, per Decision B.
@@ -352,10 +363,27 @@ pub const SocketDomain = struct {
     /// returned rather than closed here to keep this module free of I/O.
     pub fn close(domain: *SocketDomain, handle: SocketHandle) ?Fd {
         const slot = domain.slotPointer(handle) orelse return null;
+        // Validate the generation and recycle the slot ATOMICALLY under the
+        // domain lock (MED-2). Reading the state, deciding the handle is live,
+        // and retiring/recycling the slot must be ONE indivisible step:
+        // otherwise two concurrent closes of the same live handle could BOTH
+        // pass the generation check (each loading before either recycles) and
+        // BOTH recycle the slot — corrupting the free list (a slot linked
+        // twice) and double-closing a possibly-already-reused fd. Taking the
+        // lock BEFORE the validating load closes that window: the first close
+        // bumps the generation under the lock, so the second's load (also under
+        // the lock) fails the generation check and returns null. The `.acquire`
+        // load still pairs with `open`'s `.release` publish (performed outside
+        // the lock) so `slot.fd`/`owner`/`kind` are visible to this reader.
+        domain.lockDomain();
         const state: SlotState = @bitCast(slot.state.load(.acquire));
-        if (state.occupancy != .occupied or state.generation != handle.generation) return null;
+        if (state.occupancy != .occupied or state.generation != handle.generation) {
+            domain.domain_lock.unlock();
+            return null;
+        }
         const closed_fd = slot.fd;
-        domain.recycleSlot(handle.slot, slot, state.generation);
+        domain.recycleSlotLocked(handle.slot, slot, state.generation);
+        domain.domain_lock.unlock();
         return closed_fd;
     }
 
@@ -433,12 +461,12 @@ pub const SocketDomain = struct {
         };
     }
 
-    /// Recycle a slot on close: bump the generation (killing every
-    /// outstanding handle of this slot) and return it to the free list, or
-    /// retire it at generation exhaustion. `current_generation` is the
-    /// validated live generation.
-    fn recycleSlot(domain: *SocketDomain, slot_index: u32, slot: *Slot, current_generation: u32) void {
-        domain.lockDomain();
+    /// Recycle a slot on close, with `domain_lock` ALREADY HELD by the caller
+    /// (`close`, so validation and recycling are one atomic step — MED-2): bump
+    /// the generation (killing every outstanding handle of this slot) and
+    /// return it to the free list, or retire it at generation exhaustion.
+    /// `current_generation` is the validated live generation.
+    fn recycleSlotLocked(domain: *SocketDomain, slot_index: u32, slot: *Slot, current_generation: u32) void {
         const retiring = current_generation == retired_generation - 1;
         if (retiring) {
             // Generation space exhausted: park the slot permanently so the
@@ -458,7 +486,6 @@ pub const SocketDomain = struct {
         }
         std.debug.assert(domain.live_socket_count > 0);
         domain.live_socket_count -= 1;
-        domain.domain_lock.unlock();
     }
 
     fn noteSocketOpenedLocked(domain: *SocketDomain) void {
@@ -671,6 +698,58 @@ test "SocketDomain: many opens grow segments and stay generation-consistent" {
     try testing.expectEqual(@as(u32, 2500), domain.statistics().live_socket_count);
     for (handles, 0..) |h, i| try testing.expectEqual(@as(?Fd, @intCast(i)), domain.fd(h));
     for (handles) |h| _ = domain.close(h);
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain: concurrent closes of the same handle are exactly-once (MED-2 atomic validate+recycle)" {
+    // Many threads each try to close EVERY handle in a batch. With the atomic
+    // validate+recycle under `domain_lock`, exactly ONE close per handle
+    // returns the fd; every other returns null. The pre-fix code read the slot
+    // state OUTSIDE the lock and only THEN took the lock to recycle, so two
+    // threads could both pass the generation check and both recycle the same
+    // slot — the same fd returned twice (a double-close) plus free-list
+    // corruption (a slot linked into the free list twice). Here that surfaces
+    // as a per-handle win count of 2 (caught by the assertion) or a
+    // `live_socket_count` underflow in `recycleSlotLocked`.
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle_count = 64;
+    var handles: [handle_count]SocketHandle = undefined;
+    for (&handles, 0..) |*handle, index| handle.* = try domain.open(@intCast(1000 + index), 0, 0, .plain);
+    try testing.expectEqual(@as(u32, handle_count), domain.statistics().live_socket_count);
+
+    var win_counts: [handle_count]std.atomic.Value(u32) = undefined;
+    for (&win_counts) |*count| count.* = .init(0);
+
+    const Closer = struct {
+        domain: *SocketDomain,
+        handles: []const SocketHandle,
+        win_counts: []std.atomic.Value(u32),
+
+        fn run(closer: @This()) void {
+            for (closer.handles, 0..) |handle, index| {
+                if (closer.domain.close(handle)) |_| {
+                    _ = closer.win_counts[index].fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    const thread_count = 8;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Closer.run, .{Closer{
+            .domain = &domain,
+            .handles = handles[0..],
+            .win_counts = win_counts[0..],
+        }});
+    }
+    for (threads) |thread| thread.join();
+
+    // Exactly one close won per handle — no double-close, no lost close.
+    for (win_counts) |count| try testing.expectEqual(@as(u32, 1), count.load(.monotonic));
+    // Leak-exact: every slot recycled exactly once, the count back to zero.
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
 }
 
