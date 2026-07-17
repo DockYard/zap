@@ -72,6 +72,14 @@ pub struct SocketTest {
     }
   }
 
+  describe("Socket.local_port / peer_port (gate-OFF)") {
+    test("peer_port reports the remote endpoint's port; local_port a nonzero ephemeral source port") {
+      base = Socket.live_count()
+      assert(SocketTest.port_symmetry() == :ok)
+      assert(Socket.live_count() == base)
+    }
+  }
+
   describe("Socket.set_options / get_option (gate-OFF)") {
     test("set_options(nodelay: true) is ACTUALLY applied — get_option reads back 1 (was 0)") {
       # PRE-fix there was no way to set TCP_NODELAY at all; POST-fix it is set
@@ -90,6 +98,42 @@ pub struct SocketTest {
 
     test("listen/3 with reuse_port lets two listeners bind the same port (EADDRINUSE without)") {
       assert(SocketTest.reuse_port_double_bind())
+    }
+  }
+
+  # A connected client's PEER port is the listener's bound port it dialed; its
+  # LOCAL port is a nonzero ephemeral source port the OS assigned. Proves
+  # `peer_port` mirrors `local_port` over the same connected data `Socket`.
+  fn port_symmetry() -> Atom {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> :listen_failed
+      Result.Ok(listener) ->
+        {
+          port = SocketListener.local_port(listener)
+          result = SocketTest.port_symmetry_on_client(port)
+          _closed = SocketListener.close(listener)
+          result
+        }
+    }
+  }
+
+  fn port_symmetry_on_client(port :: i64) -> Atom {
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) -> :connect_failed
+      Result.Ok(client) ->
+        {
+          peer = Socket.peer_port(client)
+          local = Socket.local_port(client)
+          _c = Socket.close(client)
+          case peer == port {
+            false -> :peer_wrong
+            true ->
+              case local > 0 {
+                true -> :ok
+                false -> :local_wrong
+              }
+          }
+        }
     }
   }
 

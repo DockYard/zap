@@ -6,9 +6,10 @@
   plain struct of sendable scalars it can travel in a message like any other
   value.
 
-  DNS resolution (`resolve/2`) lives *inside* `Socket.connect(host, port)` by
-  default and is deferred to S1 (§7.2); S0 connects to explicit IPv4
-  addresses (the loopback exit gate).
+  DNS resolution lives *inside* `Socket.connect_host(host, port, timeout_ms)`
+  (§7.2 — RFC 8305 Happy Eyeballs racing over the resolved addresses); a
+  `SocketAddress` is always an explicit, already-resolved endpoint that
+  `Socket.connect`/`connect_to` dial directly.
 
   Only available on targets with the `:network` capability.
 

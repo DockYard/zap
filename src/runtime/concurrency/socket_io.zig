@@ -49,9 +49,18 @@ const net = std.Io.net;
 pub const Fd = i64;
 
 /// A stable, gate-crossing failure reason. `abi.zig` passes `@intFromEnum`
-/// across the C-ABI to `runtime.zig`, which maps each value to a matchable
-/// `SocketError` reason atom (the atom table lives in the runtime, not the
-/// kernel — the mapping stays in ONE place). `ok` is success.
+/// across the C-ABI to `runtime.zig`, which forwards the RAW integer unchanged
+/// to the Zap layer; the single code → matchable-atom decoder is
+/// `SocketError.reason_from_code` (`lib/socket/error.zap`) — the atom table
+/// lives in the Zap runtime library, not this kernel, so the mapping stays in
+/// ONE place. `ok` is success.
+///
+/// COUPLING (ABI contract): because `SocketError.reason_from_code` matches
+/// these integers POSITIONALLY and no source of truth spans both languages,
+/// renumbering a variant would silently remap every Zap reason. The test
+/// `"socket_io: Reason integer values are the pinned ABI contract …"` PINS
+/// each `@intFromEnum` value below; a renumber breaks it, forcing the Zap
+/// table to move in lockstep. Keep the two in sync.
 pub const Reason = enum(i32) {
     ok = 0,
     connection_refused = 1,
@@ -1831,6 +1840,32 @@ fn countOpenFds() usize {
             return count;
         },
     }
+}
+
+test "socket_io: Reason integer values are the pinned ABI contract mirrored by lib/socket/error.zap reason_from_code" {
+    // The `@intFromEnum(Reason.*)` values are a STABLE, gate-crossing ABI
+    // contract: `runtime.zig` forwards them across the C-ABI UNCHANGED, and the
+    // Zap-level `SocketError.reason_from_code` (lib/socket/error.zap) decodes
+    // each integer back to its matchable reason atom POSITIONALLY. No source of
+    // truth spans both languages, so renumbering a variant would silently remap
+    // every Zap reason. This test PINS each value; a renumber breaks the build
+    // HERE, forcing the Zap table to be updated in lockstep. Any change below
+    // MUST be mirrored in `SocketError.reason_from_code` and vice versa.
+    try testing.expectEqual(@as(i32, 0), @intFromEnum(Reason.ok));
+    try testing.expectEqual(@as(i32, 1), @intFromEnum(Reason.connection_refused));
+    try testing.expectEqual(@as(i32, 2), @intFromEnum(Reason.timed_out));
+    try testing.expectEqual(@as(i32, 3), @intFromEnum(Reason.host_unreachable));
+    try testing.expectEqual(@as(i32, 4), @intFromEnum(Reason.network_unreachable));
+    try testing.expectEqual(@as(i32, 5), @intFromEnum(Reason.connection_reset));
+    try testing.expectEqual(@as(i32, 6), @intFromEnum(Reason.address_in_use));
+    try testing.expectEqual(@as(i32, 7), @intFromEnum(Reason.address_unavailable));
+    try testing.expectEqual(@as(i32, 8), @intFromEnum(Reason.fd_quota_exceeded));
+    try testing.expectEqual(@as(i32, 9), @intFromEnum(Reason.access_denied));
+    try testing.expectEqual(@as(i32, 10), @intFromEnum(Reason.network_down));
+    try testing.expectEqual(@as(i32, 11), @intFromEnum(Reason.out_of_memory));
+    try testing.expectEqual(@as(i32, 12), @intFromEnum(Reason.unknown_host));
+    try testing.expectEqual(@as(i32, 13), @intFromEnum(Reason.invalid_argument));
+    try testing.expectEqual(@as(i32, 99), @intFromEnum(Reason.other));
 }
 
 test "socket_io: accept observes a pending kill at the top of the quantum and returns promptly without consuming a queued connection" {

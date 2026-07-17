@@ -1,6 +1,6 @@
 @doc = """
-  `Socket` — a value-threaded handle to an open network socket (Phase S0 of
-  the socket layer; `docs/socket-implementation-plan.md`).
+  `Socket` — a value-threaded handle to an open network socket (the
+  value-threaded socket layer; `docs/socket-implementation-plan.md`).
 
   A `Socket` is a **one-word, single-owner, move-only** handle (Decision B):
   the reserved field `zap_socket_handle` is a generation-validated token into
@@ -24,11 +24,13 @@
 
   ## Tier-1 scope (S1)
 
-  The value-threaded Tier-1 op set: `connect`/`connect_to`, `send`/`send_all`/
-  `send_some`, the EOF-safe `recv`/`recv_exact`/`recv_blob` returning
-  `SocketRecv`, `shutdown` (half-close), `close`, `local_address`/
-  `peer_address`/`local_port`, and the streaming Form-1 surface `chunks`/
-  `fold` (an `Enumerable` of received chunks). `listen` yields a DISTINCT
+  The value-threaded Tier-1 op set: `connect`/`connect_to` (resolved address)
+  and `connect_host` (connect by NAME with RFC 8305 Happy Eyeballs over DNS),
+  `send`/`send_all`/`send_some`, the EOF-safe `recv`/`recv_exact` returning
+  `SocketRecv` (and `recv_blob` returning the `Blob`-carrying `SocketRecvBlob`),
+  `shutdown` (half-close), `close`, `local_address`/`peer_address`/
+  `local_port`/`peer_port`, and the streaming Form-1 surface `chunks`/`fold`
+  (an `Enumerable` of received chunks). `listen` yields a DISTINCT
   `SocketListener` (which `accept`s data `Socket`s); the type system alone
   forbids `recv` on a listener or `accept` on a data socket. Timeouts are
   poll-quantum-bounded (§6.1), never `SO_RCVTIMEO`, and a timeout never closes
@@ -57,12 +59,14 @@ pub struct Socket {
     Connects an IPv4 stream socket to `address`, waiting at most `timeout_ms`
     milliseconds (`0` = no deadline). Returns `Result.Ok(socket)` on success
     or `Result.Error(%SocketError{...})` with a matchable reason. The
-    connection races nothing in S0 (single explicit address); happy-eyeballs
-    over DNS is S1.
+    connection races nothing — `address` is a single explicit, already-resolved
+    endpoint; connect by NAME with RFC 8305 Happy Eyeballs over DNS is
+    `Socket.connect_host/3`.
 
     Decision E: `timeout_ms` is a per-call relative timeout, never
-    `SO_SNDTIMEO`. Its enforcement is poll-quantum-bounded from S1 (§6.1); in
-    S0 it is accepted for the stable API shape (loopback connects instantly).
+    `SO_SNDTIMEO`. Its enforcement is poll-quantum-bounded (§6.1): a
+    non-blocking connect polled against an ABSOLUTE monotonic deadline, so a
+    black-holed address is bounded by the deadline rather than the OS default.
 
     ## Examples
 
@@ -158,13 +162,16 @@ pub struct Socket {
   }
 
   @doc = """
-    Returns the local (bound) port of a socket — the ephemeral port a
-    `listen(_, 0)` was assigned. Panics on a closed or stale handle.
+    Returns the LOCAL port of a connected data `Socket` via `getsockname` — the
+    ephemeral source port the OS assigned to an outbound `connect` (a thin read
+    of `local_address(socket).port`, the symmetric companion to `peer_port`).
+    For a LISTENER's bound port use `SocketListener.local_port`. Panics on a
+    closed or stale handle.
 
     ## Examples
 
-        case Socket.listen(SocketAddress.loopback(0), 128) {
-          Result.Ok(listener) -> Socket.local_port(listener)   # => e.g. 54233
+        case Socket.connect(SocketAddress.loopback(port), 5000) {
+          Result.Ok(client) -> Socket.local_port(client)   # => e.g. 54233
           Result.Error(_error) -> 0
         }
     """
@@ -172,7 +179,8 @@ pub struct Socket {
   @available_on(:network)
 
   pub fn local_port(socket :: Socket) -> i64 {
-    :zig.SocketRuntime.local_port(socket.zap_socket_handle)
+    local = Socket.local_address(socket)
+    local.port
   }
 
   @doc = """
@@ -368,13 +376,15 @@ pub struct Socket {
 
   @doc = """
     Receives from a raw socket handle and decodes the runtime's status into the
-    EOF-safe `SocketRecv` union — the single decode point shared by `recv`,
-    `fold`, and the `SocketChunks` stream pull. `byte_count == 0` is next-
-    available; `> 0` is `recv_exact`; `timeout_ms` bounds each pull. The status
-    read must IMMEDIATELY follow the receive (a non-yielding per-process slot),
-    so the two `:zig` calls are paired with nothing between. A timeout decodes
-    to `TimedOut(partial)` — carrying any bytes already consumed off the socket
-    — and never closes the socket.
+    EOF-safe `SocketRecv` union via `SocketRecvDecoder.decode` — the ONE shared
+    decode core `recv`/`recv_exact`, `Socket.fold`, and the `SocketChunks`
+    stream pull all route through (each then maps the union onto its own tail),
+    so the status → variant mapping cannot drift between forms. `byte_count == 0` is
+    next-available; `> 0` is `recv_exact`; `timeout_ms` bounds each pull. The
+    status read must IMMEDIATELY follow the receive (a non-yielding per-process
+    slot), so the two `:zig` calls are paired with nothing between. A timeout
+    decodes to `TimedOut(partial)` — carrying any bytes already consumed off the
+    socket — and never closes the socket.
     """
 
   @available_on(:network)
@@ -382,33 +392,7 @@ pub struct Socket {
   pub fn recv_from_handle(handle_bits :: u64, byte_count :: i64, timeout_ms :: i64) -> SocketRecv {
     bytes = :zig.SocketRuntime.recv(handle_bits, byte_count, timeout_ms)
     status = :zig.SocketRuntime.recv_status()
-    Socket.decode_recv(status, bytes)
-  }
-
-  @doc = """
-    Decodes a `recv` status code + bytes into the EOF-safe `SocketRecv` union:
-    `0` = a data `Chunk`, a negative status = clean `Closed` (EOF), status `2`
-    = an idle `TimedOut(partial)` (the `bytes` are the already-consumed prefix,
-    surfaced so a framed reader never desyncs — MED-1), any other positive
-    status = a `Failed` reason. Split out so the decode is a plain Bool cascade
-    (no integer-literal case arm).
-    """
-
-  @available_on(:network)
-
-  fn decode_recv(status :: i64, bytes :: String) -> SocketRecv {
-    case status == 0 {
-      true -> SocketRecv.Chunk(bytes)
-      false ->
-        case status < 0 {
-          true -> SocketRecv.Closed
-          false ->
-            case status == 2 {
-              true -> SocketRecv.TimedOut(bytes)
-              false -> SocketRecv.Failed(SocketError.from_code(status))
-            }
-        }
-    }
+    SocketRecvDecoder.decode(status, bytes)
   }
 
   @doc = """
@@ -630,6 +614,27 @@ pub struct Socket {
 
   pub fn peer_address(socket :: Socket) -> SocketAddress {
     SocketAddress.from_packed(:zig.SocketRuntime.endpoint(socket.zap_socket_handle, 1))
+  }
+
+  @doc = """
+    Returns the REMOTE (peer) port of a connected data `Socket` — the port on
+    the far end of the connection (the symmetric companion to `local_port`, a
+    thin read of `peer_address(socket).port`). Panics on a closed or stale
+    handle.
+
+    ## Examples
+
+        case Socket.connect(SocketAddress.loopback(port), 5000) {
+          Result.Ok(client) -> Socket.peer_port(client)   # => the listener's port
+          Result.Error(_error) -> 0
+        }
+    """
+
+  @available_on(:network)
+
+  pub fn peer_port(socket :: Socket) -> i64 {
+    peer = Socket.peer_address(socket)
+    peer.port
   }
 
   @doc = """

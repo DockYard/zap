@@ -492,6 +492,84 @@ pub struct SocketStreamTest {
     }
   }
 
+  # ---- chunks: a MID-STREAM idle timeout is a final Error(:etimedout) --------
+  # P3f: the SocketChunks pull routes through the SAME `SocketRecv.decode` core
+  # as `recv`/`fold`. A chunks pull is always next-available (byte_count 0), so
+  # an idle timeout reads NOTHING (empty partial — no data loss); the stream
+  # surfaces it as one final `Error(:etimedout)` element then `:done`, matching
+  # `Socket.fold`. `recv`/`recv_exact` instead keep the resumable
+  # `TimedOut(partial)` (pinned by `timeout_keeps_open` / `partial_on_timeout`).
+
+  fn chunks_timeout_terminal() -> Atom {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> :listen_failed
+      Result.Ok(listener) -> SocketStreamTest.chunks_timeout_after_listen(listener)
+    }
+  }
+
+  fn chunks_timeout_after_listen(listener :: SocketListener) -> Atom {
+    port = SocketListener.local_port(listener)
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) ->
+        {
+          _l = SocketListener.close(listener)
+          :connect_failed
+        }
+      Result.Ok(client) -> SocketStreamTest.chunks_timeout_after_connect(listener, client)
+    }
+  }
+
+  fn chunks_timeout_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+    case Socket.accept(listener) {
+      Result.Error(_e) ->
+        {
+          _c = Socket.close(client)
+          _l = SocketListener.close(listener)
+          :accept_failed
+        }
+      Result.Ok(server) -> SocketStreamTest.chunks_timeout_exchange(listener, client, server)
+    }
+  }
+
+  fn chunks_timeout_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+    # Client sends ONE chunk then stays idle (no more sends, no close). The
+    # server's chunks stream reads "hi", then the next pull idles past the 150ms
+    # deadline and yields a final Error(:etimedout), ending the stream.
+    _sent = Socket.send(client, "hi")
+    markers = for chunk <- Socket.chunks(server, 150) {
+      SocketStreamTest.mark_chunk(chunk)
+    }
+    _c1 = Socket.close(server)
+    _c2 = Socket.close(client)
+    _c3 = SocketListener.close(listener)
+    SocketStreamTest.classify_chunks_timeout(markers)
+  }
+
+  fn mark_chunk(chunk :: Result(String, SocketError)) -> Atom {
+    case chunk {
+      Result.Ok(_bytes) -> :data
+      Result.Error(error) ->
+        case error.reason == :etimedout {
+          true -> :etimedout
+          false -> :other_error
+        }
+    }
+  }
+
+  # The stream must END on the idle-timeout terminal (:etimedout), have DELIVERED
+  # its data chunk first (no silent swallow — the mid-stream property), and raise
+  # NO other error kind.
+  fn classify_chunks_timeout(markers :: List(Atom)) -> Atom {
+    ends_timeout = List.last(markers) == :etimedout
+    kept_data = List.contains?(markers, :data)
+    no_other = List.contains?(markers, :other_error) == false
+    passed = ends_timeout and kept_data and no_other
+    case passed {
+      true -> :ok
+      false -> :chunks_timeout_failed
+    }
+  }
+
   # ------------------------------------------------------------------------
 
   describe("Socket Tier-1 streams (gate-OFF)") {
@@ -540,6 +618,12 @@ pub struct SocketStreamTest {
     test("Socket.fold halts mid-stream on a protocol terminator") {
       base = Socket.live_count()
       assert(SocketStreamTest.fold_halts_on_terminator() == :ok)
+      assert(Socket.live_count() == base)
+    }
+
+    test("Socket.chunks surfaces a mid-stream idle timeout as a final Error(:etimedout), no data lost") {
+      base = Socket.live_count()
+      assert(SocketStreamTest.chunks_timeout_terminal() == :ok)
       assert(Socket.live_count() == base)
     }
   }

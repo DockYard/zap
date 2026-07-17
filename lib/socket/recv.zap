@@ -41,6 +41,64 @@ pub union SocketRecv {
   Failed :: SocketError
 }
 
+@doc = """
+  `SocketRecvDecoder` — the ONE shared decode core that turns a runtime `recv`
+  status code + bytes into the EOF-safe `SocketRecv` union.
+
+  It is a stateless namespace (no fields), the single point EVERY receive form
+  routes its status → variant mapping through: `Socket.recv`/`recv_exact` (via
+  `Socket.recv_from_handle`), `Socket.fold` (via its pull loop), and the
+  `SocketChunks` stream pull. Each form then maps the returned `SocketRecv` onto
+  its own tail, so the mapping lives in ONE place and cannot drift between forms
+  (the divergence that once made a `chunks` idle timeout a bare stream error
+  while `recv` surfaced a resumable partial).
+
+  It lives on its OWN struct — depending on neither `Socket` nor `SocketChunks`
+  — precisely so BOTH can call it WITHOUT a `Socket ↔ SocketChunks` mutual
+  struct cycle (the dependency the codegen cannot yet resolve). This is the same
+  neutral-home pattern `SocketError.reason_from_code` uses to keep `Socket` and
+  `SocketListener` decoupled.
+
+  ## Examples
+
+      SocketRecvDecoder.decode(0, "hi")   # => SocketRecv.Chunk("hi")
+  """
+
+@available_on(:network)
+
+pub struct SocketRecvDecoder {
+  @doc = """
+    Decodes a `recv` status code + `bytes` into the EOF-safe `SocketRecv` union.
+    `0` = a data `Chunk` (always ≥ 1 byte); a NEGATIVE status = clean `Closed`
+    (EOF); status `2` = an idle `TimedOut(partial)` — `bytes` is the already-
+    consumed prefix, EMPTY for a next-available pull that read nothing, surfaced
+    so a framed reader never desyncs (MED-1); any OTHER positive status = a
+    `Failed` reason. A plain Bool cascade (no integer-literal `case` arm). A
+    timeout NEVER closes the socket.
+
+    ## Examples
+
+        SocketRecvDecoder.decode(2, "")   # => SocketRecv.TimedOut("")
+    """
+
+  @available_on(:network)
+
+  pub fn decode(status :: i64, bytes :: String) -> SocketRecv {
+    case status == 0 {
+      true -> SocketRecv.Chunk(bytes)
+      false ->
+        case status < 0 {
+          true -> SocketRecv.Closed
+          false ->
+            case status == 2 {
+              true -> SocketRecv.TimedOut(bytes)
+              false -> SocketRecv.Failed(SocketError.from_code(status))
+            }
+        }
+    }
+  }
+}
+
 
 @doc = """
   `SocketRecvBlob` — the `Blob`-carrying analogue of `SocketRecv` for the

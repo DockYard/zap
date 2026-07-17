@@ -18,7 +18,10 @@
   * `:enomem` — the runtime could not allocate for the socket.
   * `:nxdomain` — the host name could not be resolved to any address.
   * `:einval` — the supplied host name is syntactically invalid (RFC 1123).
-  * `:closed` — the socket was closed under the operation.
+  * `:closed` — a config op (`set_options`) ran against a socket this program
+    no longer owns (a closed or foreign handle): the ownership gate, surfaced
+    as a recoverable error rather than a panic. It comes from that gate, NOT
+    from a numeric runtime code (`reason_from_code` has no `:closed` arm).
   * `:unknown` — an unmapped failure (the open-set escape hatch).
 
   `bytes_sent` reports how much of a payload committed before a `send`
@@ -50,6 +53,19 @@ pub error SocketError {
     atom mapping is testable and the matchable reason set lives with the
     language. As an ordinary member of the network-gated `SocketError` error,
     it is covered by the declaration's `@available_on(:network)` gate.
+
+    ## Coupling to the runtime `socket_io.Reason` enum (ABI contract)
+
+    Each numeric arm below is the `@intFromEnum` value of the matching
+    `socket_io.Reason` variant (`src/runtime/concurrency/socket_io.zig`):
+    `runtime.zig` passes those integers across the C-ABI UNCHANGED, so this
+    table is the sole code → atom decoder and the two must agree POSITIONALLY.
+    There is no cross-language source of truth, so a Zig-side test pins every
+    `Reason` integer value (`test "socket_io: Reason integer values are the
+    pinned ABI contract …"`): renumbering the enum breaks that test, forcing
+    this table to move in lockstep. `:closed` is NOT in this table — it is
+    surfaced directly by `Socket.set_options` on a stale/foreign handle (the
+    ownership gate), never by a numeric code.
 
     ## Examples
 

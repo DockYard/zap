@@ -86,26 +86,35 @@ pub impl Enumerable(Result(String, SocketError)) for SocketChunks {
     nil
   }
 
-  # Pulls the next chunk directly from the runtime handle and maps the status
-  # onto a `Result` element. Decoding INLINE (rather than calling back into the
-  # `Socket` struct) keeps `SocketChunks` free of any reference to `Socket`, so
-  # `Socket → SocketChunks` (via `Socket.chunks`) is a one-directional
-  # dependency, not a mutual struct cycle. `status == 0` → a data chunk;
-  # `status < 0` → clean EOF (`:done`); `status > 0` → a failure/idle-timeout
-  # (a final `Error` element, then the terminal state reports `:done`).
+  # Pulls the next chunk from the runtime handle and routes the status through
+  # `SocketRecvDecoder.decode` — the SAME shared decode core `Socket.recv`/`fold`
+  # use — then maps the returned `SocketRecv` onto this stream's `Result`
+  # element (the per-form tail). Routing through the NEUTRAL `SocketRecvDecoder`
+  # (which references neither `Socket` nor `SocketChunks`) keeps `SocketChunks`
+  # free of any reference to `Socket`, so `Socket → SocketChunks` (via
+  # `Socket.chunks`) stays a one-directional dependency, not a mutual struct
+  # cycle — while the decode itself is no longer a second, drift-prone copy.
   fn pull(handle :: u64, timeout_ms :: i64) -> {Atom, Result(String, SocketError), SocketChunks} {
     bytes = :zig.SocketRuntime.recv(handle, 0, timeout_ms)
     status = :zig.SocketRuntime.recv_status()
-    case status == 0 {
-      true -> {:cont, Result(String, SocketError).Ok(bytes), SocketChunks.resume(handle, timeout_ms)}
-      false -> SocketChunks.pull_ended(handle, timeout_ms, status)
-    }
+    SocketChunks.emit(handle, timeout_ms, SocketRecvDecoder.decode(status, bytes))
   }
 
-  fn pull_ended(handle :: u64, timeout_ms :: i64, status :: i64) -> {Atom, Result(String, SocketError), SocketChunks} {
-    case status < 0 {
-      true -> {:done, SocketChunks.manufactured(), SocketChunks.terminal(handle, timeout_ms)}
-      false -> {:cont, Result(String, SocketError).Error(SocketError.from_code(status)), SocketChunks.terminal(handle, timeout_ms)}
+  # Maps a decoded `SocketRecv` onto the stream tuple. `Chunk` → a data element
+  # (`:cont`, resume). `Closed` (clean EOF) → `:done`. `TimedOut` → because a
+  # `SocketChunks` pull is always next-available (`byte_count 0`), an idle
+  # timeout read NOTHING, so `partial` is EMPTY (no data loss): the stream ends
+  # the idle connection with a final `Error(:etimedout)` element then `:done` —
+  # consistent with `Socket.fold`, which ends the same next-available pull as
+  # `Error(:etimedout)`. (`recv`/`recv_exact` keep the resumable
+  # `TimedOut(partial)`, which may carry consumed bytes.) `Failed` → a final
+  # `Error` element then `:done`.
+  fn emit(handle :: u64, timeout_ms :: i64, received :: SocketRecv) -> {Atom, Result(String, SocketError), SocketChunks} {
+    case received {
+      SocketRecv.Chunk(bytes) -> {:cont, Result(String, SocketError).Ok(bytes), SocketChunks.resume(handle, timeout_ms)}
+      SocketRecv.Closed -> {:done, SocketChunks.manufactured(), SocketChunks.terminal(handle, timeout_ms)}
+      SocketRecv.TimedOut(_partial) -> {:cont, Result(String, SocketError).Error(%SocketError{reason: :etimedout}), SocketChunks.terminal(handle, timeout_ms)}
+      SocketRecv.Failed(error) -> {:cont, Result(String, SocketError).Error(error), SocketChunks.terminal(handle, timeout_ms)}
     }
   }
 
