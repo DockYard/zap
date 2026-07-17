@@ -58,6 +58,20 @@ pub struct TestConcurrency.SocketTest {
     }
   }
 
+  describe("Socket.set_options under the concurrency kernel (gate-ON)") {
+    test("set_options(nodelay: true) is applied through the ABI/ledger path — get_option reads back 1") {
+      base = Socket.live_count()
+      # The full gate-ON path: the ownership-gated zap_socket_set_option ABI
+      # over the per-process ledger, applying setsockopt inline on the owned fd.
+      assert(TestConcurrency.SocketTest.nodelay_applied_under_kernel() == :applied)
+      assert(Socket.live_count() == base)
+    }
+
+    test("set_options on a stale handle returns a typed SocketError (ownership gate), no crash") {
+      assert(TestConcurrency.SocketTest.set_options_on_closed_is_error())
+    }
+  }
+
   fn loopback_ok() -> Bool {
     case Socket.listen(SocketAddress.loopback(0), 128) {
       Result.Error(_e) -> false
@@ -103,6 +117,75 @@ pub struct TestConcurrency.SocketTest {
           gone = Socket.open?(client) == false
           _c2 = SocketListener.close(listener)
           was_open and gone
+        }
+    }
+  }
+
+  # Gate-ON read-back: connect a loopback client under the kernel, set nodelay
+  # via the ownership-gated ABI, and confirm get_option(0) flipped 0 -> 1.
+  fn nodelay_applied_under_kernel() -> Atom {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> :listen_failed
+      Result.Ok(listener) ->
+        {
+          port = SocketListener.local_port(listener)
+          result = TestConcurrency.SocketTest.nodelay_on_client(port)
+          _closed = SocketListener.close(listener)
+          result
+        }
+    }
+  }
+
+  fn nodelay_on_client(port :: i64) -> Atom {
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) -> :connect_failed
+      Result.Ok(client) ->
+        {
+          before = Socket.get_option(client, 0)
+          case Socket.set_options(client, %SocketOptions{nodelay: true}) {
+            Result.Error(_e) ->
+              {
+                _c = Socket.close(client)
+                :set_failed
+              }
+            Result.Ok(configured) ->
+              {
+                after = Socket.get_option(configured, 0)
+                _c = Socket.close(configured)
+                nodelay_on = (before == 0) and (after == 1)
+                case nodelay_on {
+                  true -> :applied
+                  false -> :not_applied
+                }
+              }
+          }
+        }
+    }
+  }
+
+  fn set_options_on_closed_is_error() -> Bool {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> false
+      Result.Ok(listener) ->
+        {
+          port = SocketListener.local_port(listener)
+          result = TestConcurrency.SocketTest.set_options_after_close(port)
+          _closed = SocketListener.close(listener)
+          result
+        }
+    }
+  }
+
+  fn set_options_after_close(port :: i64) -> Bool {
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) -> false
+      Result.Ok(client) ->
+        {
+          _closed = Socket.close(client)
+          case Socket.set_options(client, SocketOptions.default()) {
+            Result.Ok(_configured) -> false
+            Result.Error(error) -> error.reason == :closed
+          }
         }
     }
   }

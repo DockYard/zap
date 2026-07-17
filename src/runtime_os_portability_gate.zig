@@ -559,12 +559,16 @@ const kernel_seam_allowlist = [_]KernelSeam{
         .needles = &.{
             // The posix socket syscalls (the seam's whole purpose): the
             // non-blocking connect + poll-quantum recv/send + half-close +
-            // endpoint resolution.
+            // endpoint resolution + the pre-bind listener (socket/bind/listen)
+            // + the curated-portable socket options (setsockopt/getsockopt).
             "std.posix.system.socket",
             "std.posix.system.close",
             "std.posix.system.fcntl",
             "std.posix.system.connect",
+            "std.posix.system.bind",
+            "std.posix.system.listen",
             "std.posix.system.send",
+            "std.posix.system.setsockopt",
             "std.posix.system.getsockopt",
             "std.posix.system.getsockname",
             "std.posix.system.getpeername",
@@ -572,10 +576,11 @@ const kernel_seam_allowlist = [_]KernelSeam{
             "std.posix.errno",
             // The posix socket constant/type namespaces the syscalls above
             // reference (address families, socket types, fcntl/poll/socket-
-            // option flags, and the sockaddr/pollfd/errno-enum types).
+            // option flags, and the sockaddr/pollfd/errno-enum/linger types).
             "std.posix.AF",
             "std.posix.SOCK",
             "std.posix.IPPROTO",
+            "std.posix.TCP",
             "std.posix.O",
             "std.posix.F.",
             "std.posix.MSG",
@@ -586,6 +591,7 @@ const kernel_seam_allowlist = [_]KernelSeam{
             "std.posix.socklen_t",
             "std.posix.fd_t",
             "std.posix.pollfd",
+            "std.posix.linger",
             "std.posix.E",
             // The per-OS monotonic clock (`monotonicMillis`) the poll-quantum
             // deadline math reads — posix `clock_gettime` + the wasi arm.
@@ -604,6 +610,10 @@ const kernel_seam_allowlist = [_]KernelSeam{
         \\`getsockname`/`getpeername` syscalls directly, bounded by a
         \\`clock_gettime` monotonic deadline; the poll-less Windows/wasi arms
         \\keep the blocking portable path with the timeout a documented no-op.
+        \\The pre-bind listener (`socket`/`bind`/`listen` + `SO_REUSEADDR`/
+        \\`SO_REUSEPORT` before bind) and the curated-portable socket options
+        \\(`setsockopt`/`getsockopt` over TCP_NODELAY, SO_KEEPALIVE, SO_RCVBUF/
+        \\SNDBUF, SO_REUSE*, IPV6_V6ONLY, SO_LINGER) are the same seam surface.
         \\The needles enumerate exactly those primitives — a NEW, unrelated
         \\per-OS call here (e.g. `std.posix.fork`, `std.os.linux.*`) matches no
         \\needle and fails the gate, so whole-file trust is NOT implied.

@@ -2691,8 +2691,43 @@ export fn zap_socket_listen(
 ) callconv(.c) u64 {
     const context = contextFromHandle(process);
     const outcome = concurrency.socket_io.listenIp4(.{ ip0, ip1, ip2, ip3 }, port, @intCast(backlog));
-    if (outcome.reason != .ok) return socketConnectFailed(context, outcome.reason);
+    return promoteListener(context, outcome);
+}
 
+/// The pre-bind-option-aware listen (`Socket.listen/3`): bind + listen honoring
+/// `reuse_address` (`SO_REUSEADDR`) and `reuse_port` (`SO_REUSEPORT`), which the
+/// OS only respects when set BEFORE `bind` — so the seam applies them to the
+/// fresh socket pre-bind. Otherwise identical to `zap_socket_listen`
+/// (ownership recorded, bound port stored, sweep node ensured).
+export fn zap_socket_listen_with_options(
+    process: *anyopaque,
+    ip0: u8,
+    ip1: u8,
+    ip2: u8,
+    ip3: u8,
+    port: u16,
+    backlog: u32,
+    reuse_address: i32,
+    reuse_port: i32,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    const outcome = concurrency.socket_io.listenIp4WithOptions(
+        .{ ip0, ip1, ip2, ip3 },
+        port,
+        @intCast(backlog),
+        reuse_address != 0,
+        reuse_port != 0,
+    );
+    return promoteListener(context, outcome);
+}
+
+/// Promote a just-bound listener fd into the socket domain + the caller's
+/// ledger (bound port stored, sweep node ensured), returning the handle bits —
+/// the shared tail of `zap_socket_listen`/`zap_socket_listen_with_options`.
+/// On the outcome's failure it records the reason in the caller's last-error
+/// and returns the invalid handle.
+fn promoteListener(context: *concurrency.ProcessContext, outcome: concurrency.socket_io.ListenOutcome) u64 {
+    if (outcome.reason != .ok) return socketConnectFailed(context, outcome.reason);
     const handle = runtime_state.socket_domain.open(
         outcome.fd,
         context.selfPid().toBits(),
@@ -2959,6 +2994,44 @@ export fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) c
     const reason = concurrency.socket_io.shutdownFd(fd, how);
     if (reason != .ok) return @intFromEnum(reason);
     return 0;
+}
+
+/// Apply a curated socket option (`option_code` → `socket_io.SocketOption`) to
+/// a socket the caller owns via `setsockopt` (`Socket.set_options`). Runs INLINE
+/// — a `setsockopt` on an owned fd is a synchronous non-blocking syscall, so no
+/// blocking-pool offload is needed (unlike connect/recv/send). Ownership-gated
+/// against the caller's ledger exactly like `shutdown`/`endpoint`. Returns `0`
+/// on success, a positive `Reason` code on a syscall failure (e.g. an
+/// unsupported option → `invalid_argument`), or `-1` when the caller does not
+/// own the handle — which `lib/socket.zap` turns into a typed `SocketError`
+/// (NOT a panic: configuring a stale handle is a recoverable caller error).
+export fn zap_socket_set_option(process: *anyopaque, handle_bits: u64, option_code: i32, value: i64) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    const option = concurrency.socket_io.optionFromCode(option_code) orelse
+        return @intFromEnum(concurrency.socket_io.Reason.invalid_argument);
+    const reason = concurrency.socket_io.setOption(fd, option, value);
+    if (reason != .ok) return @intFromEnum(reason);
+    return 0;
+}
+
+/// Read back a curated socket option from a socket the caller owns via
+/// `getsockopt` — the runtime side of the read-back proof (`Socket.get_option`).
+/// Returns the decoded option value on success (the int for the int/bool
+/// options; milliseconds for `linger`), or `-1` when the caller does not own
+/// the handle, the option code is out of range, or the `getsockopt` failed.
+/// Ownership-gated; inline (a fast leaf syscall).
+export fn zap_socket_get_option(process: *anyopaque, handle_bits: u64, option_code: i32) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    const option = concurrency.socket_io.optionFromCode(option_code) orelse return -1;
+    const outcome = concurrency.socket_io.getOption(fd, option);
+    if (outcome.reason != .ok) return -1;
+    return outcome.value;
 }
 
 /// An `accept`'s blocking request.

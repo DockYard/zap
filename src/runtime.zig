@@ -4067,6 +4067,19 @@ const ZapConcurrencyKernel = struct {
         port: u16,
         backlog: u32,
     ) callconv(.c) u64;
+    extern fn zap_socket_listen_with_options(
+        process: *anyopaque,
+        ip0: u8,
+        ip1: u8,
+        ip2: u8,
+        ip3: u8,
+        port: u16,
+        backlog: u32,
+        reuse_address: i32,
+        reuse_port: i32,
+    ) callconv(.c) u64;
+    extern fn zap_socket_set_option(process: *anyopaque, handle_bits: u64, option_code: i32, value: i64) callconv(.c) i64;
+    extern fn zap_socket_get_option(process: *anyopaque, handle_bits: u64, option_code: i32) callconv(.c) i64;
     extern fn zap_socket_local_port(process: *anyopaque, handle_bits: u64) callconv(.c) i64;
     extern fn zap_socket_last_error(process: *anyopaque) callconv(.c) i32;
     extern fn zap_socket_close(process: *anyopaque, handle_bits: u64) callconv(.c) i32;
@@ -7129,6 +7142,91 @@ pub const SocketRuntime = struct {
                 return 0;
             };
             return handle.toBits();
+        }
+    }
+
+    /// `Socket.listen/3`: bind + listen an IPv4 stream socket honoring the
+    /// PRE-BIND options `reuse_address` (`SO_REUSEADDR`) and `reuse_port`
+    /// (`SO_REUSEPORT`), applied to the fresh socket BEFORE `bind` (the only
+    /// point the OS respects them). Returns the listener handle bits, or `0`
+    /// on failure (reason in the process last-error). `0`/`1` encode the bools.
+    pub fn listen_with_options(a: i64, b: i64, c: i64, d: i64, port: i64, backlog: i64, reuse_address: bool, reuse_port: bool) u64 {
+        const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
+        const port16: u16 = checkedPort(port);
+        const backlog32: u32 = checkedBacklog(backlog);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_listen_with_options(
+                requireCurrentProcessHandle(),
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                port16,
+                backlog32,
+                if (reuse_address) 1 else 0,
+                if (reuse_port) 1 else 0,
+            );
+        } else {
+            const outcome = socket_io.listenIp4WithOptions(ip, port16, @intCast(backlog32), reuse_address, reuse_port);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, outcome.bound_port, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
+    /// `Socket.set_options`: apply a curated socket option (`option_code` →
+    /// `socket_io.SocketOption`) to a socket this program owns via `setsockopt`.
+    /// A synchronous non-blocking syscall — a DIRECT call on the resolved fd
+    /// (no offload), ownership-gated. Returns `0` on success, a positive
+    /// `Reason` code on a syscall failure, or `-1` when this program does not
+    /// own the handle (which `lib/socket.zap` turns into a typed `SocketError`,
+    /// not a panic). Gate-OFF the fd is resolved WITHOUT panicking on a stale
+    /// handle (`-1` instead), so a config op on a closed socket is a
+    /// recoverable error, not a crash.
+    pub fn set_option(handle_bits: u64, option_code: i64, value: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_set_option(requireCurrentProcessHandle(), handle_bits, @intCast(option_code), value);
+        } else {
+            const fd = gateOffDomain().fd(socket_table.SocketHandle.fromBits(handle_bits)) orelse return -1;
+            const option = socket_io.optionFromCode(option_code) orelse
+                return @intFromEnum(socket_io.Reason.invalid_argument);
+            const reason = socket_io.setOption(fd, option, value);
+            if (reason != .ok) return @intFromEnum(reason);
+            return 0;
+        }
+    }
+
+    /// `Socket.set_options`, boolean-field variant: apply a BOOL option
+    /// (`nodelay`/`keepalive`/`reuse_*`/`ip6_only`) whose Zap value is a `Bool`
+    /// — routed straight from Zap without an intermediate integer-literal case
+    /// (which would surface as a comptime-only value through runtime control
+    /// flow in the lowering). Converts the flag to `1`/`0` and reuses the exact
+    /// `set_option` path (ownership gate, `setsockopt`).
+    pub fn set_option_flag(handle_bits: u64, option_code: i64, flag: bool) i64 {
+        return set_option(handle_bits, option_code, if (flag) 1 else 0);
+    }
+
+    /// `Socket.get_option`: read back a curated socket option from a socket this
+    /// program owns via `getsockopt` — the read-back proof surface. Returns the
+    /// decoded value (the int for int/bool options; milliseconds for `linger`),
+    /// or `-1` when this program does not own the handle, the code is out of
+    /// range, or the `getsockopt` failed. Ownership-gated; a direct leaf syscall.
+    pub fn get_option(handle_bits: u64, option_code: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_get_option(requireCurrentProcessHandle(), handle_bits, @intCast(option_code));
+        } else {
+            const fd = gateOffDomain().fd(socket_table.SocketHandle.fromBits(handle_bits)) orelse return -1;
+            const option = socket_io.optionFromCode(option_code) orelse return -1;
+            const outcome = socket_io.getOption(fd, option);
+            if (outcome.reason != .ok) return -1;
+            return outcome.value;
         }
     }
 

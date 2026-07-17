@@ -104,6 +104,33 @@ pub struct Socket {
   }
 
   @doc = """
+    Binds and listens like `listen/2`, but honoring the PRE-BIND options in
+    `options` — `reuse_address` (`SO_REUSEADDR`) and `reuse_port`
+    (`SO_REUSEPORT`), which the OS only respects when set BEFORE `bind`, so the
+    runtime applies them to the fresh socket in the listen path pre-bind. The
+    listener's `backlog` comes from the explicit argument (not `options`).
+    Accepted connections INHERIT the listener's kernel-level options.
+
+    Use this (not `set_options` after `listen`) when you need `reuse_port` /
+    `reuse_address`: applying them post-bind is too late to matter. The other
+    `SocketOptions` fields (nodelay, keepalive, buffers, linger) are per-
+    connection concerns — set them on the accepted `Socket` with `set_options`.
+
+    ## Examples
+
+        Socket.listen(SocketAddress.loopback(0), 128, %SocketOptions{reuse_port: true})
+    """
+
+  @available_on(:network)
+
+  pub fn listen(address :: SocketAddress, backlog :: i64, options :: SocketOptions) -> Result(SocketListener, SocketError) {
+    case :zig.SocketRuntime.listen_with_options(address.a, address.b, address.c, address.d, address.port, backlog, options.reuse_address, options.reuse_port) {
+      0 -> Result(SocketListener, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(SocketListener, SocketError).Ok(%SocketListener{zap_socket_handle: handle_bits})
+    }
+  }
+
+  @doc = """
     Accepts the next inbound connection on `listener`, parking the fiber until
     one arrives (offloaded off the process's core gate-ON, inline gate-OFF).
     Returns `Result.Ok(socket)` — a data `Socket` that INHERITS the listener's
@@ -704,6 +731,74 @@ pub struct Socket {
     }
   }
 
+  @doc = """
+    Applies `options` to `socket` via `setsockopt`, returning
+    `Result.Ok(socket)` (the same value-threaded handle, for rebinding) once
+    every option applied, or `Result.Error(%SocketError{...})` on failure. This
+    is the OPT-IN that makes `SocketOptions`' defaults take effect: a bare
+    `connect` keeps OS-default behavior (Nagle ON), and calling
+    `set_options(socket, SocketOptions.default())` turns on the latency-first
+    `TCP_NODELAY` (and the rest of the curated set) — a deliberate, applied-on-
+    request posture, never an automatic flip of every socket.
 
+    Each field is pushed through the runtime bridge, short-circuiting on the
+    first `setsockopt` failure; fields at their "unset" sentinel are skipped (a
+    buffer size of `0` = leave the OS default; `linger_ms` of `-1` = no
+    override; `ip6_only` applied only when `true`). A stale or foreign handle
+    yields `Result.Error(%SocketError{reason: :closed})` — the ownership gate,
+    surfaced as a recoverable error rather than a panic (unlike `send`/`recv`,
+    a config op on a closed socket is not a program bug). `reuse_address` /
+    `reuse_port` are pre-bind options; set those with `Socket.listen/3`, not
+    here (post-bind they are inert).
+
+    ## Examples
+
+        case Socket.connect(SocketAddress.loopback(8080), 5000) {
+          Result.Ok(client) ->
+            case Socket.set_options(client, SocketOptions.default()) {
+              Result.Ok(configured) -> Socket.send(configured, "GET / HTTP/1.0\\r\\n\\r\\n")
+              Result.Error(error)   -> Result(i64, SocketError).Error(error)
+            }
+          Result.Error(error) -> Result(i64, SocketError).Error(error)
+        }
+    """
+
+  @available_on(:network)
+
+  pub fn set_options(socket :: Socket, options :: SocketOptions) -> Result(Socket, SocketError) {
+    status = SocketOptions.apply_to_handle(options, socket.zap_socket_handle)
+    case status == 0 {
+      true -> Result(Socket, SocketError).Ok(socket)
+      false ->
+        case status < 0 {
+          true -> Result(Socket, SocketError).Error(%SocketError{reason: :closed})
+          false -> Result(Socket, SocketError).Error(SocketError.from_code(status))
+        }
+    }
+  }
+
+  @doc = """
+    Reads back a curated socket option from `socket` via `getsockopt` — the
+    introspection/verification companion to `set_options`. `option_code` is the
+    stable option tag (`0` nodelay, `1` keepalive, `2` recv_buffer, `3`
+    send_buffer, `4` reuse_address, `5` reuse_port, `6` ip6_only, `7` linger),
+    the ABI contract with the runtime's `socket_io.SocketOption`. Returns the
+    OS-applied value (a `0`/`1` bool, a byte count, or `linger` milliseconds),
+    or `-1` when the socket is not a live handle this program owns or the
+    option could not be read. Lets a program CONFIRM that, say,
+    `set_options(_, %SocketOptions{nodelay: true})` actually took effect
+    (`get_option(socket, 0) == 1`), not merely that the call was accepted.
+
+    ## Examples
+
+        _ = Socket.set_options(socket, %SocketOptions{nodelay: true})
+        Socket.get_option(socket, 0)   # => 1 (TCP_NODELAY is on)
+    """
+
+  @available_on(:network)
+
+  pub fn get_option(socket :: Socket, option_code :: i64) -> i64 {
+    :zig.SocketRuntime.get_option(socket.zap_socket_handle, option_code)
+  }
 
 }

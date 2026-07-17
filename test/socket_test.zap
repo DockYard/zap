@@ -72,6 +72,27 @@ pub struct SocketTest {
     }
   }
 
+  describe("Socket.set_options / get_option (gate-OFF)") {
+    test("set_options(nodelay: true) is ACTUALLY applied — get_option reads back 1 (was 0)") {
+      # PRE-fix there was no way to set TCP_NODELAY at all; POST-fix it is set
+      # AND reads back on the socket (Nagle off), proving the option reached
+      # setsockopt, not merely that the call was accepted.
+      assert(SocketTest.nodelay_readback() == :applied)
+    }
+
+    test("set_options applies keepalive and a receive buffer (both read back)") {
+      assert(SocketTest.keepalive_and_buffer_readback())
+    }
+
+    test("set_options on a stale/closed handle yields a typed SocketError, no crash") {
+      assert(SocketTest.set_options_on_closed_is_error())
+    }
+
+    test("listen/3 with reuse_port lets two listeners bind the same port (EADDRINUSE without)") {
+      assert(SocketTest.reuse_port_double_bind())
+    }
+  }
+
   fn connect_host_ok() -> Bool {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> false
@@ -143,6 +164,145 @@ pub struct SocketTest {
         {
           _closed = Socket.close(client)
           false
+        }
+    }
+  }
+
+  # Connect a loopback client, set nodelay on it, and prove get_option(0)
+  # flipped 0 -> 1 (TCP_NODELAY read back set). Returns :applied on success.
+  fn nodelay_readback() -> Atom {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> :listen_failed
+      Result.Ok(listener) ->
+        {
+          port = SocketListener.local_port(listener)
+          result = SocketTest.nodelay_on_client(port)
+          _closed = SocketListener.close(listener)
+          result
+        }
+    }
+  }
+
+  fn nodelay_on_client(port :: i64) -> Atom {
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) -> :connect_failed
+      Result.Ok(client) ->
+        {
+          before = Socket.get_option(client, 0)
+          case Socket.set_options(client, %SocketOptions{nodelay: true}) {
+            Result.Error(_e) ->
+              {
+                _c = Socket.close(client)
+                :set_failed
+              }
+            Result.Ok(configured) ->
+              {
+                after = Socket.get_option(configured, 0)
+                _c = Socket.close(configured)
+                nodelay_on = (before == 0) and (after == 1)
+                case nodelay_on {
+                  true -> :applied
+                  false -> :not_applied
+                }
+              }
+          }
+        }
+    }
+  }
+
+  # Prove a second, non-boolean option end-to-end: SO_KEEPALIVE reads back on,
+  # and SO_RCVBUF reads back >= the requested size (the OS may round up).
+  fn keepalive_and_buffer_readback() -> Bool {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> false
+      Result.Ok(listener) ->
+        {
+          port = SocketListener.local_port(listener)
+          result = SocketTest.keepalive_on_client(port)
+          _closed = SocketListener.close(listener)
+          result
+        }
+    }
+  }
+
+  fn keepalive_on_client(port :: i64) -> Bool {
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) -> false
+      Result.Ok(client) ->
+        {
+          options = %SocketOptions{keepalive: true, recv_buffer: 16384}
+          case Socket.set_options(client, options) {
+            Result.Error(_e) ->
+              {
+                _c = Socket.close(client)
+                false
+              }
+            Result.Ok(configured) ->
+              {
+                keepalive = Socket.get_option(configured, 1)
+                recv_buffer = Socket.get_option(configured, 2)
+                _c = Socket.close(configured)
+                (keepalive == 1) and (recv_buffer >= 16384)
+              }
+          }
+        }
+    }
+  }
+
+  # A config op on a closed handle must return Result.Error (the ownership
+  # gate), never panic/crash — unlike send/recv, which treat it as a bug.
+  fn set_options_on_closed_is_error() -> Bool {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> false
+      Result.Ok(listener) ->
+        {
+          port = SocketListener.local_port(listener)
+          result = SocketTest.set_options_after_close(port)
+          _closed = SocketListener.close(listener)
+          result
+        }
+    }
+  }
+
+  fn set_options_after_close(port :: i64) -> Bool {
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) -> false
+      Result.Ok(client) ->
+        {
+          _closed = Socket.close(client)
+          case Socket.set_options(client, SocketOptions.default()) {
+            Result.Ok(_configured) -> false
+            Result.Error(error) -> error.reason == :closed
+          }
+        }
+    }
+  }
+
+  # listen/3 with reuse_port: a second listener binds the SAME port while the
+  # first is still listening — only possible because SO_REUSEPORT was set
+  # PRE-bind. Without it the second bind fails EADDRINUSE.
+  fn reuse_port_double_bind() -> Bool {
+    reuse = %SocketOptions{reuse_port: true, reuse_address: true}
+    case Socket.listen(SocketAddress.loopback(0), 8, reuse) {
+      Result.Error(_e) -> false
+      Result.Ok(first) ->
+        {
+          port = SocketListener.local_port(first)
+          second_ok = SocketTest.second_listener_on(port)
+          _closed = SocketListener.close(first)
+          second_ok
+        }
+    }
+  }
+
+  fn second_listener_on(port :: i64) -> Bool {
+    reuse = %SocketOptions{reuse_port: true, reuse_address: true}
+    case Socket.listen(SocketAddress.ip4(127, 0, 0, 1, port), 8, reuse) {
+      Result.Error(_e) -> false
+      Result.Ok(second) ->
+        {
+          _closed = SocketListener.close(second)
+          true
         }
     }
   }

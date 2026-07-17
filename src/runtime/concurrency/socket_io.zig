@@ -786,25 +786,297 @@ fn mapLookupError(err: net.HostName.LookupError) Reason {
 }
 
 /// Bind + listen an IPv4 stream socket on `ip:port` (port 0 → an ephemeral
-/// port the kernel chooses, reported as `bound_port`). `SO_REUSEADDR` is
-/// set so a just-closed test port is immediately reusable. This is the S0
-/// minimal listener: enough for a self-contained loopback connect (the
-/// connection completes in the kernel's accept queue without an `accept`
-/// call). The distinct `Socket.Listener` type + `accept` are S1/S3.
+/// port the kernel chooses, reported as `bound_port`) with `SO_REUSEADDR` set
+/// (a just-closed port is immediately rebindable) and `SO_REUSEPORT` OFF — the
+/// default listener (`Socket.listen/2`). The pre-bind-option-aware
+/// `listenIp4WithOptions` is the general form; this is the byte-identical
+/// default wrapper `Socket.listen/2` and every existing caller uses.
 pub fn listenIp4(ip: [4]u8, port: u16, backlog: u31) ListenOutcome {
-    const address = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
-    const server = address.listen(io(), .{
-        .kernel_backlog = backlog,
-        .reuse_address = true,
-    }) catch |err|
-        return .{ .reason = mapListenError(err), .fd = 0, .bound_port = 0 };
-    // The fork surfaces the resolved (ephemeral) bound port portably in
-    // `Socket.address` after `listen` — no `getsockname` needed.
-    const bound_port = switch (server.socket.address) {
-        .ip4 => |resolved| resolved.port,
-        .ip6 => |resolved| resolved.port,
+    return listenIp4WithOptions(ip, port, backlog, true, false);
+}
+
+/// Bind + listen an IPv4 stream socket on `ip:port` honoring the PRE-BIND
+/// options `reuse_address` (`SO_REUSEADDR`) and `reuse_port` (`SO_REUSEPORT`)
+/// — both of which the OS only respects when set BEFORE `bind` (§4, item 3).
+/// The portable `IpAddress.listen` supports only `reuse_address`, so on posix
+/// this issues the socket syscalls directly (`socket` → `setsockopt` the
+/// pre-bind flags → `bind` → `listen` → `getsockname` for the ephemeral port),
+/// legitimate here because this file IS the socket syscall seam. The poll-less
+/// targets (Windows/wasi — not in v1 run scope) keep the portable
+/// `IpAddress.listen`, where `reuse_port` is a documented no-op (the portable
+/// `ListenOptions` has no such field), matching the connect/recv/send posture.
+pub fn listenIp4WithOptions(ip: [4]u8, port: u16, backlog: u31, reuse_address: bool, reuse_port: bool) ListenOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        const address = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
+        const server = address.listen(io(), .{
+            .kernel_backlog = backlog,
+            .reuse_address = reuse_address,
+        }) catch |err|
+            return .{ .reason = mapListenError(err), .fd = 0, .bound_port = 0 };
+        // The fork surfaces the resolved (ephemeral) bound port portably in
+        // `Socket.address` after `listen` — no `getsockname` needed.
+        const bound_port = switch (server.socket.address) {
+            .ip4 => |resolved| resolved.port,
+            .ip6 => |resolved| resolved.port,
+        };
+        return .{ .reason = .ok, .fd = fdToBits(server.socket.handle), .bound_port = bound_port };
+    }
+    return listenIp4Posix(ip, port, backlog, reuse_address, reuse_port);
+}
+
+/// The posix raw-syscall listener with pre-bind options (behind
+/// `listenIp4WithOptions`): `socket` → `setsockopt` the pre-bind flags → `bind`
+/// → `listen` → `getsockname`. The pre-bind flags are applied to the fresh
+/// socket BEFORE `bind` (the only point at which `SO_REUSEADDR`/`SO_REUSEPORT`
+/// take effect); a create/setsockopt/bind/listen failure closes the transient
+/// fd here so a `.failed` result never leaks a fd. The returned fd is BLOCKING
+/// (the `socket(2)` default), compatible with the poll-then-blocking
+/// `accept`/`recv`. Posix-only.
+fn listenIp4Posix(ip: [4]u8, port: u16, backlog: u31, reuse_address: bool, reuse_port: bool) ListenOutcome {
+    const socket_rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    if (std.posix.errno(socket_rc) != .SUCCESS)
+        return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0, .bound_port = 0 };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+
+    // Pre-bind options (item 3): `SO_REUSEADDR`/`SO_REUSEPORT` MUST be set on
+    // the fresh socket BEFORE `bind` to take effect.
+    if (reuse_address and setOption(fdToBits(handle), .reuse_address, 1) != .ok) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    if (reuse_port and setOption(fdToBits(handle), .reuse_port, 1) != .ok) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+
+    var bind_addr = std.mem.zeroInit(std.posix.sockaddr.in, .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @as(u32, @bitCast(ip)), // [a,b,c,d] in memory == network byte order
+    });
+    const bind_rc = std.posix.system.bind(handle, @ptrCast(&bind_addr), @sizeOf(std.posix.sockaddr.in));
+    if (std.posix.errno(bind_rc) != .SUCCESS) {
+        const reason = mapListenErrno(std.posix.errno(bind_rc));
+        _ = std.posix.system.close(handle);
+        return .{ .reason = reason, .fd = 0, .bound_port = 0 };
+    }
+    const listen_rc = std.posix.system.listen(handle, backlog);
+    if (std.posix.errno(listen_rc) != .SUCCESS) {
+        const reason = mapListenErrno(std.posix.errno(listen_rc));
+        _ = std.posix.system.close(handle);
+        return .{ .reason = reason, .fd = 0, .bound_port = 0 };
+    }
+
+    // The kernel-chosen ephemeral port (port 0 → a real port) via getsockname.
+    var bound = std.mem.zeroes(std.posix.sockaddr.in);
+    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(handle, @ptrCast(&bound), &bound_len)) != .SUCCESS) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    return .{ .reason = .ok, .fd = fdToBits(handle), .bound_port = std.mem.bigToNative(u16, bound.port) };
+}
+
+/// Map a `bind(2)`/`listen(2)` errno to a stable `Reason` — the raw-syscall
+/// twin of `mapListenError` (which maps the portable `ListenError`).
+fn mapListenErrno(err: std.posix.E) Reason {
+    return switch (err) {
+        .ADDRINUSE => .address_in_use,
+        .ADDRNOTAVAIL, .AFNOSUPPORT => .address_unavailable,
+        .ACCES => .access_denied,
+        .MFILE, .NFILE => .fd_quota_exceeded,
+        .NOBUFS, .NOMEM => .out_of_memory,
+        else => .other,
     };
-    return .{ .reason = .ok, .fd = fdToBits(server.socket.handle), .bound_port = bound_port };
+}
+
+// ---------------------------------------------------------------------------
+// Socket options (setsockopt / getsockopt) — the curated-portable option seam
+// (R3, the TCP_NODELAY fix). A curated set of options crosses the runtime↔seam
+// boundary as a stable integer tag (`SocketOption`); each is mapped HERE to its
+// exact (level, optname) pair and value encoding — the ONE place the per-OS
+// socket-option constants live (this file IS the socket syscall seam, so per-OS
+// constants are its purpose, exactly like the connect/recv/send syscalls). The
+// poll-less targets (Windows/wasi — not in v1 run scope) degrade to a documented
+// no-op, matching the rest of the seam: wasi has NO socket API (socket code is
+// rejected at compile time via the `:network` capability), and gate-ON Windows
+// is blocked on the concurrency 7.2a port, so a Windows binary never reaches a
+// live socket op to configure.
+// ---------------------------------------------------------------------------
+
+/// A curated, portable socket option, crossing the C-ABI as a stable integer
+/// tag. The tag values are an ABI contract with `lib/socket/options.zap`
+/// (`Socket.set_options` passes the matching integer), so they are APPEND-ONLY
+/// — never renumber an existing option.
+pub const SocketOption = enum(i32) {
+    /// `TCP_NODELAY` (IPPROTO_TCP) — disable Nagle's algorithm. Value: bool
+    /// (`1` on / `0` off). The latency-first option a request/response client
+    /// sets to dodge the 40 ms Nagle × delayed-ACK stall.
+    nodelay = 0,
+    /// `SO_KEEPALIVE` (SOL_SOCKET) — enable TCP keepalive probes. Value: bool.
+    keepalive = 1,
+    /// `SO_RCVBUF` (SOL_SOCKET) — receive buffer size in bytes. Value: an int
+    /// byte count (the OS may round/clamp; Linux stores 2× the requested size).
+    recv_buffer = 2,
+    /// `SO_SNDBUF` (SOL_SOCKET) — send buffer size in bytes. Value: int bytes.
+    send_buffer = 3,
+    /// `SO_REUSEADDR` (SOL_SOCKET) — rebind a just-closed address. Value: bool.
+    /// Only meaningful BEFORE bind (applied in the listen path pre-bind).
+    reuse_address = 4,
+    /// `SO_REUSEPORT` (SOL_SOCKET) — allow multiple binds to one addr/port.
+    /// Value: bool. Only meaningful BEFORE bind.
+    reuse_port = 5,
+    /// `IPV6_V6ONLY` (IPPROTO_IPV6) — restrict an AF_INET6 socket to IPv6.
+    /// Value: bool. Only valid on an IPv6 socket (`ENOPROTOOPT`/`EINVAL` on an
+    /// IPv4 socket — surfaced as `.invalid_argument`).
+    ip6_only = 6,
+    /// `SO_LINGER` (SOL_SOCKET) — close-time linger. Value: MILLISECONDS
+    /// (`< 0` = OFF / OS default; `0` = linger on with a 0 s timeout, the
+    /// RST-close affordance; `> 0` = linger on, rounded UP to whole seconds
+    /// because the OS `l_linger` field is second-granular).
+    linger = 7,
+};
+
+/// Validate a raw option code (from `lib/socket/options.zap`) into a
+/// `SocketOption`, returning `null` for an out-of-range code so the caller can
+/// surface `.invalid_argument` instead of an illegal `@enumFromInt`. The codes
+/// are compiler-trusted (emitted by the stdlib, never remote), but validating
+/// keeps a future ABI skew a typed failure rather than undefined behavior.
+pub fn optionFromCode(code: i64) ?SocketOption {
+    if (code < 0) return null;
+    inline for (@typeInfo(SocketOption).@"enum".fields) |field| {
+        if (code == field.value) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+/// The (level, optname) pair for a `SocketOption`, resolved from `std.posix`
+/// where the fork wires the namespace and from a per-OS literal for
+/// `IPV6_V6ONLY` (the fork's `std.posix.IPV6` is not wired for the Darwin
+/// family — `darwin.IPV6.V6ONLY = 27` exists but the `c.zig` dispatch omits it
+/// — so the seam names the constant directly, exactly as the fork's own per-OS
+/// tables do).
+const OptionName = struct { level: i32, name: u32 };
+
+fn optionName(option: SocketOption) OptionName {
+    return switch (option) {
+        .nodelay => .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.NODELAY },
+        .keepalive => .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE },
+        .recv_buffer => .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.RCVBUF },
+        .send_buffer => .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.SNDBUF },
+        .reuse_address => .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.REUSEADDR },
+        .reuse_port => .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.REUSEPORT },
+        .ip6_only => .{ .level = std.posix.IPPROTO.IPV6, .name = ipv6V6OnlyOptname() },
+        .linger => .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.LINGER },
+    };
+}
+
+/// The `IPV6_V6ONLY` optname, per OS: Linux `26`, the BSD/Darwin family `27`.
+/// Named directly because the fork's `std.posix.IPV6` namespace resolves to
+/// `void` on the Darwin family (its `darwin.IPV6.V6ONLY = 27` is not wired into
+/// the `c.zig` dispatch), so `std.posix.IPV6.V6ONLY` will not compile there.
+fn ipv6V6OnlyOptname() u32 {
+    return switch (comptime builtin.os.tag) {
+        .linux => 26,
+        else => 27, // Darwin family + the BSDs
+    };
+}
+
+/// The outcome of a `getOption` read-back: `.ok` with the decoded `value`
+/// (an int for the int/bool options; MILLISECONDS for `linger` — `-1` when
+/// off), else a mapped failure `Reason` with `value` meaningless.
+pub const OptionOutcome = struct { reason: Reason, value: i64 };
+
+/// Encode a `SocketOption`'s Zap-side `value` into the `int`-valued
+/// `setsockopt` payload (the `linger` option uses `encodeLinger` instead). The
+/// bool options coerce any non-zero to `1`; the buffer sizes are a byte count
+/// clamped into the `c_int` range the kernel expects.
+fn encodeOptionInt(option: SocketOption, value: i64) i32 {
+    return switch (option) {
+        .recv_buffer, .send_buffer => @intCast(std.math.clamp(value, 0, std.math.maxInt(i32))),
+        else => if (value != 0) 1 else 0,
+    };
+}
+
+/// Encode a millisecond `linger` value into the OS `linger` struct: `< 0` is
+/// OFF (`onoff = 0`); `0` lingers with a 0 s timeout (the RST-close affordance);
+/// `> 0` lingers, rounded UP to whole seconds (the `l_linger` field is
+/// second-granular), saturating at `maxInt(i32)` seconds.
+fn encodeLinger(milliseconds: i64) std.posix.linger {
+    if (milliseconds < 0) return .{ .onoff = 0, .linger = 0 };
+    const seconds: i64 = if (milliseconds == 0) 0 else @divTrunc(milliseconds + 999, 1000);
+    return .{ .onoff = 1, .linger = @intCast(std.math.clamp(seconds, 0, std.math.maxInt(i32))) };
+}
+
+/// Apply `option = value` to `fd` via `setsockopt`, returning `.ok` or a mapped
+/// failure `Reason`. `value` is interpreted per the option's encoding (int bool
+/// / int byte-count / `SO_LINGER` struct from a millisecond value). A
+/// synchronous, non-blocking syscall — safe to call inline on any thread (no
+/// offload). Poll-less targets: a documented no-op returning `.ok` (see the
+/// section header).
+pub fn setOption(fd: Fd, option: SocketOption, value: i64) Reason {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .ok; // documented no-op on the poll-less targets
+    }
+    const handle = fdFromBits(fd);
+    const target = optionName(option);
+    if (option == .linger) {
+        var linger_value = encodeLinger(value);
+        const rc = std.posix.system.setsockopt(handle, target.level, target.name, @ptrCast(&linger_value), @sizeOf(std.posix.linger));
+        return if (std.posix.errno(rc) == .SUCCESS) .ok else mapSetOptErrno(std.posix.errno(rc));
+    }
+    var int_value: i32 = encodeOptionInt(option, value);
+    const rc = std.posix.system.setsockopt(handle, target.level, target.name, @ptrCast(&int_value), @sizeOf(i32));
+    return if (std.posix.errno(rc) == .SUCCESS) .ok else mapSetOptErrno(std.posix.errno(rc));
+}
+
+/// Read back `option` from `fd` via `getsockopt` — the deterministic proof that
+/// a `setOption` actually reached the kernel (a wrong level/optname/encoding
+/// would not read back). Returns the decoded value: the raw int for the int/
+/// bool options; MILLISECONDS for `linger` (`-1` when off, else `l_linger`
+/// seconds × 1000). Poll-less targets: a documented no-op returning `.ok` with
+/// `value = 0`.
+pub fn getOption(fd: Fd, option: SocketOption) OptionOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .ok, .value = 0 }; // documented no-op
+    }
+    const handle = fdFromBits(fd);
+    const target = optionName(option);
+    if (option == .linger) {
+        var linger_value: std.posix.linger = .{ .onoff = 0, .linger = 0 };
+        var length: std.posix.socklen_t = @sizeOf(std.posix.linger);
+        const rc = std.posix.system.getsockopt(handle, target.level, target.name, @ptrCast(&linger_value), &length);
+        if (std.posix.errno(rc) != .SUCCESS) return .{ .reason = mapSetOptErrno(std.posix.errno(rc)), .value = 0 };
+        const milliseconds: i64 = if (linger_value.onoff == 0) -1 else @as(i64, linger_value.linger) * 1000;
+        return .{ .reason = .ok, .value = milliseconds };
+    }
+    var int_value: i32 = 0;
+    var length: std.posix.socklen_t = @sizeOf(i32);
+    const rc = std.posix.system.getsockopt(handle, target.level, target.name, @ptrCast(&int_value), &length);
+    if (std.posix.errno(rc) != .SUCCESS) return .{ .reason = mapSetOptErrno(std.posix.errno(rc)), .value = 0 };
+    // Normalize the BOOLEAN options to 0/1: BSD/Darwin `getsockopt` returns the
+    // option's flag BIT for the SO_* booleans (e.g. `SO_KEEPALIVE` reads back
+    // `0x0008`, `SO_REUSEADDR` reads back `0x0004`), so a raw pass-through would
+    // leak that platform quirk. The buffer sizes are genuine byte counts and
+    // pass through unchanged.
+    const decoded: i64 = switch (option) {
+        .nodelay, .keepalive, .reuse_address, .reuse_port, .ip6_only => if (int_value != 0) 1 else 0,
+        else => int_value,
+    };
+    return .{ .reason = .ok, .value = decoded };
+}
+
+/// Map a `setsockopt`/`getsockopt` errno to a stable `Reason`. An unsupported
+/// option or one applied to the wrong socket type (`ENOPROTOOPT`/`EINVAL` — e.g.
+/// `IPV6_V6ONLY` on an IPv4 socket) is `invalid_argument`; a bad fd is `other`
+/// (the ownership gate already rejects a foreign handle before the syscall).
+fn mapSetOptErrno(err: std.posix.E) Reason {
+    return switch (err) {
+        .NOPROTOOPT, .INVAL, .OPNOTSUPP => .invalid_argument,
+        .ACCES, .PERM => .access_denied,
+        .NOBUFS, .NOMEM => .out_of_memory,
+        else => .other,
+    };
 }
 
 /// Close a socket fd through the portable `std.Io.net` close.
@@ -2162,4 +2434,129 @@ test "socket_io: connectHost yields promptly to a kill mid-race and reclaims the
     try testing.expectEqual(@as(Fd, 0), outcome.fd);
     // All in-flight attempt fds reclaimed on the kill path — fd baseline holds.
     try testing.expectEqual(baseline, countOpenFds());
+}
+
+// ---------------------------------------------------------------------------
+// Socket-option tests (setsockopt/getsockopt read-back) — the DETERMINISTIC
+// proof that each option's (level, optname, value-encoding) actually reaches
+// the kernel. A wrong optname would silently no-op or error, so a read-back of
+// the value we set is the primary R3 (TCP_NODELAY) proof. Loopback-only.
+// ---------------------------------------------------------------------------
+
+test "socket_io: setOption(nodelay) actually applies — getsockopt(TCP_NODELAY) reads back 1 (the R3 proof)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+
+    // Before: a fresh TCP socket has Nagle ON — TCP_NODELAY reads back 0.
+    try testing.expectEqual(@as(i64, 0), getOption(client.fd, .nodelay).value);
+    // Apply, then read back: the option ACTUALLY took effect (1), not merely
+    // "accepted". PRE-fix there was no seam to set it at all.
+    try testing.expectEqual(Reason.ok, setOption(client.fd, .nodelay, 1));
+    const read_back = getOption(client.fd, .nodelay);
+    try testing.expectEqual(Reason.ok, read_back.reason);
+    try testing.expectEqual(@as(i64, 1), read_back.value);
+    // And it toggles back off deterministically.
+    try testing.expectEqual(Reason.ok, setOption(client.fd, .nodelay, 0));
+    try testing.expectEqual(@as(i64, 0), getOption(client.fd, .nodelay).value);
+}
+
+test "socket_io: setOption(keepalive/reuse_address) read back their applied bool value" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+
+    try testing.expectEqual(Reason.ok, setOption(client.fd, .keepalive, 1));
+    try testing.expect(getOption(client.fd, .keepalive).value != 0); // SO_KEEPALIVE on
+    try testing.expectEqual(Reason.ok, setOption(client.fd, .reuse_address, 1));
+    try testing.expect(getOption(client.fd, .reuse_address).value != 0); // SO_REUSEADDR on
+}
+
+test "socket_io: setOption(recv_buffer) grows the OS receive buffer (read back >= requested)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+
+    // A modest request the OS honors without clamping (Linux stores 2×, so the
+    // read-back is >= requested; macOS honors small values). The proof is that
+    // the applied value reached the kernel, not the exact byte count.
+    const requested: i64 = 16384;
+    try testing.expectEqual(Reason.ok, setOption(client.fd, .recv_buffer, requested));
+    const read_back = getOption(client.fd, .recv_buffer);
+    try testing.expectEqual(Reason.ok, read_back.reason);
+    try testing.expect(read_back.value >= requested);
+}
+
+test "socket_io: setOption(linger) encodes SO_LINGER from milliseconds and reads back the seconds" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+
+    // Off by default (no SO_LINGER override): read-back is -1.
+    try testing.expectEqual(@as(i64, -1), getOption(client.fd, .linger).value);
+    // 0 ms → linger ON, 0 s timeout (the RST-close affordance).
+    try testing.expectEqual(Reason.ok, setOption(client.fd, .linger, 0));
+    try testing.expectEqual(@as(i64, 0), getOption(client.fd, .linger).value);
+    // 1500 ms → rounds UP to 2 s (l_linger is second-granular) → reads back 2000.
+    try testing.expectEqual(Reason.ok, setOption(client.fd, .linger, 1500));
+    try testing.expectEqual(@as(i64, 2000), getOption(client.fd, .linger).value);
+}
+
+test "socket_io: listenIp4WithOptions sets SO_REUSEPORT before bind — read back on the listener fd" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // A listener created WITH reuse_port has SO_REUSEPORT set on its fd (applied
+    // pre-bind); reuse_address is on too. Read-back is deterministic (unlike a
+    // timing-based bind-after-close race).
+    const with_reuse = listenIp4WithOptions(.{ 127, 0, 0, 1 }, 0, 8, true, true);
+    try testing.expectEqual(Reason.ok, with_reuse.reason);
+    defer closeFd(with_reuse.fd);
+    try testing.expect(getOption(with_reuse.fd, .reuse_port).value != 0);
+    try testing.expect(getOption(with_reuse.fd, .reuse_address).value != 0);
+
+    // A default listener (reuse_port OFF) does NOT have SO_REUSEPORT set.
+    const without = listenIp4WithOptions(.{ 127, 0, 0, 1 }, 0, 8, true, false);
+    try testing.expectEqual(Reason.ok, without.reason);
+    defer closeFd(without.fd);
+    try testing.expectEqual(@as(i64, 0), getOption(without.fd, .reuse_port).value);
+    try testing.expect(getOption(without.fd, .reuse_address).value != 0); // still on
+}
+
+test "socket_io: two listeners bind the SAME port in succession with reuse_port (would EADDRINUSE without)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // First listener on an ephemeral port WITH reuse_port; a second listener on
+    // that SAME port also with reuse_port succeeds — SO_REUSEPORT permits the
+    // concurrent bind. Both stay open simultaneously (the load-balancing use).
+    const first = listenIp4WithOptions(.{ 127, 0, 0, 1 }, 0, 8, true, true);
+    try testing.expectEqual(Reason.ok, first.reason);
+    defer closeFd(first.fd);
+    const shared_port = first.bound_port;
+
+    const second = listenIp4WithOptions(.{ 127, 0, 0, 1 }, shared_port, 8, true, true);
+    // macOS additionally requires matching UIDs (always true here); on both
+    // Linux and macOS a second reuse_port bind to the same port succeeds.
+    try testing.expectEqual(Reason.ok, second.reason);
+    defer closeFd(second.fd);
+    try testing.expectEqual(shared_port, second.bound_port);
 }
