@@ -162,8 +162,10 @@ fn fdFromBits(bits: Fd) net.Socket.Handle {
 /// thread pinned; instead we do a NON-BLOCKING connect (set `O_NONBLOCK`,
 /// `connect` → `EINPROGRESS`) and poll `POLL.OUT` in `poll_quantum_ms`
 /// quanta, re-checking an ABSOLUTE monotonic deadline and the `kill_flag`
-/// each quantum, then read `SO_ERROR` on wake to learn the outcome and
-/// restore blocking mode. A timeout does NOT leak the fd (it is closed on the
+/// each quantum, then read `SO_ERROR` on wake to learn the outcome. The fd
+/// stays `O_NONBLOCK` for its whole life (the always-non-blocking discipline);
+/// `recv`/`send` poll every read/write and tolerate `EAGAIN`, so there is no
+/// per-connect restore. A timeout does NOT leak the fd (it is closed on the
 /// error path); a live connected fd is never `0`.
 ///
 /// The fork's portable `IpAddress.connect` cannot do this (its
@@ -208,16 +210,16 @@ pub fn connectIp6(bytes: [16]u8, port: u16, scope_id: u32, flow: u32, timeout_ms
 /// `connectIp6`). Issues the connect via the shared `startAttempt` primitive,
 /// then — for an EINPROGRESS attempt — hands the fd to `awaitConnect`, which
 /// polls `POLL.OUT` in deadline-and-kill-bounded quanta until `SO_ERROR`
-/// reports the outcome and restores blocking mode. An immediate connect
-/// (common on loopback) restores blocking and returns the live fd directly.
+/// reports the outcome. An immediate connect (common on loopback) returns the
+/// live fd directly. The fd stays `O_NONBLOCK` for its whole life (set once in
+/// `startAttempt`) — the always-non-blocking discipline: no per-connect restore
+/// and no per-send flip, since `recv`/`send` poll every read/write and tolerate
+/// `EAGAIN`.
 fn connectSingle(address: net.IpAddress, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
     const start = startAttempt(address);
     switch (start.state) {
         .failed => return .{ .reason = start.reason, .fd = 0 },
-        .connected => {
-            restoreBlocking(start.fd);
-            return .{ .reason = .ok, .fd = fdToBits(start.fd) };
-        },
+        .connected => return .{ .reason = .ok, .fd = fdToBits(start.fd) },
         .in_progress => return awaitConnect(start.fd, timeout_ms, kill_flag),
     }
 }
@@ -226,10 +228,10 @@ fn connectSingle(address: net.IpAddress, timeout_ms: i64, kill_flag: ?*std.atomi
 const AttemptState = enum { connected, in_progress, failed };
 
 /// The result of issuing one non-blocking connect: `.connected` = finished
-/// synchronously, `fd` live (non-blocking; the caller restores blocking);
-/// `.in_progress` = EINPROGRESS, `fd` the pending socket to poll `POLL.OUT`;
-/// `.failed` = socket-create or a hard connect error, `fd` already CLOSED and
-/// `reason` naming the failure.
+/// synchronously, `fd` live (and stays `O_NONBLOCK` for its whole life — the
+/// caller does NOT restore blocking); `.in_progress` = EINPROGRESS, `fd` the
+/// pending socket to poll `POLL.OUT`; `.failed` = socket-create or a hard
+/// connect error, `fd` already CLOSED and `reason` naming the failure.
 const AttemptStart = struct { fd: net.Socket.Handle, state: AttemptState, reason: Reason };
 
 /// Create a non-blocking stream socket for `address`'s family and ISSUE a
@@ -248,7 +250,10 @@ fn startAttempt(address: net.IpAddress) AttemptStart {
     if (std.posix.errno(socket_rc) != .SUCCESS)
         return .{ .fd = 0, .state = .failed, .reason = mapSocketCreateErrno(socket_rc) };
     const handle: net.Socket.Handle = @intCast(socket_rc);
-    // Flip to non-blocking so `connect` returns EINPROGRESS instead of blocking.
+    // Set non-blocking so `connect` returns EINPROGRESS instead of blocking —
+    // and KEEP it for the fd's whole life (the always-non-blocking discipline;
+    // `recv`/`send` poll every read/write and tolerate `EAGAIN`, so there is no
+    // per-connect restore and no per-send flip).
     if (!setNonBlocking(handle)) {
         _ = std.posix.system.close(handle);
         return .{ .fd = 0, .state = .failed, .reason = .other };
@@ -272,8 +277,9 @@ fn startAttempt(address: net.IpAddress) AttemptStart {
 /// shared completion tail of `connectSingle`). Polls `POLL.OUT` in
 /// `poll_quantum_ms` quanta bounded by an ABSOLUTE monotonic deadline (HIGH-3,
 /// dribble-proof) and the `kill_flag` (HIGH-2), reads `SO_ERROR` on wake for
-/// the verdict, and RESTORES blocking mode on success so the returned fd is
-/// compatible with the poll-then-blocking `recv`. On ANY non-success exit
+/// the verdict. On success the fd stays `O_NONBLOCK` (the always-non-blocking
+/// discipline — `recv`/`send` poll every read/write and tolerate `EAGAIN`, so
+/// no blocking restore is needed). On ANY non-success exit
 /// (failure/timeout/kill/`getsockopt`-error) it CLOSES `handle` on THIS thread
 /// — the transient fd never reaches the fiber continuation a kill teardown
 /// would skip (HIGH-1) — and returns the reason with `fd = 0`. On success fd
@@ -318,7 +324,6 @@ fn awaitConnect(handle: net.Socket.Handle, timeout_ms: i64, kill_flag: ?*std.ato
                     return .{ .reason = .other, .fd = 0 };
                 }
             }
-            restoreBlocking(handle);
             return .{ .reason = .ok, .fd = fdToBits(handle) };
         }
         _ = std.posix.system.close(handle);
@@ -366,25 +371,16 @@ fn buildSockAddr(address: net.IpAddress) BuiltSockAddr {
 }
 
 /// Set `O_NONBLOCK` on `handle`, returning whether it succeeded (the caller
-/// closes the fd on failure). Shared by every posix connect path.
+/// closes the fd on failure). The fd then stays non-blocking for its whole
+/// life (the always-non-blocking discipline). Shared by every posix fd the
+/// runtime owns for `recv`/`send`: the connect paths (`startAttempt`) and the
+/// just-accepted connection (`accept`).
 fn setNonBlocking(handle: net.Socket.Handle) bool {
     const nonblock_bit: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
     const flags_rc = std.posix.system.fcntl(handle, std.posix.F.GETFL, @as(usize, 0));
     if (std.posix.errno(flags_rc) != .SUCCESS) return false;
     const flags: usize = @intCast(flags_rc);
     return std.posix.errno(std.posix.system.fcntl(handle, std.posix.F.SETFL, flags | nonblock_bit)) == .SUCCESS;
-}
-
-/// Clear `O_NONBLOCK` on a just-connected `handle`, so the returned fd is
-/// compatible with the poll-then-blocking `recv` (which requires a BLOCKING
-/// fd). A best-effort `fcntl`; a failure leaves the socket usable (poll still
-/// gates every read/write).
-fn restoreBlocking(handle: net.Socket.Handle) void {
-    const flags_rc = std.posix.system.fcntl(handle, std.posix.F.GETFL, @as(usize, 0));
-    if (std.posix.errno(flags_rc) != .SUCCESS) return;
-    const flags: usize = @intCast(flags_rc);
-    const nonblock_bit: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, flags & ~nonblock_bit);
 }
 
 // ---------------------------------------------------------------------------
@@ -600,8 +596,9 @@ fn isUnspecified(bytes: []const u8) bool {
 /// connects with ONE `poll()` over the whole pollfd array, staggering new
 /// attempts by `connection_attempt_delay_ms`, re-checking the absolute
 /// deadline + `kill_flag` each quantum. The FIRST attempt whose `SO_ERROR` is
-/// `0` is the winner (blocking mode restored, fd returned); EVERY other fd —
-/// in-flight OR not-yet-started — is closed on THIS thread.
+/// `0` is the winner (fd returned, staying `O_NONBLOCK` for life — the
+/// always-non-blocking discipline); EVERY other fd — in-flight OR
+/// not-yet-started — is closed on THIS thread.
 ///
 /// LOSER-CLEANUP GUARANTEE (SECURITY — no fd-exhaustion DoS): the `defer`
 /// closes every fd still marked open in `fds`, on EVERY exit path (winner,
@@ -647,16 +644,16 @@ fn raceConnectPosix(addresses: []const net.IpAddress, timeout_ms: i64, kill_flag
             switch (start.state) {
                 .connected => {
                     // Immediate winner (loopback). Kill re-check (HIGH-1) before
-                    // handing a live fd back, then claim + restore. The `defer`
-                    // closes every loser; `start.fd` is not in `fds`, so on the
-                    // kill path it is closed explicitly here.
+                    // handing a live fd back, then claim it. The `defer` closes
+                    // every loser; `start.fd` is not in `fds`, so on the kill
+                    // path it is closed explicitly here. The winner stays
+                    // `O_NONBLOCK` for life (always-non-blocking discipline).
                     if (kill_flag) |flag| {
                         if (flag.load(.acquire)) {
                             _ = std.posix.system.close(start.fd);
                             return .{ .reason = .other, .fd = 0 };
                         }
                     }
-                    restoreBlocking(start.fd);
                     return .{ .reason = .ok, .fd = fdToBits(start.fd) };
                 },
                 .in_progress => {
@@ -712,11 +709,11 @@ fn raceConnectPosix(addresses: []const net.IpAddress, timeout_ms: i64, kill_flag
             const pending = soError(fds[i]);
             if (pending == 0) {
                 // WINNER. Kill re-check (HIGH-1), then claim its fd (clear the
-                // slot so the loser-cleanup defer skips it) and restore blocking.
+                // slot so the loser-cleanup defer skips it). The winner stays
+                // `O_NONBLOCK` for life (always-non-blocking discipline).
                 if (kill_flag) |flag| {
                     if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0 };
                 }
-                restoreBlocking(fds[i]);
                 const winner = fds[i];
                 fds[i] = -1;
                 return .{ .reason = .ok, .fd = fdToBits(winner) };
@@ -1251,7 +1248,6 @@ pub fn recv(
     var buffer = try allocator.alloc(u8, initial_capacity);
     errdefer allocator.free(buffer);
 
-    const the_io = io();
     const handle = fdFromBits(fd);
     var filled: usize = 0;
     // ABSOLUTE monotonic deadline (HIGH-3): read the clock once and recompute
@@ -1283,9 +1279,33 @@ pub fn recv(
             .failed => return try shrinkRecv(allocator, buffer, @intFromEnum(Reason.other), filled),
             .ready => {},
         }
-        var iovec = [1][]u8{buffer[filled..]};
-        const read_count = the_io.vtable.netRead(the_io.userdata, handle, iovec[0..]) catch |err|
-            return try shrinkRecv(allocator, buffer, @intFromEnum(mapReadError(err)), filled);
+        // The fd is ALWAYS `O_NONBLOCK` (set once at creation — the
+        // always-non-blocking discipline). On the common path the read after a
+        // readable poll returns bytes immediately; but a spurious readable wake
+        // or a competing reader that drained the socket first can return
+        // `EAGAIN`/`EWOULDBLOCK` — which is NOT EOF and NOT an error, so re-poll
+        // the quantum (the absolute deadline + `kill_flag` are re-checked at the
+        // loop top). `EINTR` re-polls likewise. EVERY other outcome — clean EOF
+        // (`0` → CLOSED) and every mapped error — is byte-identical to the prior
+        // poll-then-blocking `netRead` path. The poll-less targets (Windows/wasi)
+        // keep the fork's blocking `netRead`: their fd is blocking, so a read
+        // after a readable poll simply returns the available bytes.
+        const read_count: usize = if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) blk: {
+            const the_io = io();
+            var iovec = [1][]u8{buffer[filled..]};
+            break :blk the_io.vtable.netRead(the_io.userdata, handle, iovec[0..]) catch |err|
+                return try shrinkRecv(allocator, buffer, @intFromEnum(mapReadError(err)), filled);
+        } else blk: {
+            const dest = buffer[filled..];
+            const rc = std.posix.system.recv(handle, @ptrCast(dest.ptr), dest.len, 0);
+            break :blk switch (std.posix.errno(rc)) {
+                .SUCCESS => @intCast(rc),
+                // No data yet (spurious readable wake / competing reader) or an
+                // interrupted read: re-poll — never a false EOF or error.
+                .AGAIN, .INTR => continue,
+                else => |recv_errno| return try shrinkRecv(allocator, buffer, @intFromEnum(mapRecvErrno(recv_errno)), filled),
+            };
+        };
         if (read_count == 0) {
             // Clean EOF. For an exact read that already saw bytes, the stream
             // ended mid-frame — still CLOSED (the caller asked for N and the
@@ -1382,9 +1402,10 @@ fn sendImpl(fd: Fd, bytes: []const u8, all: bool, timeout_ms: i64, kill_flag: ?*
     return sendImplPosix(fd, bytes, all, timeout_ms, kill_flag);
 }
 
-/// The posix poll-quantum send loop. CRITICAL: the fd is flipped to
-/// `O_NONBLOCK` for the duration (restored on exit), so each `send` places only
-/// what currently fits (or returns `EAGAIN`) and returns immediately. A blocking
+/// The posix poll-quantum send loop. CRITICAL: the fd is ALWAYS `O_NONBLOCK`
+/// (set once at fd creation — the always-non-blocking discipline; NO per-send
+/// flip, so no `fcntl` on the send hot path), so each `send` places only what
+/// currently fits (or returns `EAGAIN`) and returns immediately. A blocking
 /// `write`/`sendmsg` of a large payload blocks until the ENTIRE payload is
 /// queued — it does NOT return after merely filling the buffer (unlike `read`,
 /// which returns the bytes already available). So poll-then-BLOCKING-write would
@@ -1393,20 +1414,10 @@ fn sendImpl(fd: Fd, bytes: []const u8, all: bool, timeout_ms: i64, kill_flag: ?*
 /// megabytes blocks waiting for the peer to drain. (`MSG_DONTWAIT` alone is
 /// unreliable on macOS, so `O_NONBLOCK` is the portable mechanism.) Non-blocking
 /// writes make the per-quantum deadline and `kill_flag` checks always run
-/// (HIGH-2). The blocking mode is RESTORED on every exit path, so `recv`'s
-/// poll-then-blocking-read (safe — a read returns available bytes) is unaffected.
+/// (HIGH-2).
 fn sendImplPosix(fd: Fd, bytes: []const u8, all: bool, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
     const handle = fdFromBits(fd);
-    const flags: u32 = std.posix.MSG.NOSIGNAL; // no SIGPIPE; O_NONBLOCK gives non-blocking
-
-    // Flip to non-blocking for the send, restore the original mode on exit.
-    const nonblock_bit: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    const original_flags_rc = std.posix.system.fcntl(handle, std.posix.F.GETFL, @as(usize, 0));
-    if (std.posix.errno(original_flags_rc) != .SUCCESS) return .{ .reason = .other, .bytes_sent = 0 };
-    const original_flags: usize = @intCast(original_flags_rc);
-    if (std.posix.errno(std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags | nonblock_bit)) != .SUCCESS)
-        return .{ .reason = .other, .bytes_sent = 0 };
-    defer _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags);
+    const flags: u32 = std.posix.MSG.NOSIGNAL; // no SIGPIPE; the fd is already O_NONBLOCK
 
     var sent: usize = 0;
     const has_deadline = timeout_ms > 0;
@@ -1484,7 +1495,9 @@ pub const AcceptOutcome = struct {
 var test_after_accept_hook: ?*const fn () void = null;
 
 /// Accept one connection from a listening socket, blocking (poll-quantum
-/// bounded, kill-checked) until one arrives.
+/// bounded, kill-checked) until one arrives. The accepted connection is set
+/// `O_NONBLOCK` for its whole life (the always-non-blocking discipline) so
+/// `recv`/`send` on it need no per-operation mode flip.
 pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
     const the_io = io();
     const listen_handle = fdFromBits(fd);
@@ -1520,6 +1533,21 @@ pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
         // kill becomes visible only AFTER this check but before re-attach.)
         if (kill_flag) |flag| {
             if (flag.load(.acquire)) {
+                var accepted_handle = accepted.handle;
+                the_io.vtable.netClose(the_io.userdata, (&accepted_handle)[0..1]);
+                return .{ .reason = .other, .fd = 0, .peer = AddressV4.none };
+            }
+        }
+        // Make the accepted connection `O_NONBLOCK` from birth (the
+        // always-non-blocking discipline): the accepted fd does NOT inherit the
+        // listener's blocking mode portably, and `recv`/`send` on it require a
+        // non-blocking fd (they poll every read/write and tolerate `EAGAIN`), so
+        // set it once here rather than flipping per operation. The poll-less
+        // targets (Windows/wasi) keep the accepted fd blocking, matching their
+        // blocking `netRead`/`netWrite`. On a set failure the just-accepted fd
+        // is closed here (never leaked, never handed back unusable).
+        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            if (!setNonBlocking(accepted.handle)) {
                 var accepted_handle = accepted.handle;
                 the_io.vtable.netClose(the_io.userdata, (&accepted_handle)[0..1]);
                 return .{ .reason = .other, .fd = 0, .peer = AddressV4.none };
@@ -1730,6 +1758,22 @@ fn mapSendErrno(err: std.posix.E) Reason {
         .NETUNREACH => .network_unreachable,
         .HOSTUNREACH => .host_unreachable,
         .ACCES => .access_denied,
+        .NOBUFS, .NOMEM => .out_of_memory,
+        else => .other,
+    };
+}
+
+/// Map a non-blocking `recv(2)` errno to a stable `Reason` — the SAME `Reason`
+/// set the fork's blocking `netRead` produces (via `mapReadError`), so the
+/// always-non-blocking recv is behaviorally IDENTICAL to the prior
+/// poll-then-blocking read on every error path. `EAGAIN`/`EWOULDBLOCK` and
+/// `EINTR` are handled by the caller's re-poll arm and never reach here.
+fn mapRecvErrno(err: std.posix.E) Reason {
+    return switch (err) {
+        .CONNRESET => .connection_reset,
+        .TIMEDOUT => .timed_out,
+        .NOTCONN, .PIPE => .connection_reset,
+        .NETDOWN => .network_down,
         .NOBUFS, .NOMEM => .out_of_memory,
         else => .other,
     };
@@ -2325,6 +2369,113 @@ test "socket_io: next-available recv SHRINKS the buffer to what arrived (no over
     try testing.expectEqual(payload.len, outcome.bytes_filled);
     try testing.expectEqual(payload.len, outcome.buffer.len); // shrunk, not 65536
     try testing.expectEqualSlices(u8, payload, outcome.buffer[0..outcome.bytes_filled]);
+}
+
+test "socket_io: always-non-blocking recv round-trips a long stream of framed messages byte-exact (common-case, first-poll data)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+    const accepted = accept(listener.fd, null);
+    try testing.expectEqual(Reason.ok, accepted.reason);
+    defer closeFd(accepted.fd);
+
+    // 500 distinct 8-byte frames sent client→server; the server `recv_exact`s
+    // each frame IN ORDER. On the always-non-blocking accepted fd the read after
+    // a readable poll returns the bytes on the FIRST try (the common case — no
+    // EAGAIN, so the re-poll arm adds ZERO latency here); a healthy fast peer's
+    // whole stream round-trips byte-exact. This is the regression guard that the
+    // always-non-blocking discipline did not change ordinary recv correctness.
+    const frame_count: usize = 500;
+    var seq: usize = 0;
+    while (seq < frame_count) : (seq += 1) {
+        var frame: [8]u8 = undefined;
+        std.mem.writeInt(u64, &frame, @as(u64, seq), .little);
+        try testing.expectEqual(Reason.ok, send(client.fd, frame[0..], 5000, null).reason);
+        const r = try recv(testing.allocator, accepted.fd, 8, 0, 5000, null);
+        defer testing.allocator.free(r.buffer);
+        try testing.expectEqual(@as(i32, recv_status_chunk), r.status);
+        try testing.expectEqual(@as(usize, 8), r.bytes_filled);
+        try testing.expectEqualSlices(u8, frame[0..], r.buffer[0..r.bytes_filled]);
+    }
+}
+
+test "socket_io: always-non-blocking recv re-polls on a competing-reader EAGAIN — no false EOF/error, every byte accounted" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+    const accepted = accept(listener.fd, null);
+    try testing.expectEqual(Reason.ok, accepted.reason);
+    defer closeFd(accepted.fd);
+
+    // TWO reader threads poll+recv the SAME accepted fd. When a byte arrives,
+    // level-triggered POLLIN wakes BOTH; one reader's recv gets the byte, the
+    // other's recv returns EAGAIN because the byte was already consumed. On the
+    // always-non-blocking fd that EAGAIN MUST re-poll — NEVER a false EOF
+    // (`recv_status_closed`) and NEVER a mapped error (a positive status). If the
+    // EAGAIN arm were missing, the losing reader would mis-map `EAGAIN` to a
+    // `.other` error and short-circuit the stream. The invariant proven here:
+    // across both readers EXACTLY the sent bytes are accounted, and each reader
+    // terminates ONLY on the real EOF after `shutdown(write)`. Each reader uses
+    // the thread-safe page allocator (never the shared testing allocator).
+    const total_bytes: usize = 300;
+    const Reader = struct {
+        fd: Fd,
+        received: usize = 0,
+        saw_bad_status: bool = false,
+        fn run(self: *@This()) void {
+            while (true) {
+                const r = recv(std.heap.page_allocator, self.fd, 0, 256, 5000, null) catch {
+                    self.saw_bad_status = true; // OOM only — never expected here
+                    return;
+                };
+                defer std.heap.page_allocator.free(r.buffer);
+                if (r.status == recv_status_chunk) {
+                    self.received += r.bytes_filled;
+                    continue;
+                }
+                if (r.status == recv_status_closed) return; // the real EOF
+                // A positive status is a mapped error — a missing EAGAIN re-poll
+                // arm (EAGAIN → `.other`) would land here. It must not.
+                self.saw_bad_status = true;
+                return;
+            }
+        }
+    };
+    var reader_a = Reader{ .fd = accepted.fd };
+    var reader_b = Reader{ .fd = accepted.fd };
+    const thread_a = try std.Thread.spawn(.{}, Reader.run, .{&reader_a});
+    const thread_b = try std.Thread.spawn(.{}, Reader.run, .{&reader_b});
+
+    // Dribble single bytes with tiny gaps so the two readers interleave and the
+    // losing reader repeatedly takes the EAGAIN re-poll path, then EOF the stream.
+    var n: usize = 0;
+    while (n < total_bytes) : (n += 1) {
+        const one = [_]u8{@intCast(n & 0xff)};
+        try testing.expectEqual(Reason.ok, send(client.fd, one[0..], 5000, null).reason);
+        var ts: std.c.timespec = .{ .sec = 0, .nsec = 150_000 }; // 150µs
+        _ = std.c.nanosleep(&ts, null);
+    }
+    try testing.expectEqual(Reason.ok, shutdownFd(client.fd, 1)); // EOF
+
+    thread_a.join();
+    thread_b.join();
+
+    // No reader ever saw EAGAIN mis-reported as an error or a premature EOF.
+    try testing.expect(!reader_a.saw_bad_status);
+    try testing.expect(!reader_b.saw_bad_status);
+    // Every sent byte was received EXACTLY once across the two readers — the
+    // EAGAIN re-poll neither dropped a byte nor short-circuited the stream.
+    try testing.expectEqual(total_bytes, reader_a.received + reader_b.received);
 }
 
 // ---------------------------------------------------------------------------

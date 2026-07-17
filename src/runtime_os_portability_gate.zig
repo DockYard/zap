@@ -568,6 +568,7 @@ const kernel_seam_allowlist = [_]KernelSeam{
             "std.posix.system.bind",
             "std.posix.system.listen",
             "std.posix.system.send",
+            "std.posix.system.recv",
             "std.posix.system.setsockopt",
             "std.posix.system.getsockopt",
             "std.posix.system.getsockname",
@@ -606,9 +607,14 @@ const kernel_seam_allowlist = [_]KernelSeam{
         \\whole purpose, exactly like `futex.zig` is the parking seam. The
         \\fork's portable `std.Io.net` cannot express the poll-quantum timeout
         \\(`ConnectOptions.timeout` is a TODO-panic), so the posix path issues
-        \\the raw `socket`/`fcntl`/`connect`/`poll`/`send`/`getsockopt`/
+        \\the raw `socket`/`fcntl`/`connect`/`poll`/`send`/`recv`/`getsockopt`/
         \\`getsockname`/`getpeername` syscalls directly, bounded by a
-        \\`clock_gettime` monotonic deadline; the poll-less Windows/wasi arms
+        \\`clock_gettime` monotonic deadline. The recv is a raw non-blocking
+        \\`recv(2)` (not the fork's blocking `netRead`, which treats `EAGAIN` as
+        \\a programmer-bug panic): on the always-non-blocking fd a spurious
+        \\readable wake / competing reader can return `EAGAIN`, which must
+        \\re-poll — so recv issues the syscall directly, exactly like send. The
+        \\poll-less Windows/wasi arms
         \\keep the blocking portable path with the timeout a documented no-op.
         \\The pre-bind listener (`socket`/`bind`/`listen` + `SO_REUSEADDR`/
         \\`SO_REUSEPORT` before bind) and the curated-portable socket options
