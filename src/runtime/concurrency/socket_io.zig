@@ -1475,46 +1475,71 @@ pub fn shutdownFd(fd: Fd, how: i32) Reason {
 }
 
 /// The outcome of an `accept`: the accepted connection's fd plus the peer's
-/// IPv4 endpoint (for the accepted socket's `peer_address`), or a mapped
-/// reason. Poll-quantum bounded on the listener fd, so a blocked acceptor is
-/// kill-responsive (the S3 graceful-drain seam).
+/// endpoint (for the accepted socket's `peer_address`, of any family —
+/// generalized to `SocketEndpoint` in Phase S2 so an AF_UNIX accept is
+/// representable), or a mapped reason. Poll-quantum bounded on the listener fd,
+/// so a blocked acceptor is kill-responsive (the S3 graceful-drain seam).
 pub const AcceptOutcome = struct {
     reason: Reason,
     fd: Fd,
-    peer: AddressV4,
+    peer: SocketEndpoint,
 };
 
-/// Test-only injection seam for the deterministic post-`netAccept` kill test.
-/// `accept` invokes this hook (when non-null) IMMEDIATELY after `netAccept`
-/// returns a connection and BEFORE the post-accept kill re-check, so a test
-/// can flip the `kill_flag` precisely inside that window — landing execution
-/// in the close-on-kill branch every run, which the timing-racing test lands
-/// only occasionally. Guarded by `comptime builtin.is_test`, so it and its
-/// call site are DEAD CODE (fully elided) in every shipped binary — zero
-/// production cost, no reachable seam.
+/// Test-only injection seam for the deterministic post-accept kill test.
+/// `accept`/`acceptAny` invoke this hook (when non-null) IMMEDIATELY after the
+/// accept syscall returns a connection and BEFORE the post-accept kill re-check,
+/// so a test can flip the `kill_flag` precisely inside that window — landing
+/// execution in the close-on-kill branch every run, which the timing-racing
+/// test lands only occasionally. Guarded by `comptime builtin.is_test`, so it
+/// and its call sites are DEAD CODE (fully elided) in every shipped binary —
+/// zero production cost, no reachable seam.
 var test_after_accept_hook: ?*const fn () void = null;
 
-/// Accept one connection from a listening socket, blocking (poll-quantum
-/// bounded, kill-checked) until one arrives. The accepted connection is set
-/// `O_NONBLOCK` for its whole life (the always-non-blocking discipline) so
-/// `recv`/`send` on it need no per-operation mode flip.
+/// Accept one connection from a listening socket of EITHER address family
+/// (Phase S2), blocking (poll-quantum bounded, kill-checked) until one arrives.
+/// The listener's family is probed once via `getsockname`: an AF_UNIX listener
+/// routes to the raw-`accept(2)` `acceptAny` path (the fork's `netAccept`/
+/// `net.IpAddress` cannot represent a Unix peer), while an IPv4/IPv6 listener
+/// keeps the byte-identical S1 `netAccept` path (`acceptInet`) — so TCP accept
+/// is unchanged and Unix-domain accept is newly supported. The accepted
+/// connection is set `O_NONBLOCK` for its whole life (the always-non-blocking
+/// discipline) so `recv`/`send` on it need no per-operation mode flip.
 pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        // One cheap, non-blocking `getsockname` (nanoseconds) before the
+        // BLOCKING accept — negligible relative to the accept itself — routes a
+        // Unix-domain listener to the family-agnostic raw-accept path.
+        const handle = fdFromBits(fd);
+        var storage: std.posix.sockaddr.storage = undefined;
+        var address_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        if (std.posix.errno(std.posix.system.getsockname(handle, @ptrCast(&storage), &address_len)) == .SUCCESS) {
+            const family: *const std.posix.sockaddr = @ptrCast(&storage);
+            if (family.family == std.posix.AF.UNIX) return acceptAny(fd, kill_flag);
+        }
+    }
+    return acceptInet(fd, kill_flag);
+}
+
+/// The IPv4/IPv6 accept path (the byte-identical S1 `netAccept` implementation,
+/// now producing a `SocketEndpoint` peer). Reached from `accept` for a non-Unix
+/// listener.
+fn acceptInet(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
     const the_io = io();
     const listen_handle = fdFromBits(fd);
     while (true) {
         if (kill_flag) |flag| {
-            if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0, .peer = AddressV4.none };
+            if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
         }
         switch (waitReadable(listen_handle, poll_quantum_ms)) {
             .timeout => continue,
-            .failed => return .{ .reason = .other, .fd = 0, .peer = AddressV4.none },
+            .failed => return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none },
             .ready => {},
         }
         // `net.Server.AcceptOptions` is `void` on some targets (e.g. macOS) and
         // a struct on others — pass the right default for either shape.
         const accept_options: net.Server.AcceptOptions = if (net.Server.AcceptOptions == void) {} else .{};
         const accepted = the_io.vtable.netAccept(the_io.userdata, listen_handle, accept_options) catch |err|
-            return .{ .reason = mapAcceptError(err), .fd = 0, .peer = AddressV4.none };
+            return .{ .reason = mapAcceptError(err), .fd = 0, .peer = SocketEndpoint.none };
         // Test-only: flip the kill flag exactly inside the post-accept window
         // (comptime-dead in production — see `test_after_accept_hook`).
         if (comptime builtin.is_test) {
@@ -1535,7 +1560,7 @@ pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
             if (flag.load(.acquire)) {
                 var accepted_handle = accepted.handle;
                 the_io.vtable.netClose(the_io.userdata, (&accepted_handle)[0..1]);
-                return .{ .reason = .other, .fd = 0, .peer = AddressV4.none };
+                return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
             }
         }
         // Make the accepted connection `O_NONBLOCK` from birth (the
@@ -1550,30 +1575,16 @@ pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
             if (!setNonBlocking(accepted.handle)) {
                 var accepted_handle = accepted.handle;
                 the_io.vtable.netClose(the_io.userdata, (&accepted_handle)[0..1]);
-                return .{ .reason = .other, .fd = 0, .peer = AddressV4.none };
+                return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
             }
         }
-        const peer = switch (accepted.address) {
-            .ip4 => |ip4| AddressV4{ .a = ip4.bytes[0], .b = ip4.bytes[1], .c = ip4.bytes[2], .d = ip4.bytes[3], .port = ip4.port, .ok = true },
-            .ip6 => AddressV4.none,
+        const peer: SocketEndpoint = switch (accepted.address) {
+            .ip4 => |ip4| .{ .family = .ip4, .v4 = ip4.bytes, .v6 = @splat(0), .port = ip4.port, .scope_id = 0 },
+            .ip6 => |ip6| .{ .family = .ip6, .v4 = .{ 0, 0, 0, 0 }, .v6 = ip6.bytes, .port = ip6.port, .scope_id = ip6.interface.index },
         };
         return .{ .reason = .ok, .fd = fdToBits(accepted.handle), .peer = peer };
     }
 }
-
-/// A resolved IPv4 endpoint (for `local_address`/`peer_address`). `ok` is
-/// false when the socket is unbound/unconnected or bound to a non-IPv4 family
-/// (S1 surfaces IPv4; the S2 datagram/IPv6 work broadens it).
-pub const AddressV4 = struct {
-    a: u8,
-    b: u8,
-    c: u8,
-    d: u8,
-    port: u16,
-    ok: bool,
-
-    pub const none = AddressV4{ .a = 0, .b = 0, .c = 0, .d = 0, .port = 0, .ok = false };
-};
 
 /// A resolved endpoint of EITHER family — the IPv6-aware `local_address`/
 /// `peer_address` result. After a happy-eyeballs connect that won over IPv6,
@@ -1586,7 +1597,7 @@ pub const AddressV4 = struct {
 /// endpoint never crosses the ABI into Zap — it lives only here.
 pub const SocketEndpoint = struct {
     /// The endpoint family: `.unavailable` (unbound/unconnected/error),
-    /// `.ip4`, or `.ip6`.
+    /// `.ip4`, `.ip6`, or `.unix` (an AF_UNIX endpoint — Phase S2).
     family: Family,
     /// IPv4 octets (meaningful iff `family == .ip4`).
     v4: [4]u8,
@@ -1597,10 +1608,29 @@ pub const SocketEndpoint = struct {
     /// IPv6 zone/scope id (meaningful iff `family == .ip6`; `0` = none).
     scope_id: u32,
 
-    pub const Family = enum { unavailable, ip4, ip6 };
+    /// The endpoint's address family. `.unix` (Phase S2) marks an AF_UNIX
+    /// endpoint: a socket bound/connected over the Unix-domain. The path is
+    /// NOT carried in this struct (a Unix path readback across the ABI as a
+    /// String is a documented S2 follow-up — the datagram peer / stream
+    /// `local_address`/`peer_address` of a Unix socket surface `:unix` /
+    /// `:unavailable`, while the CONSTRUCTION side — `bind`/`connect`/`listen`/
+    /// `send_to` taking a path — is fully supported), so `.unix` is a family
+    /// marker only.
+    pub const Family = enum { unavailable, ip4, ip6, unix };
 
     pub const none = SocketEndpoint{
         .family = .unavailable,
+        .v4 = .{ 0, 0, 0, 0 },
+        .v6 = @splat(0),
+        .port = 0,
+        .scope_id = 0,
+    };
+
+    /// A bare AF_UNIX endpoint marker (no IP address, no port). The Unix
+    /// datagram sender's path is not surfaced across the ABI in S2 (see
+    /// `Family`), so a Unix peer/local endpoint carries only the family tag.
+    pub const unix_endpoint = SocketEndpoint{
+        .family = .unix,
         .v4 = .{ 0, 0, 0, 0 },
         .v6 = @splat(0),
         .port = 0,
@@ -1638,6 +1668,7 @@ pub fn peerAddress(fd: Fd) SocketEndpoint {
 pub fn endpointFamilyCode(endpoint: SocketEndpoint) i64 {
     return switch (endpoint.family) {
         .unavailable => 0,
+        .unix => 1,
         .ip4 => 4,
         .ip6 => 6,
     };
@@ -1844,6 +1875,11 @@ fn nameAddress(fd: Fd, kind: NameKind) SocketEndpoint {
             .scope_id = in6.scope_id,
         };
     }
+    // AF_UNIX (Phase S2): a bound/connected Unix-domain endpoint. The path is
+    // present in `storage` but NOT surfaced across the ABI in S2 (see
+    // `SocketEndpoint.Family`); the endpoint is reported as the `.unix` family
+    // marker — honest ("this is a Unix endpoint") without the path channel.
+    if (sockaddr_ptr.family == std.posix.AF.UNIX) return SocketEndpoint.unix_endpoint;
     return SocketEndpoint.none;
 }
 
@@ -1916,6 +1952,606 @@ fn mapListenError(err: net.IpAddress.ListenError) Reason {
         error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => .fd_quota_exceeded,
         error.NetworkDown => .network_down,
         error.SystemResources => .out_of_memory,
+        else => .other,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Phase S2 — Datagram (UDP) + Unix-domain (Decision C: no fork change; the
+// domain is protocol-agnostic — a UDP/unix fd flows through `SocketDomain.open`
+// UNCHANGED). Every seam op below mirrors an S1 template (bindUdp ← listenIp4;
+// sendTo* ← sendImplPosix; recvFrom ← recv; connectUdp/connectUnix ←
+// connectSingle; listenUnix ← listenIp4Posix) and keeps the S1 discipline:
+// always-non-blocking fd, poll-quantum + absolute-monotonic-deadline + kill,
+// fd never leaked on any error path, bounded buffers, no silent truncation.
+// ---------------------------------------------------------------------------
+
+/// The hard cap on a single datagram receive buffer (SECURITY, Decision E):
+/// however large a caller asks, at most this many bytes are ever allocated for
+/// ONE `recvFrom` — a peer/caller cannot force an unbounded allocation. 65536
+/// safely exceeds the maximum UDP payload (65507 for IPv4), so a whole
+/// datagram fits when the caller allows it; a larger datagram is truncated to
+/// this cap and reported through the distinct truncated channel (never silent).
+pub const max_datagram_bytes: usize = 65536;
+
+/// The portable Unix-domain path cap (Decision 3): a path longer than the
+/// `sockaddr.un.path` field (`[104]u8`) is rejected on EVERY OS with
+/// `invalid_argument`, rather than silently truncated. Filesystem paths need a
+/// trailing NUL, so their usable length is one less (`max_unix_path - 1`);
+/// abstract-namespace names (Linux, `@`-prefixed → leading NUL) may use the
+/// full width.
+pub const max_unix_path: usize = 104;
+
+// -- Unix-domain sockaddr ---------------------------------------------------
+
+/// Build the AF_UNIX `sockaddr` for `path` (the `buildSockAddr` twin for the
+/// Unix-domain, Phase S2). A leading `@` selects the Linux ABSTRACT namespace
+/// (the `@` becomes a leading NUL `sun_path[0]`, so the name lives in an
+/// abstract namespace with no filesystem entry — ideal for hermetic tests);
+/// any other first byte is a FILESYSTEM path (NUL-terminated in `sun_path`).
+///
+/// Validation (SECURITY — a caller-supplied path never overflows `sun_path`):
+///   * a filesystem path must fit with its NUL terminator (`len <=
+///     max_unix_path - 1`);
+///   * an abstract name must fit the full field (`len <= max_unix_path`);
+///   * the abstract namespace is Linux-only — an `@`-prefixed path on any
+///     other OS is `invalid_argument` (no silent reinterpretation).
+/// Any violation yields `.reason = .invalid_argument` with `len = 0`.
+const UnixSockAddr = struct {
+    reason: Reason,
+    storage: std.posix.sockaddr.storage,
+    len: std.posix.socklen_t,
+};
+
+fn buildUnixSockAddr(path: []const u8) UnixSockAddr {
+    var result: UnixSockAddr = .{
+        .reason = .ok,
+        .storage = std.mem.zeroes(std.posix.sockaddr.storage),
+        .len = 0,
+    };
+    const abstract = path.len > 0 and path[0] == '@';
+    if (abstract and comptime builtin.os.tag != .linux) {
+        // The abstract namespace is a Linux extension; reject `@`-prefixed
+        // paths on every other OS rather than treat the `@` as a literal byte.
+        result.reason = .invalid_argument;
+        return result;
+    }
+    if (abstract) {
+        if (path.len > max_unix_path) {
+            result.reason = .invalid_argument;
+            return result;
+        }
+    } else if (path.len == 0 or path.len > max_unix_path - 1) {
+        // A filesystem path must be non-empty and leave room for the NUL.
+        result.reason = .invalid_argument;
+        return result;
+    }
+
+    const un: *std.posix.sockaddr.un = @ptrCast(@alignCast(&result.storage));
+    un.family = std.posix.AF.UNIX;
+    const sun_path_offset = @offsetOf(std.posix.sockaddr.un, "path");
+    if (abstract) {
+        // Leading NUL selects the abstract namespace; the name is `path[1..]`.
+        un.path[0] = 0;
+        @memcpy(un.path[1 .. path.len], path[1..]);
+        result.len = @intCast(sun_path_offset + path.len);
+    } else {
+        @memcpy(un.path[0..path.len], path);
+        un.path[path.len] = 0; // NUL-terminate the filesystem path
+        result.len = @intCast(sun_path_offset + path.len + 1);
+    }
+    return result;
+}
+
+// -- UDP bind ---------------------------------------------------------------
+
+/// Bind a UDP (`SOCK_DGRAM`) socket to `ip:port` (port 0 → an ephemeral port
+/// the kernel chooses, reported as `bound_port`) — the datagram twin of
+/// `listenIp4` with NO `listen(2)` (a datagram socket has no accept queue).
+/// The fd is set `O_NONBLOCK` for its whole life (the always-non-blocking
+/// discipline `recvFrom`/`sendTo` rely on). A create/bind failure closes the
+/// transient fd here, so a `.failed` result never leaks a fd. The poll-less
+/// targets (Windows/wasi — not in v1 run scope) return `.other` (a documented
+/// no-op — wasi has no socket API and is rejected by the `:network` capability
+/// at compile time; gate-ON Windows awaits the 7.2a port).
+pub fn bindUdp(ip: [4]u8, port: u16) ListenOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    const socket_rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    if (std.posix.errno(socket_rc) != .SUCCESS)
+        return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0, .bound_port = 0 };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+    if (!setNonBlocking(handle)) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    var bind_addr = std.mem.zeroInit(std.posix.sockaddr.in, .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @as(u32, @bitCast(ip)), // [a,b,c,d] in memory == network byte order
+    });
+    const bind_rc = std.posix.system.bind(handle, @ptrCast(&bind_addr), @sizeOf(std.posix.sockaddr.in));
+    if (std.posix.errno(bind_rc) != .SUCCESS) {
+        const reason = mapListenErrno(std.posix.errno(bind_rc));
+        _ = std.posix.system.close(handle);
+        return .{ .reason = reason, .fd = 0, .bound_port = 0 };
+    }
+    var bound = std.mem.zeroes(std.posix.sockaddr.in);
+    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(handle, @ptrCast(&bound), &bound_len)) != .SUCCESS) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    return .{ .reason = .ok, .fd = fdToBits(handle), .bound_port = std.mem.bigToNative(u16, bound.port) };
+}
+
+/// Bind a Unix-domain DATAGRAM (`AF_UNIX`/`SOCK_DGRAM`) socket to `path` — the
+/// receiving end of a Unix datagram exchange. `path` is validated by
+/// `buildUnixSockAddr` (length + abstract-namespace rules); the fd is set
+/// `O_NONBLOCK`. Filesystem-path cleanup is caller-managed (Decision 4:
+/// unlink-before-bind), so a stale socket file surfaces as `address_in_use`.
+/// `bound_port` is always `0` (a Unix socket has no port). The transient fd is
+/// closed on any failure (never leaked). Poll-less targets: `.other`.
+pub fn bindUnixDatagram(path: []const u8) ListenOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    const address = buildUnixSockAddr(path);
+    if (address.reason != .ok) return .{ .reason = address.reason, .fd = 0, .bound_port = 0 };
+    const socket_rc = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.DGRAM, 0);
+    if (std.posix.errno(socket_rc) != .SUCCESS)
+        return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0, .bound_port = 0 };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+    if (!setNonBlocking(handle)) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    var storage = address.storage;
+    const bind_rc = std.posix.system.bind(handle, @ptrCast(&storage), address.len);
+    if (std.posix.errno(bind_rc) != .SUCCESS) {
+        const reason = mapListenErrno(std.posix.errno(bind_rc));
+        _ = std.posix.system.close(handle);
+        return .{ .reason = reason, .fd = 0, .bound_port = 0 };
+    }
+    return .{ .reason = .ok, .fd = fdToBits(handle), .bound_port = 0 };
+}
+
+// -- Datagram send (sendto — ONE atomic datagram, never a partial loop) -----
+
+/// Send `bytes` as ONE datagram to the IPv4 `ip:port` (`sendToIp4`) — the
+/// unconnected UDP send. A datagram is ATOMIC: it is delivered whole or not at
+/// all, so there is NO all-or-error byte loop (unlike stream `send`); an
+/// oversize payload fails with `EMSGSIZE` → `.invalid_argument` rather than a
+/// partial send. Bounded by `timeout_ms` + `kill_flag` through the same
+/// poll-`POLL.OUT`-quantum machinery stream send uses (a full socket send
+/// buffer yields `EAGAIN`, re-polled). On success `bytes_sent == bytes.len`.
+pub fn sendToIp4(fd: Fd, ip: [4]u8, port: u16, bytes: []const u8, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        // Poll-less targets (not in v1 run scope): a documented no-op. The
+        // posix path below (which names `std.posix.sockaddr.in`, a type that is
+        // `void` on wasi) is comptime-dead here, so it is never analyzed —
+        // exactly the guard posture `connectIp4`/`bindUdp` take.
+        return .{ .reason = .other, .bytes_sent = 0 };
+    }
+    const dest = std.mem.zeroInit(std.posix.sockaddr.in, .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @as(u32, @bitCast(ip)),
+    });
+    return sendToPosix(fd, bytes, @ptrCast(&dest), @sizeOf(std.posix.sockaddr.in), timeout_ms, kill_flag);
+}
+
+/// Send `bytes` as ONE datagram to the IPv6 `bytes:port` (`sendToIp6`). The
+/// IPv6 twin of `sendToIp4` (`sockaddr_in6` carrying flow label + scope id).
+pub fn sendToIp6(fd: Fd, addr: [16]u8, port: u16, scope_id: u32, flow: u32, bytes: []const u8, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .other, .bytes_sent = 0 }; // documented no-op (see `sendToIp4`)
+    }
+    const dest = std.mem.zeroInit(std.posix.sockaddr.in6, .{
+        .family = std.posix.AF.INET6,
+        .port = std.mem.nativeToBig(u16, port),
+        .flowinfo = flow,
+        .addr = addr, // already big-endian
+        .scope_id = scope_id,
+    });
+    return sendToPosix(fd, bytes, @ptrCast(&dest), @sizeOf(std.posix.sockaddr.in6), timeout_ms, kill_flag);
+}
+
+/// Send `bytes` as ONE Unix-domain datagram to `path` (`sendToUnix`). `path` is
+/// validated by `buildUnixSockAddr`; a bad path is `.invalid_argument` (never a
+/// syscall on an overflowing address). Otherwise identical to `sendToIp4` (one
+/// atomic `sendto`, poll-quantum bounded).
+pub fn sendToUnix(fd: Fd, path: []const u8, bytes: []const u8, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        // Documented no-op (see `sendToIp4`): `buildUnixSockAddr` below names
+        // `std.posix.sockaddr.un`/`.storage`, `void` on wasi, so this comptime-
+        // dead posix path is never analyzed on the poll-less targets.
+        return .{ .reason = .other, .bytes_sent = 0 };
+    }
+    const address = buildUnixSockAddr(path);
+    if (address.reason != .ok) return .{ .reason = address.reason, .bytes_sent = 0 };
+    var storage = address.storage;
+    return sendToPosix(fd, bytes, @ptrCast(&storage), address.len, timeout_ms, kill_flag);
+}
+
+/// The shared posix `sendto` datagram send behind `sendToIp4`/`Ip6`/`Unix`.
+/// ONE atomic `sendto` (a datagram is all-or-nothing) bounded by the poll-
+/// quantum + absolute monotonic deadline + kill loop. `EAGAIN` (a transiently
+/// full send buffer) re-polls `POLL.OUT`; `EMSGSIZE` (payload exceeds the
+/// datagram max) is `.invalid_argument`. On the poll-less targets a blocking
+/// `sendto` runs with the timeout a documented no-op (`waitWritable` returns
+/// `.ready`), matching the stream-send posture.
+fn sendToPosix(fd: Fd, bytes: []const u8, dest: *const std.posix.sockaddr, dest_len: std.posix.socklen_t, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) SendOutcome {
+    const handle = fdFromBits(fd);
+    const flags: u32 = std.posix.MSG.NOSIGNAL; // the fd is already O_NONBLOCK
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
+    while (true) {
+        if (kill_flag) |flag| {
+            if (flag.load(.acquire)) return .{ .reason = .other, .bytes_sent = 0 };
+        }
+        var quantum: i32 = poll_quantum_ms;
+        if (has_deadline) {
+            const remaining = deadline_ms - monotonicMillis();
+            if (remaining <= 0) return .{ .reason = .timed_out, .bytes_sent = 0 };
+            if (remaining < quantum) quantum = @intCast(remaining);
+        }
+        switch (waitWritable(handle, quantum)) {
+            .timeout => continue, // re-check deadline + kill
+            .failed => return .{ .reason = .other, .bytes_sent = 0 },
+            .ready => {},
+        }
+        const rc = std.posix.system.sendto(handle, @ptrCast(bytes.ptr), bytes.len, flags, dest, dest_len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return .{ .reason = .ok, .bytes_sent = @intCast(rc) },
+            // Send buffer transiently full, or interrupted — re-poll.
+            .AGAIN, .INTR => {},
+            // The datagram is larger than the datagram maximum: a typed reject,
+            // NOT a partial (a datagram cannot be split).
+            .MSGSIZE => return .{ .reason = .invalid_argument, .bytes_sent = 0 },
+            else => |send_errno| return .{ .reason = mapSendErrno(send_errno), .bytes_sent = 0 },
+        }
+    }
+}
+
+// -- Datagram receive (recvmsg — MSG_TRUNC truncation detection) ------------
+
+/// The outcome of a `recvFrom`: a stable status (same encoding as `RecvOutcome`
+/// MINUS the CLOSED case — a datagram socket has no EOF), the (caller-owned)
+/// buffer holding the captured bytes, the sender's endpoint, whether the
+/// datagram was TRUNCATED (larger than the buffer — surfaced through the
+/// distinct `Truncated` variant, never silently dropped), and the datagram's
+/// true length (exact on Linux via the `MSG_TRUNC` recv flag; the captured
+/// length — the floor — on macOS, where the truncated FLAG is still exact).
+///
+///   * `status == 0` — a DATAGRAM: `bytes_filled` bytes are in `buffer`.
+///   * `status > 0` — FAILED: the value is a `Reason` code (`timed_out == 2`
+///     is the idle-timeout case; the socket stays OPEN, Decision E).
+/// There is NO `status < 0` (CLOSED) case for datagrams.
+pub const RecvFromOutcome = struct {
+    status: i32,
+    buffer: []u8,
+    bytes_filled: usize,
+    truncated: bool,
+    datagram_len: usize,
+    peer: SocketEndpoint,
+};
+
+/// Receive ONE datagram into a fresh buffer allocated from `allocator`,
+/// capturing the sender's endpoint and detecting truncation — the datagram
+/// twin of `recv`. `max_bytes` is CLAMPED to `max_datagram_bytes` (SECURITY:
+/// no unbounded allocation), and exactly ONE fixed-capacity buffer is allocated
+/// (a datagram is atomic — there is no growth loop). Uses `recvmsg` so the
+/// out `msg_flags & MSG_TRUNC` reports truncation on BOTH macOS and Linux;
+/// additionally, on Linux the `MSG_TRUNC` recv flag makes the return value the
+/// datagram's TRUE length even when truncated (macOS reports the captured
+/// length — the floor). Bounded by `timeout_ms` + `kill_flag` through the same
+/// poll-`POLL.IN`-quantum loop `recv` uses; a timeout leaves the socket OPEN.
+/// The returned `buffer` is owned by `allocator` and is exactly `bytes_filled`
+/// bytes (a zero-length datagram is valid — `status == 0`, `bytes_filled == 0`,
+/// an empty buffer). Returns `error.OutOfMemory` if the buffer cannot be
+/// allocated (nothing leaked).
+pub fn recvFrom(
+    allocator: std.mem.Allocator,
+    fd: Fd,
+    max_bytes: usize,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+) error{OutOfMemory}!RecvFromOutcome {
+    const capacity: usize = @min(@max(max_bytes, 1), max_datagram_bytes);
+    const buffer = try allocator.alloc(u8, capacity);
+    errdefer allocator.free(buffer);
+    const handle = fdFromBits(fd);
+
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
+    while (true) {
+        if (kill_flag) |flag| {
+            // Killed while parked: report as a benign "no datagram" (the socket
+            // is about to be reclaimed by the teardown sweep anyway). Free the
+            // buffer — nothing arrived.
+            if (flag.load(.acquire)) return shrinkRecvFrom(allocator, buffer, @intFromEnum(Reason.other), 0, false, 0, SocketEndpoint.none);
+        }
+        var quantum: i32 = poll_quantum_ms;
+        if (has_deadline) {
+            const remaining = deadline_ms - monotonicMillis();
+            if (remaining <= 0) return shrinkRecvFrom(allocator, buffer, @intFromEnum(Reason.timed_out), 0, false, 0, SocketEndpoint.none);
+            if (remaining < quantum) quantum = @intCast(remaining);
+        }
+        switch (waitReadable(handle, quantum)) {
+            .timeout => continue, // re-check deadline + kill
+            .failed => return shrinkRecvFrom(allocator, buffer, @intFromEnum(Reason.other), 0, false, 0, SocketEndpoint.none),
+            .ready => {},
+        }
+        // On the poll-less targets there is no recvmsg path in v1 run scope;
+        // the socket layer is compile-rejected on wasi and gate-ON Windows is
+        // blocked on the 7.2a port, so this leaf is only reached on posix.
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            return shrinkRecvFrom(allocator, buffer, @intFromEnum(Reason.other), 0, false, 0, SocketEndpoint.none);
+        }
+        var peer_storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+        var iov = [1]std.posix.iovec{.{ .base = buffer.ptr, .len = buffer.len }};
+        var message: std.posix.msghdr = std.mem.zeroes(std.posix.msghdr);
+        message.name = @ptrCast(&peer_storage);
+        message.namelen = @sizeOf(std.posix.sockaddr.storage);
+        message.iov = iov[0..].ptr;
+        message.iovlen = 1;
+        // Linux: pass MSG_TRUNC as an INPUT flag so the return value is the
+        // datagram's TRUE length even when the buffer truncates it. macOS does
+        // not support that input flag, so the return there is the captured
+        // length (the floor) — but the OUTPUT `msg_flags & MSG_TRUNC` is exact
+        // on both, so the truncated VARIANT is always correct.
+        const input_flags: u32 = if (comptime builtin.os.tag == .linux) std.posix.MSG.TRUNC else 0;
+        const rc = std.posix.system.recvmsg(handle, &message, input_flags);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                const returned: usize = @intCast(rc);
+                // `returned` is the true datagram length on Linux (MSG_TRUNC
+                // input flag) and the captured length on macOS; the bytes
+                // actually written are min(returned, buffer.len).
+                const captured: usize = @min(returned, buffer.len);
+                const truncated = (message.flags & std.posix.MSG.TRUNC) != 0;
+                // datagram_len: the true length where known (Linux `returned`),
+                // else the captured floor (macOS). Never less than `captured`.
+                const datagram_len: usize = @max(returned, captured);
+                const peer = decodeSockaddr(&peer_storage);
+                return shrinkRecvFrom(allocator, buffer, recv_status_chunk, captured, truncated, datagram_len, peer);
+            },
+            // Spurious readable wake / competing reader / interrupted — re-poll.
+            .AGAIN, .INTR => continue,
+            else => |recv_errno| return shrinkRecvFrom(allocator, buffer, @intFromEnum(mapRecvErrno(recv_errno)), 0, false, 0, SocketEndpoint.none),
+        }
+    }
+}
+
+/// Shrink `buffer` to exactly `filled` bytes and package the `recvFrom`
+/// outcome — the datagram twin of `shrinkRecv`. A zero-length result frees the
+/// buffer and returns an empty slice; a zero-length DATAGRAM (`status == 0`,
+/// `filled == 0`) is legitimate and still returns an empty, non-error outcome.
+fn shrinkRecvFrom(
+    allocator: std.mem.Allocator,
+    buffer: []u8,
+    status: i32,
+    filled: usize,
+    truncated: bool,
+    datagram_len: usize,
+    peer: SocketEndpoint,
+) error{OutOfMemory}!RecvFromOutcome {
+    if (filled == 0) {
+        allocator.free(buffer);
+        return .{ .status = status, .buffer = &.{}, .bytes_filled = 0, .truncated = truncated, .datagram_len = datagram_len, .peer = peer };
+    }
+    if (filled == buffer.len)
+        return .{ .status = status, .buffer = buffer, .bytes_filled = filled, .truncated = truncated, .datagram_len = datagram_len, .peer = peer };
+    const shrunk = allocator.realloc(buffer, filled) catch buffer;
+    return .{ .status = status, .buffer = shrunk, .bytes_filled = filled, .truncated = truncated, .datagram_len = datagram_len, .peer = peer };
+}
+
+/// Decode a filled `sockaddr.storage` (the sender of a received datagram) into
+/// a `SocketEndpoint` — the recvmsg-name twin of `nameAddress`'s decode. An
+/// AF_UNIX sender surfaces the `.unix` family marker (its path is not carried
+/// across the ABI in S2 — see `SocketEndpoint.Family`); an unnamed sender
+/// (`family == AF_UNSPEC`, common for an unbound Unix datagram sender) surfaces
+/// `.unavailable`.
+fn decodeSockaddr(storage: *const std.posix.sockaddr.storage) SocketEndpoint {
+    const sockaddr_ptr: *const std.posix.sockaddr = @ptrCast(storage);
+    if (sockaddr_ptr.family == std.posix.AF.INET) {
+        const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(storage));
+        const octets: [4]u8 = @bitCast(in.addr);
+        return .{ .family = .ip4, .v4 = octets, .v6 = @splat(0), .port = std.mem.bigToNative(u16, in.port), .scope_id = 0 };
+    }
+    if (sockaddr_ptr.family == std.posix.AF.INET6) {
+        const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(storage));
+        return .{ .family = .ip6, .v4 = .{ 0, 0, 0, 0 }, .v6 = in6.addr, .port = std.mem.bigToNative(u16, in6.port), .scope_id = in6.scope_id };
+    }
+    if (sockaddr_ptr.family == std.posix.AF.UNIX) return SocketEndpoint.unix_endpoint;
+    return SocketEndpoint.none;
+}
+
+// -- Connected UDP (connect(2) on SOCK_DGRAM completes immediately) ----------
+
+/// Connect a UDP socket to the IPv4 `ip:port` (`connectUdpIp4`). Unlike a
+/// stream connect, `connect(2)` on a `SOCK_DGRAM` socket completes IMMEDIATELY
+/// (no handshake, no poll loop): it merely sets the default peer, after which
+/// the kernel FILTERS inbound datagrams to that peer and `send`/`recv` (not
+/// `sendto`/`recvfrom`) address it. The fd is `O_NONBLOCK` for life. A create/
+/// connect failure closes the transient fd (never leaked). Poll-less targets:
+/// `.other` (documented no-op).
+pub fn connectUdpIp4(ip: [4]u8, port: u16) ConnectOutcome {
+    return connectUdpPosix(.{ .ip4 = .{ .bytes = ip, .port = port } });
+}
+
+/// Connect a UDP socket to the IPv6 `bytes:port` (`connectUdpIp6`) — the IPv6
+/// twin of `connectUdpIp4` (immediate, no poll loop).
+pub fn connectUdpIp6(addr: [16]u8, port: u16, scope_id: u32, flow: u32) ConnectOutcome {
+    return connectUdpPosix(.{ .ip6 = .{ .bytes = addr, .port = port, .flow = flow, .interface = .{ .index = scope_id } } });
+}
+
+/// The shared posix connected-UDP path: create a non-blocking `SOCK_DGRAM`
+/// socket for `address`'s family and `connect(2)` it (which completes
+/// synchronously for a datagram socket). The transient fd is closed on any
+/// failure so a `.failed` outcome never leaks a fd.
+fn connectUdpPosix(address: net.IpAddress) ConnectOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .other, .fd = 0 };
+    }
+    const socket_rc = switch (address) {
+        .ip4 => std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP),
+        .ip6 => std.posix.system.socket(std.posix.AF.INET6, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP),
+    };
+    if (std.posix.errno(socket_rc) != .SUCCESS)
+        return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0 };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+    if (!setNonBlocking(handle)) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0 };
+    }
+    const sa = buildSockAddr(address);
+    const connect_rc = std.posix.system.connect(handle, @ptrCast(&sa.storage), sa.len);
+    switch (std.posix.errno(connect_rc)) {
+        .SUCCESS => return .{ .reason = .ok, .fd = fdToBits(handle) },
+        else => |connect_errno| {
+            _ = std.posix.system.close(handle);
+            return .{ .reason = mapConnectErrno(connect_errno), .fd = 0 };
+        },
+    }
+}
+
+// -- Unix-domain stream (listen / connect) ----------------------------------
+
+/// Bind + `listen` a Unix-domain STREAM (`AF_UNIX`/`SOCK_STREAM`) socket on
+/// `path` — the Unix twin of `listenIp4Posix` (no port, no `SO_REUSEADDR`).
+/// `path` is validated by `buildUnixSockAddr`. Filesystem-path cleanup is
+/// caller-managed (Decision 4: unlink-before-bind — a stale socket file
+/// surfaces as `address_in_use`). The returned listener fd is BLOCKING (the
+/// `socket(2)` default), compatible with the poll-then-blocking `accept`. A
+/// create/bind/listen failure closes the transient fd (never leaked).
+/// `bound_port` is `0`. Poll-less targets: `.other`.
+pub fn listenUnix(path: []const u8, backlog: u31) ListenOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    const address = buildUnixSockAddr(path);
+    if (address.reason != .ok) return .{ .reason = address.reason, .fd = 0, .bound_port = 0 };
+    const socket_rc = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    if (std.posix.errno(socket_rc) != .SUCCESS)
+        return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0, .bound_port = 0 };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+    var storage = address.storage;
+    const bind_rc = std.posix.system.bind(handle, @ptrCast(&storage), address.len);
+    if (std.posix.errno(bind_rc) != .SUCCESS) {
+        const reason = mapListenErrno(std.posix.errno(bind_rc));
+        _ = std.posix.system.close(handle);
+        return .{ .reason = reason, .fd = 0, .bound_port = 0 };
+    }
+    const listen_rc = std.posix.system.listen(handle, backlog);
+    if (std.posix.errno(listen_rc) != .SUCCESS) {
+        const reason = mapListenErrno(std.posix.errno(listen_rc));
+        _ = std.posix.system.close(handle);
+        return .{ .reason = reason, .fd = 0, .bound_port = 0 };
+    }
+    return .{ .reason = .ok, .fd = fdToBits(handle), .bound_port = 0 };
+}
+
+/// Connect a Unix-domain STREAM socket to `path` — the Unix twin of
+/// `connectSingle`, using a raw non-blocking `socket(AF_UNIX)` +
+/// `connect(sockaddr_un)`. For a loopback Unix socket the connect completes
+/// IMMEDIATELY (no network handshake); a still-in-progress connect (`EAGAIN`/
+/// `EINPROGRESS`) is polled `POLL.OUT` on the shared `awaitConnect` machinery,
+/// bounded by `timeout_ms` + `kill_flag`. `path` is validated by
+/// `buildUnixSockAddr`. The fd stays `O_NONBLOCK` for life; the transient fd is
+/// closed on any failure (never leaked). Poll-less targets: `.other`.
+pub fn connectUnix(path: []const u8, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .other, .fd = 0 };
+    }
+    const address = buildUnixSockAddr(path);
+    if (address.reason != .ok) return .{ .reason = address.reason, .fd = 0 };
+    const socket_rc = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    if (std.posix.errno(socket_rc) != .SUCCESS)
+        return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0 };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+    if (!setNonBlocking(handle)) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0 };
+    }
+    var storage = address.storage;
+    const connect_rc = std.posix.system.connect(handle, @ptrCast(&storage), address.len);
+    switch (std.posix.errno(connect_rc)) {
+        .SUCCESS => return .{ .reason = .ok, .fd = fdToBits(handle) },
+        .INPROGRESS, .INTR, .AGAIN => return awaitConnect(handle, timeout_ms, kill_flag),
+        else => |connect_errno| {
+            _ = std.posix.system.close(handle);
+            return .{ .reason = mapConnectErrno(connect_errno), .fd = 0 };
+        },
+    }
+}
+
+/// Accept one connection from a listening socket of EITHER family (the S2
+/// generalization of `accept`): a raw non-blocking `accept(2)` over a
+/// `sockaddr.storage`, poll-quantum + kill bounded exactly like `accept`, whose
+/// accepted-peer decode is the family-agnostic `decodeSockaddr` (so an AF_UNIX
+/// listener — which the fork's `netAccept`/`net.IpAddress` cannot represent —
+/// works). The accepted fd is set `O_NONBLOCK` from birth. A kill observed at
+/// the top of the loop, or in the post-`accept` window, closes any just-
+/// accepted fd on THIS thread (never handed to a tearing-down process — the
+/// HIGH-1 discipline). This is the seam for Unix-domain stream accept; the
+/// IPv4/IPv6 path keeps the byte-identical `accept` (`netAccept`) above.
+pub fn acceptAny(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
+    }
+    const listen_handle = fdFromBits(fd);
+    while (true) {
+        if (kill_flag) |flag| {
+            if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
+        }
+        switch (waitReadable(listen_handle, poll_quantum_ms)) {
+            .timeout => continue,
+            .failed => return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none },
+            .ready => {},
+        }
+        var peer_storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+        var peer_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        const accept_rc = std.posix.system.accept(listen_handle, @ptrCast(&peer_storage), &peer_len);
+        switch (std.posix.errno(accept_rc)) {
+            .SUCCESS => {},
+            // No connection ready after a spurious readable wake, or interrupted
+            // — re-poll (the kill/quantum are re-checked at the loop top).
+            .AGAIN, .INTR => continue,
+            else => |accept_errno| return .{ .reason = mapAcceptErrno(accept_errno), .fd = 0, .peer = SocketEndpoint.none },
+        }
+        const accepted_handle: net.Socket.Handle = @intCast(accept_rc);
+        if (comptime builtin.is_test) {
+            if (test_after_accept_hook) |hook| hook();
+        }
+        // A kill that landed WHILE we were blocked accepting: close the
+        // just-accepted fd HERE rather than hand a live connection to a process
+        // that is tearing down (HIGH-1).
+        if (kill_flag) |flag| {
+            if (flag.load(.acquire)) {
+                _ = std.posix.system.close(accepted_handle);
+                return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
+            }
+        }
+        if (!setNonBlocking(accepted_handle)) {
+            _ = std.posix.system.close(accepted_handle);
+            return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
+        }
+        return .{ .reason = .ok, .fd = fdToBits(accepted_handle), .peer = decodeSockaddr(&peer_storage) };
+    }
+}
+
+/// Map an `accept(2)` errno to a stable `Reason` — the raw-syscall twin of
+/// `mapAcceptError` (which maps the portable `AcceptError`).
+fn mapAcceptErrno(err: std.posix.E) Reason {
+    return switch (err) {
+        .MFILE, .NFILE => .fd_quota_exceeded,
+        .CONNABORTED => .connection_reset,
+        .INVAL => .connection_reset,
+        .NOBUFS, .NOMEM => .out_of_memory,
+        .PERM => .access_denied,
         else => .other,
     };
 }
@@ -2084,7 +2720,7 @@ test "socket_io: accept DETERMINISTICALLY closes a just-accepted fd when a kill 
     // The branch fired: the just-accepted fd was closed inside `accept`.
     try testing.expectEqual(Reason.other, outcome.reason);
     try testing.expectEqual(@as(Fd, 0), outcome.fd);
-    try testing.expect(!outcome.peer.ok);
+    try testing.expectEqual(SocketEndpoint.Family.unavailable, outcome.peer.family);
     // The kill flag was in fact observed as set (the hook ran).
     try testing.expect(kill_flag.load(.acquire));
     // The server-side fd `netAccept` opened was closed by the branch — no leak.
@@ -2131,8 +2767,8 @@ test "socket_io: accept + full-duplex send/recv echo, binary-safe payload, then 
     const accepted = accept(listener.fd, null);
     try testing.expectEqual(Reason.ok, accepted.reason);
     defer closeFd(accepted.fd);
-    try testing.expect(accepted.peer.ok);
-    try testing.expectEqual(@as(u8, 127), accepted.peer.a);
+    try testing.expectEqual(SocketEndpoint.Family.ip4, accepted.peer.family);
+    try testing.expectEqual(@as(u8, 127), accepted.peer.v4[0]);
 
     // Binary-safe payload: embedded NUL and a non-UTF-8 byte (0xFF).
     const payload = [_]u8{ 'h', 'i', 0, 0xFF, 'z' };
@@ -2862,4 +3498,264 @@ test "socket_io: two listeners bind the SAME port in succession with reuse_port 
     try testing.expectEqual(Reason.ok, second.reason);
     defer closeFd(second.fd);
     try testing.expectEqual(shared_port, second.bound_port);
+}
+
+// ---------------------------------------------------------------------------
+// Phase S2 — Datagram (UDP) + Unix-domain seam tests
+// ---------------------------------------------------------------------------
+
+test "socket_io: UDP loopback roundtrip — bindUdp + sendToIp4 + recvFrom, binary-safe, peer surfaced" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // Two bound UDP sockets on loopback: `receiver` (an ephemeral port) and
+    // `sender`. A datagram sent to the receiver arrives whole, and recvFrom
+    // reports the SENDER's endpoint as the peer.
+    const receiver = bindUdp(.{ 127, 0, 0, 1 }, 0);
+    try testing.expectEqual(Reason.ok, receiver.reason);
+    try testing.expect(receiver.bound_port != 0);
+    defer closeFd(receiver.fd);
+
+    const sender = bindUdp(.{ 127, 0, 0, 1 }, 0);
+    try testing.expectEqual(Reason.ok, sender.reason);
+    try testing.expect(sender.bound_port != 0);
+    defer closeFd(sender.fd);
+
+    // Binary-safe payload: embedded NUL + a non-UTF-8 byte.
+    const payload = [_]u8{ 'd', 'g', 0, 0xFE, 'm' };
+    const sent = sendToIp4(sender.fd, .{ 127, 0, 0, 1 }, receiver.bound_port, payload[0..], 5000, null);
+    try testing.expectEqual(Reason.ok, sent.reason);
+    try testing.expectEqual(payload.len, sent.bytes_sent);
+
+    const got = try recvFrom(testing.allocator, receiver.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(got.buffer);
+    try testing.expectEqual(@as(i32, recv_status_chunk), got.status);
+    try testing.expect(!got.truncated);
+    try testing.expectEqual(payload.len, got.bytes_filled);
+    try testing.expectEqual(payload.len, got.datagram_len);
+    try testing.expectEqualSlices(u8, payload[0..], got.buffer[0..got.bytes_filled]);
+    // The peer is the sender's loopback endpoint.
+    try testing.expectEqual(SocketEndpoint.Family.ip4, got.peer.family);
+    try testing.expectEqual(@as(u8, 127), got.peer.v4[0]);
+    try testing.expectEqual(sender.bound_port, got.peer.port);
+}
+
+test "socket_io: UDP truncation is DETECTED (never silent) — a big datagram into a small buffer sets truncated" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const receiver = bindUdp(.{ 127, 0, 0, 1 }, 0);
+    try testing.expectEqual(Reason.ok, receiver.reason);
+    defer closeFd(receiver.fd);
+    const sender = bindUdp(.{ 127, 0, 0, 1 }, 0);
+    try testing.expectEqual(Reason.ok, sender.reason);
+    defer closeFd(sender.fd);
+
+    // Send a 100-byte datagram; receive with a 10-byte cap. The excess MUST be
+    // reported as truncated (never silently dropped), and only 10 bytes captured.
+    var payload: [100]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    const sent = sendToIp4(sender.fd, .{ 127, 0, 0, 1 }, receiver.bound_port, payload[0..], 5000, null);
+    try testing.expectEqual(Reason.ok, sent.reason);
+
+    const got = try recvFrom(testing.allocator, receiver.fd, 10, 5000, null);
+    defer testing.allocator.free(got.buffer);
+    try testing.expectEqual(@as(i32, recv_status_chunk), got.status);
+    try testing.expect(got.truncated); // the distinct truncation channel fired
+    try testing.expectEqual(@as(usize, 10), got.bytes_filled); // captured the prefix
+    // The captured 10 bytes are the datagram's PREFIX (binary-exact).
+    try testing.expectEqualSlices(u8, payload[0..10], got.buffer[0..10]);
+    // On Linux the true datagram length is exact (MSG_TRUNC recv flag); on
+    // macOS it is the captured floor. Either way >= the captured length.
+    try testing.expect(got.datagram_len >= 10);
+    if (builtin.os.tag == .linux) try testing.expectEqual(@as(usize, 100), got.datagram_len);
+}
+
+test "socket_io: connected UDP — connectUdpIp4 filters datagrams to the connected peer" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // A "server" UDP socket and two senders. The server connects to sender A;
+    // a connected UDP socket only delivers datagrams from its connected peer,
+    // so B's datagram is filtered out by the kernel and A's is received.
+    const server = bindUdp(.{ 127, 0, 0, 1 }, 0);
+    try testing.expectEqual(Reason.ok, server.reason);
+    defer closeFd(server.fd);
+    const sender_a = bindUdp(.{ 127, 0, 0, 1 }, 0);
+    try testing.expectEqual(Reason.ok, sender_a.reason);
+    defer closeFd(sender_a.fd);
+
+    // Connect the server back to A, then A can `send` (not sendto) and the
+    // server receives ONLY from A.
+    const connected = connectUdpIp4(.{ 127, 0, 0, 1 }, sender_a.bound_port);
+    try testing.expectEqual(Reason.ok, connected.reason);
+    defer closeFd(connected.fd);
+
+    // The server's connected socket is bound to some ephemeral port; A must send
+    // to THAT port. Discover it via getsockname.
+    const server2_local = localAddress(connected.fd);
+    try testing.expectEqual(SocketEndpoint.Family.ip4, server2_local.family);
+
+    // A sends to the connected server socket; it arrives.
+    const from_a = sendToIp4(sender_a.fd, .{ 127, 0, 0, 1 }, server2_local.port, "from-A", 5000, null);
+    try testing.expectEqual(Reason.ok, from_a.reason);
+
+    const got = try recvFrom(testing.allocator, connected.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(got.buffer);
+    try testing.expectEqual(@as(i32, recv_status_chunk), got.status);
+    try testing.expectEqualSlices(u8, "from-A", got.buffer[0..got.bytes_filled]);
+    try testing.expectEqual(sender_a.bound_port, got.peer.port);
+}
+
+test "socket_io: buildUnixSockAddr rejects an over-long path and (non-Linux) an abstract path" {
+    // A path longer than the portable cap is rejected on EVERY OS (never
+    // silently truncated into `sun_path`).
+    var too_long: [max_unix_path + 5]u8 = undefined;
+    @memset(too_long[0..], 'a');
+    try testing.expectEqual(Reason.invalid_argument, buildUnixSockAddr(too_long[0..]).reason);
+
+    // A valid short filesystem path is accepted.
+    try testing.expectEqual(Reason.ok, buildUnixSockAddr("/tmp/zap-unix-ok.sock").reason);
+
+    // The abstract namespace (`@`-prefixed) is Linux-only; on any other OS it
+    // is invalid_argument (no silent reinterpretation of the leading `@`).
+    if (builtin.os.tag != .linux) {
+        try testing.expectEqual(Reason.invalid_argument, buildUnixSockAddr("@zap-abstract").reason);
+    } else {
+        try testing.expectEqual(Reason.ok, buildUnixSockAddr("@zap-abstract").reason);
+        // Even on Linux, an abstract name past the full field width is rejected.
+        var abstract_too_long: [max_unix_path + 2]u8 = undefined;
+        @memset(abstract_too_long[0..], 'a');
+        abstract_too_long[0] = '@';
+        try testing.expectEqual(Reason.invalid_argument, buildUnixSockAddr(abstract_too_long[0..]).reason);
+    }
+    // An empty path is not a valid filesystem address.
+    try testing.expectEqual(Reason.invalid_argument, buildUnixSockAddr("").reason);
+}
+
+test "socket_io: Unix-domain STREAM echo — listenUnix + connectUnix + acceptAny, binary-safe" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var path_buffer: [max_unix_path]u8 = undefined;
+    const path = try uniqueUnixPath(path_buffer[0..], "stream");
+    defer _ = std.posix.system.unlink(path.ptr);
+
+    const listener = listenUnix(path, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+
+    const client = connectUnix(path, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+
+    const accepted = accept(listener.fd, null);
+    try testing.expectEqual(Reason.ok, accepted.reason);
+    defer closeFd(accepted.fd);
+    // The accepted peer is a Unix endpoint (family marker; path not surfaced).
+    try testing.expectEqual(SocketEndpoint.Family.unix, accepted.peer.family);
+
+    const payload = [_]u8{ 'u', 'x', 0, 0xFF, 'z' };
+    const sent = send(client.fd, payload[0..], 5000, null);
+    try testing.expectEqual(Reason.ok, sent.reason);
+    const received = try recv(testing.allocator, accepted.fd, payload.len, 0, 5000, null);
+    defer testing.allocator.free(received.buffer);
+    try testing.expectEqual(@as(i32, recv_status_chunk), received.status);
+    try testing.expectEqualSlices(u8, payload[0..], received.buffer[0..received.bytes_filled]);
+
+    // Echo back the other way (full duplex over the Unix stream).
+    const reply = send(accepted.fd, "ok", 5000, null);
+    try testing.expectEqual(Reason.ok, reply.reason);
+    const echoed = try recv(testing.allocator, client.fd, 0, 64, 5000, null);
+    defer testing.allocator.free(echoed.buffer);
+    try testing.expectEqualSlices(u8, "ok", echoed.buffer[0..echoed.bytes_filled]);
+}
+
+test "socket_io: Unix-domain DATAGRAM roundtrip — bindUnixDatagram + sendToUnix + recvFrom" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var receiver_path_buffer: [max_unix_path]u8 = undefined;
+    const receiver_path = try uniqueUnixPath(receiver_path_buffer[0..], "dgram-rx");
+    defer _ = std.posix.system.unlink(receiver_path.ptr);
+    var sender_path_buffer: [max_unix_path]u8 = undefined;
+    const sender_path = try uniqueUnixPath(sender_path_buffer[0..], "dgram-tx");
+    defer _ = std.posix.system.unlink(sender_path.ptr);
+
+    const receiver = bindUnixDatagram(receiver_path);
+    try testing.expectEqual(Reason.ok, receiver.reason);
+    defer closeFd(receiver.fd);
+    // The sender is bound too (so it has an address; not strictly required, but
+    // exercises the bind path both ways).
+    const sender = bindUnixDatagram(sender_path);
+    try testing.expectEqual(Reason.ok, sender.reason);
+    defer closeFd(sender.fd);
+
+    const payload = [_]u8{ 'u', 'd', 0, 0x01, 'g' };
+    const sent = sendToUnix(sender.fd, receiver_path, payload[0..], 5000, null);
+    try testing.expectEqual(Reason.ok, sent.reason);
+    try testing.expectEqual(payload.len, sent.bytes_sent);
+
+    const got = try recvFrom(testing.allocator, receiver.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(got.buffer);
+    try testing.expectEqual(@as(i32, recv_status_chunk), got.status);
+    try testing.expect(!got.truncated);
+    try testing.expectEqualSlices(u8, payload[0..], got.buffer[0..got.bytes_filled]);
+    // A bound Unix datagram sender surfaces as the `.unix` family marker.
+    try testing.expectEqual(SocketEndpoint.Family.unix, got.peer.family);
+}
+
+test "socket_io: recvFrom idle-timeout returns timed_out WITHOUT closing the socket" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const receiver = bindUdp(.{ 127, 0, 0, 1 }, 0);
+    try testing.expectEqual(Reason.ok, receiver.reason);
+    defer closeFd(receiver.fd);
+    const sender = bindUdp(.{ 127, 0, 0, 1 }, 0);
+    try testing.expectEqual(Reason.ok, sender.reason);
+    defer closeFd(sender.fd);
+
+    // Nothing sent — recvFrom must TIME OUT (never hang), socket stays usable.
+    const timed = try recvFrom(testing.allocator, receiver.fd, max_datagram_bytes, 150, null);
+    defer testing.allocator.free(timed.buffer);
+    try testing.expectEqual(@as(i32, @intFromEnum(Reason.timed_out)), timed.status);
+
+    // Prove the socket survived: a subsequent datagram is received.
+    _ = sendToIp4(sender.fd, .{ 127, 0, 0, 1 }, receiver.bound_port, "later", 5000, null);
+    const after = try recvFrom(testing.allocator, receiver.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(after.buffer);
+    try testing.expectEqual(@as(i32, recv_status_chunk), after.status);
+    try testing.expectEqualSlices(u8, "later", after.buffer[0..after.bytes_filled]);
+}
+
+test "socket_io: kill mid-recvFrom reclaims no fd — OS fd count stable across many cycles" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // A recvFrom parked on an idle UDP socket is torn down by a kill flag; no
+    // fd is orphaned by the kill path (the socket fd itself is closed by the
+    // test's `defer`). Proven by the OS fd count returning to baseline.
+    const baseline = countOpenFds();
+    var iteration: usize = 0;
+    while (iteration < 32) : (iteration += 1) {
+        const receiver = bindUdp(.{ 127, 0, 0, 1 }, 0);
+        try testing.expectEqual(Reason.ok, receiver.reason);
+
+        var kill_flag = std.atomic.Value(bool).init(true); // already pending
+        const got = try recvFrom(testing.allocator, receiver.fd, max_datagram_bytes, 5000, &kill_flag);
+        testing.allocator.free(got.buffer);
+        // A pending kill at the top of the loop returns promptly with no
+        // datagram and does not close the socket (the caller owns it).
+        try testing.expectEqual(@as(i32, @intFromEnum(Reason.other)), got.status);
+        try testing.expectEqual(@as(usize, 0), got.bytes_filled);
+        closeFd(receiver.fd);
+    }
+    try testing.expectEqual(baseline, countOpenFds());
+}
+
+/// A run-unique Unix-domain socket path under the system temp dir, written into
+/// the caller's `buffer` (so two paths can be live at once — the datagram test
+/// needs both endpoints). A monotonic counter plus a millisecond timestamp keep
+/// concurrent test runs from colliding. Caller unlinks it.
+var unique_unix_path_counter: std.atomic.Value(u32) = .init(0);
+
+fn uniqueUnixPath(buffer: []u8, tag: []const u8) ![:0]const u8 {
+    const n = unique_unix_path_counter.fetchAdd(1, .monotonic);
+    const written = try std.fmt.bufPrint(buffer, "/tmp/zap-{s}-{d}-{d}.sock", .{ tag, monotonicMillis(), n });
+    buffer[written.len] = 0; // NUL-terminate for the raw `unlink`
+    return buffer[0..written.len :0];
 }

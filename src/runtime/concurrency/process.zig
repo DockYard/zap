@@ -94,6 +94,7 @@ const mailbox_module = @import("mailbox.zig");
 const signal_module = @import("signal.zig");
 const blob_module = @import("blob.zig");
 const socket_table = @import("socket_table.zig");
+const socket_io = @import("socket_io.zig");
 
 /// Process identifier — the generational pid of `pid_table.zig` (plan
 /// Phase 1 item 1.2, locked design decision 4): `{slot, generation,
@@ -483,6 +484,24 @@ pub const ProcessControlBlock = struct {
     /// teardown as an independent copy.
     socket_recv_arena: std.heap.ArenaAllocator,
 
+    /// The sender endpoint of this process's most recent `recv_from` (Phase S2
+    /// datagram). A datagram carries its sender's address out-of-band; the
+    /// recv leaf records it here (the peer analogue of `SocketLedger`'s
+    /// `last_recv_status`) for the immediately-following (non-yielding)
+    /// `recv_peer_*` accessor reads that build the `SocketDatagramData.peer`.
+    /// Per-process, so it is race-free across green-process preemption.
+    socket_last_recv_peer: socket_io.SocketEndpoint,
+    /// Whether this process's most recent `recv_from` datagram was TRUNCATED
+    /// (larger than the receive buffer): `1` truncated, `0` not. Surfaced
+    /// through the distinct `SocketDatagramRecv.Truncated` variant so datagram
+    /// loss is never silent. Read in the arm right after `recv_from`.
+    socket_last_recv_truncated: i32,
+    /// The true length of this process's most recent `recv_from` datagram
+    /// (exact on Linux via the `MSG_TRUNC` recv flag; the captured floor on
+    /// macOS). The `SocketDatagramData.datagram_size`. Read right after
+    /// `recv_from`.
+    socket_last_recv_datagram_len: i64,
+
     /// Assemble a PCB IN PLACE — at its final address, which the mailbox
     /// pins from this call on (its empty state references its embedded
     /// stub envelope; `register` already required the same pinning) —
@@ -512,6 +531,9 @@ pub const ProcessControlBlock = struct {
         process.socket_pending_fd = socket_table.no_pending_socket_fd;
         process.pending_resolve = null;
         process.socket_recv_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        process.socket_last_recv_peer = socket_io.SocketEndpoint.none;
+        process.socket_last_recv_truncated = 0;
+        process.socket_last_recv_datagram_len = 0;
     }
 
     /// Creation seam (Phase 1.4 spawn path): acquire a pid-table slot

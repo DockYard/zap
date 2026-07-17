@@ -56,11 +56,13 @@ pub struct Socket {
   zap_socket_handle :: u64
 
   @doc = """
-    Connects an IPv4 stream socket to `address`, waiting at most `timeout_ms`
-    milliseconds (`0` = no deadline). Returns `Result.Ok(socket)` on success
-    or `Result.Error(%SocketError{...})` with a matchable reason. The
-    connection races nothing — `address` is a single explicit, already-resolved
-    endpoint; connect by NAME with RFC 8305 Happy Eyeballs over DNS is
+    Connects a stream socket to `address`, waiting at most `timeout_ms`
+    milliseconds (`0` = no deadline). An `:ip4` address connects an IPv4 TCP
+    socket; a `:unix` address (Phase S2) connects a Unix-domain STREAM socket to
+    the address's path. Returns `Result.Ok(socket)` on success or
+    `Result.Error(%SocketError{...})` with a matchable reason. The connection
+    races nothing — `address` is a single explicit, already-resolved endpoint;
+    connect by NAME with RFC 8305 Happy Eyeballs over DNS is
     `Socket.connect_host/3`.
 
     Decision E: `timeout_ms` is a per-call relative timeout, never
@@ -76,19 +78,26 @@ pub struct Socket {
   @available_on(:network)
 
   pub fn connect(address :: SocketAddress, timeout_ms :: i64) -> Result(Socket, SocketError) {
-    case :zig.SocketRuntime.connect(address.a, address.b, address.c, address.d, address.port, timeout_ms) {
+    raw = case address.family {
+      :unix -> :zig.SocketRuntime.connect_unix(address.path, timeout_ms)
+      _ -> :zig.SocketRuntime.connect(address.a, address.b, address.c, address.d, address.port, timeout_ms)
+    }
+    case raw {
       0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
       handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
     }
   }
 
   @doc = """
-    Binds and listens an IPv4 stream socket on `address` with the given
-    `backlog` (port 0 → an ephemeral port, discoverable via
-    `SocketListener.local_port`), returning a DISTINCT `SocketListener` handle
-    (Phase S1). `accept` it into per-connection `Socket`s; you cannot `send`/
-    `recv` a listener (no such operation exists on the type). The backlog is
-    capped by the OS `somaxconn`.
+    Binds and listens a stream socket on `address` with the given `backlog`
+    (an `:ip4` address binds an IPv4 TCP listener — port 0 → an ephemeral port,
+    discoverable via `SocketListener.local_port`; a `:unix` address, Phase S2,
+    binds a Unix-domain STREAM listener at the address's path), returning a
+    DISTINCT `SocketListener` handle (Phase S1). `accept` it into per-connection
+    `Socket`s (Unix-domain accepts flow through the SAME `accept`); you cannot
+    `send`/`recv` a listener (no such operation exists on the type). The backlog
+    is capped by the OS `somaxconn`. For a Unix filesystem path, unlink any stale
+    socket file before binding (Decision 4 — caller-managed cleanup).
 
     ## Examples
 
@@ -101,7 +110,11 @@ pub struct Socket {
   @available_on(:network)
 
   pub fn listen(address :: SocketAddress, backlog :: i64) -> Result(SocketListener, SocketError) {
-    case :zig.SocketRuntime.listen(address.a, address.b, address.c, address.d, address.port, backlog) {
+    raw = case address.family {
+      :unix -> :zig.SocketRuntime.listen_unix(address.path, backlog)
+      _ -> :zig.SocketRuntime.listen(address.a, address.b, address.c, address.d, address.port, backlog)
+    }
+    case raw {
       0 -> Result(SocketListener, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
       handle_bits -> Result(SocketListener, SocketError).Ok(%SocketListener{zap_socket_handle: handle_bits})
     }

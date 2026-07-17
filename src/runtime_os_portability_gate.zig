@@ -573,6 +573,17 @@ const kernel_seam_allowlist = [_]KernelSeam{
             "std.posix.system.getsockopt",
             "std.posix.system.getsockname",
             "std.posix.system.getpeername",
+            // Phase S2 datagram (UDP) + Unix-domain: the datagram send/receive
+            // (`sendto`/`recvmsg` — recvmsg for the portable MSG_TRUNC
+            // truncation detection) and the raw family-agnostic `accept(2)` the
+            // Unix-domain listener needs (the fork's `netAccept`/`net.IpAddress`
+            // cannot represent an AF_UNIX peer). The `msghdr`/`iovec` types the
+            // recvmsg call references.
+            "std.posix.system.sendto",
+            "std.posix.system.recvmsg",
+            "std.posix.system.accept",
+            "std.posix.msghdr",
+            "std.posix.iovec",
             "std.posix.poll",
             "std.posix.errno",
             // The posix socket constant/type namespaces the syscalls above
@@ -620,6 +631,11 @@ const kernel_seam_allowlist = [_]KernelSeam{
         \\`SO_REUSEPORT` before bind) and the curated-portable socket options
         \\(`setsockopt`/`getsockopt` over TCP_NODELAY, SO_KEEPALIVE, SO_RCVBUF/
         \\SNDBUF, SO_REUSE*, IPV6_V6ONLY, SO_LINGER) are the same seam surface.
+        \\The Phase S2 datagram/Unix-domain ops add the same-kind primitives:
+        \\`sendto` (one atomic datagram), `recvmsg` (datagram receive with the
+        \\portable MSG_TRUNC truncation flag + the `msghdr`/`iovec` types), and a
+        \\raw `accept(2)` for the Unix-domain listener whose AF_UNIX peer the
+        \\fork's `netAccept` cannot represent.
         \\The needles enumerate exactly those primitives — a NEW, unrelated
         \\per-OS call here (e.g. `std.posix.fork`, `std.os.linux.*`) matches no
         \\needle and fails the gate, so whole-file trust is NOT implied.

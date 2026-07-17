@@ -4111,6 +4111,21 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_socket_endpoint_v6_word(process: *anyopaque, handle_bits: u64, kind: i32, word_index: i32) callconv(.c) i64;
     extern fn zap_socket_endpoint_port(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
     extern fn zap_socket_endpoint_scope(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
+    // Phase S2 — datagram (UDP) + Unix-domain.
+    extern fn zap_socket_bind_udp(process: *anyopaque, ip0: u8, ip1: u8, ip2: u8, ip3: u8, port: u16) callconv(.c) u64;
+    extern fn zap_socket_bind_udp_unix(process: *anyopaque, path_ptr: [*]const u8, path_len: usize) callconv(.c) u64;
+    extern fn zap_socket_connect_udp(process: *anyopaque, ip0: u8, ip1: u8, ip2: u8, ip3: u8, port: u16) callconv(.c) u64;
+    extern fn zap_socket_listen_unix(process: *anyopaque, path_ptr: [*]const u8, path_len: usize, backlog: u32) callconv(.c) u64;
+    extern fn zap_socket_connect_unix(process: *anyopaque, path_ptr: [*]const u8, path_len: usize, timeout_ms: i64) callconv(.c) u64;
+    extern fn zap_socket_send_to_ip4(process: *anyopaque, handle_bits: u64, ip0: u8, ip1: u8, ip2: u8, ip3: u8, port: u16, bytes_ptr: [*]const u8, bytes_len: usize, timeout_ms: i64) callconv(.c) i64;
+    extern fn zap_socket_send_to_unix(process: *anyopaque, handle_bits: u64, path_ptr: [*]const u8, path_len: usize, bytes_ptr: [*]const u8, bytes_len: usize, timeout_ms: i64) callconv(.c) i64;
+    extern fn zap_socket_recv_from(process: *anyopaque, handle_bits: u64, max_bytes: i64, timeout_ms: i64, out_chunk_ptr: *?[*]const u8) callconv(.c) i64;
+    extern fn zap_socket_recv_truncated(process: *anyopaque) callconv(.c) i32;
+    extern fn zap_socket_recv_datagram_len(process: *anyopaque) callconv(.c) i64;
+    extern fn zap_socket_recv_peer(process: *anyopaque) callconv(.c) i64;
+    extern fn zap_socket_recv_peer_v6_word(process: *anyopaque, word_index: i32) callconv(.c) i64;
+    extern fn zap_socket_recv_peer_port(process: *anyopaque) callconv(.c) i64;
+    extern fn zap_socket_recv_peer_scope(process: *anyopaque) callconv(.c) i64;
     // P6-J4 (plan item 6.4): the receive-back-edge arena auto-reset — emitted
     // by the compiler ONLY at receive sites whose iteration closure it proved
     // (`src/receive_reset.zig`); `hibernate` — the BEAM-analogue idle park
@@ -7307,6 +7322,14 @@ pub const SocketRuntime = struct {
     /// gate-OFF, so a plain global is race-free.
     var gate_off_last_recv_status: i32 = 0;
 
+    /// The gate-OFF datagram `recv_from` metadata slots (Phase S2) — the
+    /// gate-OFF twins of the per-process PCB datagram slots (gate-ON). Single
+    /// OS thread gate-OFF, so plain globals are race-free. The status reuses
+    /// `gate_off_last_recv_status` (a datagram socket never uses stream recv).
+    var gate_off_last_recv_peer: socket_io.SocketEndpoint = socket_io.SocketEndpoint.none;
+    var gate_off_last_recv_truncated: i32 = 0;
+    var gate_off_last_recv_datagram_len: i64 = 0;
+
     /// The next-available `recv` buffer size (`byte_count == 0`): a moderate
     /// chunk, deliberately below the 64 KiB String→Blob promotion threshold so
     /// stream chunks stay in the ordinary String tier.
@@ -7572,6 +7595,236 @@ pub const SocketRuntime = struct {
             const fd = gateOffFd(handle_bits);
             const address = if (kind == 0) socket_io.localAddress(fd) else socket_io.peerAddress(fd);
             return socket_io.endpointScopeValue(address);
+        }
+    }
+
+    // -- Phase S2: datagram (UDP) + Unix-domain --------------------------
+
+    /// `SocketDatagram.bind`: bind a UDP socket on `a.b.c.d:port` (port 0 → an
+    /// ephemeral port, discoverable via `local_port`). Returns the handle bits,
+    /// or `0` on failure (reason in the process last-error).
+    pub fn bind_udp(a: i64, b: i64, c: i64, d: i64, port: i64) u64 {
+        const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
+        const port16: u16 = checkedPort(port);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_bind_udp(requireCurrentProcessHandle(), ip[0], ip[1], ip[2], ip[3], port16);
+        } else {
+            const outcome = socket_io.bindUdp(ip, port16);
+            return promoteGateOff(outcome);
+        }
+    }
+
+    /// `SocketDatagram.bind` for a Unix-domain datagram socket on `path`.
+    pub fn bind_udp_unix(path: []const u8) u64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_bind_udp_unix(requireCurrentProcessHandle(), path.ptr, path.len);
+        } else {
+            const outcome = socket_io.bindUnixDatagram(path);
+            return promoteGateOff(outcome);
+        }
+    }
+
+    /// `SocketDatagram.connect`: connect a UDP socket to `a.b.c.d:port` (the
+    /// datagram connect completes immediately; the kernel then filters inbound
+    /// datagrams to that peer). Returns the handle bits or `0` on failure.
+    pub fn connect_udp(a: i64, b: i64, c: i64, d: i64, port: i64) u64 {
+        const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
+        const port16: u16 = checkedPort(port);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_connect_udp(requireCurrentProcessHandle(), ip[0], ip[1], ip[2], ip[3], port16);
+        } else {
+            const outcome = socket_io.connectUdpIp4(ip, port16);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, 0, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
+    /// `Socket.listen` for a Unix-domain STREAM socket on `path` with `backlog`.
+    /// Returns the listener handle bits or `0` on failure.
+    pub fn listen_unix(path: []const u8, backlog: i64) u64 {
+        const backlog32: u32 = checkedBacklog(backlog);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_listen_unix(requireCurrentProcessHandle(), path.ptr, path.len, backlog32);
+        } else {
+            const outcome = socket_io.listenUnix(path, @intCast(backlog32));
+            return promoteGateOff(outcome);
+        }
+    }
+
+    /// `Socket.connect` for a Unix-domain STREAM socket to `path`, bounded by
+    /// `timeout_ms`. Returns the socket handle bits or `0` on failure.
+    pub fn connect_unix(path: []const u8, timeout_ms: i64) u64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_connect_unix(requireCurrentProcessHandle(), path.ptr, path.len, timeout_ms);
+        } else {
+            const outcome = socket_io.connectUnix(path, timeout_ms, null);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, 0, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
+    /// Shared gate-OFF promotion of a bind/listen outcome into the domain (the
+    /// gate-OFF twin of `abi.zig`'s `promoteListener`), recording the bound port
+    /// and the failure reason. Returns the handle bits or `0`.
+    fn promoteGateOff(outcome: socket_io.ListenOutcome) u64 {
+        if (outcome.reason != .ok) {
+            gate_off_last_error = @intFromEnum(outcome.reason);
+            return 0;
+        }
+        const handle = gateOffDomain().open(outcome.fd, 0, outcome.bound_port, .plain) catch {
+            socket_io.closeFd(outcome.fd);
+            gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+            return 0;
+        };
+        return handle.toBits();
+    }
+
+    /// `SocketDatagram.send_to`: send `bytes` as ONE datagram to the IPv4
+    /// `a.b.c.d:port`. Returns the bytes sent (`== bytes.len` on success),
+    /// with the reason in the last-error slot on failure.
+    pub fn send_to_ip4(handle_bits: u64, a: i64, b: i64, c: i64, d: i64, port: i64, bytes: []const u8, timeout_ms: i64) i64 {
+        const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
+        const port16: u16 = checkedPort(port);
+        if (comptime runtime_concurrency_active) {
+            const sent = ZapConcurrencyKernel.zap_socket_send_to_ip4(requireCurrentProcessHandle(), handle_bits, ip[0], ip[1], ip[2], ip[3], port16, bytes.ptr, bytes.len, timeout_ms);
+            if (sent < 0) @panic("zap: SocketDatagram.send_to on a socket this process does not own (a closed or stale handle)");
+            return sent;
+        } else {
+            const outcome = socket_io.sendToIp4(gateOffFd(handle_bits), ip, port16, bytes, timeout_ms, null);
+            if (outcome.reason != .ok) gate_off_last_error = @intFromEnum(outcome.reason);
+            return @intCast(outcome.bytes_sent);
+        }
+    }
+
+    /// `SocketDatagram.send_to` for a Unix-domain datagram to `path`.
+    pub fn send_to_unix(handle_bits: u64, path: []const u8, bytes: []const u8, timeout_ms: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            const sent = ZapConcurrencyKernel.zap_socket_send_to_unix(requireCurrentProcessHandle(), handle_bits, path.ptr, path.len, bytes.ptr, bytes.len, timeout_ms);
+            if (sent < 0) @panic("zap: SocketDatagram.send_to on a socket this process does not own (a closed or stale handle)");
+            return sent;
+        } else {
+            const outcome = socket_io.sendToUnix(gateOffFd(handle_bits), path, bytes, timeout_ms, null);
+            if (outcome.reason != .ok) gate_off_last_error = @intFromEnum(outcome.reason);
+            return @intCast(outcome.bytes_sent);
+        }
+    }
+
+    /// `SocketDatagram.recv_from`: receive ONE datagram into a fresh transient
+    /// String, capturing the sender endpoint + truncation flag + true length in
+    /// the recv metadata slots for the immediately-following (non-yielding)
+    /// `recv_status`/`recv_truncated`/`recv_datagram_len`/`recv_peer*` reads.
+    /// `max_bytes <= 0` uses the datagram maximum. Panics on a stale handle.
+    pub fn recv_from(handle_bits: u64, max_bytes: i64, timeout_ms: i64) []const u8 {
+        if (comptime runtime_concurrency_active) {
+            var chunk_ptr: ?[*]const u8 = null;
+            const filled = ZapConcurrencyKernel.zap_socket_recv_from(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                max_bytes,
+                timeout_ms,
+                &chunk_ptr,
+            );
+            if (filled < 0) @panic(
+                "zap: SocketDatagram.recv_from on a socket this process does not own (a closed or stale handle)",
+            );
+            const received_len: usize = @intCast(filled);
+            if (received_len == 0) return &.{};
+            recordBump(.socket_recv, received_len);
+            return chunk_ptr.?[0..received_len];
+        } else {
+            const cap: usize = if (max_bytes > 0) @intCast(max_bytes) else socket_io.max_datagram_bytes;
+            const outcome = socket_io.recvFrom(
+                gate_off_recv_arena.allocator(),
+                gateOffFd(handle_bits),
+                cap,
+                timeout_ms,
+                null,
+            ) catch {
+                gate_off_last_recv_status = @intFromEnum(socket_io.Reason.out_of_memory);
+                gate_off_last_recv_peer = socket_io.SocketEndpoint.none;
+                gate_off_last_recv_truncated = 0;
+                gate_off_last_recv_datagram_len = 0;
+                return &.{};
+            };
+            gate_off_last_recv_status = outcome.status;
+            gate_off_last_recv_peer = outcome.peer;
+            gate_off_last_recv_truncated = if (outcome.truncated) 1 else 0;
+            gate_off_last_recv_datagram_len = @intCast(outcome.datagram_len);
+            recordBump(.socket_recv, outcome.bytes_filled);
+            return outcome.buffer[0..outcome.bytes_filled];
+        }
+    }
+
+    /// Whether the most recent `recv_from` datagram was TRUNCATED (`1`/`0`).
+    pub fn recv_truncated() i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_recv_truncated(requireCurrentProcessHandle());
+        } else {
+            return gate_off_last_recv_truncated;
+        }
+    }
+
+    /// The true length of the most recent `recv_from` datagram.
+    pub fn recv_datagram_len() i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_recv_datagram_len(requireCurrentProcessHandle());
+        } else {
+            return gate_off_last_recv_datagram_len;
+        }
+    }
+
+    /// The packed IPv4 sender endpoint of the most recent `recv_from`, or `-1`
+    /// when the peer is not IPv4 (the `SocketAddress.from_packed` input).
+    pub fn recv_peer() i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_recv_peer(requireCurrentProcessHandle());
+        } else {
+            return packEndpoint(gate_off_last_recv_peer);
+        }
+    }
+
+    /// The 32-bit big-endian word (`word_index` `0..3`) of the IPv6 sender
+    /// endpoint of the most recent `recv_from`, or `-1` when not IPv6.
+    pub fn recv_peer_v6_word(word_index: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_recv_peer_v6_word(requireCurrentProcessHandle(), @intCast(word_index));
+        } else {
+            return socket_io.endpointV6Word(gate_off_last_recv_peer, @intCast(word_index));
+        }
+    }
+
+    /// The port of the sender endpoint of the most recent `recv_from`.
+    pub fn recv_peer_port() i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_recv_peer_port(requireCurrentProcessHandle());
+        } else {
+            return socket_io.endpointPortValue(gate_off_last_recv_peer);
+        }
+    }
+
+    /// The IPv6 zone/scope id of the sender endpoint of the most recent
+    /// `recv_from` (`0` = none).
+    pub fn recv_peer_scope() i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_recv_peer_scope(requireCurrentProcessHandle());
+        } else {
+            return socket_io.endpointScopeValue(gate_off_last_recv_peer);
         }
     }
 

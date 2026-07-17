@@ -3177,6 +3177,316 @@ fn packEndpoint(endpoint: concurrency.socket_io.SocketEndpoint) i64 {
     return host * 65536 + @as(i64, endpoint.port);
 }
 
+// ---------------------------------------------------------------------------
+// Phase S2 — Datagram (UDP) + Unix-domain bridge. UDP bind/connect and Unix
+// stream listen are non-blocking leaf ops (bind/connect on a datagram socket,
+// and bind/listen, complete immediately), so they run INLINE and promote
+// through the SAME `promoteListener`/`promoteConnectedFd` tails as S1. The
+// BLOCKING leaves — `send_to`, `recv_from`, and the Unix stream `connect` —
+// offload onto the pool exactly like S1 `send`/`recv`/`connect`: kill-flag
+// captured on-core, ownership-gated, pending-fd reclamation for a produced fd.
+// ---------------------------------------------------------------------------
+
+/// Bind a UDP (`SOCK_DGRAM`) socket on `ip0.ip1.ip2.ip3:port` (port 0 → an
+/// ephemeral port, discoverable via `zap_socket_local_port`). Returns the
+/// handle bits (ownership + bound port recorded, sweep node ensured) or `0`
+/// with the reason in the process last-error. Inline (bind is a leaf syscall).
+export fn zap_socket_bind_udp(
+    process: *anyopaque,
+    ip0: u8,
+    ip1: u8,
+    ip2: u8,
+    ip3: u8,
+    port: u16,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    const outcome = concurrency.socket_io.bindUdp(.{ ip0, ip1, ip2, ip3 }, port);
+    return promoteListener(context, outcome);
+}
+
+/// Bind a Unix-domain DATAGRAM socket on `path_ptr[0..path_len]`. Returns the
+/// handle bits or `0` (reason in the process last-error — a too-long/`@`-on-
+/// non-Linux path is `invalid_argument`). Inline.
+export fn zap_socket_bind_udp_unix(
+    process: *anyopaque,
+    path_ptr: [*]const u8,
+    path_len: usize,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    const outcome = concurrency.socket_io.bindUnixDatagram(path_ptr[0..path_len]);
+    return promoteListener(context, outcome);
+}
+
+/// Connect a UDP socket to `ip0.ip1.ip2.ip3:port` (`connect(2)` on a datagram
+/// socket completes immediately — the kernel then FILTERS inbound datagrams to
+/// that peer and `send`/`recv` address it). Returns the handle bits or `0`.
+/// Inline (no handshake, no poll loop).
+export fn zap_socket_connect_udp(
+    process: *anyopaque,
+    ip0: u8,
+    ip1: u8,
+    ip2: u8,
+    ip3: u8,
+    port: u16,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    context.ensureSocketSweep(socketSweepDestructor);
+    const outcome = concurrency.socket_io.connectUdpIp4(.{ ip0, ip1, ip2, ip3 }, port);
+    if (outcome.reason != .ok) return socketConnectFailed(context, outcome.reason);
+    return promoteConnectedFd(context, outcome.fd);
+}
+
+/// Bind + `listen` a Unix-domain STREAM socket on `path_ptr[0..path_len]` with
+/// `backlog`. Returns the listener handle bits or `0`. Inline (bind/listen are
+/// leaf syscalls). The accepted connections come through the SAME
+/// `zap_socket_accept` (which probes the listener family and routes a Unix
+/// listener to the raw-accept path).
+export fn zap_socket_listen_unix(
+    process: *anyopaque,
+    path_ptr: [*]const u8,
+    path_len: usize,
+    backlog: u32,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    const outcome = concurrency.socket_io.listenUnix(path_ptr[0..path_len], @intCast(backlog));
+    return promoteListener(context, outcome);
+}
+
+/// The blocking request for an offloaded Unix-domain STREAM connect (mirrors
+/// `SocketConnectRequest`: the produced fd is parked in the teardown-visible
+/// pending slot for kill-safe reclamation).
+const SocketConnectUnixRequest = struct {
+    path: []const u8,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    pending_fd_slot: *concurrency.socket_io.Fd,
+    outcome: concurrency.socket_io.ConnectOutcome,
+};
+
+fn socketConnectUnixBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketConnectUnixRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.connectUnix(request.path, request.timeout_ms, request.kill_flag);
+    if (request.outcome.reason == .ok) request.pending_fd_slot.* = request.outcome.fd;
+    return null;
+}
+
+/// Connect a Unix-domain STREAM socket to `path_ptr[0..path_len]`, offloading
+/// the poll-quantum connect off-core (Decision D). Returns the socket handle
+/// bits or `0` with the reason in the process last-error. Registers the socket-
+/// sweep before the offload (HIGH-1) so a kill during the connect reclaims a
+/// just-produced fd parked in the pending slot.
+export fn zap_socket_connect_unix(
+    process: *anyopaque,
+    path_ptr: [*]const u8,
+    path_len: usize,
+    timeout_ms: i64,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    var request = SocketConnectUnixRequest{
+        .path = path_ptr[0..path_len],
+        .timeout_ms = timeout_ms,
+        .kill_flag = context.pendingKillFlag(),
+        .pending_fd_slot = context.socketPendingFdSlot(),
+        .outcome = undefined,
+    };
+    context.ensureSocketSweep(socketSweepDestructor);
+    _ = context.blocking(socketConnectUnixBlockingTrampoline, &request);
+    if (request.outcome.reason != .ok) return socketConnectFailed(context, request.outcome.reason);
+    request.pending_fd_slot.* = concurrency.socket_table.no_pending_socket_fd;
+    return promoteConnectedFd(context, request.outcome.fd);
+}
+
+/// The destination of a `send_to`, tagged per family (the ONE atomic datagram
+/// address). Built on-core in each `zap_socket_send_to_*` and passed across the
+/// offload; a Unix path slice points into the caller's String, valid while the
+/// fiber is parked `.blocking` (the same lifetime as the `bytes` slice).
+const SendToDest = union(enum) {
+    ip4: struct { ip: [4]u8, port: u16 },
+    ip6: struct { addr: [16]u8, port: u16, scope_id: u32, flow: u32 },
+    unix: []const u8,
+};
+
+/// A `send_to`'s blocking request: the fd, the caller-owned payload, the tagged
+/// destination, the per-call timeout, and the kill flag.
+const SocketSendToRequest = struct {
+    fd: concurrency.socket_io.Fd,
+    bytes: []const u8,
+    dest: SendToDest,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    outcome: concurrency.socket_io.SendOutcome,
+};
+
+fn socketSendToBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketSendToRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = switch (request.dest) {
+        .ip4 => |d| concurrency.socket_io.sendToIp4(request.fd, d.ip, d.port, request.bytes, request.timeout_ms, request.kill_flag),
+        .ip6 => |d| concurrency.socket_io.sendToIp6(request.fd, d.addr, d.port, d.scope_id, d.flow, request.bytes, request.timeout_ms, request.kill_flag),
+        .unix => |path| concurrency.socket_io.sendToUnix(request.fd, path, request.bytes, request.timeout_ms, request.kill_flag),
+    };
+    return null;
+}
+
+/// Send `bytes_ptr[0..bytes_len]` as ONE datagram to `dest`, offloading the
+/// atomic `sendto` off-core (Decision D). Ownership-gated; records the failure
+/// reason in the caller's ledger and returns the bytes sent (`>= 0`) or `-1`
+/// when the caller does not own a live handle (panic at the surface). The
+/// shared tail of the per-family `zap_socket_send_to_*` exports.
+fn sendToCommon(context: *concurrency.ProcessContext, handle_bits: u64, bytes: []const u8, dest: SendToDest, timeout_ms: i64) i64 {
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    var request = SocketSendToRequest{
+        .fd = fd,
+        .bytes = bytes,
+        .dest = dest,
+        .timeout_ms = timeout_ms,
+        .kill_flag = context.pendingKillFlag(),
+        .outcome = undefined,
+    };
+    _ = context.blocking(socketSendToBlockingTrampoline, &request);
+    if (request.outcome.reason != .ok)
+        context.socketLedger().last_error = @intFromEnum(request.outcome.reason);
+    return @intCast(request.outcome.bytes_sent);
+}
+
+/// Send one datagram to the IPv4 `ip0.ip1.ip2.ip3:port`.
+export fn zap_socket_send_to_ip4(
+    process: *anyopaque,
+    handle_bits: u64,
+    ip0: u8,
+    ip1: u8,
+    ip2: u8,
+    ip3: u8,
+    port: u16,
+    bytes_ptr: [*]const u8,
+    bytes_len: usize,
+    timeout_ms: i64,
+) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    return sendToCommon(context, handle_bits, bytes_ptr[0..bytes_len], .{ .ip4 = .{ .ip = .{ ip0, ip1, ip2, ip3 }, .port = port } }, timeout_ms);
+}
+
+/// Send one Unix-domain datagram to `path_ptr[0..path_len]`.
+export fn zap_socket_send_to_unix(
+    process: *anyopaque,
+    handle_bits: u64,
+    path_ptr: [*]const u8,
+    path_len: usize,
+    bytes_ptr: [*]const u8,
+    bytes_len: usize,
+    timeout_ms: i64,
+) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    return sendToCommon(context, handle_bits, bytes_ptr[0..bytes_len], .{ .unix = path_ptr[0..path_len] }, timeout_ms);
+}
+
+/// A `recv_from`'s blocking request (the datagram twin of `SocketRecvRequest`):
+/// the per-process recv-arena allocator, the fd, the (clamped) buffer cap, the
+/// timeout, and the kill flag. `outcome` is `null` iff the allocation failed.
+const SocketRecvFromRequest = struct {
+    allocator: std.mem.Allocator,
+    fd: concurrency.socket_io.Fd,
+    max_bytes: usize,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    outcome: ?concurrency.socket_io.RecvFromOutcome,
+};
+
+fn socketRecvFromBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketRecvFromRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.recvFrom(
+        request.allocator,
+        request.fd,
+        request.max_bytes,
+        request.timeout_ms,
+        request.kill_flag,
+    ) catch null;
+    return null;
+}
+
+/// Receive ONE datagram into the caller's PRIVATE recv arena (the same HIGH-4
+/// lifetime binding as `zap_socket_recv`), offloading the poll-quantum recvmsg
+/// off-core (Decision D). Records the CHUNK/timeout/failed status in the
+/// caller's ledger (`zap_socket_recv_status`) and the sender endpoint +
+/// truncation flag + true datagram length in the PCB datagram slots (read by
+/// `zap_socket_recv_peer*`/`_truncated`/`_datagram_len`), writes the chunk's
+/// backing pointer to `out_chunk_ptr` (null when zero bytes), and returns the
+/// captured byte count (`>= 0`) or `-1` when the caller does not own a live
+/// handle. NEVER closes the socket — a timeout leaves it usable (Decision E).
+export fn zap_socket_recv_from(
+    process: *anyopaque,
+    handle_bits: u64,
+    max_bytes: i64,
+    timeout_ms: i64,
+    out_chunk_ptr: *?[*]const u8,
+) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    out_chunk_ptr.* = null;
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return -1;
+    var request = SocketRecvFromRequest{
+        .allocator = context.socketRecvArena().allocator(),
+        .fd = fd,
+        .max_bytes = if (max_bytes > 0) @intCast(max_bytes) else concurrency.socket_io.max_datagram_bytes,
+        .timeout_ms = timeout_ms,
+        .kill_flag = context.pendingKillFlag(),
+        .outcome = null,
+    };
+    _ = context.blocking(socketRecvFromBlockingTrampoline, &request);
+    if (request.outcome) |outcome| {
+        context.socketLedger().last_recv_status = outcome.status;
+        context.socketLastRecvPeer().* = outcome.peer;
+        context.socketLastRecvTruncated().* = if (outcome.truncated) 1 else 0;
+        context.socketLastRecvDatagramLen().* = @intCast(outcome.datagram_len);
+        out_chunk_ptr.* = if (outcome.bytes_filled == 0) null else outcome.buffer.ptr;
+        return @intCast(outcome.bytes_filled);
+    }
+    // OOM allocating the datagram buffer off-core: a failed recv (no peer).
+    context.socketLedger().last_recv_status = @intFromEnum(concurrency.socket_io.Reason.out_of_memory);
+    context.socketLastRecvPeer().* = concurrency.socket_io.SocketEndpoint.none;
+    context.socketLastRecvTruncated().* = 0;
+    context.socketLastRecvDatagramLen().* = 0;
+    return 0;
+}
+
+/// Whether the caller's most recent `recv_from` datagram was TRUNCATED (`1`) or
+/// not (`0`) — the distinct truncation channel (`SocketDatagramRecv.Truncated`).
+export fn zap_socket_recv_truncated(process: *anyopaque) callconv(.c) i32 {
+    return contextFromHandle(process).socketLastRecvTruncated().*;
+}
+
+/// The true length of the caller's most recent `recv_from` datagram (exact on
+/// Linux, the captured floor on macOS) — `SocketDatagramData.datagram_size`.
+export fn zap_socket_recv_datagram_len(process: *anyopaque) callconv(.c) i64 {
+    return contextFromHandle(process).socketLastRecvDatagramLen().*;
+}
+
+/// The packed IPv4 sender endpoint of the caller's most recent `recv_from`
+/// (`((((a*256+b)*256+c)*256+d)*65536)+port`) or `-1` when the peer is not IPv4
+/// (IPv6/Unix/unavailable). The datagram-peer twin of `zap_socket_endpoint`.
+export fn zap_socket_recv_peer(process: *anyopaque) callconv(.c) i64 {
+    return packEndpoint(contextFromHandle(process).socketLastRecvPeer().*);
+}
+
+/// The 32-bit big-endian word (`word_index` `0..3`) of the IPv6 sender endpoint
+/// of the caller's most recent `recv_from`, or `-1` when the peer is not IPv6.
+export fn zap_socket_recv_peer_v6_word(process: *anyopaque, word_index: i32) callconv(.c) i64 {
+    return concurrency.socket_io.endpointV6Word(contextFromHandle(process).socketLastRecvPeer().*, @intCast(word_index));
+}
+
+/// The port of the sender endpoint of the caller's most recent `recv_from`.
+export fn zap_socket_recv_peer_port(process: *anyopaque) callconv(.c) i64 {
+    return concurrency.socket_io.endpointPortValue(contextFromHandle(process).socketLastRecvPeer().*);
+}
+
+/// The IPv6 zone/scope id of the sender endpoint of the caller's most recent
+/// `recv_from` (`0` = none).
+export fn zap_socket_recv_peer_scope(process: *anyopaque) callconv(.c) i64 {
+    return concurrency.socket_io.endpointScopeValue(contextFromHandle(process).socketLastRecvPeer().*);
+}
+
 /// Terminate the calling process NORMALLY (reason `normal`, P5-J1): the same
 /// clean exit as returning from its entry. A linked non-trapping process is NOT
 /// killed; a trapping linked/monitoring process receives `{'EXIT', Self, normal}`

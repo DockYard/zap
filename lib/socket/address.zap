@@ -4,8 +4,10 @@
   It carries the address `family` and the endpoint's `port`. For an `:ip4`
   endpoint the four octets `a`/`b`/`c`/`d` are meaningful; for an `:ip6`
   endpoint the eight hextets `h0`..`h7` (each a 16-bit group, `0..65535`) and the
-  IPv6 zone `scope_id` are meaningful. `:unavailable` names an
-  unbound/unconnected endpoint. Being a plain struct of sendable scalars it can
+  IPv6 zone `scope_id` are meaningful; for a `:unix` (Unix-domain, Phase S2)
+  endpoint the `path` is meaningful (a filesystem path, or a `@`-prefixed Linux
+  abstract-namespace name). `:unavailable` names an unbound/unconnected
+  endpoint. Being a plain struct of sendable scalars plus a `String` path it can
   travel in a message like any other value.
 
   A `:ip6` endpoint arises when a `Socket.connect_host` Happy-Eyeballs race
@@ -48,6 +50,7 @@ pub struct SocketAddress {
   h6 :: i64 = 0
   h7 :: i64 = 0
   scope_id :: i64 = 0
+  path :: String = ""
 
   @doc = """
     Builds an IPv4 address from its four octets and a port.
@@ -107,6 +110,44 @@ pub struct SocketAddress {
 
   pub fn ip6_loopback(port :: i64) -> SocketAddress {
     SocketAddress.ip6(0, 0, 0, 0, 0, 0, 0, 1, 0, port)
+  }
+
+  @doc = """
+    Builds a Unix-domain (`:unix`) address from a socket `path` (Phase S2) — the
+    endpoint a `SocketDatagram.bind`/`send_to` or a `Socket.connect`/`listen`
+    over the Unix-domain names. A plain path is a FILESYSTEM socket (the caller
+    manages the socket file — unlink it before re-binding); a `@`-prefixed path
+    is a Linux ABSTRACT-namespace name (no filesystem entry, auto-cleaned when
+    the last handle closes — ideal for hermetic tests, Linux-only). The portable
+    path cap is 104 bytes; a longer path is rejected by the runtime as `:einval`.
+
+    ## Examples
+
+        SocketAddress.unix("/tmp/app.sock")
+        SocketAddress.unix("@app-abstract")   # Linux abstract namespace
+    """
+
+  @available_on(:network)
+
+  pub fn unix(path :: String) -> SocketAddress {
+    %SocketAddress{family: :unix, path: path}
+  }
+
+  @doc = """
+    Reconstructs a `:unix` `SocketAddress` from a `path` — the decoder companion
+    to `unix/1` (identical result), named for symmetry with `from_packed`/
+    `ip6_from_words`. Kept distinct so a future path-bearing peer readback has a
+    single decode point to route through.
+
+    ## Examples
+
+        SocketAddress.unix_from_path("/tmp/app.sock")
+    """
+
+  @available_on(:network)
+
+  pub fn unix_from_path(path :: String) -> SocketAddress {
+    %SocketAddress{family: :unix, path: path}
   }
 
   @doc = """
@@ -177,8 +218,9 @@ pub struct SocketAddress {
     Renders a `SocketAddress` as its canonical textual form with the port:
     `"a.b.c.d:port"` for `:ip4`, the bracketed RFC 5952 form `"[address]:port"`
     for `:ip6` (lowercase hextets, no leading zeros, the longest run of zero
-    hextets compressed to `::`, a non-zero zone appended as `%scope_id`), and
-    `"unavailable"` for an unbound/unconnected endpoint.
+    hextets compressed to `::`, a non-zero zone appended as `%scope_id`),
+    `"unix:<path>"` for a `:unix` endpoint, and `"unavailable"` for an
+    unbound/unconnected endpoint.
 
     ## Examples
 
@@ -200,6 +242,7 @@ pub struct SocketAddress {
           }
           "[" <> SocketAddress.ip6_body(address) <> zone <> "]:" <> Integer.to_string(address.port)
         }
+      :unix -> "unix:" <> address.path
       _ -> "unavailable"
     }
   }

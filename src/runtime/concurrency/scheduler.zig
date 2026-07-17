@@ -322,6 +322,7 @@ const signal_module = @import("signal.zig");
 const registry_module = @import("registry.zig");
 const blob_module = @import("blob.zig");
 const socket_table = @import("socket_table.zig");
+const socket_io = @import("socket_io.zig");
 const trace_module = @import("trace.zig");
 
 const Pid = pid_table_module.Pid;
@@ -1110,6 +1111,25 @@ pub const ProcessContext = struct {
     /// across the offload.
     pub fn socketRecvArena(context: *ProcessContext) *std.heap.ArenaAllocator {
         return &context.record.pcb.socket_recv_arena;
+    }
+
+    /// This process's datagram `recv_from` metadata slots (Phase S2): the
+    /// sender endpoint, the truncation flag, and the true datagram length of the
+    /// most recent `recv_from`. Owner-only PCB fields, like every socket slot;
+    /// the socket bridge writes them when a `recv_from` completes and
+    /// `lib/socket/datagram.zap` reads them in the immediately-following
+    /// (non-yielding) `recv_peer_*`/`recv_truncated`/`recv_datagram_len`
+    /// accessors — race-free across green-process preemption.
+    pub fn socketLastRecvPeer(context: *ProcessContext) *socket_io.SocketEndpoint {
+        return &context.record.pcb.socket_last_recv_peer;
+    }
+
+    pub fn socketLastRecvTruncated(context: *ProcessContext) *i32 {
+        return &context.record.pcb.socket_last_recv_truncated;
+    }
+
+    pub fn socketLastRecvDatagramLen(context: *ProcessContext) *i64 {
+        return &context.record.pcb.socket_last_recv_datagram_len;
     }
 
     /// A pointer to this process's `pending_kill` atomic — the kill-
