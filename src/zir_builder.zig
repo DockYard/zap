@@ -1259,6 +1259,19 @@ pub const ZirDriver = struct {
     /// `Socket.fold`/`Enum.reduce_while` to O(chunk) without a use-after-free.
     /// `null` outside such a loop (and always with the gate OFF — zero emission).
     loopify_recv_arena_ref: ?u32 = null,
+    /// Part-3 loop-entry WATERMARK for the recv-arena back-edge reset — the two
+    /// scalar halves of an `ArenaAllocator.Mark`, each a loop-INVARIANT Ref
+    /// resolved ONCE in the loop preheader (mirroring `loopify_recv_arena_ref`
+    /// EXACTLY): the `used_list` head node pointer (`?*anyopaque` from
+    /// `Kernel.recvArenaMarkNode`) and that node's `end_index` (`usize` from
+    /// `Kernel.recvArenaMarkEnd`). Threaded into every back-edge `recvGateStep`
+    /// (to scope the alias probe ABOVE the mark) and the final
+    /// `recvArenaResetIfUnaliased` (which `resetToMark`s to the watermark instead
+    /// of resetting to empty). Split into two scalar refs — rather than one
+    /// struct-return Ref — to avoid a composite return through the kernel call.
+    /// `null` whenever `loopify_recv_arena_ref` is.
+    loopify_recv_mark_node_ref: ?u32 = null,
+    loopify_recv_mark_end_ref: ?u32 = null,
     /// Nesting depth of capture contexts (case/switch/if-else bodies).
     /// When > 0, struct_init_typed can't be used because struct_init_field_type
     /// instructions (emitted via addInst) don't enter captured bodies.
@@ -6494,17 +6507,39 @@ pub const ZirDriver = struct {
             // SEEDLESS amortized back-edge tick instead of this counter —
             // see `loopify_backedge_unroll`.
             //
-            // Gate OFF: nothing is emitted — the CLBG binaries are
-            // byte-for-byte unchanged.
+            // Gate OFF: the SAFEPOINT poll seed below emits nothing (it is a
+            // concurrency-only preemption tick). The scalar-numeric CLBG
+            // kill-criterion loops (nbody, spectral-norm, …) are all-scalar and
+            // TCO-safe, so they musttail rather than loopify — `emit_loopified`
+            // is false for them and NONE of the loopify-preheader machinery
+            // (poll seed OR the gate-independent recv-arena seed below) reaches
+            // them: those binaries stay byte-for-byte unchanged gate-OFF.
             if (self.runtime_concurrency) {
                 const unroll_factor = self.backedgePollUnrollFactor(func);
                 try self.emitBackedgeSafepointSeed(unroll_factor);
-                // Part-2c: resolve the calling process's recv-arena pointer ONCE
-                // here (loop-invariant), so the back-edge recv-memory gate reads
-                // and conditionally resets it without a per-iteration
-                // current-process lookup. See `emitRecvArenaBackedgeGate`.
-                try self.emitRecvArenaSeed();
             }
+            // Part-2c recv-memory back-edge gate — GATE-INDEPENDENT. Resolve the
+            // recv-arena pointer ONCE here (loop-invariant), so the back-edge
+            // recv-memory gate reads and conditionally resets it without a
+            // per-iteration lookup. Gate-ON this is the calling process's PRIVATE
+            // PCB recv arena; GATE-OFF it is the module-global `gate_off_recv_arena`
+            // (`Kernel.recvArenaSeedPtr`). BOTH must be bounded to O(chunk) so a
+            // streaming socket fold does not accumulate every byte received into
+            // program-lifetime memory (the HIGH-4 memory-exhaustion DoS, which is
+            // identical gate-OFF — a gate-OFF socket client with inline socket ops
+            // per Decision D). Emitting for EVERY loopified loop is the only SOUND
+            // choice: recv-reachability is interprocedural (an `Enum.reduce` over
+            // `Socket.chunks` reaches `recv` through `Enumerable.next` dispatch,
+            // and an arbitrary fold callback may itself `recv`), so it cannot be
+            // statically discharged — the runtime aliasing probe + `used_list`
+            // self-gate is the discharge. A loop whose program never received
+            // self-gates to a no-op reset (one `used_list == null` load +
+            // not-taken branch), so non-socket programs are behaviorally
+            // unaffected; gate-OFF this even resolves the arena as a plain global
+            // address (cheaper than gate-ON's current-process lookup). This is the
+            // SAME back-edge gate gate-ON already emits for every loopified loop.
+            // See `emitRecvArenaBackedgeGate`.
+            try self.emitRecvArenaSeed();
             self.beginCapture();
             loopify_capture_open = true;
         }
@@ -6648,6 +6683,8 @@ pub const ZirDriver = struct {
         self.loopify_safepoint_slot = null;
         self.loopify_backedge_unroll = 1;
         self.loopify_recv_arena_ref = null;
+        self.loopify_recv_mark_node_ref = null;
+        self.loopify_recv_mark_end_ref = null;
     }
 
     /// Emit a `zap_runtime.Kernel.<name>(args...)` call — the P2-J6 layer-2
@@ -6801,29 +6838,46 @@ pub const ZirDriver = struct {
         _ = try self.emitKernelCall("procBackedgePoll", &.{slot});
     }
 
-    /// Part-2c preheader emission: resolve the calling process's recv-arena
-    /// pointer ONCE (`Kernel.recvArenaSeedPtr()` → `?*anyopaque`) and stash its
-    /// Ref in `loopify_recv_arena_ref`. Emitted before the `loop` capture so it
-    /// runs on loop ENTRY, not per iteration; the pointer is loop-invariant (a
-    /// fiber runs its whole loop as one process, and the PCB is address-pinned),
-    /// so the back-edge reuses it. Only reached under the `runtime_concurrency`
-    /// gate (the caller guards it); OFF builds emit nothing.
+    /// Part-2c preheader emission: resolve the recv-arena pointer ONCE
+    /// (`Kernel.recvArenaSeedPtr()` → `?*anyopaque`) and stash its Ref in
+    /// `loopify_recv_arena_ref`, then capture the loop-entry WATERMARK from that
+    /// same arena into `loopify_recv_mark_node_ref`/`loopify_recv_mark_end_ref`
+    /// (`Kernel.recvArenaMarkNode`/`recvArenaMarkEnd`) so the back-edge can
+    /// `resetToMark` the arena rather than reset it to empty — keeping a chunk
+    /// that escaped an earlier fold (below the mark) byte-stable.
+    /// Emitted before the `loop` capture so it runs on
+    /// loop ENTRY, not per iteration; the pointer is loop-invariant (gate-ON a
+    /// fiber runs its whole loop as one process and the PCB is address-pinned;
+    /// GATE-OFF it is the fixed module-global `gate_off_recv_arena` address), so
+    /// the back-edge reuses it. GATE-INDEPENDENT: the recv-memory DoS is identical
+    /// gate-OFF (a gate-OFF socket fold with inline socket ops per Decision D), so
+    /// the seed + back-edge reset emit in BOTH gates. Non-socket loops self-gate
+    /// to a no-op at runtime (the arena's empty `used_list`).
     fn emitRecvArenaSeed(self: *ZirDriver) BuildError!void {
         // No loop-carried slots (zero-param loopified shell) → nothing the gate
         // could alias-test, so skip the preheader resolution entirely.
         if (self.loopify_slots == null) return;
         const arena_ref = try self.emitKernelCall("recvArenaSeedPtr", &.{});
         self.loopify_recv_arena_ref = arena_ref;
+        // Capture the loop-entry watermark from the SAME resolved arena, also
+        // loop-invariant (see `loopify_recv_mark_node_ref`). The back-edge scopes
+        // its reset/alias probe to memory allocated ABOVE this mark, so a recv
+        // chunk that escaped an earlier fold (below the mark) is never freed.
+        self.loopify_recv_mark_node_ref = try self.emitKernelCall("recvArenaMarkNode", &.{arena_ref});
+        self.loopify_recv_mark_end_ref = try self.emitKernelCall("recvArenaMarkEnd", &.{arena_ref});
     }
 
     /// Part-2c back-edge emission: bound a now-loopified fold/reduce PULL loop's
-    /// per-process recv arena. For each heap-possible loop-carried slot, fold a
+    /// recv arena (gate-ON the per-process PCB arena, GATE-OFF the module-global
+    /// `gate_off_recv_arena`). For each heap-possible loop-carried slot, fold a
     /// runtime aliasing test into a boolean gate
-    /// (`Kernel.recvGateStep(arena, prev, value)`), then reset the recv arena to
-    /// O(chunk) unless any slot aliases it
-    /// (`Kernel.recvArenaResetIfUnaliased(arena, gate)`). The reset is suppressed
-    /// whenever a live loop-carried value points into the arena — the no-UAF
-    /// invariant — and the per-slot probes fold to comptime-nothing for scalar
+    /// (`Kernel.recvGateStep(arena, mark_node, mark_end, prev, value)`), then reset
+    /// the recv arena back to its loop-entry watermark unless any slot aliases
+    /// ABOVE-mark memory
+    /// (`Kernel.recvArenaResetIfUnaliased(arena, mark_node, mark_end, gate)`). The
+    /// reset is suppressed whenever a live loop-carried value points ABOVE the
+    /// mark — the no-UAF invariant — and the per-slot probes fold to
+    /// comptime-nothing for scalar
     /// loop-carried values, so a scalar-accumulator fold (the HIGH-4 DoS case)
     /// resets every iteration and stays RSS-flat while an aliasing/aggregate
     /// accumulator conservatively retains its chunks. See `runtime.zig`'s
@@ -6835,6 +6889,8 @@ pub const ZirDriver = struct {
     /// storage) is skipped — it cannot reference the arena and cannot be loaded.
     fn emitRecvArenaBackedgeGate(self: *ZirDriver) BuildError!void {
         const arena_ref = self.loopify_recv_arena_ref orelse return;
+        const mark_node_ref = self.loopify_recv_mark_node_ref orelse return;
+        const mark_end_ref = self.loopify_recv_mark_end_ref orelse return;
         const slots = self.loopify_slots orelse return;
 
         var gate_ref = zir_builder_emit_bool(self.handle, false);
@@ -6848,10 +6904,10 @@ pub const ZirDriver = struct {
                 if (i < direct.len and direct[i]) continue;
             }
             const value_ref = try self.emitLoad(slot_ref);
-            gate_ref = try self.emitKernelCall("recvGateStep", &.{ arena_ref, gate_ref, value_ref });
+            gate_ref = try self.emitKernelCall("recvGateStep", &.{ arena_ref, mark_node_ref, mark_end_ref, gate_ref, value_ref });
         }
 
-        _ = try self.emitKernelCall("recvArenaResetIfUnaliased", &.{ arena_ref, gate_ref });
+        _ = try self.emitKernelCall("recvArenaResetIfUnaliased", &.{ arena_ref, mark_node_ref, mark_end_ref, gate_ref });
     }
 
     /// Resolve the per-iteration value of param `index` when emitting

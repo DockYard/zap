@@ -689,6 +689,33 @@ fn stdoutWrite(bytes: []const u8) void {
 
 var runtime_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.c_allocator);
 
+// ============================================================
+// GATE-OFF socket recv arena
+//
+// The gate-OFF twin of the gate-ON per-process `ProcessControlBlock
+// .socket_recv_arena`: a dedicated, RESETTABLE arena that backs EVERY
+// gate-OFF `Socket.recv` chunk — deliberately NOT `runtime_arena`, which is
+// program-lifetime and grow-only (macOS arenas cannot `mremap`, so a node
+// pins until process exit). A streaming socket fold's chunks land here and
+// the loopify back-edge gate (`Kernel.recvArenaResetIfUnaliased`, emitted
+// gate-independently at every loopified back-edge) resets it to O(chunk)
+// whenever no live loop-carried value aliases it. Without this a long-running
+// gate-OFF socket stream that discards each chunk (a `Socket.fold`/
+// `Enum.reduce` over `Socket.chunks`) would accumulate every byte it ever
+// received into program-lifetime memory — RSS growing to the total-bytes-
+// received, an OOM. That is the HIGH-4 peer-controlled memory-exhaustion DoS,
+// which is IDENTICAL gate-OFF (a gate-OFF socket client — `zap run
+// client.zap` with socket ops inlined per Decision D — is a real deployment).
+//
+// Gate-OFF the runtime is single-OS-thread (socket ops run inline, never on a
+// pool), so a plain module global is race-free — exactly like
+// `gate_off_last_recv_status`. A program that never receives never allocates
+// into it, so its `used_list` stays null and the back-edge reset self-gates to
+// a no-op (one load + not-taken branch): non-socket programs are unaffected.
+// ============================================================
+
+var gate_off_recv_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+
 // Terminal raw/normal-mode state (`original_termios`/`raw_mode_saved`)
 // lives inside the `runtime_os` seam (`enterRawMode`/`exitRawMode`), since
 // the `termios` type and its save/restore are POSIX-only and degrade to a
@@ -7218,12 +7245,16 @@ pub const SocketRuntime = struct {
     /// recreating the header-less-slice false positive that routing through the
     /// per-process manager heap (`containerBufferAlloc`) would.
     ///
-    /// GATE-OFF (single-thread scripts, no processes) the chunk lives in
-    /// `runtime_arena` as before — but now right-sized: the leaf grows toward
-    /// bytes actually received and shrinks the buffer to what arrived, so a
-    /// next-available read no longer wastes a full 16 KiB chunk and a
-    /// `recv_exact` no longer pre-allocates a peer-supplied `byte_count` up
-    /// front (MED-3).
+    /// GATE-OFF (single-thread scripts, no processes) the chunk lives in the
+    /// dedicated, RESETTABLE `gate_off_recv_arena` — the gate-OFF twin of the
+    /// per-process PCB arena, NOT the program-lifetime grow-only `runtime_arena`.
+    /// The read is right-sized identically (the leaf grows toward bytes actually
+    /// received and shrinks the buffer to what arrived — MED-3), and the
+    /// loopify back-edge gate (`recvArenaResetIfUnaliased`, emitted gate-
+    /// independently) resets this arena to O(chunk) whenever no live loop-carried
+    /// value aliases it, so a long-running gate-OFF socket stream that discards
+    /// each chunk stays RSS-FLAT instead of accumulating every byte ever received
+    /// (the HIGH-4 memory-exhaustion DoS, which is identical gate-OFF).
     ///
     /// The CHUNK/CLOSED/FAILED status lands in the per-process slot for the
     /// immediately-following `Socket.recv_status()` read. Panics on a
@@ -7251,7 +7282,7 @@ pub const SocketRuntime = struct {
         } else {
             const exact_target: usize = if (byte_count > 0) @intCast(byte_count) else 0;
             const outcome = socket_io.recv(
-                runtime_arena.allocator(),
+                gate_off_recv_arena.allocator(),
                 gateOffFd(handle_bits),
                 exact_target,
                 default_recv_chunk_len,
@@ -17524,64 +17555,133 @@ pub const Kernel = struct {
 
     // -----------------------------------------------------------------------
     // Part-2c recv-memory back-edge gate (bounds the fold/reduce PULL loop's
-    // per-process recv arena so a now-loopified fold does not grow O(total
-    // bytes) — the HIGH-4 DoS that Part 1's TCO would otherwise reopen).
+    // recv arena so a now-loopified fold does not grow O(total bytes) — the
+    // HIGH-4 DoS that Part 1's TCO would otherwise reopen). GATE-INDEPENDENT:
+    // the DoS shape is identical gate-OFF.
     //
     // `Socket.fold`/`Enum.reduce_while` pull chunks through `:zig.SocketRuntime
-    // .recv`, which grows the process's PRIVATE recv arena (`ProcessControlBlock
-    // .socket_recv_arena`, a raw `c_allocator`-backed `ArenaAllocator`). That
-    // arena is reclaimed only at process teardown or at the mailbox-`receive`
-    // back-edge (`zap_proc_receive_iteration_reset`) — NEITHER fires on the
-    // `SocketRuntime.recv` pull path. Once Part 1 lets a fold stream indefinitely
-    // with a constant stack, the arena would grow without bound.
+    // .recv`, which grows a recv arena — GATE-ON the process's PRIVATE arena
+    // (`ProcessControlBlock.socket_recv_arena`), GATE-OFF the module-global
+    // `gate_off_recv_arena` (the single-thread inline-socket domain has no PCB),
+    // both raw `c_allocator`-backed `ArenaAllocator`s. That arena is reclaimed
+    // only at process teardown / the mailbox-`receive` back-edge gate-ON, or
+    // (gate-OFF) never on its own — NEITHER fires on the `SocketRuntime.recv`
+    // pull path. Once Part 1 (gate-ON) or a plain gate-OFF `func.loopify` lets a
+    // fold stream indefinitely with a constant stack, the arena grows unbounded:
+    // an OOM driven entirely by peer-supplied bytes.
     //
-    // The fix: at EVERY loopified loop's back-edge (emitted broadly, gate-ON —
-    // `src/zir_builder.zig`), reset the recv arena to O(chunk) — but ONLY when no
-    // live loop-carried value points into it (resetting under a live alias is a
-    // use-after-free, strictly WORSE than the leak). The reset is DYNAMICALLY
-    // GATED, not statically proven: the callback is opaque and may return the raw
-    // chunk (`{:cont, bytes}`), so `acc'` may alias the arena — a static closure
-    // proof cannot discharge that for an arbitrary callback. A runtime aliasing
-    // probe (`ArenaAllocator.ownsPtr`) is the sound discharge.
+    // The fix: at EVERY loopified loop's back-edge (emitted GATE-INDEPENDENTLY —
+    // `src/zir_builder.zig`), reset the recv arena back to its LOOP-ENTRY
+    // WATERMARK — but ONLY when no live loop-carried value points into memory
+    // ABOVE that watermark (resetting under a live alias is a use-after-free,
+    // strictly WORSE than the leak). The reset is DYNAMICALLY GATED, not
+    // statically proven: the callback is opaque and may return the raw chunk
+    // (`{:cont, bytes}`), so `acc'` may alias the arena — a static closure proof
+    // cannot discharge that for an arbitrary callback. A runtime aliasing probe
+    // (`ArenaAllocator.ownsPtrAboveMark`) is the sound discharge.
+    //
+    // WHY A WATERMARK, not a reset-to-empty: the recv arena is SHARED across
+    // every socket fold in a process, and a chunk can ESCAPE its producing fold —
+    // returned in the accumulator, or a bare `Socket.recv` held in an enclosing
+    // frame — outliving the loop that created it. `reset(.retain_capacity)` frees
+    // the whole arena AND reallocates (MOVES) the oldest backing node, so a LATER
+    // loopified fold's back-edge reset of the shared arena would free/move that
+    // escaped chunk out from under its holder: a cross-fold UAF the per-loop alias
+    // probe (which sees only the CURRENT loop's carried slots) is blind to.
+    // `resetToMark` instead recycles only the nodes allocated ABOVE the loop's
+    // entry watermark, keeping the mark node and everything below it BYTE-STABLE —
+    // an escaped chunk lives at or below this loop's mark, so it is never touched.
+    // Nesting composes by construction: an inner fold's mark sits ABOVE an outer
+    // fold's in-flight chunk, so the inner reset cannot free it; the outer reset
+    // (after the inner finishes) reclaims the dead inner nodes.
     //
     // Soundness (no UAF): the previous chunk `bytes` is DEAD at the back-edge
-    // (the `tail_call` threads `continued`/`acc'`, not `bytes`), so freeing the
-    // arena is safe UNLESS a loop-carried value aliases it. The probe suppresses
-    // the reset whenever ANY reachable `[]const u8` in a loop-carried value lies
-    // in the arena, and conservatively suppresses whenever a loop-carried value
-    // is a heap aggregate the shallow probe cannot enumerate (a List/Map header,
-    // a tagged union). A recv chunk's bytes are reachable, in Zap's type system,
-    // ONLY through a `[]const u8` String slice, so probing every reachable slice
-    // (plus suppress-on-unknown) covers every alias. Over-suppression is a missed
-    // reclamation (memory grows for a program that genuinely retains chunks),
-    // never a UAF. The `acc <> bytes` concat lands in the STRING arena
-    // (`String.concat`), never the recv arena, so it correctly resets.
+    // (the `tail_call` threads `continued`/`acc'`, not `bytes`), so recycling the
+    // above-mark nodes is safe UNLESS a loop-carried value aliases above-mark
+    // memory. The probe suppresses the reset whenever ANY reachable `[]const u8`
+    // in a loop-carried value lies ABOVE the mark, and conservatively suppresses
+    // whenever a loop-carried value is a heap aggregate the shallow probe cannot
+    // enumerate (a List/Map header, a tagged union). A recv chunk's bytes are
+    // reachable, in Zap's type system, ONLY through a `[]const u8` String slice,
+    // so probing every reachable slice (plus suppress-on-unknown) covers every
+    // alias. A below-mark alias must NOT suppress (it is byte-stable across the
+    // reset, and suppressing on it would forfeit the DoS bound for a fold that
+    // carries an escaped chunk). Over-suppression is a missed reclamation (memory
+    // grows for a program that genuinely retains this-loop chunks), never a UAF.
+    // The `acc <> bytes` concat lands in the STRING arena (`String.concat`), never
+    // the recv arena, so it correctly resets.
     //
-    // Cost: the arena pointer is loop-INVARIANT (a fiber runs its whole loop as
-    // one process; the PCB is address-pinned), so it is resolved ONCE in the
-    // loop preheader (`recvArenaSeedPtr`) and the back-edge pays, for a loop
-    // whose process never touched a socket, a single `used_list == null` load +
-    // not-taken branch (`recvArenaResetIfUnaliased`). The per-slot probes fold to
-    // comptime-nothing for scalar loop-carried values. Gate OFF: nothing emitted.
+    // Cost: the arena pointer AND the watermark are loop-INVARIANT (gate-ON a
+    // fiber runs its whole loop as one process and the PCB is address-pinned;
+    // gate-OFF the global is fixed; alloc never frees/moves existing nodes, so the
+    // mark node stays valid across an off-core parking recv), so both are resolved
+    // ONCE in the loop preheader (`recvArenaSeedPtr` + `recvArenaMarkNode`/
+    // `recvArenaMarkEnd`) and the back-edge pays, for a loop whose program never
+    // received, a single `used_list == null` load + not-taken branch
+    // (`recvArenaResetIfUnaliased`). The per-slot probes fold to comptime-nothing
+    // for scalar loop-carried values. Non-socket programs are behaviorally
+    // unaffected (the arena stays empty → an empty watermark → the reset is always
+    // a no-op, identical to the prior reset-to-empty).
     // -----------------------------------------------------------------------
 
-    /// Resolve the calling process's recv-arena pointer ONCE, in a loopified
-    /// loop's preheader. The pointer is loop-invariant (see the section doc), so
-    /// the back-edge reuses it without a per-iteration current-process lookup.
-    /// `null` off a process quantum (the back-edge gate then no-ops).
+    /// Resolve the recv-arena pointer ONCE, in a loopified loop's preheader. The
+    /// pointer is loop-invariant (see the section doc), so the back-edge reuses
+    /// it without a per-iteration lookup. GATE-ON it is the calling process's
+    /// private PCB recv arena (`null` off a process quantum — the back-edge gate
+    /// then no-ops). GATE-OFF it is the module-global `gate_off_recv_arena` (the
+    /// single-thread inline-socket domain has no PCB): the back-edge gate resets
+    /// THAT arena to bound a streaming gate-OFF socket fold's recv memory (the
+    /// HIGH-4 DoS is identical gate-OFF). A loop whose program never received
+    /// self-gates to a no-op via the arena's empty `used_list`.
     pub inline fn recvArenaSeedPtr() ?*anyopaque {
-        if (comptime !runtime_concurrency_active) return null;
+        if (comptime !runtime_concurrency_active) return @ptrCast(&gate_off_recv_arena);
         return ZapConcurrencyKernel.zap_socket_current_recv_arena();
     }
 
-    /// Whether `addr` lies within the recv arena's live backing buffers. Fast
-    /// self-gate first: an arena that never allocated (every non-socket loop)
-    /// owns nothing, answered by one `used_list`/`free_list` load.
-    inline fn recvArenaOwnsPtr(arena_opaque: ?*anyopaque, addr: usize) bool {
+    /// Capture the recv arena's high-water WATERMARK node in a loopified loop's
+    /// preheader (loop-INVARIANT, resolved once on loop ENTRY). Paired with
+    /// `recvArenaMarkEnd`, the two scalar refs reconstitute an
+    /// `ArenaAllocator.Mark` (`markFromParts`) that scopes the back-edge reset to
+    /// memory allocated ABOVE loop entry — so a recv chunk that escaped an EARLIER
+    /// fold (returned in an accumulator, or a bare `Socket.recv` held in an
+    /// enclosing frame) sits at or below this mark and is NEVER freed/moved by a
+    /// LATER loopified socket fold's reset of the SHARED arena. `null` arena (off a
+    /// process quantum, or a non-socket loop) → `null` node (an empty mark, which
+    /// degenerates the reset to today's reset-to-empty). See `recvArenaMarkEnd`,
+    /// `recvArenaResetIfUnaliased`, and the section doc.
+    pub inline fn recvArenaMarkNode(arena_opaque: ?*anyopaque) ?*anyopaque {
+        const opaque_ptr = arena_opaque orelse return null;
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(opaque_ptr));
+        return @ptrCast(arena.mark().node);
+    }
+
+    /// Capture the `end_index` half of the recv arena's loop-entry WATERMARK (see
+    /// `recvArenaMarkNode`). Loop-invariant, resolved once in the preheader. `0`
+    /// for a `null`/empty arena. The mark node's high-water offset is what
+    /// `resetToMark` restores, reclaiming only the this-loop tail bump-allocated
+    /// from the mark node while keeping the pre-loop region (where an escaped
+    /// chunk may live) byte-stable.
+    pub inline fn recvArenaMarkEnd(arena_opaque: ?*anyopaque) usize {
+        const opaque_ptr = arena_opaque orelse return 0;
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(opaque_ptr));
+        return arena.mark().end_index;
+    }
+
+    /// Whether `addr` lies in recv-arena memory allocated ABOVE the loop-entry
+    /// mark — the region the back-edge `resetToMark` would recycle. Only such a
+    /// pin must suppress the reset; a pin at or BELOW the mark (an escaped chunk
+    /// from an enclosing/earlier frame) is left byte-stable by `resetToMark`, so
+    /// it must NOT suppress (else a `Socket.fold` retaining an escaped chunk would
+    /// forfeit the DoS bound). Fast self-gate first: an arena that never allocated
+    /// (every non-socket loop) owns nothing, answered by one `used_list`/
+    /// `free_list` load. Empty mark (`mark_node == null`) → whole-arena `ownsPtr`,
+    /// so the tested-good empty-at-entry cases behave EXACTLY as before the
+    /// watermark.
+    inline fn recvArenaOwnsPtrAboveMark(arena_opaque: ?*anyopaque, mark_node: ?*anyopaque, mark_end: usize, addr: usize) bool {
         const opaque_ptr = arena_opaque orelse return false;
         const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(opaque_ptr));
         if (arena.state.used_list == null and arena.state.free_list == null) return false;
-        return arena.ownsPtr(addr);
+        return arena.ownsPtrAboveMark(std.heap.ArenaAllocator.markFromParts(mark_node, mark_end), addr);
     }
 
     /// Whether `T` is a pointer-free SCALAR leaf: a value of `T` cannot itself be
@@ -17608,7 +17708,7 @@ pub const Kernel = struct {
     /// (scalars, structs/tuples, arrays, optionals, byte/scalar slices);
     /// conservatively suppresses for shapes it cannot enumerate (heap-pointer
     /// aggregates, tagged unions, opaques).
-    fn recvArenaValueAliases(arena_opaque: ?*anyopaque, value: anytype) bool {
+    fn recvArenaValueAliases(arena_opaque: ?*anyopaque, mark_node: ?*anyopaque, mark_end: usize, value: anytype) bool {
         const T = @TypeOf(value);
         return switch (@typeInfo(T)) {
             // Pointer-free leaves: a recv chunk is referenced only through a
@@ -17622,7 +17722,7 @@ pub const Kernel = struct {
                 // exhaustive. A non-scalar-element slice (`[]const String`, …) can
                 // hold pins the probe cannot enumerate per element → suppress.
                 .slice => if (comptime typeIsScalarLeaf(p.child))
-                    recvArenaOwnsPtr(arena_opaque, @intFromPtr(value.ptr))
+                    recvArenaOwnsPtrAboveMark(arena_opaque, mark_node, mark_end, @intFromPtr(value.ptr))
                 else
                     true,
                 // A single/many/c pointer. A scalar pointee (`*i64`, `[*]const u8`)
@@ -17633,7 +17733,7 @@ pub const Kernel = struct {
                 // arena bytes through runtime structure the shallow probe cannot
                 // follow, so conservatively suppress.
                 else => if (comptime typeIsScalarLeaf(p.child))
-                    recvArenaOwnsPtr(arena_opaque, @intFromPtr(value))
+                    recvArenaOwnsPtrAboveMark(arena_opaque, mark_node, mark_end, @intFromPtr(value))
                 else
                     true,
             },
@@ -17643,17 +17743,17 @@ pub const Kernel = struct {
             // field does).
             .@"struct" => |s| blk: {
                 inline for (s.fields) |field| {
-                    if (recvArenaValueAliases(arena_opaque, @field(value, field.name))) break :blk true;
+                    if (recvArenaValueAliases(arena_opaque, mark_node, mark_end, @field(value, field.name))) break :blk true;
                 }
                 break :blk false;
             },
             .array => blk: {
                 inline for (value) |elem| {
-                    if (recvArenaValueAliases(arena_opaque, elem)) break :blk true;
+                    if (recvArenaValueAliases(arena_opaque, mark_node, mark_end, elem)) break :blk true;
                 }
                 break :blk false;
             },
-            .optional => if (value) |present| recvArenaValueAliases(arena_opaque, present) else false,
+            .optional => if (value) |present| recvArenaValueAliases(arena_opaque, mark_node, mark_end, present) else false,
 
             // A tagged union: reading an inactive field is UB and some variant
             // may carry a String, so suppress. Anything else the probe cannot
@@ -17666,24 +17766,31 @@ pub const Kernel = struct {
     /// arena`. Threaded across the loop-carried slots (`prev` starts `false`),
     /// short-circuiting once any slot aliases. Folds to comptime-`prev` for a
     /// scalar `value`, so an all-scalar loop's per-slot probes vanish.
-    pub inline fn recvGateStep(arena_opaque: ?*anyopaque, prev: bool, value: anytype) bool {
-        if (comptime !runtime_concurrency_active) return prev;
+    pub inline fn recvGateStep(arena_opaque: ?*anyopaque, mark_node: ?*anyopaque, mark_end: usize, prev: bool, value: anytype) bool {
         if (prev) return true;
-        return recvArenaValueAliases(arena_opaque, value);
+        return recvArenaValueAliases(arena_opaque, mark_node, mark_end, value);
     }
 
-    /// Reset the recv arena to O(chunk) at a loopified loop's back-edge UNLESS a
-    /// loop-carried value aliases it (`aliased`, computed by `recvGateStep`). The
+    /// Reset the recv arena back to its loop-entry WATERMARK at a loopified loop's
+    /// back-edge UNLESS a loop-carried value aliases ABOVE-mark memory (`aliased`,
+    /// computed by `recvGateStep`). `resetToMark` recycles only the nodes
+    /// allocated during this loop (above the mark) onto the free list and restores
+    /// the mark node's high-water — keeping the mark node and everything BELOW it
+    /// byte-stable, so a recv chunk that escaped an enclosing/earlier frame (at or
+    /// below the mark) is never freed/MOVED (the use-after-free
+    /// `.retain_capacity`'s oldest-node realloc caused). Recycled capacity is
+    /// reused by the next `alloc`, so a streaming fold's RSS stays FLAT. The
     /// self-gate — `used_list == null`, one load + not-taken branch — makes every
-    /// loop whose process never received pay essentially nothing. `.retain_capacity`
-    /// reuses the backing buffer, so a streaming fold's RSS stays FLAT.
-    pub inline fn recvArenaResetIfUnaliased(arena_opaque: ?*anyopaque, aliased: bool) void {
-        if (comptime !runtime_concurrency_active) return;
+    /// loop whose process never received pay essentially nothing. An empty mark
+    /// (`mark_node == null`, arena empty at loop entry) degenerates `resetToMark`
+    /// to a reset-to-empty that retains all capacity on the free list — identical,
+    /// for RSS, to the prior `.retain_capacity`.
+    pub inline fn recvArenaResetIfUnaliased(arena_opaque: ?*anyopaque, mark_node: ?*anyopaque, mark_end: usize, aliased: bool) void {
         if (aliased) return;
         const opaque_ptr = arena_opaque orelse return;
         const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(opaque_ptr));
         if (arena.state.used_list == null) return;
-        _ = arena.reset(.retain_capacity);
+        arena.resetToMark(std.heap.ArenaAllocator.markFromParts(mark_node, mark_end));
     }
 
     /// Generic string conversion used by string interpolation. Strings
