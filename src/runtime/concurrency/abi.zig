@@ -853,6 +853,22 @@ fn readBlockingPoolOptions() concurrency.BlockingPool.Options {
     return options;
 }
 
+/// Read `ZAP_RESOLVER_MAX_THREADS` — the runtime knob for the DEDICATED
+/// DNS-resolver pool's grow ceiling (the Decision-C isolation fix: hostname
+/// resolves offload here, SEPARATE from the I/O pool, so `getaddrinfo` can only
+/// pin resolver threads). Absent or unparseable keeps the default (16). Clamped
+/// to at least 1.
+fn readResolverPoolOptions() concurrency.ResolverPool.Options {
+    var options = concurrency.ResolverPool.Options{};
+    if (std.c.getenv("ZAP_RESOLVER_MAX_THREADS")) |raw| {
+        const text = std.mem.sliceTo(raw, 0);
+        if (std.fmt.parseInt(usize, text, 10)) |parsed| {
+            options.max_thread_count = @max(parsed, 1);
+        } else |_| {}
+    }
+    return options;
+}
+
 /// Read `ZAP_DEADLOCK_ACTION` — what the pool does after DETECTING a
 /// system deadlock (P6-J6, plan item 6.5): `continue` (the default —
 /// report once to stderr and stay parked, BEAM-compatible-plus-diagnostic),
@@ -1012,6 +1028,9 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
                 // Phase S0: the socket layer's blocking offloads run on this
                 // pool; `ZAP_BLOCKING_MAX_THREADS` tunes its ceiling.
                 .blocking_pool_options = readBlockingPoolOptions(),
+                // The dedicated DNS-resolver pool (isolation fix);
+                // `ZAP_RESOLVER_MAX_THREADS` tunes its ceiling.
+                .resolver_pool_options = readResolverPoolOptions(),
             },
         ) catch {
             runtime_state.socket_domain.deinit();
@@ -1074,6 +1093,60 @@ fn runtimeInitSeededForTest(seed: u64, core_count: usize) i32 {
         return ZapProcStatus.out_of_memory;
     };
     runtime_state.backend = .{ .seeded_simulator = simulator };
+    runtime_initialized = true;
+    return ZapProcStatus.ok;
+}
+
+/// Test-only: initialize the runtime with the PRODUCTION M:N pool backend
+/// DIRECTLY with caller-supplied `SchedulerPool.Options` (no env vars) — the
+/// seam the two-stage `connect_host` DoS-isolation / deadline / abandon tests
+/// drive, so they can size the resolver + blocking pools small AND inject a
+/// deterministic stub resolve (no live network). Mirrors the production branch
+/// of `zap_proc_runtime_init`, wiring the shared kernel structures identically;
+/// the caller's `core_options` signal/registry/blob fields are overwritten with
+/// the runtime's own (they are runtime-owned).
+fn runtimeInitProductionForTest(pool_options: concurrency.SchedulerPool.Options) i32 {
+    if (runtime_initialized) return ZapProcStatus.already_initialized;
+    runtime_state.ledger = .{};
+    runtime_state.manager_registry = @splat(null);
+    runtime_state.pid_table = concurrency.PidTable.init(backing_allocator, .{}) catch
+        return ZapProcStatus.out_of_memory;
+    runtime_state.envelope_pool = concurrency.EnvelopePool.init(backing_allocator, .{});
+    installSignalRuntime();
+    runtime_state.registry = concurrency.ProcessRegistry.init(backing_allocator, .{}) catch {
+        runtime_state.signal_runtime.deinit();
+        runtime_state.envelope_pool.deinit();
+        runtime_state.pid_table.deinit();
+        return ZapProcStatus.out_of_memory;
+    };
+    runtime_state.blob_domain = concurrency.BlobDomain.init() catch {
+        runtime_state.registry.deinit();
+        runtime_state.signal_runtime.deinit();
+        runtime_state.envelope_pool.deinit();
+        runtime_state.pid_table.deinit();
+        return ZapProcStatus.out_of_memory;
+    };
+    runtime_state.socket_domain = concurrency.SocketDomain.init();
+    var options = pool_options;
+    options.core_options.signal_runtime = &runtime_state.signal_runtime;
+    options.core_options.registry = &runtime_state.registry;
+    options.core_options.blob_domain = &runtime_state.blob_domain;
+    runtime_state.backend = .{ .production_pool = undefined };
+    concurrency.SchedulerPool.init(
+        &runtime_state.backend.production_pool,
+        backing_allocator,
+        &runtime_state.pid_table,
+        &runtime_state.envelope_pool,
+        options,
+    ) catch {
+        runtime_state.socket_domain.deinit();
+        runtime_state.blob_domain.deinit();
+        runtime_state.registry.deinit();
+        runtime_state.signal_runtime.deinit();
+        runtime_state.envelope_pool.deinit();
+        runtime_state.pid_table.deinit();
+        return ZapProcStatus.out_of_memory;
+    };
     runtime_initialized = true;
     return ZapProcStatus.ok;
 }
@@ -2264,6 +2337,22 @@ fn socketConnectBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c)
 /// closes THIS process's sockets — never a sibling that reused a slot).
 fn socketSweepDestructor(node: *process_module.DropListNode) void {
     const pcb: *process_module.ProcessControlBlock = @fieldParentPtr("socket_sweep_node", node);
+    // An IN-FLIGHT Stage-1 DNS resolve (the process was killed while parked in
+    // `.waiting_for_resolve_deadline`) is reclaimed FIRST: ABANDON the resolver
+    // slab slot — mark it (so a worker still in `getaddrinfo` discards its
+    // result), drop the fiber's slab reference (the worker frees the slot when
+    // it finishes), and clear the slot so a later run cannot double-abandon it.
+    // A resolve produces NO fd (Stage 2 does), so this adds no fd-lifecycle
+    // surface — it only returns the slab slot to the free-list, the ONLY
+    // reclamation path for a resolve a kill skipped the continuation of. The
+    // normal path clears `pending_resolve` on completion/timeout, so the sweep
+    // finds nothing there.
+    if (pcb.pending_resolve) |raw_slot| {
+        if (productionResolverPool()) |resolver_pool| {
+            resolver_pool.abandon(@ptrCast(@alignCast(raw_slot)));
+        }
+        pcb.pending_resolve = null;
+    }
     // HIGH-1: an fd produced by an in-flight connect/accept offload but NOT yet
     // promoted into the domain+ledger (a kill skipped the fiber continuation)
     // is parked in `socket_pending_fd`. Close it here — the ONLY reclamation
@@ -2358,31 +2447,66 @@ export fn zap_socket_connect(
     return handle.toBits();
 }
 
-/// The blocking-pool request for an offloaded hostname connect + RFC 8305
-/// Happy Eyeballs race — the multi-address analogue of `SocketConnectRequest`.
-/// The resolve + interleave + racing all run on the pool thread inside
-/// `socket_io.connectHost`; ONLY the winner fd rides back in `outcome` and is
-/// parked in `pending_fd_slot`. `host` points at the caller's `String` bytes,
-/// valid for the whole offload because the owning fiber is parked (its heap is
-/// pinned), exactly like the `bytes` slice `zap_socket_send` threads through.
+/// The dedicated DNS-resolver pool for the running backend, or null — the
+/// seeded simulator (single-threaded, no thread pools) has none. Returns the
+/// pool POINTER regardless of `isLive()`; callers gate on liveness themselves
+/// (`connect_host` degrades when not live, the sweep just drops a slab ref
+/// which works on any pool). Reached through `runtime_state` exactly as the
+/// socket domain is (a socket-layer concern, not a `Scheduler.Options` seam).
+fn productionResolverPool() ?*concurrency.ResolverPool {
+    return switch (runtime_state.backend) {
+        .production_pool => |*pool| pool.resolverPool(),
+        .seeded_simulator => null,
+    };
+}
+
+/// Whether the two-stage (resolver-isolated) hostname connect is available on
+/// this target: posix only (Stage 2 is the poll-quantum race). The poll-less
+/// targets keep the single-offload `connectHost` path.
+const two_stage_connect_supported = builtin.os.tag != .windows and builtin.os.tag != .wasi;
+
+/// STAGE 2's blocking request: race an already-resolved address batch on the
+/// I/O (blocking) pool. The resolve is NO LONGER coupled to this — the addresses
+/// were produced off a resolver thread in Stage 1, so a resolve storm can never
+/// pin one of THESE (I/O) threads. Otherwise identical to `zap_socket_connect`'s
+/// single-address offload: ONLY the winner fd rides back and is parked in
+/// `pending_fd_slot`; every loser fd was closed on this pool thread.
+const SocketRaceRequest = struct {
+    addresses: [concurrency.socket_io.max_addresses]concurrency.socket_io.IpAddress,
+    count: usize,
+    /// The REMAINING budget after Stage 1's resolve consumed part of the
+    /// caller's absolute deadline (relative ms; 0 = no deadline).
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    pending_fd_slot: *concurrency.socket_io.Fd,
+    outcome: concurrency.socket_io.ConnectOutcome,
+};
+
+fn socketRaceBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketRaceRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.raceConnectAddresses(
+        request.addresses[0..request.count],
+        request.timeout_ms,
+        request.kill_flag,
+    );
+    if (request.outcome.reason == .ok) request.pending_fd_slot.* = request.outcome.fd;
+    return null;
+}
+
+/// The INLINE (single-offload) hostname connect — today's behavior: resolve +
+/// race run TOGETHER on one blocking-pool offload through `connectHost`. Used
+/// as the R4 DEGRADE path when the resolver pool is unavailable (seeded
+/// simulator, standalone, spawn-OOM, or a poll-less target): correctness holds,
+/// only the DNS↔I/O isolation is lost in that degenerate case.
 const SocketConnectManyRequest = struct {
     host: []const u8,
     port: u16,
     timeout_ms: i64,
     kill_flag: ?*std.atomic.Value(bool),
-    /// The teardown-visible pending-fd slot (HIGH-1); see
-    /// `SocketConnectRequest.pending_fd_slot`.
     pending_fd_slot: *concurrency.socket_io.Fd,
     outcome: concurrency.socket_io.ConnectOutcome,
 };
 
-/// The blocking trampoline for the hostname connect: runs the WHOLE state
-/// machine (resolve → interleave → cap → race) off-core through `connectHost`.
-/// The poll-quantum racing driver observes `kill_flag` each quantum so a slow
-/// race yields promptly; the resolve step is the uninterruptible-`getaddrinfo`
-/// residual documented on `connectHost`. Every LOSER fd was already closed on
-/// this pool thread by the loser-cleanup guarantee, so only a live winner can
-/// be parked in the pending slot before re-attach.
 fn socketConnectManyBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
     const request: *SocketConnectManyRequest = @ptrCast(@alignCast(operation_argument.?));
     request.outcome = concurrency.socket_io.connectHost(request.host, request.port, request.timeout_ms, request.kill_flag);
@@ -2390,13 +2514,139 @@ fn socketConnectManyBlockingTrampoline(operation_argument: ?*anyopaque) callconv
     return null;
 }
 
-/// Connect to `host_ptr[0..host_len]:port` with Happy Eyeballs, offloading the
-/// whole resolve+race onto the blocking pool (Decision D) — a copy of
-/// `zap_socket_connect`'s domain/ledger/sweep integration over the single
-/// winner fd. Returns the new socket handle bits on success (a live handle is
-/// never `0`); on failure returns `0` with the reason recorded in the process
-/// socket last-error. The single Pass-2a `pending_fd_slot` holds ONLY the
-/// winner, so ≤ 1 fd is ever outside the stack-scoped loser cleanup.
+fn connectHostInline(
+    context: *concurrency.ProcessContext,
+    host: []const u8,
+    port: u16,
+    timeout_ms: i64,
+) u64 {
+    var request = SocketConnectManyRequest{
+        .host = host,
+        .port = port,
+        .timeout_ms = timeout_ms,
+        .kill_flag = context.pendingKillFlag(),
+        .pending_fd_slot = context.socketPendingFdSlot(),
+        .outcome = undefined,
+    };
+    _ = context.blocking(socketConnectManyBlockingTrampoline, &request);
+    if (request.outcome.reason != .ok) return socketConnectFailed(context, request.outcome.reason);
+    request.pending_fd_slot.* = concurrency.socket_table.no_pending_socket_fd;
+    return promoteConnectedFd(context, request.outcome.fd);
+}
+
+/// Promote a just-connected winner fd into the socket domain + the caller's
+/// ledger, returning the handle bits (never `0`) — the shared tail of every
+/// connect path. The pending-fd slot MUST already be cleared by the caller.
+fn promoteConnectedFd(context: *concurrency.ProcessContext, fd: concurrency.socket_io.Fd) u64 {
+    const handle = runtime_state.socket_domain.open(
+        fd,
+        context.selfPid().toBits(),
+        0,
+        .plain,
+    ) catch {
+        concurrency.socket_io.closeFd(fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.socketLedger().append(handle.toBits()) catch {
+        if (runtime_state.socket_domain.close(handle)) |slot_fd| concurrency.socket_io.closeFd(slot_fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    return handle.toBits();
+}
+
+/// The TWO-STAGE hostname connect (the DoS root fix): Stage 1 resolves on the
+/// dedicated resolver pool while the fiber parks ON-CORE with the caller's
+/// deadline (`resolveWaitDeadline`), then Stage 2 races the resolved addresses
+/// on the I/O pool. `getaddrinfo` can only ever pin a resolver thread, so a
+/// resolve storm never starves `recv`/`send`.
+fn connectHostTwoStage(
+    context: *concurrency.ProcessContext,
+    resolver_pool: *concurrency.ResolverPool,
+    host: []const u8,
+    port: u16,
+    timeout_ms: i64,
+) u64 {
+    // Reject an over-long name on-core (the resolver re-validates syntax): it
+    // never fits the fixed slot buffer, so it is a prompt typed failure.
+    if (host.len > concurrency.resolver_pool.host_max_len) return socketConnectFailed(context, .invalid_argument);
+
+    // ONE absolute deadline (scheduler-clock ns) spans Stage 1 (the timed park)
+    // and Stage 2 (the remaining budget). `timeout_ms == 0` → null (no timeout:
+    // an indefinite no-timer park).
+    const deadline_nanoseconds: ?u64 = if (timeout_ms > 0) blk: {
+        const timeout_ns = @as(u64, @intCast(timeout_ms)) *| std.time.ns_per_ms;
+        break :blk context.schedulerNowNanoseconds() +| timeout_ns;
+    } else null;
+
+    // Acquire a slab slot — a full slab REJECTS (bounded backpressure): the
+    // caller gets `:etimedout`, and the storm grows nothing (in-flight ≤ cap,
+    // outstanding ≤ slab).
+    const slot = resolver_pool.acquire() orelse return socketConnectFailed(context, .timed_out);
+    concurrency.ResolverPool.fillHost(slot, host, port);
+    slot.waiter_record = context.record;
+    // Publish the slot into the teardown-visible pending-resolve slot BEFORE
+    // submit (mirror `socket_pending_fd`): a kill during the Stage-1 park runs
+    // the socket-sweep, which abandons the still-in-flight resolve.
+    context.resolvePendingSlot(slot);
+    // Plain enqueue + worker wake (NOT a fiber evacuation — the fiber keeps its
+    // PCB and parks on-core).
+    resolver_pool.submit(slot);
+
+    switch (context.resolveWaitDeadline(&slot.completed, deadline_nanoseconds)) {
+        .completed => {
+            // Snapshot the result off the slab slot while we still hold the fiber
+            // ref, then clear the pending slot and drop the ref. Straight-line
+            // on-core (no safepoint), so no kill interposes between clear+drop.
+            const resolve_reason = slot.result.reason;
+            const resolve_count = slot.result.count;
+            var addresses: [concurrency.socket_io.max_addresses]concurrency.socket_io.IpAddress = undefined;
+            if (resolve_count > 0) @memcpy(addresses[0..resolve_count], slot.result.addresses[0..resolve_count]);
+            context.resolvePendingSlot(null);
+            resolver_pool.releaseCompleted(slot);
+
+            if (resolve_reason != .ok) return socketConnectFailed(context, resolve_reason);
+            if (resolve_count == 0) return socketConnectFailed(context, .unknown_host);
+
+            // Stage 2's REMAINING budget (relative ms — Stage 2's poll loop uses
+            // its own posix monotonic clock, so an absolute deadline cannot
+            // cross; a fully-consumed deadline is a prompt timeout).
+            var stage2_timeout_ms: i64 = 0;
+            if (deadline_nanoseconds) |deadline| {
+                const now_nanoseconds = context.schedulerNowNanoseconds();
+                if (now_nanoseconds >= deadline) return socketConnectFailed(context, .timed_out);
+                stage2_timeout_ms = @intCast(@max((deadline - now_nanoseconds) / std.time.ns_per_ms, 1));
+            }
+
+            var race = SocketRaceRequest{
+                .addresses = addresses,
+                .count = resolve_count,
+                .timeout_ms = stage2_timeout_ms,
+                .kill_flag = context.pendingKillFlag(),
+                .pending_fd_slot = context.socketPendingFdSlot(),
+                .outcome = undefined,
+            };
+            _ = context.blocking(socketRaceBlockingTrampoline, &race);
+            if (race.outcome.reason != .ok) return socketConnectFailed(context, race.outcome.reason);
+            race.pending_fd_slot.* = concurrency.socket_table.no_pending_socket_fd;
+            return promoteConnectedFd(context, race.outcome.fd);
+        },
+        .timed_out => {
+            // Deadline elapsed with the resolve still in flight: ABANDON (mark,
+            // clear the pending slot, drop the fiber ref → the worker frees the
+            // slot when it finishes) and report `:etimedout`. No fd is produced
+            // by a resolve, so nothing else leaks.
+            context.resolvePendingSlot(null);
+            resolver_pool.abandon(slot);
+            return socketConnectFailed(context, .timed_out);
+        },
+    }
+}
+
+/// Connect to `host_ptr[0..host_len]:port` with RFC-8305 Happy Eyeballs.
+/// Two-stage (resolver-isolated) when the dedicated resolver pool is live and
+/// the target is posix; otherwise the inline single-offload degrade. Returns the
+/// new socket handle bits on success (a live handle is never `0`); on failure
+/// returns `0` with the reason in the process socket last-error.
 export fn zap_socket_connect_host(
     process: *anyopaque,
     host_ptr: [*]const u8,
@@ -2405,43 +2655,22 @@ export fn zap_socket_connect_host(
     timeout_ms: i64,
 ) callconv(.c) u64 {
     const context = contextFromHandle(process);
-    var request = SocketConnectManyRequest{
-        .host = host_ptr[0..host_len],
-        .port = port,
-        .timeout_ms = timeout_ms,
-        // Capture the process's `pending_kill` on-core so the racing driver
-        // stays kill-responsive off-core (HIGH-2).
-        .kill_flag = context.pendingKillFlag(),
-        // Capture the teardown-visible pending-fd slot on-core (HIGH-1): the
-        // pool thread records the winner fd here so a kill that skips the
-        // continuation below still reclaims it via the socket-sweep.
-        .pending_fd_slot = context.socketPendingFdSlot(),
-        .outcome = undefined,
-    };
-    // Register the socket-sweep drop-node BEFORE the offload (HIGH-1), exactly
-    // as `zap_socket_connect` does — a kill during the race must find the sweep
-    // node already on the drop-list to reclaim the parked winner.
+    const host = host_ptr[0..host_len];
+    // Register the socket-sweep drop-node BEFORE any offload/park (HIGH-1 + the
+    // resolve-abandon seam): a kill during Stage 1's park OR Stage 2's race must
+    // find the sweep node on the drop-list to reclaim the parked slot/fd.
     context.ensureSocketSweep(socketSweepDestructor);
-    _ = context.blocking(socketConnectManyBlockingTrampoline, &request);
-    if (request.outcome.reason != .ok) return socketConnectFailed(context, request.outcome.reason);
 
-    // Promotion (the continuation a kill teardown skips): clear the pending slot
-    // FIRST so the winner fd is not double-closed once it lives in the ledger.
-    request.pending_fd_slot.* = concurrency.socket_table.no_pending_socket_fd;
-    const handle = runtime_state.socket_domain.open(
-        request.outcome.fd,
-        context.selfPid().toBits(),
-        0,
-        .plain,
-    ) catch {
-        concurrency.socket_io.closeFd(request.outcome.fd);
-        return socketConnectFailed(context, .out_of_memory);
-    };
-    context.socketLedger().append(handle.toBits()) catch {
-        if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
-        return socketConnectFailed(context, .out_of_memory);
-    };
-    return handle.toBits();
+    if (two_stage_connect_supported) {
+        if (productionResolverPool()) |resolver_pool| {
+            if (resolver_pool.isLive()) {
+                return connectHostTwoStage(context, resolver_pool, host, port, timeout_ms);
+            }
+        }
+    }
+    // R4 degrade: no live resolver pool (seeded sim / standalone / spawn-OOM) or
+    // a poll-less target → resolve + race together on one I/O offload.
+    return connectHostInline(context, host, port, timeout_ms);
 }
 
 /// Bind + listen an IPv4 stream socket on `ip0.ip1.ip2.ip3:port` (port 0 →
@@ -3809,6 +4038,278 @@ test "abi: repeated kill-during-offload cycles never accumulate fds (no fd-exhau
         if (cycle == 0) baseline = abiCountOpenFds();
         try testing.expectEqual(baseline, abiCountOpenFds());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Two-stage `connect_host` — the DNS-DoS isolation fix (`resolver_pool.zig`).
+// These drive the REAL gate-ON `zap_socket_connect_host` through the production
+// pool; a deterministic stub resolve (injected via `SchedulerPool.Options
+// .resolver_resolve`) stands in for a slow/black-hole `getaddrinfo` so the tests
+// need no live network.
+// ---------------------------------------------------------------------------
+
+fn abiNowMillis() i64 {
+    var now: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.c.clock_gettime(.MONOTONIC, &now);
+    return @as(i64, @intCast(now.sec)) * 1000 + @divTrunc(@as(i64, @intCast(now.nsec)), std.time.ns_per_ms);
+}
+
+/// Real (non-busy) sleep for a test stub resolve — a posix `nanosleep`, retried
+/// through EINTR so a signal does not cut the simulated resolve short.
+fn abiSleepNanoseconds(nanoseconds: u64) void {
+    var request: std.c.timespec = .{
+        .sec = @intCast(nanoseconds / std.time.ns_per_s),
+        .nsec = @intCast(nanoseconds % std.time.ns_per_s),
+    };
+    var remaining: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    while (std.c.nanosleep(&request, &remaining) != 0) : (request = remaining) {}
+}
+
+/// A deterministic stub resolve simulating a SLOW `getaddrinfo`: it sleeps
+/// `sleep_ns` (pinning ONLY its resolver thread), then writes a canned loopback
+/// address. Injected as `SchedulerPool.Options.resolver_resolve`.
+const StubSlowResolve = struct {
+    sleep_ns: u64,
+    ran_total: std.atomic.Value(u64) = .init(0),
+
+    fn resolve(resolve_context: ?*anyopaque, slot: *concurrency.ResolveRequest) void {
+        const self: *StubSlowResolve = @ptrCast(@alignCast(resolve_context.?));
+        _ = self.ran_total.fetchAdd(1, .monotonic);
+        abiSleepNanoseconds(self.sleep_ns);
+        slot.result.count = 1;
+        slot.result.reason = .ok;
+        slot.result.addresses[0] = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = slot.port } };
+    }
+};
+
+/// Shared host name for the storm attackers (syntactically valid; the stub
+/// resolve handles it, so no real DNS is consulted).
+const storm_host_name = "slow.black-hole.storm.test";
+
+const ResolveStormProbe = struct {
+    timed_out: std.atomic.Value(u64) = .init(0),
+    unexpected: std.atomic.Value(u64) = .init(0),
+    max_elapsed_ms: std.atomic.Value(i64) = .init(0),
+};
+
+/// One storm attacker: `connect_host` to the slow-resolving name with a SHORT
+/// timeout (`< sleep_ns`). It must return `:etimedout` at its deadline, NOT
+/// after the (much longer) resolve — and it must never have touched an I/O
+/// thread.
+fn resolveStormAttackerEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *ResolveStormProbe = @ptrCast(@alignCast(argument.?));
+    const start_ms = abiNowMillis();
+    const handle = zap_socket_connect_host(process, storm_host_name.ptr, storm_host_name.len, 9, 50);
+    const elapsed_ms = abiNowMillis() - start_ms;
+    var observed = probe.max_elapsed_ms.load(.monotonic);
+    while (elapsed_ms > observed) {
+        observed = probe.max_elapsed_ms.cmpxchgWeak(observed, elapsed_ms, .monotonic, .monotonic) orelse break;
+    }
+    if (handle == concurrency.SocketHandle.invalid.toBits()) {
+        if (zap_socket_last_error(process) == @intFromEnum(concurrency.socket_io.Reason.timed_out)) {
+            _ = probe.timed_out.fetchAdd(1, .monotonic);
+        } else {
+            _ = probe.unexpected.fetchAdd(1, .monotonic);
+        }
+    } else {
+        _ = probe.unexpected.fetchAdd(1, .monotonic);
+    }
+}
+
+const HealthyLoopbackProbe = struct {
+    connected: std.atomic.Value(usize) = .init(0),
+};
+
+/// A HEALTHY I/O operation running concurrently with the resolve storm: it
+/// listens on loopback and `connect`s (an IP connect — the I/O/blocking pool),
+/// which must succeed PROMPTLY because the storm only pins resolver threads.
+/// This is the "I/O NOT starved" leg of the DoS regression.
+fn healthyLoopbackEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *HealthyLoopbackProbe = @ptrCast(@alignCast(argument.?));
+    const listen_handle = zap_socket_listen(process, 127, 0, 0, 1, 0, 4);
+    if (listen_handle == concurrency.SocketHandle.invalid.toBits()) return;
+    const port_i64 = zap_socket_local_port(process, listen_handle);
+    if (port_i64 < 0) {
+        _ = zap_socket_close(process, listen_handle);
+        return;
+    }
+    const connect_handle = zap_socket_connect(process, 127, 0, 0, 1, @intCast(port_i64), 5000);
+    if (connect_handle != concurrency.SocketHandle.invalid.toBits()) {
+        probe.connected.store(1, .release);
+        _ = zap_socket_close(process, connect_handle);
+    }
+    _ = zap_socket_close(process, listen_handle);
+}
+
+test "abi: a resolve storm saturates ONLY resolver threads — I/O is not starved (the DNS-DoS regression)" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    // Small, known pool sizes: 2 resolver threads, 2 I/O threads. The stub
+    // resolve sleeps 400 ms; the attackers time out at 50 ms — a wide margin so
+    // the deadline reliably fires before the resolve could complete (otherwise a
+    // late-firing wheel would let the resolve win and the attacker would connect
+    // to the discard port instead of timing out).
+    var stub = StubSlowResolve{ .sleep_ns = 400 * std.time.ns_per_ms };
+    try testing.expectEqual(ZapProcStatus.ok, runtimeInitProductionForTest(.{
+        .scheduler_count = 2,
+        .blocking_pool_options = .{ .max_thread_count = 2 },
+        .resolver_pool_options = .{ .initial_thread_count = 1, .max_thread_count = 2, .slab_capacity = 64 },
+        .resolver_resolve = StubSlowResolve.resolve,
+        .resolver_resolve_context = &stub,
+    }));
+    var runtime_live = true;
+    defer if (runtime_live) zap_proc_runtime_deinit();
+    bindTestManager();
+
+    const attacker_count: usize = 6;
+    var storm = ResolveStormProbe{};
+    var i: usize = 0;
+    while (i < attacker_count) : (i += 1) {
+        try testing.expect(zap_proc_spawn(resolveStormAttackerEntry, &storm) != concurrency.Pid.invalid.toBits());
+    }
+    var healthy = HealthyLoopbackProbe{};
+    try testing.expect(zap_proc_spawn(healthyLoopbackEntry, &healthy) != concurrency.Pid.invalid.toBits());
+
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // The healthy loopback connect completed while the storm raged — I/O was
+    // NOT starved (on HEAD it would queue behind the storm on the shared pool).
+    try testing.expectEqual(@as(usize, 1), healthy.connected.load(.acquire));
+    // EVERY attacker got :etimedout at its ~50 ms deadline — NOT after the 400 ms
+    // resolve (the caller's timeout bounds the on-core wait, never the resolve).
+    try testing.expectEqual(@as(u64, attacker_count), storm.timed_out.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), storm.unexpected.load(.monotonic));
+    try testing.expect(storm.max_elapsed_ms.load(.monotonic) < 300); // beat the 400 ms resolve
+
+    switch (runtime_state.backend) {
+        .production_pool => |*pool| {
+            const resolver_stats = pool.resolverPoolStatistics();
+            const blocking_stats = pool.blockingPoolStatistics();
+            // The resolves ALL offloaded onto the resolver pool …
+            try testing.expectEqual(@as(u64, attacker_count), resolver_stats.submit_total);
+            // … and NONE of them touched the I/O pool: its only submit is the
+            // healthy IP connect (on HEAD the pool would see all 6 storms + 1).
+            try testing.expectEqual(@as(u64, 1), blocking_stats.submit_total);
+            try testing.expect(resolver_stats.reject_total == 0);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Deinit quiesces the still-sleeping resolver workers (draining every
+    // abandoned slot) and ASSERTS the slab is fully returned — leak-exactness.
+    zap_proc_runtime_deinit();
+    runtime_live = false;
+}
+
+const ConnectHostHappyProbe = struct {
+    connected: std.atomic.Value(usize) = .init(0),
+    resolver_used: std.atomic.Value(usize) = .init(0),
+};
+
+/// Happy path through the REAL resolver: listen on loopback, then
+/// `connect_host("localhost", port)` — the resolver pool resolves localhost and
+/// Stage 2 races the addresses, connecting to the live listener.
+fn connectHostLocalhostEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *ConnectHostHappyProbe = @ptrCast(@alignCast(argument.?));
+    const listen_handle = zap_socket_listen(process, 127, 0, 0, 1, 0, 4);
+    if (listen_handle == concurrency.SocketHandle.invalid.toBits()) return;
+    const port_i64 = zap_socket_local_port(process, listen_handle);
+    if (port_i64 >= 0) {
+        const host = "localhost";
+        const connect_handle = zap_socket_connect_host(process, host.ptr, host.len, @intCast(port_i64), 5000);
+        if (connect_handle != concurrency.SocketHandle.invalid.toBits()) {
+            probe.connected.store(1, .release);
+            _ = zap_socket_close(process, connect_handle);
+        }
+    }
+    _ = zap_socket_close(process, listen_handle);
+}
+
+test "abi: gate-ON connect_host resolves localhost through the resolver pool and connects (two-stage happy path)" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    // The REAL resolver (default `resolver_resolve`) — proves the end-to-end
+    // two-stage path, not a stub.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    var runtime_live = true;
+    defer if (runtime_live) zap_proc_runtime_deinit();
+    bindTestManager();
+    const live_baseline = runtime_state.socket_domain.statistics().live_socket_count;
+
+    var probe = ConnectHostHappyProbe{};
+    const connector_bits = zap_proc_spawn(connectHostLocalhostEntry, &probe);
+    try testing.expect(connector_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(connector_bits));
+
+    try testing.expectEqual(@as(usize, 1), probe.connected.load(.acquire));
+    switch (runtime_state.backend) {
+        .production_pool => |*pool| try testing.expect(pool.resolverPoolStatistics().submit_total >= 1),
+        else => return error.TestUnexpectedResult,
+    }
+    // Both sockets closed by the connector — leak-exact (no fd/handle residue).
+    try testing.expectEqual(live_baseline, runtime_state.socket_domain.statistics().live_socket_count);
+
+    zap_proc_runtime_deinit();
+    runtime_live = false;
+}
+
+/// Parks in Stage 1 forever (the stub resolve sleeps far longer than the test
+/// runs) with NO deadline, so the process is still parked in
+/// `.waiting_for_resolve_deadline`'s no-timer sibling when it is killed at
+/// teardown — the state the socket-sweep's `pending_resolve` abandon clause
+/// reclaims.
+fn connectHostParkForeverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const opened: *std.atomic.Value(usize) = @ptrCast(@alignCast(argument.?));
+    _ = opened.fetchAdd(1, .release);
+    // `timeout_ms = 0` → an indefinite resolve park; the stub never completes in
+    // the test window, so this call never returns (the process is killed parked).
+    _ = zap_socket_connect_host(process, storm_host_name.ptr, storm_host_name.len, 9, 0);
+    @panic("the parked resolve worker must never return (killed while parked)");
+}
+
+test "abi: a process killed while parked on a Stage-1 resolve abandons its slab slot (no leak)" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    // A stub that sleeps far longer (1 s) than the test's run window — the
+    // killed process's resolve is still in flight at teardown (the worker is
+    // drained at quiesce, so the test blocks there ~1 s; native code is never
+    // interrupted).
+    var stub = StubSlowResolve{ .sleep_ns = std.time.ns_per_s };
+    try testing.expectEqual(ZapProcStatus.ok, runtimeInitProductionForTest(.{
+        .blocking_pool_options = .{ .max_thread_count = 2 },
+        .resolver_pool_options = .{ .initial_thread_count = 1, .max_thread_count = 2, .slab_capacity = 32 },
+        .resolver_resolve = StubSlowResolve.resolve,
+        .resolver_resolve_context = &stub,
+    }));
+    var runtime_live = true;
+    defer if (runtime_live) zap_proc_runtime_deinit();
+    bindTestManager();
+
+    var opened = std.atomic.Value(usize).init(0);
+    const parker_bits = zap_proc_spawn(connectHostParkForeverEntry, &opened);
+    try testing.expect(parker_bits != concurrency.Pid.invalid.toBits());
+    const driver_bits = zap_proc_spawn(immediateExitEntry, null);
+    try testing.expect(driver_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(driver_bits));
+    try testing.expectEqual(@as(usize, 1), opened.load(.acquire));
+
+    // One resolve is outstanding (the parked process holds a slab slot; the
+    // worker is mid-sleep holding the other ref).
+    switch (runtime_state.backend) {
+        .production_pool => |*pool| {
+            const stats = pool.resolverPoolStatistics();
+            try testing.expectEqual(stats.slab_capacity - 1, stats.free_count);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Shutdown KILLS the parked process: the socket-sweep's `pending_resolve`
+    // clause abandons the slot (drops the fiber ref), the sleeping worker later
+    // drains and drops the last ref, and `resolver_pool.deinit`'s assert (slab
+    // fully returned) proves no slot leaked. (The 1 s sleep is drained at
+    // quiesce — the test blocks there; native code is never interrupted.)
+    zap_proc_runtime_deinit();
+    runtime_live = false;
 }
 
 test "abi: a killed process's live allocations are wholesale-freed at teardown (crash-teardown leak-exactness)" {

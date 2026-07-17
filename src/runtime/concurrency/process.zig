@@ -448,6 +448,19 @@ pub const ProcessControlBlock = struct {
     /// `socket_table.no_pending_socket_fd` (`-1`) when none. Owner/handoff-
     /// ordered like `socket_ledger`; never touched by two threads at once.
     socket_pending_fd: socket_table.Fd,
+    /// An IN-FLIGHT DNS-resolve slab slot (Stage 1 of the two-stage hostname
+    /// connect), held here for teardown-visible ABANDON — the resolver analogue
+    /// of `socket_pending_fd`. `connect_host` publishes the resolver-pool slot
+    /// pointer here on-core BEFORE it submits the resolve and parks
+    /// (`.waiting_for_resolve_deadline`); a kill of the parked process tears it
+    /// down WITHOUT resuming the continuation, so the socket-sweep destructor
+    /// reads this slot and abandons the resolve (marks it, drops the fiber's slab
+    /// reference, clears this) — bounded reclamation on every exit path. Unlike
+    /// `socket_pending_fd` a resolve produces NO fd, so there is no fd-lifecycle
+    /// surface here — only the slab-slot reference. Opaque (`*anyopaque`): the
+    /// slot type lives in `resolver_pool.zig`, which the socket bridge (not the
+    /// scheduler) owns; the bridge casts it back in the sweep. Null when none.
+    pending_resolve: ?*anyopaque,
     /// This process's PRIVATE arena for received-chunk bytes (the HIGH-4
     /// recv-lifetime fix). A `Socket.recv` chunk is a transient `String` the
     /// process reads off a socket; before this it copied into the process-
@@ -497,6 +510,7 @@ pub const ProcessControlBlock = struct {
         process.socket_sweep_node = .{ .destructor = unregisteredSocketSweepDestructor };
         process.socket_sweep_registered = false;
         process.socket_pending_fd = socket_table.no_pending_socket_fd;
+        process.pending_resolve = null;
         process.socket_recv_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     }
 

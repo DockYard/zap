@@ -397,6 +397,18 @@ fn restoreBlocking(handle: net.Socket.Handle) void {
 /// lookup queue is independently bounded at `dns_queue_capacity`.
 const max_connect_attempts: usize = 8;
 
+/// The connect-target address type, re-exported so the resolver pool
+/// (`resolver_pool.zig`) can carry resolved addresses across the two-stage
+/// hostname connect (Stage 1 resolve → Stage 2 race) without depending on the
+/// fork's `std.Io.net` namespace directly.
+pub const IpAddress = net.IpAddress;
+
+/// The maximum number of resolved addresses one hostname connect ever races
+/// (the RFC-8305 attempt cap, `max_connect_attempts`). The hard ceiling on how
+/// many sockets a single `connect_host` can ever open — re-exported so the
+/// resolver-pool slot sizes its address buffer to match.
+pub const max_addresses: usize = max_connect_attempts;
+
 /// The DNS result queue capacity. The fork guarantees `HostName.lookup` does
 /// not block with a queue of capacity ≥ 16; `HostName.connectMany` uses 32, so
 /// this matches — a second independent bound on how many records are retained.
@@ -458,6 +470,56 @@ pub fn connectHost(host: []const u8, port: u16, timeout_ms: i64, kill_flag: ?*st
         break :blk remaining;
     } else 0;
     return raceConnectPosix(addresses[0..attempt_count], race_timeout, kill_flag);
+}
+
+/// The resolved-address batch a Stage-1 resolve produces: up to
+/// `max_addresses` interleaved (RFC-8305) addresses plus the resolution
+/// `reason` (`.ok` when `count > 0`). Fixed-size (no allocation) so it lives
+/// entirely inside a resolver-pool slab slot.
+pub const ResolvedAddresses = struct {
+    addresses: [max_connect_attempts]net.IpAddress,
+    count: usize,
+    reason: Reason,
+};
+
+/// STAGE 1 of the two-stage hostname connect (`docs/socket-implementation-plan.md`,
+/// Decision-C isolation fix): validate `host` at the seam and resolve it to an
+/// interleaved address batch. This is the ONLY step that calls the
+/// uninterruptible `getaddrinfo`, so the resolver pool runs it on a DEDICATED
+/// resolver thread — a resolve can then only ever pin a resolver thread, never
+/// an I/O (blocking-pool) thread, severing the resolve↔I/O coupling that was the
+/// DoS. Produces NO fd (the race in Stage 2 does), so an abandoned resolve
+/// leaks nothing. Writes the outcome into `out` (never raises). `port` is folded
+/// into every resolved address so Stage 2 needs only the batch.
+pub fn resolveHost(host: []const u8, port: u16, out: *ResolvedAddresses) void {
+    out.count = 0;
+    // Validate the host name at the seam — an invalid name never reaches the
+    // resolver (SECURITY: no attacker-controlled bytes reach `getaddrinfo`
+    // unvalidated; a syntactic error is a prompt typed failure).
+    net.HostName.validate(host) catch |validate_error| {
+        out.reason = switch (validate_error) {
+            error.NameTooLong, error.InvalidHostName => .invalid_argument,
+        };
+        return;
+    };
+    const count = resolveInterleaved(host, port, &out.addresses) catch |lookup_error| {
+        out.reason = mapLookupError(lookup_error);
+        return;
+    };
+    out.count = count;
+    out.reason = if (count == 0) .unknown_host else .ok;
+}
+
+/// STAGE 2 of the two-stage hostname connect: race the already-resolved
+/// `addresses` (RFC-8305 Happy Eyeballs) with the existing poll-quantum driver,
+/// returning the winner fd or a mapped failure. `timeout_ms` (≤ 0 → no deadline)
+/// is the REMAINING budget after Stage 1's resolve consumed part of the caller's
+/// absolute deadline; `kill_flag` is observed each quantum. Runs on the I/O
+/// (blocking) pool exactly as `zap_socket_connect`'s single-address race does —
+/// the resolve is no longer coupled to it. Posix-only (the racing poll loop);
+/// the poll-less targets keep the single-offload `connectHost` path.
+pub fn raceConnectAddresses(addresses: []const net.IpAddress, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
+    return raceConnectPosix(addresses, timeout_ms, kill_flag);
 }
 
 /// Resolve `host` and fill `out` with up to `max_connect_attempts` addresses

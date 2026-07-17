@@ -701,6 +701,27 @@ const YieldReason = enum(u8) {
     /// made runnable by a wake signal, a kill, OR the scheduler observing
     /// `wake_deadline_nanoseconds` elapse (which sets `receive_timed_out`).
     waiting_for_message_deadline,
+    /// Suspended awaiting an off-thread DNS RESOLVE with NO timeout (Stage 1 of
+    /// the two-stage hostname connect when `connect_host` was given `timeout_ms
+    /// = 0` — "wait indefinitely"). The no-timer sibling of
+    /// `.waiting_for_resolve_deadline`: it commits the SAME plain cross-thread
+    /// park as `.waiting_for_message` (no timing-wheel entry) and is woken only
+    /// by a resolver-pool `wakeParked` or a kill. Kept distinct from
+    /// `.waiting_for_message` only for trace/observability clarity; the
+    /// scheduler treats the two identically.
+    waiting_for_resolve,
+    /// Suspended awaiting an off-thread DNS RESOLVE with a timeout (Stage 1 of
+    /// the two-stage hostname connect — `ProcessContext.resolveWaitDeadline`).
+    /// STRUCTURALLY IDENTICAL to `.waiting_for_message_deadline`: it arms the
+    /// SAME timing-wheel entry at `wake_deadline_nanoseconds` and commits the
+    /// SAME cross-thread park; only the wake-source differs — a resolver-pool
+    /// worker's `Scheduler.wakeParked` (the foreign-revive leg) instead of a
+    /// mailbox push, and on wake the fiber checks a resolve completion flag
+    /// instead of the mailbox. Made runnable by resolver completion, a kill, OR
+    /// the deadline elapsing (which sets `receive_timed_out`). The resolver
+    /// pool NEVER touches an I/O thread, so this park is what isolates the DNS
+    /// DoS from `recv`/`send`.
+    waiting_for_resolve_deadline,
     /// Hibernating (`Process.hibernate`, plan item 6.4): suspended awaiting
     /// a user message exactly like `.waiting_for_message`, but the scheduler
     /// additionally releases the fiber's committed stack pages below the
@@ -1060,6 +1081,23 @@ pub const ProcessContext = struct {
         return &context.record.pcb.socket_pending_fd;
     }
 
+    /// Publish (or clear) the process's teardown-visible IN-FLIGHT RESOLVE slot
+    /// (`ProcessControlBlock.pending_resolve`) — the resolver analogue of
+    /// `socketPendingFdSlot`, and the abandon seam for the two-stage hostname
+    /// connect's Stage 1. The socket bridge publishes the resolver-pool slot
+    /// pointer here on-core BEFORE it submits the resolve, so a kill during the
+    /// Stage-1 timed park runs the socket-sweep destructor, which ABANDONS the
+    /// still-in-flight resolve (marks it, drops the fiber's slab reference,
+    /// clears this slot) on EVERY exit path. Cleared by the bridge on completion
+    /// (promotion) and on a deadline abandon; the sweep clears whatever is still
+    /// parked here otherwise. Opaque (`*anyopaque`) because the slot type lives
+    /// in `resolver_pool.zig`, which the bridge (not the scheduler) owns. The PCB
+    /// is pinned for the process's life, so the pointer is stable across the
+    /// offload.
+    pub fn resolvePendingSlot(context: *ProcessContext, slot: ?*anyopaque) void {
+        context.record.pcb.pending_resolve = slot;
+    }
+
     /// This process's PRIVATE received-chunk arena (the HIGH-4 recv-lifetime
     /// fix — `ProcessControlBlock.socket_recv_arena`). The socket bridge reads
     /// chunk bytes off a fd DIRECTLY into a buffer grown from this arena, so a
@@ -1102,6 +1140,93 @@ pub const ProcessContext = struct {
         pcb.socket_sweep_node.destructor = destructor;
         context.registerDropResource(&pcb.socket_sweep_node);
         pcb.socket_sweep_registered = true;
+    }
+
+    /// This scheduler's monotonic clock reading (nanoseconds) — the SAME clock
+    /// `resolveWaitDeadline` and the timing wheel compare against, so the socket
+    /// bridge computes Stage 1's absolute deadline in the exact units the park
+    /// fires on. Production reads the real monotonic clock; the seeded simulator
+    /// its virtual clock.
+    pub fn schedulerNowNanoseconds(context: *const ProcessContext) u64 {
+        return context.scheduler.options.clock.read();
+    }
+
+    /// Park ON-CORE awaiting an off-thread DNS resolve, bounded by an absolute
+    /// `deadline_nanoseconds` — Stage 1 of the two-stage hostname connect. The
+    /// deliberate MIRROR of `receiveWaitTimeout`'s deadline park
+    /// (`.waiting_for_message_deadline`): it arms the SAME timing-wheel entry and
+    /// commits the SAME cross-thread park, so the timing wheel, the epoch-packed
+    /// park-control handshake, the deadline-fire (`fireReceiveTimeout`), the
+    /// foreign-revive (`wakeParked`/`reviveIfParked`), and the pending-kill
+    /// re-check are ALL reused unchanged. The ONLY differences from the mailbox
+    /// park live here on the fiber side: the wake-check tests `completed`
+    /// (a resolver-pool worker's release-store) instead of the mailbox, and the
+    /// foreign wake-source is the resolver worker (never an I/O thread — that is
+    /// the whole isolation).
+    ///
+    /// Returns `.completed` when the resolve finished (the caller reads the slot
+    /// result), `.timed_out` when the absolute deadline elapsed first (the caller
+    /// ABANDONS the still-in-flight resolve). `deadline_nanoseconds == null` is
+    /// the no-timeout form (`connect_host` with `timeout_ms = 0`): a no-timer
+    /// park (`.waiting_for_resolve`) that can only ever return `.completed` (or
+    /// never return — a kill tears it down). A KILL requested while parked is
+    /// handled exactly as `receiveWaitTimeout` handles it — the suspension never
+    /// returns; the process tears down and its socket-sweep destructor abandons
+    /// the resolve — so the caller need not handle a kill outcome. Core is freed
+    /// to run other processes while parked; the I/O pool is NEVER involved.
+    pub fn resolveWaitDeadline(
+        context: *ProcessContext,
+        completed_flag: *std.atomic.Value(bool),
+        deadline_nanoseconds: ?u64,
+    ) ResolveWaitOutcome {
+        const record = context.record;
+        while (true) {
+            // Kill while parked/looping: yield `.reenqueue` so the scheduler
+            // observes the pending kill and tears the process down (the
+            // suspension never returns) — the exact idiom `receiveWaitTimeout`
+            // uses. The socket-sweep destructor abandons the in-flight resolve.
+            if (record.pending_kill.load(.acquire)) {
+                record.yield_reason = .reenqueue;
+                context.execution.yield();
+                continue;
+            }
+            // Completed before we (re-)park: take the result immediately.
+            if (completed_flag.load(.acquire)) return .completed;
+            // Deadline already elapsed: concede the timeout (the caller abandons).
+            if (deadline_nanoseconds) |deadline| {
+                if (context.scheduler.options.clock.read() >= deadline) return .timed_out;
+            }
+
+            // Park. No "arm the wake" step is needed (a resolver worker
+            // unconditionally calls `wakeParked` on completion, and the
+            // park-control handshake linearizes it against this commit — a
+            // completion that races the commit self-revives at `commitPark`).
+            // A deadline arms the timing wheel (`.waiting_for_resolve_deadline`);
+            // no deadline is the plain no-timer park (`.waiting_for_resolve`).
+            record.receive_timed_out = false;
+            if (deadline_nanoseconds) |deadline| {
+                record.wake_deadline_nanoseconds = deadline;
+                record.yield_reason = .waiting_for_resolve_deadline;
+            } else {
+                record.yield_reason = .waiting_for_resolve;
+            }
+            context.execution.yield();
+
+            // Resumed by: resolver completion / deadline timer / kill / spurious.
+            if (completed_flag.load(.acquire)) {
+                record.receive_timed_out = false;
+                return .completed;
+            }
+            if (record.receive_timed_out) {
+                record.receive_timed_out = false;
+                // A completion that raced the timeout wins: one final check
+                // before conceding (the resolver may have set `completed`
+                // between the timer fire and here).
+                if (completed_flag.load(.acquire)) return .completed;
+                return .timed_out;
+            }
+            // Kill or spurious wake: loop re-checks kill, completion, deadline.
+        }
     }
 
     /// The shared blob domain this scheduler runs over, or null when the
@@ -1877,6 +2002,18 @@ pub const ReceiveWaitOutcome = enum {
     /// A message is at the mailbox head; a following `receive` pops it.
     message_available,
     /// The `after` duration elapsed with no message.
+    timed_out,
+};
+
+/// The outcome of `ProcessContext.resolveWaitDeadline` — Stage 1 of the
+/// two-stage hostname connect. (A kill while parked never returns — the process
+/// tears down — so there is no killed outcome; the caller handles only these.)
+pub const ResolveWaitOutcome = enum {
+    /// The off-thread resolve finished; the caller reads the slot result and
+    /// proceeds to Stage 2 (the address race).
+    completed,
+    /// The caller's absolute deadline elapsed with the resolve still in flight;
+    /// the caller ABANDONS the resolve and reports `:etimedout`.
     timed_out,
 };
 
@@ -3421,7 +3558,13 @@ pub const Scheduler = struct {
                         pcb.transitionTo(.runnable);
                         scheduler.readyEnqueue(record);
                     },
-                    .waiting_for_message => {
+                    // A no-timer park: an empty-mailbox `receive`, OR a
+                    // no-deadline Stage-1 DNS resolve (`.waiting_for_resolve` —
+                    // `connect_host` with `timeout_ms = 0`). Both wait for a
+                    // foreign revive (a mailbox push / a resolver-pool
+                    // `wakeParked`) with NO timing-wheel entry, so both commit
+                    // the identical plain cross-thread park.
+                    .waiting_for_message, .waiting_for_resolve => {
                         scheduler.emitTrace(.wait, pcb.pid);
                         pcb.transitionTo(.waiting);
                         // Commit the park under the cross-thread handshake: a
@@ -3452,7 +3595,17 @@ pub const Scheduler = struct {
                         pcb.transitionTo(.waiting);
                         _ = scheduler.commitPark(record);
                     },
-                    .waiting_for_message_deadline => {
+                    // Both deadline parks are handled identically: a `receive …
+                    // after` waiter (`.waiting_for_message_deadline`) and a
+                    // Stage-1 DNS-resolve waiter (`.waiting_for_resolve_deadline`)
+                    // arm the SAME timing-wheel entry and commit the SAME
+                    // cross-thread park — only the fiber's post-wake check
+                    // (mailbox vs resolve-completion flag) and the foreign
+                    // wake-source (mailbox push vs resolver-pool `wakeParked`)
+                    // differ, and both of those live on the fiber / worker side,
+                    // not here. Sharing this arm is what makes the resolve park a
+                    // faithful mirror of the proven `after` park.
+                    .waiting_for_message_deadline, .waiting_for_resolve_deadline => {
                         // Arm the timing-wheel entry on THIS core's wheel BEFORE
                         // committing the park, so the entry's writes
                         // (`timer_entry`/`timer_wheel_owner`/`timer_epoch`) are
@@ -4921,8 +5074,12 @@ pub const Scheduler = struct {
             // same thread. A cross-core wake leaves the entry for the owning
             // wheel to reap lazily (its epoch now mismatches, so the fire
             // callback discards it). `ended_epoch` proves the entry is the
-            // current episode's live node before it is touched.
-            if (record.yield_reason == .waiting_for_message_deadline) {
+            // current episode's live node before it is touched. Both timing-wheel
+            // parks (`receive … after` and the Stage-1 DNS resolve) arm the same
+            // entry, so both are cancelled here on a foreign revive.
+            if (record.yield_reason == .waiting_for_message_deadline or
+                record.yield_reason == .waiting_for_resolve_deadline)
+            {
                 scheduler.tryEagerCancelReceiveTimer(record, ended_epoch);
             }
             if (pcb.currentState() == .waiting) {
@@ -4959,9 +5116,12 @@ pub const Scheduler = struct {
     fn cancelProcessTimer(scheduler: *Scheduler, record: *ProcessRecord) void {
         const control = record.park_control.load(.seq_cst);
         const epoch = parkControlEpoch(control);
-        // Only a `.waiting_for_message_deadline` waiter can hold a live entry;
-        // for any other teardown the timer (if it ever existed) already ended.
-        if (record.yield_reason == .waiting_for_message_deadline) {
+        // Only a deadline waiter can hold a live entry (a `receive … after` OR a
+        // Stage-1 DNS resolve, which share the timing wheel); for any other
+        // teardown the timer (if it ever existed) already ended.
+        if (record.yield_reason == .waiting_for_message_deadline or
+            record.yield_reason == .waiting_for_resolve_deadline)
+        {
             scheduler.tryEagerCancelReceiveTimer(record, epoch);
         }
         record.park_control.store(packParkControl(epoch + 1, .running), .seq_cst);
@@ -5031,6 +5191,29 @@ pub const Scheduler = struct {
         // a foreign waker falls back to the target's last-running scheduler.
         const target = current_scheduler orelse record.scheduler;
         pushWake(target, record);
+    }
+
+    /// Public foreign-revive entry for a NON-scheduler thread that completed
+    /// work a process is parked on — currently the resolver pool
+    /// (`resolver_pool.zig`), whose worker calls this after publishing a Stage-1
+    /// DNS resolve to wake the fiber parked in `.waiting_for_resolve_deadline`.
+    /// It routes through the SAME `reviveIfParked` cross-thread handshake a
+    /// foreign message producer uses (the caller's completion write must be
+    /// sequenced-before this call, exactly as a mailbox push is), so there is no
+    /// new parking discipline: no lost wake, no double revive, and a revive that
+    /// races the deadline timer or a kill is arbitrated by the epoch-packed CAS.
+    /// A resolver thread has no `current_scheduler`, so the revive routes to the
+    /// process's last-running core (`record.scheduler`). Safe even if the process
+    /// has since torn down — records are pinned until scheduler deinit; and the
+    /// worker only calls this when the slot was NOT abandoned, so on the
+    /// kill/timeout paths (where the record may have been recycled and reparked)
+    /// this is never reached. In the theoretical recycled-and-reparked case a
+    /// stale revive is at worst a BENIGN SPURIOUS wakeup — `reviveIfParked` does
+    /// not consult an epoch; every park loop already tolerates a spurious wake
+    /// (it re-checks its own completion/deadline/kill condition and re-parks),
+    /// exactly as the mailbox seam does.
+    pub fn wakeParked(record: *ProcessRecord) void {
+        reviveIfParked(record);
     }
 
     // -------------------------------------------------------------------------
@@ -5961,6 +6144,105 @@ test "Scheduler: receive … after times out when no message arrives (determinis
     try kernel.scheduler.runUntilQuiescent();
 
     try testing.expectEqual(ReceiveWaitOutcome.timed_out, probe.outcome);
+    try kernel.expectExactAccounting();
+}
+
+// -- Stage-1 DNS resolve deadline park (the two-stage `connect_host` isolation
+// -- primitive `.waiting_for_resolve_deadline` — the mirror of the `receive …
+// -- after` deadline park; proves both wake legs against the SAME machinery).
+
+const ResolveWaitProbe = struct {
+    /// The resolver-completion flag `resolveWaitDeadline` checks on wake (a
+    /// resolver-pool worker sets it release; here a reviver process does).
+    completed: std.atomic.Value(bool) = .init(false),
+    /// Published by the parker before it parks, read by the reviver.
+    waiter_record: ?*ProcessRecord = null,
+    outcome: ResolveWaitOutcome = .completed,
+    reviver_target: Pid = Pid.invalid,
+};
+
+fn resolveTimeoutEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *ResolveWaitProbe = @ptrCast(@alignCast(argument.?));
+    // A resolve that NEVER completes: deterministic mode advances virtual time
+    // and fires the armed deadline when nothing else can run — the DEADLINE leg.
+    const deadline = context.scheduler.options.clock.read() +| 60 * std.time.ns_per_s;
+    probe.outcome = context.resolveWaitDeadline(&probe.completed, deadline);
+}
+
+test "Scheduler: a Stage-1 resolve park times out at its deadline when the resolve never completes" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(.{
+        .stack_usable_size = 64 * 1024,
+        .preemption_budget = 128,
+        .idle_strategy = .forbid_parking,
+    });
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var probe = ResolveWaitProbe{};
+    _ = try kernel.scheduler.spawn(.{
+        .entry = resolveTimeoutEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    // The timing wheel fired the resolve deadline exactly as it fires a
+    // `receive … after` deadline — the shared arm proves the mirror.
+    try testing.expectEqual(ResolveWaitOutcome.timed_out, probe.outcome);
+    try kernel.expectExactAccounting();
+}
+
+fn resolveReviverEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *ResolveWaitProbe = @ptrCast(@alignCast(argument.?));
+    // Block until the parker has published its record and parked on the resolve
+    // (its send wakes us), then simulate a resolver-pool worker completing:
+    // publish the result flag, then foreign-revive via `wakeParked` — the exact
+    // cross-thread handshake `resolver_pool.zig`'s worker performs.
+    const envelope = context.receive();
+    envelope_pool_module.free(envelope);
+    probe.completed.store(true, .release);
+    Scheduler.wakeParked(probe.waiter_record.?);
+}
+
+fn resolveParkerEntry(context: *ProcessContext, argument: ?*anyopaque) void {
+    const probe: *ResolveWaitProbe = @ptrCast(@alignCast(argument.?));
+    probe.waiter_record = context.record;
+    // Signal the reviver we are about to park, then park on the resolve with a
+    // generous deadline — the FOREIGN-COMPLETION leg must win over the deadline.
+    _ = context.send(probe.reviver_target, .{ .payload_byte_length = 1 }) catch
+        @panic("send failed to allocate an envelope");
+    const deadline = context.scheduler.options.clock.read() +| 60 * std.time.ns_per_s;
+    probe.outcome = context.resolveWaitDeadline(&probe.completed, deadline);
+}
+
+test "Scheduler: a Stage-1 resolve park wakes on a foreign completion revive before the deadline" {
+    var kernel: TestKernel = undefined;
+    try kernel.init(test_scheduler_options);
+    defer kernel.deinit();
+    var manager = TestProcessManager.init(testing.allocator);
+    defer manager.deinitBacking();
+
+    var probe = ResolveWaitProbe{};
+    const reviver_pid = try kernel.scheduler.spawn(.{
+        .entry = resolveReviverEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+    probe.reviver_target = reviver_pid;
+    _ = try kernel.scheduler.spawn(.{
+        .entry = resolveParkerEntry,
+        .argument = &probe,
+        .manager = manager.managerContext(),
+    });
+
+    try kernel.scheduler.runUntilQuiescent();
+
+    // The foreign revive (a resolver completion) woke the parker before the
+    // 60 s deadline — `.completed`, not `.timed_out`.
+    try testing.expectEqual(ResolveWaitOutcome.completed, probe.outcome);
     try kernel.expectExactAccounting();
 }
 

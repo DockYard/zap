@@ -72,6 +72,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const scheduler_module = @import("scheduler.zig");
 const blocking_pool_module = @import("blocking_pool.zig");
+const resolver_pool_module = @import("resolver_pool.zig");
 const pid_table_module = @import("pid_table.zig");
 const envelope_pool_module = @import("envelope_pool.zig");
 const process_module = @import("process.zig");
@@ -82,6 +83,7 @@ const GlobalRunQueue = scheduler_module.GlobalRunQueue;
 const PoolHooks = scheduler_module.PoolHooks;
 const BlockingHandoff = scheduler_module.BlockingHandoff;
 const BlockingPool = blocking_pool_module.BlockingPool;
+const ResolverPool = resolver_pool_module.ResolverPool;
 const Pid = pid_table_module.Pid;
 const PidTable = pid_table_module.PidTable;
 const EnvelopePool = envelope_pool_module.EnvelopePool;
@@ -123,6 +125,17 @@ pub const SchedulerPool = struct {
     /// `Options.blocking_handoff` is `&pool.blocking_handoff` when the blocking
     /// pool is live, else null (inline degradation).
     blocking_handoff: BlockingHandoff,
+    /// The dedicated DNS-resolver pool (`resolver_pool.zig`): a bounded pool
+    /// SEPARATE from `blocking_pool`, onto which the socket layer's Stage-1
+    /// hostname resolves offload so an uninterruptible `getaddrinfo` storm can
+    /// only ever pin resolver threads, never the I/O (blocking) threads that
+    /// serve `recv`/`send`/`accept`. Owned; pinned (its workers hold
+    /// `&pool.resolver_pool`). Quiesced + joined BEFORE the cores are freed
+    /// (`deinit`), so no resolver worker can revive a core after the cores go
+    /// away. The socket bridge reaches it through the runtime; not shared via
+    /// `Scheduler.Options` (like `socket_domain`, it is a socket-layer concern
+    /// standalone kernel schedulers never touch).
+    resolver_pool: ResolverPool,
     /// Worker OS threads for cores 1..N−1 (core 0 runs on the driver thread).
     /// Empty for a single-core pool. Owned.
     worker_threads: []std.Thread,
@@ -173,6 +186,22 @@ pub const SchedulerPool = struct {
         /// here instead of a baked-in `.{}`). Left at defaults gives the
         /// prior behavior exactly.
         blocking_pool_options: BlockingPool.Options = .{},
+        /// Options for the dedicated DNS-resolver pool (the Decision-C isolation
+        /// fix): its thread cap and slab capacity bound the resolver footprint.
+        /// Left at defaults (initial 1, max 16, slab 1024) gives full isolation;
+        /// the DoS regression test shrinks both to prove the two pools are
+        /// independent.
+        resolver_pool_options: ResolverPool.Options = .{},
+        /// The resolver pool's resolve hook — production is the real Stage-1
+        /// `getaddrinfo` (`resolver_pool.realResolve`). A legitimate seam (the
+        /// same shape as `core_options.clock`): the DoS regression / deadline /
+        /// abandon tests inject a deterministic stub (a controllable sleep +
+        /// canned result) so they need no live network. Left at the default
+        /// gives production behavior exactly.
+        resolver_resolve: resolver_pool_module.ResolveFn = resolver_pool_module.realResolve,
+        /// Opaque context forwarded to `resolver_resolve` (null for the real
+        /// resolve; a test stub's shared state otherwise).
+        resolver_resolve_context: ?*anyopaque = null,
     };
 
     /// Initialize the pool in place over a shared pid table and envelope pool.
@@ -209,6 +238,7 @@ pub const SchedulerPool = struct {
             },
             .blocking_pool = undefined,
             .blocking_handoff = undefined,
+            .resolver_pool = undefined,
             .worker_threads = worker_threads,
             .live_count = .init(0),
             .idle_count = .init(0),
@@ -233,6 +263,20 @@ pub const SchedulerPool = struct {
             options.blocking_pool_options,
         );
         pool.blocking_handoff = pool.blocking_pool.handoff();
+
+        // Bring up the dedicated DNS-resolver pool alongside the blocking pool
+        // (the Decision-C isolation fix). Its `resolve` hook is the real
+        // Stage-1 `getaddrinfo` (`resolver_pool.realResolve`); it is a plain
+        // OS-thread pool with no scheduler dependency, so it needs no execute
+        // context. OOM here unwinds the blocking pool + the core/worker arrays.
+        errdefer pool.blocking_pool.deinit();
+        try ResolverPool.init(
+            &pool.resolver_pool,
+            allocator,
+            options.resolver_resolve,
+            options.resolver_resolve_context,
+            options.resolver_pool_options,
+        );
 
         // Build each core AFTER `pool.*` is set so `&pool.hooks`/
         // `&pool.global_queue`/`&pool.blocking_handoff` are their final
@@ -261,6 +305,13 @@ pub const SchedulerPool = struct {
         // and every re-attach has been drained (`shutdownAllProcesses`), so this
         // only joins idle, parked workers.
         pool.blocking_pool.deinit();
+        // Then the resolver pool, for the SAME reason: a resolver worker's
+        // completion revive touches a core (`wakeParked` → the core's wake
+        // stack). By here every process has been reaped, so every fiber slab
+        // reference was abandoned/consumed and every resolve has completed or
+        // been abandoned; `deinit` quiesces + joins the workers and asserts the
+        // slab is fully returned — all BEFORE the cores are freed below.
+        pool.resolver_pool.deinit();
         for (pool.cores) |*core| core.deinit();
         pool.allocator.free(pool.cores);
         pool.allocator.free(pool.worker_threads);
@@ -347,6 +398,20 @@ pub const SchedulerPool = struct {
     /// mark. See `blocking_pool.BlockingPool.Statistics`.
     pub fn blockingPoolStatistics(pool: *SchedulerPool) BlockingPool.Statistics {
         return pool.blocking_pool.statistics();
+    }
+
+    /// The dedicated DNS-resolver pool (the socket bridge's Stage-1 offload
+    /// target). Pinned for the pool's lifetime.
+    pub fn resolverPool(pool: *SchedulerPool) *ResolverPool {
+        return &pool.resolver_pool;
+    }
+
+    /// Snapshot of the resolver pool's statistics (submit/reject/execute totals,
+    /// worker population, slab occupancy) — the isolation observability the DoS
+    /// regression test reads to prove a resolve storm saturates ONLY resolver
+    /// threads.
+    pub fn resolverPoolStatistics(pool: *SchedulerPool) ResolverPool.Statistics {
+        return pool.resolver_pool.statistics();
     }
 
     // -------------------------------------------------------------------------

@@ -192,6 +192,7 @@ pub const timing_wheel = @import("timing_wheel.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const scheduler_pool = @import("scheduler_pool.zig");
 pub const blocking_pool = @import("blocking_pool.zig");
+pub const resolver_pool = @import("resolver_pool.zig");
 pub const futex = @import("futex.zig");
 pub const deterministic = @import("deterministic.zig");
 pub const deterministic_mn = @import("deterministic_mn.zig");
@@ -237,6 +238,8 @@ pub const EnvelopePage = envelope_pool.EnvelopePage;
 pub const Scheduler = scheduler.Scheduler;
 pub const SchedulerPool = scheduler_pool.SchedulerPool;
 pub const BlockingPool = blocking_pool.BlockingPool;
+pub const ResolverPool = resolver_pool.ResolverPool;
+pub const ResolveRequest = resolver_pool.ResolveRequest;
 pub const BlockingHandoff = scheduler.BlockingHandoff;
 pub const BlockingOperation = scheduler.BlockingOperation;
 pub const GlobalRunQueue = scheduler.GlobalRunQueue;
@@ -300,6 +303,7 @@ test {
     _ = scheduler;
     _ = scheduler_pool;
     _ = blocking_pool;
+    _ = resolver_pool;
     _ = futex;
     _ = deterministic;
     // P4-J4: the seeded MULTI-scheduler simulator — M:N interleaving under one
