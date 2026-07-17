@@ -25,6 +25,14 @@ pub struct TestConcurrency.SocketTest {
       assert(Socket.live_count() == base)
     }
 
+    test("connect_host (Happy Eyeballs) resolves localhost and connects under the kernel, leak-exactly") {
+      base = Socket.live_count()
+      assert(TestConcurrency.SocketTest.connect_host_ok())
+      # Every attempt fd (winner closed, any resolved loser reclaimed by the
+      # racing driver) is accounted for — back to baseline under the kernel.
+      assert(Socket.live_count() == base)
+    }
+
     test("fd is reclaimed by the drop-list when the owning process EXITS without closing") {
       base = Socket.live_count()
       _monitored = Process.spawn_monitor(&TestConcurrency.SocketTest.leaky_worker/0)
@@ -57,6 +65,26 @@ pub struct TestConcurrency.SocketTest {
         {
           port = SocketListener.local_port(listener)
           TestConcurrency.SocketTest.connect_close(listener, port)
+        }
+    }
+  }
+
+  fn connect_host_ok() -> Bool {
+    case Socket.listen(SocketAddress.loopback(0), 128) {
+      Result.Error(_e) -> false
+      Result.Ok(listener) ->
+        {
+          port = SocketListener.local_port(listener)
+          connected = case Socket.connect_host("localhost", port, 5000) {
+            Result.Ok(client) ->
+              {
+                _c = Socket.close(client)
+                true
+              }
+            Result.Error(_e) -> false
+          }
+          _closed = SocketListener.close(listener)
+          connected
         }
     }
   }

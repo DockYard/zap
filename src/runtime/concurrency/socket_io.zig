@@ -65,6 +65,12 @@ pub const Reason = enum(i32) {
     access_denied = 9,
     network_down = 10,
     out_of_memory = 11,
+    /// The host name could not be resolved to any address (DNS `NXDOMAIN` /
+    /// `getaddrinfo` `EAI_NONAME`), or resolution returned no usable address.
+    unknown_host = 12,
+    /// The supplied host name is syntactically invalid (RFC 1123) — rejected
+    /// at the seam before any resolver call.
+    invalid_argument = 13,
     other = 99,
 };
 
@@ -169,69 +175,125 @@ pub fn connectIp4(ip: [4]u8, port: u16, timeout_ms: i64, kill_flag: ?*std.atomic
             return .{ .reason = mapConnectError(err), .fd = 0 };
         return .{ .reason = .ok, .fd = fdToBits(stream.socket.handle) };
     }
-    return connectIp4Posix(ip, port, timeout_ms, kill_flag);
+    return connectSingle(.{ .ip4 = .{ .bytes = ip, .port = port } }, timeout_ms, kill_flag);
 }
 
-/// The posix non-blocking connect (see `connectIp4`). Creates the socket,
-/// flips it to `O_NONBLOCK`, issues the connect, and polls `POLL.OUT` in
-/// deadline-and-kill-bounded quanta until `SO_ERROR` reports the outcome,
-/// then restores blocking mode so the returned fd is compatible with the
-/// poll-then-read `recv`/`send` (which keep the fd blocking).
-fn connectIp4Posix(ip: [4]u8, port: u16, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
-    const socket_rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
-    if (std.posix.errno(socket_rc) != .SUCCESS) return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0 };
-    const handle: net.Socket.Handle = @intCast(socket_rc);
-    var connected = false;
-    defer if (!connected) {
-        _ = std.posix.system.close(handle);
-    };
-
-    // Flip to non-blocking so `connect` returns EINPROGRESS instead of
-    // blocking the pool thread on the OS connect timeout.
-    const nonblock_bit: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    const original_flags_rc = std.posix.system.fcntl(handle, std.posix.F.GETFL, @as(usize, 0));
-    if (std.posix.errno(original_flags_rc) != .SUCCESS) return .{ .reason = .other, .fd = 0 };
-    const original_flags: usize = @intCast(original_flags_rc);
-    if (std.posix.errno(std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags | nonblock_bit)) != .SUCCESS)
-        return .{ .reason = .other, .fd = 0 };
-
-    var address = std.mem.zeroInit(std.posix.sockaddr.in, .{
-        .family = std.posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = @as(u32, @bitCast(ip)), // [a,b,c,d] in memory == network byte order
-    });
-    const address_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-    const connect_rc = std.posix.system.connect(handle, @ptrCast(&address), address_len);
-    switch (std.posix.errno(connect_rc)) {
-        .SUCCESS => {
-            // Connected immediately (common on loopback). Restore blocking.
-            _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags);
-            connected = true;
-            return .{ .reason = .ok, .fd = fdToBits(handle) };
-        },
-        // In progress — poll for completion below. (`EWOULDBLOCK` == `EAGAIN`
-        // on posix, so it is covered by `.AGAIN`.)
-        .INPROGRESS, .INTR, .AGAIN => {},
-        else => |connect_errno| return .{ .reason = mapConnectErrno(connect_errno), .fd = 0 },
+/// Connect an IPv6 stream socket to `bytes:port` (`bytes` big-endian, the
+/// `Ip6Address.bytes` layout), bounded by `timeout_ms` and `kill_flag`
+/// EXACTLY like `connectIp4` (Option A — real IPv6 in the happy-eyeballs
+/// race). `scope_id` is the link-local zone index (`0` = none) and `flow`
+/// the flow label. The posix path is a raw non-blocking `socket(AF_INET6)` +
+/// `connect(sockaddr_in6)` → EINPROGRESS → `POLL.OUT` quantum loop over the
+/// absolute monotonic deadline, sharing the very machinery `connectIp4` uses.
+pub fn connectIp6(bytes: [16]u8, port: u16, scope_id: u32, flow: u32, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        const address = net.IpAddress{ .ip6 = .{ .bytes = bytes, .port = port, .flow = flow, .interface = .{ .index = scope_id } } };
+        const stream = address.connect(io(), .{ .mode = .stream, .timeout = .none }) catch |err|
+            return .{ .reason = mapConnectError(err), .fd = 0 };
+        return .{ .reason = .ok, .fd = fdToBits(stream.socket.handle) };
     }
+    return connectSingle(.{ .ip6 = .{ .bytes = bytes, .port = port, .flow = flow, .interface = .{ .index = scope_id } } }, timeout_ms, kill_flag);
+}
 
-    // Absolute monotonic deadline (HIGH-3): read once, recompute `deadline -
-    // now` each quantum so the timeout holds regardless of poll wake pattern.
+/// The posix non-blocking single-address connect (behind `connectIp4`/
+/// `connectIp6`). Issues the connect via the shared `startAttempt` primitive,
+/// then — for an EINPROGRESS attempt — hands the fd to `awaitConnect`, which
+/// polls `POLL.OUT` in deadline-and-kill-bounded quanta until `SO_ERROR`
+/// reports the outcome and restores blocking mode. An immediate connect
+/// (common on loopback) restores blocking and returns the live fd directly.
+fn connectSingle(address: net.IpAddress, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
+    const start = startAttempt(address);
+    switch (start.state) {
+        .failed => return .{ .reason = start.reason, .fd = 0 },
+        .connected => {
+            restoreBlocking(start.fd);
+            return .{ .reason = .ok, .fd = fdToBits(start.fd) };
+        },
+        .in_progress => return awaitConnect(start.fd, timeout_ms, kill_flag),
+    }
+}
+
+/// The state of one just-issued non-blocking connect (`startAttempt`).
+const AttemptState = enum { connected, in_progress, failed };
+
+/// The result of issuing one non-blocking connect: `.connected` = finished
+/// synchronously, `fd` live (non-blocking; the caller restores blocking);
+/// `.in_progress` = EINPROGRESS, `fd` the pending socket to poll `POLL.OUT`;
+/// `.failed` = socket-create or a hard connect error, `fd` already CLOSED and
+/// `reason` naming the failure.
+const AttemptStart = struct { fd: net.Socket.Handle, state: AttemptState, reason: Reason };
+
+/// Create a non-blocking stream socket for `address`'s family and ISSUE a
+/// connect, returning immediately WITHOUT waiting for completion — the single
+/// socket-create + connect-issue primitive shared by the single-address
+/// connects (`connectSingle`) and the happy-eyeballs racing driver
+/// (`raceConnectPosix`). On any create/connect-issue failure the transient fd
+/// is closed here, so a `.failed` result never leaks a fd. Posix-only (the
+/// non-blocking connect path); the poll-less targets use the blocking
+/// `IpAddress.connect` fallback in `connectIp4`/`connectIp6`.
+fn startAttempt(address: net.IpAddress) AttemptStart {
+    const socket_rc = switch (address) {
+        .ip4 => std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP),
+        .ip6 => std.posix.system.socket(std.posix.AF.INET6, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP),
+    };
+    if (std.posix.errno(socket_rc) != .SUCCESS)
+        return .{ .fd = 0, .state = .failed, .reason = mapSocketCreateErrno(socket_rc) };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+    // Flip to non-blocking so `connect` returns EINPROGRESS instead of blocking.
+    if (!setNonBlocking(handle)) {
+        _ = std.posix.system.close(handle);
+        return .{ .fd = 0, .state = .failed, .reason = .other };
+    }
+    const sa = buildSockAddr(address);
+    const connect_rc = std.posix.system.connect(handle, @ptrCast(&sa.storage), sa.len);
+    switch (std.posix.errno(connect_rc)) {
+        // Connected immediately (common on loopback).
+        .SUCCESS => return .{ .fd = handle, .state = .connected, .reason = .ok },
+        // In progress — the caller polls for completion. (`EWOULDBLOCK` ==
+        // `EAGAIN` on posix, so it is covered by `.AGAIN`.)
+        .INPROGRESS, .INTR, .AGAIN => return .{ .fd = handle, .state = .in_progress, .reason = .ok },
+        else => |connect_errno| {
+            _ = std.posix.system.close(handle);
+            return .{ .fd = 0, .state = .failed, .reason = mapConnectErrno(connect_errno) };
+        },
+    }
+}
+
+/// Await completion of an in-progress non-blocking connect on `handle` (the
+/// shared completion tail of `connectSingle`). Polls `POLL.OUT` in
+/// `poll_quantum_ms` quanta bounded by an ABSOLUTE monotonic deadline (HIGH-3,
+/// dribble-proof) and the `kill_flag` (HIGH-2), reads `SO_ERROR` on wake for
+/// the verdict, and RESTORES blocking mode on success so the returned fd is
+/// compatible with the poll-then-blocking `recv`. On ANY non-success exit
+/// (failure/timeout/kill/`getsockopt`-error) it CLOSES `handle` on THIS thread
+/// — the transient fd never reaches the fiber continuation a kill teardown
+/// would skip (HIGH-1) — and returns the reason with `fd = 0`. On success fd
+/// ownership transfers to the caller.
+fn awaitConnect(handle: net.Socket.Handle, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
     const has_deadline = timeout_ms > 0;
     const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
     while (true) {
         if (kill_flag) |flag| {
-            if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0 };
+            if (flag.load(.acquire)) {
+                _ = std.posix.system.close(handle);
+                return .{ .reason = .other, .fd = 0 };
+            }
         }
         var quantum: i32 = poll_quantum_ms;
         if (has_deadline) {
             const remaining = deadline_ms - monotonicMillis();
-            if (remaining <= 0) return .{ .reason = .timed_out, .fd = 0 };
+            if (remaining <= 0) {
+                _ = std.posix.system.close(handle);
+                return .{ .reason = .timed_out, .fd = 0 };
+            }
             if (remaining < quantum) quantum = @intCast(remaining);
         }
         switch (waitWritable(handle, quantum)) {
             .timeout => continue, // re-check deadline + kill
-            .failed => return .{ .reason = .other, .fd = 0 },
+            .failed => {
+                _ = std.posix.system.close(handle);
+                return .{ .reason = .other, .fd = 0 };
+            },
             .ready => {},
         }
         // Writable (or POLLERR/POLLHUP): `SO_ERROR` carries the verdict.
@@ -239,22 +301,426 @@ fn connectIp4Posix(ip: [4]u8, port: u16, timeout_ms: i64, kill_flag: ?*std.atomi
         if (pending == 0) {
             // Connected — but if a kill became visible right as the connect
             // completed (the "succeeds exactly at kill" residual race, HIGH-1),
-            // do NOT hand the live fd back to a tearing-down process. Leaving
-            // `connected` false makes the `defer` close the transient fd here on
-            // the pool thread, so it never reaches the fiber continuation (which
-            // the kill teardown would skip, orphaning the fd). The pending-fd
-            // teardown slot in `abi.zig` remains the backstop for a kill that
-            // becomes visible only after this check but before re-attach.
+            // do NOT hand the live fd back to a tearing-down process: close the
+            // transient fd here so it never reaches the skipped continuation.
             if (kill_flag) |flag| {
-                if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0 };
+                if (flag.load(.acquire)) {
+                    _ = std.posix.system.close(handle);
+                    return .{ .reason = .other, .fd = 0 };
+                }
             }
-            _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, original_flags);
-            connected = true;
+            restoreBlocking(handle);
             return .{ .reason = .ok, .fd = fdToBits(handle) };
         }
+        _ = std.posix.system.close(handle);
         if (pending < 0) return .{ .reason = .other, .fd = 0 };
         return .{ .reason = mapConnectErrno(@enumFromInt(pending)), .fd = 0 };
     }
+}
+
+/// A stack-built `sockaddr` for an `IpAddress` plus its length, ready to pass
+/// to `connect(2)`. `storage` (a `sockaddr.storage`) is over-aligned for any
+/// family, so `@ptrCast(&storage)` to the concrete `sockaddr` is sound.
+const BuiltSockAddr = struct {
+    storage: std.posix.sockaddr.storage,
+    len: std.posix.socklen_t,
+};
+
+/// Build the `sockaddr` for `address` (IPv4 → `sockaddr_in`, IPv6 →
+/// `sockaddr_in6` carrying flow label + scope id) — the ONE place a Zap-side
+/// address becomes an OS socket address, shared by every connect path.
+fn buildSockAddr(address: net.IpAddress) BuiltSockAddr {
+    var result: BuiltSockAddr = .{ .storage = std.mem.zeroes(std.posix.sockaddr.storage), .len = 0 };
+    switch (address) {
+        .ip4 => |a| {
+            const in = std.mem.zeroInit(std.posix.sockaddr.in, .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, a.port),
+                .addr = @as(u32, @bitCast(a.bytes)), // [a,b,c,d] in memory == network byte order
+            });
+            @memcpy(std.mem.asBytes(&result.storage)[0..@sizeOf(std.posix.sockaddr.in)], std.mem.asBytes(&in));
+            result.len = @sizeOf(std.posix.sockaddr.in);
+        },
+        .ip6 => |a| {
+            const in6 = std.mem.zeroInit(std.posix.sockaddr.in6, .{
+                .family = std.posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, a.port),
+                .flowinfo = a.flow,
+                .addr = a.bytes, // already big-endian in `Ip6Address.bytes`
+                .scope_id = a.interface.index,
+            });
+            @memcpy(std.mem.asBytes(&result.storage)[0..@sizeOf(std.posix.sockaddr.in6)], std.mem.asBytes(&in6));
+            result.len = @sizeOf(std.posix.sockaddr.in6);
+        },
+    }
+    return result;
+}
+
+/// Set `O_NONBLOCK` on `handle`, returning whether it succeeded (the caller
+/// closes the fd on failure). Shared by every posix connect path.
+fn setNonBlocking(handle: net.Socket.Handle) bool {
+    const nonblock_bit: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    const flags_rc = std.posix.system.fcntl(handle, std.posix.F.GETFL, @as(usize, 0));
+    if (std.posix.errno(flags_rc) != .SUCCESS) return false;
+    const flags: usize = @intCast(flags_rc);
+    return std.posix.errno(std.posix.system.fcntl(handle, std.posix.F.SETFL, flags | nonblock_bit)) == .SUCCESS;
+}
+
+/// Clear `O_NONBLOCK` on a just-connected `handle`, so the returned fd is
+/// compatible with the poll-then-blocking `recv` (which requires a BLOCKING
+/// fd). A best-effort `fcntl`; a failure leaves the socket usable (poll still
+/// gates every read/write).
+fn restoreBlocking(handle: net.Socket.Handle) void {
+    const flags_rc = std.posix.system.fcntl(handle, std.posix.F.GETFL, @as(usize, 0));
+    if (std.posix.errno(flags_rc) != .SUCCESS) return;
+    const flags: usize = @intCast(flags_rc);
+    const nonblock_bit: usize = @as(usize, 1) << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    _ = std.posix.system.fcntl(handle, std.posix.F.SETFL, flags & ~nonblock_bit);
+}
+
+// ---------------------------------------------------------------------------
+// Hostname connect + RFC 8305 Happy Eyeballs (Phase S1 GAP 1 — Option A: full
+// IPv6, REAL connection racing). ONE offloaded state machine: `connectHost`
+// resolves the name (Phase B), interleaves the addresses v6/v4/v6/v4…, caps
+// the attempt list, then drives ALL N non-blocking connects with ONE `poll()`
+// over the whole pollfd array (Phase C), closing every loser fd synchronously
+// on this thread and returning ONLY the winner. Runs on the blocking-pool
+// thread gate-ON / the single OS thread gate-OFF; a fiber parks ONCE (the
+// single Pass-2a `socket_pending_fd` slot holds the winner), so real racing
+// costs ONE pool thread gate-ON and zero extra threads gate-OFF.
+// ---------------------------------------------------------------------------
+
+/// The attempt-list cap (SECURITY): however many addresses a name resolves to,
+/// at most this many sockets are ever created and dialed. A hostile DNS reply
+/// with thousands of records can therefore neither create thousands of fds nor
+/// pin the pool — enforced IN the leaf, never materialized in Zap. The fork's
+/// lookup queue is independently bounded at `dns_queue_capacity`.
+const max_connect_attempts: usize = 8;
+
+/// The DNS result queue capacity. The fork guarantees `HostName.lookup` does
+/// not block with a queue of capacity ≥ 16; `HostName.connectMany` uses 32, so
+/// this matches — a second independent bound on how many records are retained.
+const dns_queue_capacity: usize = 32;
+
+/// RFC 8305 §5 Connection Attempt Delay: a new attempt is staggered by this
+/// much behind the previous one, so a fast address wins without a thundering
+/// herd of simultaneous SYNs, while a slow/black-holed earlier address does not
+/// gate the rest. A cohort that has fully failed does NOT wait this out (the
+/// next attempt starts immediately once nothing is in flight).
+const connection_attempt_delay_ms: i64 = 250;
+
+/// Connect to `host:port` with RFC 8305 Happy Eyeballs: validate the name
+/// (RFC 1123) at the seam, resolve it, interleave IPv6/IPv4, cap the attempt
+/// list, and RACE the attempts, returning the first connected fd (the winner)
+/// or a mapped failure reason. `timeout_ms` (≤ 0 → no deadline) is ONE absolute
+/// monotonic deadline spanning BOTH resolve and race; `kill_flag` (the owning
+/// process's `pending_kill`, captured on-core) is observed each poll quantum so
+/// the whole operation stays kill-responsive. BLOCKS on the calling thread.
+///
+/// SECURITY residual (documented, inherent, NOT worked around): `getaddrinfo`
+/// is uninterruptible on macOS/musl — a resolve pins the calling thread until
+/// the OS resolver returns, so `timeout_ms`/`kill_flag` bound only the on-core
+/// wait, not the pinned thread. Mitigated by the address-list cap and the one
+/// absolute deadline across resolve+race. The real fix (a kill-responsive
+/// pure-Zig resolver) is a tracked follow-up.
+pub fn connectHost(host: []const u8, port: u16, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
+    // Validate the host name at the seam — an invalid name never reaches the
+    // resolver (SECURITY: no attacker-controlled bytes reach `getaddrinfo`
+    // unvalidated, and a syntactic error is a prompt typed failure).
+    net.HostName.validate(host) catch |validate_error| return .{
+        .reason = switch (validate_error) {
+            error.NameTooLong, error.InvalidHostName => .invalid_argument,
+        },
+        .fd = 0,
+    };
+
+    // ONE absolute deadline across resolve + race (bounds the total on-core
+    // wait to `timeout_ms`). The resolve consumes wall time we cannot preempt
+    // (the getaddrinfo residual), so the race gets whatever budget remains.
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
+
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        // Poll-less targets (not in v1 run scope): sequential blocking connects
+        // over the resolved addresses (no racing poll loop available); the
+        // timeout/kill are a documented no-op there, matching `connectIp4`.
+        return connectHostBlockingFallback(host, port);
+    }
+
+    var addresses: [max_connect_attempts]net.IpAddress = undefined;
+    const attempt_count = resolveInterleaved(host, port, &addresses) catch |lookup_error|
+        return .{ .reason = mapLookupError(lookup_error), .fd = 0 };
+    if (attempt_count == 0) return .{ .reason = .unknown_host, .fd = 0 };
+
+    const race_timeout: i64 = if (has_deadline) blk: {
+        const remaining = deadline_ms - monotonicMillis();
+        if (remaining <= 0) return .{ .reason = .timed_out, .fd = 0 };
+        break :blk remaining;
+    } else 0;
+    return raceConnectPosix(addresses[0..attempt_count], race_timeout, kill_flag);
+}
+
+/// Resolve `host` and fill `out` with up to `max_connect_attempts` addresses
+/// INTERLEAVED per RFC 8305 (IPv6, IPv4, IPv6, IPv4, …) — preferring IPv6 but
+/// never letting one family starve the other — returning the count written.
+/// Runs the fork's `HostName.lookup` SYNCHRONOUSLY on the `Io.Threaded`
+/// singleton (`netLookup` fills then closes the queue), then drains it.
+/// Unspecified addresses (`0.0.0.0` / `::`) are REJECTED (SECURITY: a resolver
+/// returning the wildcard must not become a connect to "any"); the count is
+/// capped so thousands of records cannot become thousands of sockets.
+fn resolveInterleaved(host: []const u8, port: u16, out: *[max_connect_attempts]net.IpAddress) net.HostName.LookupError!usize {
+    // `host` is already `validate`d by `connectHost`, so the unchecked
+    // construction is sound (the fork asserts `bytes.len <= max_len`).
+    const host_name = net.HostName{ .bytes = host };
+    const the_io = io();
+    var lookup_buffer: [dns_queue_capacity]net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(net.HostName.LookupResult) = .init(&lookup_buffer);
+    // Fills the queue and CLOSES it before returning, even on error.
+    try host_name.lookup(the_io, &lookup_queue, .{ .port = port });
+
+    // Split into per-family lists preserving resolver order (bounded by the
+    // queue capacity — the cap is a hard ceiling on retained records).
+    var v6: [dns_queue_capacity]net.Ip6Address = undefined;
+    var v4: [dns_queue_capacity]net.Ip4Address = undefined;
+    var v6_len: usize = 0;
+    var v4_len: usize = 0;
+    while (lookup_queue.getOneUncancelable(the_io)) |result| {
+        switch (result) {
+            .address => |address| switch (address) {
+                .ip6 => |a| if (!isUnspecified(a.bytes[0..]) and v6_len < v6.len) {
+                    v6[v6_len] = a;
+                    v6_len += 1;
+                },
+                .ip4 => |a| if (!isUnspecified(a.bytes[0..]) and v4_len < v4.len) {
+                    v4[v4_len] = a;
+                    v4_len += 1;
+                },
+            },
+            .canonical_name => {},
+        }
+    } else |queue_error| switch (queue_error) {
+        error.Closed => {}, // drained
+    }
+
+    // Interleave v6/v4, capped at `out.len` (`max_connect_attempts`).
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (count < out.len and (idx < v6_len or idx < v4_len)) : (idx += 1) {
+        if (idx < v6_len and count < out.len) {
+            out[count] = .{ .ip6 = v6[idx] };
+            count += 1;
+        }
+        if (idx < v4_len and count < out.len) {
+            out[count] = .{ .ip4 = v4[idx] };
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// Whether every byte is zero — the IPv4 `0.0.0.0` / IPv6 `::` unspecified
+/// (wildcard) address, which is never a valid connect target.
+fn isUnspecified(bytes: []const u8) bool {
+    for (bytes) |byte| if (byte != 0) return false;
+    return true;
+}
+
+/// The RFC 8305 racing driver (posix). Drives ALL in-flight non-blocking
+/// connects with ONE `poll()` over the whole pollfd array, staggering new
+/// attempts by `connection_attempt_delay_ms`, re-checking the absolute
+/// deadline + `kill_flag` each quantum. The FIRST attempt whose `SO_ERROR` is
+/// `0` is the winner (blocking mode restored, fd returned); EVERY other fd —
+/// in-flight OR not-yet-started — is closed on THIS thread.
+///
+/// LOSER-CLEANUP GUARANTEE (SECURITY — no fd-exhaustion DoS): the `defer`
+/// closes every fd still marked open in `fds`, on EVERY exit path (winner,
+/// timeout, kill, all-attempts-failed, poll error). The winner clears its own
+/// slot to `-1` before returning, so it alone escapes the sweep; every started
+/// loser fd is closed EXACTLY ONCE (an in-flight loser is closed by the defer;
+/// a completed loser was already closed and its slot set to `-1`). No cancelled
+/// or racing attempt can leak a fd, and only the winner leaves this function.
+fn raceConnectPosix(addresses: []const net.IpAddress, timeout_ms: i64, kill_flag: ?*std.atomic.Value(bool)) ConnectOutcome {
+    const n = addresses.len;
+    // `-1` = slot empty (not started, already closed, or claimed by the
+    // winner). A real socket fd is always ≥ 0 (fds 0–2 are the std streams).
+    var fds: [max_connect_attempts]std.posix.fd_t = @splat(-1);
+    defer for (0..n) |i| {
+        if (fds[i] >= 0) {
+            _ = std.posix.system.close(fds[i]);
+            fds[i] = -1;
+        }
+    };
+
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
+
+    var next_index: usize = 0; // the next address to start dialing
+    var open_count: usize = 0; // attempts currently in flight (started, unresolved)
+    var last_start_ms: i64 = monotonicMillis();
+    var last_reason: Reason = .host_unreachable;
+    var started_any = false;
+
+    while (true) {
+        if (kill_flag) |flag| {
+            if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0 };
+        }
+        const now = monotonicMillis();
+        if (has_deadline and (deadline_ms - now) <= 0) return .{ .reason = .timed_out, .fd = 0 };
+
+        // Start the next attempt when due: immediately if nothing is in flight
+        // (don't wait out the stagger behind a failed cohort), else once the
+        // Connection Attempt Delay since the last real start has elapsed.
+        if (next_index < n and (open_count == 0 or (now - last_start_ms) >= connection_attempt_delay_ms)) {
+            const start = startAttempt(addresses[next_index]);
+            next_index += 1;
+            switch (start.state) {
+                .connected => {
+                    // Immediate winner (loopback). Kill re-check (HIGH-1) before
+                    // handing a live fd back, then claim + restore. The `defer`
+                    // closes every loser; `start.fd` is not in `fds`, so on the
+                    // kill path it is closed explicitly here.
+                    if (kill_flag) |flag| {
+                        if (flag.load(.acquire)) {
+                            _ = std.posix.system.close(start.fd);
+                            return .{ .reason = .other, .fd = 0 };
+                        }
+                    }
+                    restoreBlocking(start.fd);
+                    return .{ .reason = .ok, .fd = fdToBits(start.fd) };
+                },
+                .in_progress => {
+                    fds[next_index - 1] = start.fd;
+                    open_count += 1;
+                    last_start_ms = now;
+                    started_any = true;
+                },
+                .failed => {
+                    // No fd in flight from this attempt (already closed); record
+                    // the reason and loop to try the next address without delay.
+                    last_reason = start.reason;
+                    started_any = true;
+                },
+            }
+            continue;
+        }
+
+        // Nothing in flight and nothing left to start → the race is over.
+        if (open_count == 0 and next_index >= n) {
+            return .{ .reason = if (started_any) last_reason else .unknown_host, .fd = 0 };
+        }
+
+        // Poll all in-flight fds for POLL.OUT, bounded by the smaller of the
+        // kill quantum, the remaining deadline, and the time to the next
+        // stagger, so kills/timeouts/new-attempts all fire promptly.
+        var poll_fds: [max_connect_attempts]std.posix.pollfd = undefined;
+        var poll_slot: [max_connect_attempts]usize = undefined;
+        var poll_len: usize = 0;
+        for (0..n) |i| {
+            if (fds[i] >= 0) {
+                poll_fds[poll_len] = .{ .fd = fds[i], .events = std.posix.POLL.OUT, .revents = 0 };
+                poll_slot[poll_len] = i;
+                poll_len += 1;
+            }
+        }
+        var quantum: i32 = poll_quantum_ms;
+        if (has_deadline) {
+            const remaining = deadline_ms - now;
+            if (remaining < quantum) quantum = @intCast(@max(remaining, 1));
+        }
+        if (next_index < n) {
+            const to_stagger = (last_start_ms + connection_attempt_delay_ms) - now;
+            if (to_stagger < quantum) quantum = @intCast(@max(to_stagger, 1));
+        }
+        const ready_count = std.posix.poll(poll_fds[0..poll_len], quantum) catch
+            return .{ .reason = .other, .fd = 0 };
+        if (ready_count == 0) continue; // re-check kill/deadline/stagger
+
+        for (0..poll_len) |p| {
+            if (poll_fds[p].revents == 0) continue;
+            const i = poll_slot[p];
+            const pending = soError(fds[i]);
+            if (pending == 0) {
+                // WINNER. Kill re-check (HIGH-1), then claim its fd (clear the
+                // slot so the loser-cleanup defer skips it) and restore blocking.
+                if (kill_flag) |flag| {
+                    if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0 };
+                }
+                restoreBlocking(fds[i]);
+                const winner = fds[i];
+                fds[i] = -1;
+                return .{ .reason = .ok, .fd = fdToBits(winner) };
+            }
+            // Loser: close now, free the slot, record the reason.
+            _ = std.posix.system.close(fds[i]);
+            fds[i] = -1;
+            open_count -= 1;
+            last_reason = if (pending > 0) mapConnectErrno(@enumFromInt(pending)) else .other;
+        }
+    }
+}
+
+/// The poll-less (Windows/wasi) hostname-connect fallback: resolve, then try
+/// each address with the blocking `IpAddress.connect` in turn, returning the
+/// first success. No racing (no poll loop available there) and the timeout/kill
+/// are a documented no-op — the same posture `connectIp4`/`connectIp6` take on
+/// these targets. Sequential means at most one fd is open at a time, so there
+/// is nothing to clean up on failure.
+fn connectHostBlockingFallback(host: []const u8, port: u16) ConnectOutcome {
+    const host_name = net.HostName{ .bytes = host };
+    const the_io = io();
+    var lookup_buffer: [dns_queue_capacity]net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(net.HostName.LookupResult) = .init(&lookup_buffer);
+    host_name.lookup(the_io, &lookup_queue, .{ .port = port }) catch |lookup_error|
+        return .{ .reason = mapLookupError(lookup_error), .fd = 0 };
+
+    var last_reason: Reason = .unknown_host;
+    var tried: usize = 0;
+    while (lookup_queue.getOneUncancelable(the_io)) |result| {
+        switch (result) {
+            .address => |address| {
+                switch (address) {
+                    inline .ip4, .ip6 => |a| if (isUnspecified(a.bytes[0..])) continue,
+                }
+                if (tried >= max_connect_attempts) continue;
+                tried += 1;
+                const stream = address.connect(the_io, .{ .mode = .stream, .timeout = .none }) catch |connect_error| {
+                    last_reason = mapConnectError(connect_error);
+                    continue;
+                };
+                // Drain the rest of the (already-closed) queue before returning
+                // so no buffered record is left dangling, then hand back the fd.
+                while (lookup_queue.getOneUncancelable(the_io)) |_| {} else |_| {}
+                return .{ .reason = .ok, .fd = fdToBits(stream.socket.handle) };
+            },
+            .canonical_name => {},
+        }
+    } else |queue_error| switch (queue_error) {
+        error.Closed => {},
+    }
+    return .{ .reason = last_reason, .fd = 0 };
+}
+
+/// Map a `HostName.lookup` failure to a stable `Reason`. An unknown host / no
+/// records is `unknown_host` (→ `:nxdomain`); config/DNS failures degrade to
+/// `network_down`/`other`; a bind failure for the resolver socket carries its
+/// own reason.
+fn mapLookupError(err: net.HostName.LookupError) Reason {
+    return switch (err) {
+        error.UnknownHostName, error.NoAddressReturned => .unknown_host,
+        error.NameServerFailure => .network_down,
+        error.ResolvConfParseFailed,
+        error.DetectingNetworkConfigurationFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        => .other,
+        error.AddressInUse => .address_in_use,
+        error.AddressUnavailable => .address_unavailable,
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => .fd_quota_exceeded,
+        error.NetworkDown => .network_down,
+        error.SystemResources => .out_of_memory,
+        else => .other,
+    };
 }
 
 /// Bind + listen an IPv4 stream socket on `ip:port` (port 0 → an ephemeral
@@ -738,13 +1204,46 @@ pub const AddressV4 = struct {
     pub const none = AddressV4{ .a = 0, .b = 0, .c = 0, .d = 0, .port = 0, .ok = false };
 };
 
-/// The local (bound) IPv4 endpoint of `fd` via `getsockname`.
-pub fn localAddress(fd: Fd) AddressV4 {
+/// A resolved endpoint of EITHER family — the IPv6-aware `local_address`/
+/// `peer_address` result. After a happy-eyeballs connect that won over IPv6,
+/// `getsockname`/`getpeername` return an `AF_INET6` address; this type surfaces
+/// it HONESTLY on the runtime side instead of silently reporting "unavailable".
+///
+/// The Zap-visible `SocketAddress` stays IPv4-only for v1: `packEndpoint`
+/// (`abi.zig`/`runtime.zig`) packs an `ip4` endpoint into the integer code and
+/// maps an `ip6`/`unavailable` endpoint to `-1` (`:unavailable`), so a v6
+/// endpoint never crosses the ABI into Zap — it lives only here.
+pub const SocketEndpoint = struct {
+    /// The endpoint family: `.unavailable` (unbound/unconnected/error),
+    /// `.ip4`, or `.ip6`.
+    family: Family,
+    /// IPv4 octets (meaningful iff `family == .ip4`).
+    v4: [4]u8,
+    /// IPv6 bytes, big-endian (meaningful iff `family == .ip6`).
+    v6: [16]u8,
+    /// Port, native-endian.
+    port: u16,
+    /// IPv6 zone/scope id (meaningful iff `family == .ip6`; `0` = none).
+    scope_id: u32,
+
+    pub const Family = enum { unavailable, ip4, ip6 };
+
+    pub const none = SocketEndpoint{
+        .family = .unavailable,
+        .v4 = .{ 0, 0, 0, 0 },
+        .v6 = @splat(0),
+        .port = 0,
+        .scope_id = 0,
+    };
+};
+
+/// The local (bound) endpoint of `fd` via `getsockname` (IPv4 or IPv6).
+pub fn localAddress(fd: Fd) SocketEndpoint {
     return nameAddress(fd, .local);
 }
 
-/// The remote (peer) IPv4 endpoint of `fd` via `getpeername`.
-pub fn peerAddress(fd: Fd) AddressV4 {
+/// The remote (peer) endpoint of `fd` via `getpeername` (IPv4 or IPv6).
+pub fn peerAddress(fd: Fd) SocketEndpoint {
     return nameAddress(fd, .peer);
 }
 
@@ -859,11 +1358,12 @@ const NameKind = enum { local, peer };
 
 /// Resolve the local or peer endpoint through the raw `getsockname`/
 /// `getpeername` (portable across the posix targets; not scanned by the
-/// runtime OS-portability gate, which covers only `src/runtime.zig`). IPv4
-/// only in S1.
-fn nameAddress(fd: Fd, kind: NameKind) AddressV4 {
+/// runtime OS-portability gate, which covers only `src/runtime.zig`).
+/// IPv6-aware: an `AF_INET6` socket (a happy-eyeballs connect that won over
+/// IPv6) surfaces its real v6 bytes + scope id, not a silent "unavailable".
+fn nameAddress(fd: Fd, kind: NameKind) SocketEndpoint {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return AddressV4.none;
+        return SocketEndpoint.none;
     }
     const handle: std.posix.fd_t = fdFromBits(fd);
     var storage: std.posix.sockaddr.storage = undefined;
@@ -873,12 +1373,29 @@ fn nameAddress(fd: Fd, kind: NameKind) AddressV4 {
         .local => std.posix.system.getsockname(handle, sockaddr_ptr, &address_len),
         .peer => std.posix.system.getpeername(handle, sockaddr_ptr, &address_len),
     };
-    if (std.posix.errno(return_code) != .SUCCESS) return AddressV4.none;
-    if (sockaddr_ptr.family != std.posix.AF.INET) return AddressV4.none;
-    const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
-    const octets: [4]u8 = @bitCast(in.addr); // network byte order = a.b.c.d
-    const port = std.mem.bigToNative(u16, in.port);
-    return .{ .a = octets[0], .b = octets[1], .c = octets[2], .d = octets[3], .port = port, .ok = true };
+    if (std.posix.errno(return_code) != .SUCCESS) return SocketEndpoint.none;
+    if (sockaddr_ptr.family == std.posix.AF.INET) {
+        const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+        const octets: [4]u8 = @bitCast(in.addr); // network byte order = a.b.c.d
+        return .{
+            .family = .ip4,
+            .v4 = octets,
+            .v6 = @splat(0),
+            .port = std.mem.bigToNative(u16, in.port),
+            .scope_id = 0,
+        };
+    }
+    if (sockaddr_ptr.family == std.posix.AF.INET6) {
+        const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+        return .{
+            .family = .ip6,
+            .v4 = .{ 0, 0, 0, 0 },
+            .v6 = in6.addr, // already big-endian
+            .port = std.mem.bigToNative(u16, in6.port),
+            .scope_id = in6.scope_id,
+        };
+    }
+    return SocketEndpoint.none;
 }
 
 fn mapReadError(err: net.Stream.Reader.Error) Reason {
@@ -1172,7 +1689,7 @@ test "socket_io: accept + full-duplex send/recv echo, binary-safe payload, then 
 
     // The local endpoint of the accepted socket is the loopback listener port.
     const local = localAddress(accepted.fd);
-    try testing.expect(local.ok);
+    try testing.expectEqual(SocketEndpoint.Family.ip4, local.family);
     try testing.expectEqual(listener.bound_port, local.port);
 }
 
@@ -1236,7 +1753,7 @@ test "socket_io: send to a peer that never reads TIMES OUT (slowloris-send), nev
     // semantics). Draining on the peer lets a further send proceed.
     const drained = try recv(testing.allocator, accepted.fd, 0, 65536, 1000, null);
     testing.allocator.free(drained.buffer);
-    try testing.expect(localAddress(client.fd).ok);
+    try testing.expectEqual(SocketEndpoint.Family.ip4, localAddress(client.fd).family);
 }
 
 test "socket_io: connect to a black-hole address is timeout-bounded, never the ~127s OS default" {
@@ -1377,4 +1894,210 @@ test "socket_io: next-available recv SHRINKS the buffer to what arrived (no over
     try testing.expectEqual(payload.len, outcome.bytes_filled);
     try testing.expectEqual(payload.len, outcome.buffer.len); // shrunk, not 65536
     try testing.expectEqualSlices(u8, payload, outcome.buffer[0..outcome.bytes_filled]);
+}
+
+// ---------------------------------------------------------------------------
+// Hostname connect + Happy Eyeballs tests (GAP 1). Loopback-only, deterministic
+// where possible: the racing/loser-cleanup/kill tests build the address list
+// directly (no DNS dependency) and use `countOpenFds` for exact OS-level fd
+// accounting; the end-to-end `connectHost` tests exercise the real resolver.
+// ---------------------------------------------------------------------------
+
+const loopback_ip6 = [16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+
+/// Test-only: bind + listen an IPv6 loopback stream socket on `::1:port`
+/// (port 0 → ephemeral), returning the fd + bound port, or `null` when the
+/// host has no usable IPv6 loopback (the test then skips). Raw syscalls (the
+/// S1 listener is IPv4-only); test-scoped, so it never ships.
+fn listenIp6ForTest(port: u16) ?struct { fd: std.posix.fd_t, port: u16 } {
+    const socket_rc = std.posix.system.socket(std.posix.AF.INET6, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
+    if (std.posix.errno(socket_rc) != .SUCCESS) return null;
+    const fd: std.posix.fd_t = @intCast(socket_rc);
+    var bind_addr = std.mem.zeroInit(std.posix.sockaddr.in6, .{
+        .family = std.posix.AF.INET6,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = loopback_ip6,
+    });
+    if (std.posix.errno(std.posix.system.bind(fd, @ptrCast(&bind_addr), @sizeOf(std.posix.sockaddr.in6))) != .SUCCESS) {
+        _ = std.posix.system.close(fd);
+        return null;
+    }
+    if (std.posix.errno(std.posix.system.listen(fd, 8)) != .SUCCESS) {
+        _ = std.posix.system.close(fd);
+        return null;
+    }
+    var bound = std.mem.zeroes(std.posix.sockaddr.in6);
+    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in6);
+    if (std.posix.errno(std.posix.system.getsockname(fd, @ptrCast(&bound), &bound_len)) != .SUCCESS) {
+        _ = std.posix.system.close(fd);
+        return null;
+    }
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+}
+
+test "socket_io: connectIp6 connects to an IPv6 loopback listener; peerAddress surfaces the real v6 endpoint" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp6ForTest(0) orelse return error.SkipZigTest; // no IPv6 loopback here
+    defer closeFd(listener.fd);
+
+    const outcome = connectIp6(loopback_ip6, listener.port, 0, 0, 5000, null);
+    try testing.expectEqual(Reason.ok, outcome.reason);
+    defer closeFd(outcome.fd);
+
+    // The runtime side surfaces the REAL v6 endpoint (not a silent "unavailable").
+    const peer = peerAddress(outcome.fd);
+    try testing.expectEqual(SocketEndpoint.Family.ip6, peer.family);
+    try testing.expectEqual(listener.port, peer.port);
+    try testing.expectEqualSlices(u8, loopback_ip6[0..], peer.v6[0..]);
+    // The local endpoint of an IPv6 socket is also v6-aware.
+    const local = localAddress(outcome.fd);
+    try testing.expectEqual(SocketEndpoint.Family.ip6, local.family);
+}
+
+test "socket_io: happy-eyeballs races a dead IPv6 first, connects to the live IPv4, and leaks no loser fd" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // A live IPv4 loopback listener (the intended winner).
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    // Reserve a free port number nothing listens on (bind + close a v4 socket),
+    // used as the DEAD IPv6 target so the v6 attempt loses.
+    const reserved = listenIp4(.{ 127, 0, 0, 1 }, 0, 1);
+    try testing.expectEqual(Reason.ok, reserved.reason);
+    const dead_port = reserved.bound_port;
+    closeFd(reserved.fd);
+
+    const baseline = countOpenFds();
+    // RFC-8305-interleaved list: IPv6 ::1 (dead) first, then IPv4 (live). REAL
+    // v6+v4 racing — the v6 attempt is created, fails, and its fd is closed by
+    // the loser-cleanup guarantee before the v4 winner is returned.
+    var addresses = [_]net.IpAddress{
+        .{ .ip6 = .{ .bytes = loopback_ip6, .port = dead_port } },
+        .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = listener.bound_port } },
+    };
+    const outcome = raceConnectPosix(addresses[0..], 5000, null);
+    try testing.expectEqual(Reason.ok, outcome.reason);
+
+    // The winner is the LIVE IPv4 endpoint (the v6 loser did not win).
+    const peer = peerAddress(outcome.fd);
+    try testing.expectEqual(SocketEndpoint.Family.ip4, peer.family);
+    try testing.expectEqual(listener.bound_port, peer.port);
+    closeFd(outcome.fd);
+
+    // EXACTLY-ONCE loser cleanup: the v6 attempt fd was closed by the race, so
+    // the OS fd count is back to baseline — no orphaned loser fd.
+    try testing.expectEqual(baseline, countOpenFds());
+}
+
+test "socket_io: happy-eyeballs closes EVERY attempt fd when all fail (no fd-exhaustion DoS), at the cap" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // Reserve `max_connect_attempts` free port numbers nothing listens on, so
+    // every attempt in the race fails — proving the loser-cleanup guarantee
+    // closes ALL of them (the winner's single-slot invariant never fires).
+    var dead_ports: [max_connect_attempts]u16 = undefined;
+    for (0..max_connect_attempts) |i| {
+        const reserved = listenIp4(.{ 127, 0, 0, 1 }, 0, 1);
+        try testing.expectEqual(Reason.ok, reserved.reason);
+        dead_ports[i] = reserved.bound_port;
+        closeFd(reserved.fd);
+    }
+
+    const baseline = countOpenFds();
+    var addresses: [max_connect_attempts]net.IpAddress = undefined;
+    for (0..max_connect_attempts) |i| {
+        addresses[i] = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = dead_ports[i] } };
+    }
+    const outcome = raceConnectPosix(addresses[0..], 3000, null);
+    try testing.expect(outcome.reason != .ok);
+    // Every attempt fd was closed — the OS fd count never grew past baseline.
+    try testing.expectEqual(baseline, countOpenFds());
+}
+
+test "socket_io: connectHost resolves localhost and connects to a live loopback listener, no per-connect fd growth" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+
+    // The exact loser-cleanup guarantee is proven by the DNS-free race tests
+    // above (a single call returns to baseline). Here the end-to-end resolve
+    // path is exercised; the platform resolver (`getaddrinfo`) opens PERSISTENT
+    // internal fds on first use, so we assert fd STEADY STATE across two
+    // connects instead — the first call warms those resolver fds into the
+    // count, and the second must not grow it (no per-connect fd leak).
+    _ = io();
+    const first = connectHost("localhost", listener.bound_port, 5000, null);
+    // The sandbox resolver is environment-dependent; skip only if it can't
+    // resolve localhost at all (never a false failure of the racing logic).
+    if (first.reason == .unknown_host) return error.SkipZigTest;
+    try testing.expectEqual(Reason.ok, first.reason);
+    // Whatever families localhost resolved to, the loopback listener was
+    // reached and every loser (e.g. a refused ::1) was cleaned up.
+    const first_peer = peerAddress(first.fd);
+    try testing.expectEqual(listener.bound_port, first_peer.port);
+    closeFd(first.fd);
+
+    const steady = countOpenFds();
+    const second = connectHost("localhost", listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, second.reason);
+    closeFd(second.fd);
+    // No fd growth across a repeat connect — the racing driver reclaims every
+    // loser and the winner is closed, so the count returns to steady state.
+    try testing.expectEqual(steady, countOpenFds());
+}
+
+test "socket_io: connectHost rejects a syntactically invalid host name with invalid_argument, before any resolve" {
+    // No network needed — validation is the first thing `connectHost` does, on
+    // every target. A space is not a legal RFC-1123 host character.
+    const outcome = connectHost("not a host", 80, 1000, null);
+    try testing.expectEqual(Reason.invalid_argument, outcome.reason);
+    try testing.expectEqual(@as(Fd, 0), outcome.fd);
+}
+
+test "socket_io: connectHost to a black-hole address is deadline-bounded and leaks no fd" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    _ = io();
+    const baseline = countOpenFds();
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737) — routable-looking but a black hole; a
+    // numeric name resolves to itself, so the race dials it and must time out on
+    // the deadline rather than the ~127s OS default.
+    const before_ms = monotonicMillis();
+    const outcome = connectHost("192.0.2.1", 80, 300, null);
+    const elapsed_ms = monotonicMillis() - before_ms;
+    try testing.expect(outcome.reason != .ok);
+    try testing.expect(elapsed_ms < 5000);
+    // The in-flight black-hole attempt fd was reclaimed by the race.
+    try testing.expectEqual(baseline, countOpenFds());
+}
+
+test "socket_io: connectHost yields promptly to a kill mid-race and reclaims the in-flight attempt fd" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    _ = io();
+    const baseline = countOpenFds();
+    var kill_flag = std.atomic.Value(bool).init(false);
+    // Flip the kill shortly after the race begins (the numeric name resolves
+    // instantly, so the kill lands during the black-hole race, not the resolve).
+    const KillSetter = struct {
+        flag: *std.atomic.Value(bool),
+        fn run(setter: @This()) void {
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 60 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            setter.flag.store(true, .release);
+        }
+    };
+    const setter = try std.Thread.spawn(.{}, KillSetter.run, .{KillSetter{ .flag = &kill_flag }});
+    // A 30s deadline the kill must pre-empt long before it elapses.
+    const outcome = connectHost("192.0.2.1", 80, 30000, &kill_flag);
+    setter.join();
+
+    try testing.expectEqual(Reason.other, outcome.reason); // killed, not timed out
+    try testing.expectEqual(@as(Fd, 0), outcome.fd);
+    // All in-flight attempt fds reclaimed on the kill path — fd baseline holds.
+    try testing.expectEqual(baseline, countOpenFds());
 }

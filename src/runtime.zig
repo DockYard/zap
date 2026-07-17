@@ -4024,6 +4024,13 @@ const ZapConcurrencyKernel = struct {
         port: u16,
         timeout_ms: i64,
     ) callconv(.c) u64;
+    extern fn zap_socket_connect_host(
+        process: *anyopaque,
+        host_ptr: [*]const u8,
+        host_len: usize,
+        port: u16,
+        timeout_ms: i64,
+    ) callconv(.c) u64;
     extern fn zap_socket_listen(
         process: *anyopaque,
         ip0: u8,
@@ -7032,6 +7039,39 @@ pub const SocketRuntime = struct {
         }
     }
 
+    /// `Socket.connect_host`: connect to `host:port` with RFC 8305 Happy
+    /// Eyeballs — resolve the name, interleave IPv6/IPv4, and RACE the
+    /// attempts, returning the winner's socket handle bits (a live handle is
+    /// never `0`), or `0` on failure with the reason in the process last-error.
+    /// Gate-ON offloads the whole resolve+race onto the blocking pool; gate-OFF
+    /// runs the SAME state machine inline on the single OS thread (true racing
+    /// too — only the `getaddrinfo` resolve blocks). `timeout_ms` is ONE
+    /// absolute deadline across resolve+race (Decision E).
+    pub fn connect_host(host: []const u8, port: i64, timeout_ms: i64) u64 {
+        const validated_port = checkedPort(port);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_connect_host(
+                requireCurrentProcessHandle(),
+                host.ptr,
+                host.len,
+                validated_port,
+                timeout_ms,
+            );
+        } else {
+            const outcome = socket_io.connectHost(host, validated_port, timeout_ms, null);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, 0, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
     /// `Socket.listen`: bind + listen an IPv4 stream socket on `a.b.c.d:port`
     /// (port 0 → an ephemeral port, discoverable via `Socket.local_port`).
     /// The S0 minimal listener. Returns the handle bits, or `0` on failure
@@ -7149,13 +7189,14 @@ pub const SocketRuntime = struct {
             @panic("zap: Socket operation on a closed or stale Socket handle");
     }
 
-    /// Pack an `AddressV4` as the runtime's endpoint encoding
-    /// (`((((a*256+b)*256+c)*256+d)*65536)+port`, or `-1` when unavailable) —
-    /// the gate-OFF twin of `abi.zig`'s `packEndpoint`.
-    fn packEndpoint(address: socket_io.AddressV4) i64 {
-        if (!address.ok) return -1;
-        const host: i64 = (((@as(i64, address.a) * 256 + address.b) * 256 + address.c) * 256 + address.d);
-        return host * 65536 + @as(i64, address.port);
+    /// Pack a `SocketEndpoint` as the runtime's endpoint encoding
+    /// (`((((a*256+b)*256+c)*256+d)*65536)+port`, or `-1` when unavailable or
+    /// IPv6) — the gate-OFF twin of `abi.zig`'s `packEndpoint`. The Zap-visible
+    /// `SocketAddress` is IPv4-only in v1, so a v6 endpoint packs as `-1`.
+    fn packEndpoint(resolved: socket_io.SocketEndpoint) i64 {
+        if (resolved.family != .ip4) return -1;
+        const host: i64 = (((@as(i64, resolved.v4[0]) * 256 + resolved.v4[1]) * 256 + resolved.v4[2]) * 256 + resolved.v4[3]);
+        return host * 65536 + @as(i64, resolved.port);
     }
 
     /// `Socket.recv`: receive bytes into a fresh transient String.

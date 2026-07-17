@@ -2358,6 +2358,92 @@ export fn zap_socket_connect(
     return handle.toBits();
 }
 
+/// The blocking-pool request for an offloaded hostname connect + RFC 8305
+/// Happy Eyeballs race — the multi-address analogue of `SocketConnectRequest`.
+/// The resolve + interleave + racing all run on the pool thread inside
+/// `socket_io.connectHost`; ONLY the winner fd rides back in `outcome` and is
+/// parked in `pending_fd_slot`. `host` points at the caller's `String` bytes,
+/// valid for the whole offload because the owning fiber is parked (its heap is
+/// pinned), exactly like the `bytes` slice `zap_socket_send` threads through.
+const SocketConnectManyRequest = struct {
+    host: []const u8,
+    port: u16,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    /// The teardown-visible pending-fd slot (HIGH-1); see
+    /// `SocketConnectRequest.pending_fd_slot`.
+    pending_fd_slot: *concurrency.socket_io.Fd,
+    outcome: concurrency.socket_io.ConnectOutcome,
+};
+
+/// The blocking trampoline for the hostname connect: runs the WHOLE state
+/// machine (resolve → interleave → cap → race) off-core through `connectHost`.
+/// The poll-quantum racing driver observes `kill_flag` each quantum so a slow
+/// race yields promptly; the resolve step is the uninterruptible-`getaddrinfo`
+/// residual documented on `connectHost`. Every LOSER fd was already closed on
+/// this pool thread by the loser-cleanup guarantee, so only a live winner can
+/// be parked in the pending slot before re-attach.
+fn socketConnectManyBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketConnectManyRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.connectHost(request.host, request.port, request.timeout_ms, request.kill_flag);
+    if (request.outcome.reason == .ok) request.pending_fd_slot.* = request.outcome.fd;
+    return null;
+}
+
+/// Connect to `host_ptr[0..host_len]:port` with Happy Eyeballs, offloading the
+/// whole resolve+race onto the blocking pool (Decision D) — a copy of
+/// `zap_socket_connect`'s domain/ledger/sweep integration over the single
+/// winner fd. Returns the new socket handle bits on success (a live handle is
+/// never `0`); on failure returns `0` with the reason recorded in the process
+/// socket last-error. The single Pass-2a `pending_fd_slot` holds ONLY the
+/// winner, so ≤ 1 fd is ever outside the stack-scoped loser cleanup.
+export fn zap_socket_connect_host(
+    process: *anyopaque,
+    host_ptr: [*]const u8,
+    host_len: usize,
+    port: u16,
+    timeout_ms: i64,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    var request = SocketConnectManyRequest{
+        .host = host_ptr[0..host_len],
+        .port = port,
+        .timeout_ms = timeout_ms,
+        // Capture the process's `pending_kill` on-core so the racing driver
+        // stays kill-responsive off-core (HIGH-2).
+        .kill_flag = context.pendingKillFlag(),
+        // Capture the teardown-visible pending-fd slot on-core (HIGH-1): the
+        // pool thread records the winner fd here so a kill that skips the
+        // continuation below still reclaims it via the socket-sweep.
+        .pending_fd_slot = context.socketPendingFdSlot(),
+        .outcome = undefined,
+    };
+    // Register the socket-sweep drop-node BEFORE the offload (HIGH-1), exactly
+    // as `zap_socket_connect` does — a kill during the race must find the sweep
+    // node already on the drop-list to reclaim the parked winner.
+    context.ensureSocketSweep(socketSweepDestructor);
+    _ = context.blocking(socketConnectManyBlockingTrampoline, &request);
+    if (request.outcome.reason != .ok) return socketConnectFailed(context, request.outcome.reason);
+
+    // Promotion (the continuation a kill teardown skips): clear the pending slot
+    // FIRST so the winner fd is not double-closed once it lives in the ledger.
+    request.pending_fd_slot.* = concurrency.socket_table.no_pending_socket_fd;
+    const handle = runtime_state.socket_domain.open(
+        request.outcome.fd,
+        context.selfPid().toBits(),
+        0,
+        .plain,
+    ) catch {
+        concurrency.socket_io.closeFd(request.outcome.fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.socketLedger().append(handle.toBits()) catch {
+        if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    return handle.toBits();
+}
+
 /// Bind + listen an IPv4 stream socket on `ip0.ip1.ip2.ip3:port` (port 0 →
 /// an ephemeral port, discoverable via `zap_socket_local_port`). Returns the
 /// listener handle bits on success (recording ownership + the bound port in
@@ -2737,11 +2823,14 @@ export fn zap_socket_endpoint(process: *anyopaque, handle_bits: u64, kind: i32) 
     return packEndpoint(address);
 }
 
-/// Pack an `AddressV4` as `((((a*256+b)*256+c)*256+d)*65536)+port` or `-1`.
-fn packEndpoint(address: concurrency.socket_io.AddressV4) i64 {
-    if (!address.ok) return -1;
-    const host: i64 = (((@as(i64, address.a) * 256 + address.b) * 256 + address.c) * 256 + address.d);
-    return host * 65536 + @as(i64, address.port);
+/// Pack a `SocketEndpoint` as `((((a*256+b)*256+c)*256+d)*65536)+port` or `-1`.
+/// The Zap-visible `SocketAddress` is IPv4-only in v1, so a v6 (or unavailable)
+/// endpoint packs as `-1` (`:unavailable`) — a real v6 endpoint never crosses
+/// the ABI into Zap; it is surfaced only on the runtime side.
+fn packEndpoint(endpoint: concurrency.socket_io.SocketEndpoint) i64 {
+    if (endpoint.family != .ip4) return -1;
+    const host: i64 = (((@as(i64, endpoint.v4[0]) * 256 + endpoint.v4[1]) * 256 + endpoint.v4[2]) * 256 + endpoint.v4[3]);
+    return host * 65536 + @as(i64, endpoint.port);
 }
 
 /// Terminate the calling process NORMALLY (reason `normal`, P5-J1): the same

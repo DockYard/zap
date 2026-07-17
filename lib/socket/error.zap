@@ -16,6 +16,8 @@
   * `:eacces` — permission denied (e.g. a firewall rule).
   * `:enetdown` — the local network interface is down.
   * `:enomem` — the runtime could not allocate for the socket.
+  * `:nxdomain` — the host name could not be resolved to any address.
+  * `:einval` — the supplied host name is syntactically invalid (RFC 1123).
   * `:closed` — the socket was closed under the operation.
   * `:unknown` — an unmapped failure (the open-set escape hatch).
 
@@ -67,6 +69,8 @@ pub error SocketError {
       9 -> :eacces
       10 -> :enetdown
       11 -> :enomem
+      12 -> :nxdomain
+      13 -> :einval
       _ -> :unknown
     }
   }

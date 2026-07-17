@@ -60,6 +60,49 @@ pub struct SocketTest {
     }
   }
 
+  describe("Socket.connect_host / Happy Eyeballs (gate-OFF)") {
+    test("connect_host resolves localhost and connects to a live loopback listener, leak-exact") {
+      base = Socket.live_count()
+      assert(SocketTest.connect_host_ok())
+      assert(Socket.live_count() == base)
+    }
+
+    test("connect_host rejects a syntactically invalid host name with :einval, no crash") {
+      assert(SocketTest.connect_host_reason("not a host", 80) == :einval)
+    }
+  }
+
+  fn connect_host_ok() -> Bool {
+    case Socket.listen(SocketAddress.loopback(0), 8) {
+      Result.Error(_e) -> false
+      Result.Ok(listener) ->
+        {
+          port = SocketListener.local_port(listener)
+          connected = case Socket.connect_host("localhost", port, 5000) {
+            Result.Ok(client) ->
+              {
+                _c = Socket.close(client)
+                true
+              }
+            Result.Error(_e) -> false
+          }
+          _closed = SocketListener.close(listener)
+          connected
+        }
+    }
+  }
+
+  fn connect_host_reason(host :: String, port :: i64) -> Atom {
+    case Socket.connect_host(host, port, 1000) {
+      Result.Ok(client) ->
+        {
+          _c = Socket.close(client)
+          :ok
+        }
+      Result.Error(error) -> error.reason
+    }
+  }
+
   fn run_loopback() -> Atom {
     case Socket.listen(SocketAddress.loopback(0), 128) {
       Result.Error(_e) -> :listen_failed

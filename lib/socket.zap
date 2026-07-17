@@ -237,6 +237,46 @@ pub struct Socket {
   }
 
   @doc = """
+    Connects to `host:port` by NAME, with RFC 8305 Happy Eyeballs (`connect_host/3`):
+    the runtime resolves the host name, interleaves the resolved IPv6 and IPv4
+    addresses (v6, v4, v6, v4, …), and RACES the connection attempts —
+    staggered by the ~250 ms Connection Attempt Delay and bounded to a small
+    cap — returning the FIRST address that connects. Every losing attempt's fd
+    is closed on the spot, so a slow or black-holed address never wastes an fd
+    and never gates a reachable one. Real IPv6 racing, competitive with modern
+    languages, over the value-threaded `Socket` handle.
+
+    `timeout_ms` (`0` = no deadline) is ONE absolute deadline across BOTH the
+    resolve and the race (Decision E — a per-call relative timeout, never
+    `SO_*TIMEO`). Returns `Result.Ok(socket)` on the winning connection, or
+    `Result.Error(%SocketError{...})`: `:nxdomain` when the name resolves to no
+    address, `:einval` when the name is not a valid host name (RFC 1123),
+    `:etimedout` when the whole resolve+race exceeds the deadline, or a POSIX
+    reason (e.g. `:econnrefused`) from the last failed attempt.
+
+    Works in both concurrent (gate-ON) and plain-script (gate-OFF) programs;
+    the resolve step blocks the calling thread (the platform resolver is
+    uninterruptible), bounded by the address cap and the deadline. Use
+    `connect`/`connect_to` when you already hold a resolved `SocketAddress`.
+
+    ## Examples
+
+        case Socket.connect_host("example.com", 443, 5000) {
+          Result.Ok(socket)    -> socket
+          Result.Error(_error) -> :unreachable
+        }
+    """
+
+  @available_on(:network)
+
+  pub fn connect_host(host :: String, port :: i64, timeout_ms :: i64) -> Result(Socket, SocketError) {
+    case :zig.SocketRuntime.connect_host(host, port, timeout_ms) {
+      0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
+    }
+  }
+
+  @doc = """
     Receives the NEXT available bytes (blocking until at least one byte arrives
     or the stream ends), returning the EOF-safe `SocketRecv` union: a
     `Chunk(bytes)` (always ≥ 1 byte, binary-safe), `Closed` on clean EOF, or
