@@ -552,7 +552,36 @@ pub fn build(b: *std.Build) void {
     // headers, which is why the gap was invisible until the Windows
     // target.) A self-contained zig-lib must carry `include` exactly as a
     // full Zig lib dir does.
-    tar_step.addArgs(&.{ "std", "compiler_rt", "compiler_rt.zig", "ubsan_rt.zig", "fuzzer.zig", "c.zig", "c", "libc", "include" });
+    //
+    // Single source of truth for the embedded entry set: this SAME list feeds
+    // both tar's argument list (what gets archived) and the per-file content
+    // inputs registered just below (what INVALIDATES the archive). Keeping them
+    // identical guarantees the tar step's cache key covers exactly the archived
+    // bytes — add an entry here and both the archive and its invalidation set
+    // follow automatically, with no chance of the two drifting apart.
+    const embedded_zig_lib_entries = [_][]const u8{ "std", "compiler_rt", "compiler_rt.zig", "ubsan_rt.zig", "fuzzer.zig", "c.zig", "c", "libc", "include" };
+    tar_step.addArgs(&embedded_zig_lib_entries);
+
+    // Build-integrity: give the tar Run step a CONTENT dependency on the fork
+    // lib tree it archives. Without this, the step's cache key is only its argv
+    // STRINGS (`tar -cf … -C <zig_lib_dir> std compiler_rt …`) plus the output
+    // basename — the fork lib dir's *contents* are invisible to it. A warm
+    // incremental build therefore CACHE-HITS the tar step and re-embeds a STALE
+    // std even after `~/projects/zig/lib/std/**` is edited (observed: after
+    // editing `heap/ArenaAllocator.zig` a warm build shipped the old std, and a
+    // `zap`-compiled program broke with `no member named 'mark'` until caches
+    // were wiped). Zig's own `addDirectoryArg` does NOT close this hole: its
+    // `.decorated_directory` argument hashes only the resolved directory PATH
+    // string into the manifest, never the tree's bytes (see `make()` in
+    // `std/Build/Step/Run.zig`), and the build Cache exposes no directory-
+    // recursive hash. The correct, idiomatic mechanism is the Cache's real
+    // per-file content path: register every regular file under each embedded
+    // entry as a `file_input` (hashed via `Manifest.addFile`, stat-checked on
+    // the fast path, content-hashed on stat mismatch). Any edit to any embedded
+    // file then changes the manifest and forces a re-tar, while a no-op rebuild
+    // still cache-hits (stat-only, no re-tar). This is exactly the same content
+    // guarantee the rest of the build already relies on for every source file.
+    registerEmbeddedZigLibContentInputs(b, tar_step, zig_lib_dir, &embedded_zig_lib_entries);
 
     // The uncompressed `zig_lib.tar` above is ~244M (the bundled `std` + `c` +
     // `libc` trees are overwhelmingly header/source TEXT, which compresses
@@ -859,6 +888,99 @@ pub fn build(b: *std.Build) void {
     const zir_test_step = b.step("zir-test", "Run ZIR integration tests");
     zir_test_step.dependOn(&run_zir_tests.step);
     zir_test_step.dependOn(b.getInstallStep());
+}
+
+/// Register every regular file under each embedded zig-lib `entry` (relative to
+/// the fork `zig_lib_dir`) as a content input of `tar_step`, so the archive it
+/// produces is invalidated whenever any embedded file changes.
+///
+/// This is the build-integrity fix for the stale-embedded-std hazard: a `Run`
+/// step's cache key otherwise contains only its argv strings and output
+/// basename, so `tar -C <zig_lib_dir> std …` cache-HITS on a warm incremental
+/// build even after the fork's `lib/std/**` is edited, re-embedding a stale
+/// std. Zig's `addDirectoryArg` does not help — it hashes only the resolved
+/// directory PATH string, not the tree's bytes — and the build `Cache` has no
+/// directory-recursive hash primitive. The idiomatic content-hashing path is
+/// per file: `Run.addFileInput` funnels each file through `Cache.Manifest`,
+/// which stat-checks on the fast path and content-hashes on a stat mismatch —
+/// the exact guarantee every other source file in the build already gets.
+///
+/// The collected paths are SORTED before registration: `Cache.addFileInner`
+/// folds each input's prefix+sub-path into the manifest hash in the order
+/// added, so an unsorted, filesystem-iteration-order list would make the key
+/// unstable across builds and force a spurious re-tar every time. Sorting makes
+/// the key order-independent, so a no-op rebuild reliably cache-hits.
+///
+/// A missing entry, or a total of zero files, is a hard build error: the
+/// archive silently losing its content dependency is exactly the failure this
+/// guards against.
+fn registerEmbeddedZigLibContentInputs(
+    b: *std.Build,
+    tar_step: *std.Build.Step.Run,
+    zig_lib_dir: []const u8,
+    entries: []const []const u8,
+) void {
+    // This fork's std uses the `std.Io`-based filesystem API: directory and
+    // walker operations take the build graph's `Io` instance.
+    const io = b.graph.io;
+
+    var absolute_files: std.ArrayList([]const u8) = .empty;
+    defer absolute_files.deinit(b.allocator);
+
+    for (entries) |entry| {
+        const entry_absolute = b.pathJoin(&.{ zig_lib_dir, entry });
+
+        // Most embedded entries are directories (`std`, `compiler_rt`, `c`,
+        // `libc`, `include`); a few are single files (`compiler_rt.zig`,
+        // `ubsan_rt.zig`, `fuzzer.zig`, `c.zig`). Try to open as a directory;
+        // an `error.NotDir` means it is a plain file, which we register
+        // directly. Any other open error is fatal — a missing embedded entry
+        // must not silently drop out of the invalidation set.
+        var entry_dir = std.Io.Dir.cwd().openDir(io, entry_absolute, .{ .iterate = true }) catch |err| switch (err) {
+            error.NotDir => {
+                absolute_files.append(b.allocator, entry_absolute) catch @panic("OOM");
+                continue;
+            },
+            else => std.debug.panic(
+                "embedded zig-lib input: cannot open entry '{s}': {s}",
+                .{ entry_absolute, @errorName(err) },
+            ),
+        };
+        defer entry_dir.close(io);
+
+        var walker = entry_dir.walk(b.allocator) catch @panic("OOM");
+        defer walker.deinit();
+        while (walker.next(io) catch |err| {
+            std.debug.panic(
+                "embedded zig-lib input: walk of '{s}' failed: {s}",
+                .{ entry_absolute, @errorName(err) },
+            );
+        }) |walk_entry| {
+            if (walk_entry.kind != .file) continue;
+            // `walk_entry.path` is relative to `entry_dir` and reuses the
+            // walker's buffer across iterations, so `pathJoin` (which allocates
+            // a fresh string) both anchors it to an absolute path and captures
+            // a stable copy.
+            absolute_files.append(b.allocator, b.pathJoin(&.{ entry_absolute, walk_entry.path })) catch @panic("OOM");
+        }
+    }
+
+    if (absolute_files.items.len == 0) {
+        std.debug.panic(
+            "embedded zig-lib input: found zero files under '{s}' — the embedded archive would have no content dependency",
+            .{zig_lib_dir},
+        );
+    }
+
+    std.mem.sort([]const u8, absolute_files.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lessThan);
+
+    for (absolute_files.items) |absolute_file| {
+        tar_step.addFileInput(.{ .cwd_relative = absolute_file });
+    }
 }
 
 /// Build a module exporting `files`: every `lib/**/*.zap` stdlib source with

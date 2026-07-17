@@ -1,4 +1,4 @@
-pub struct SocketXFoldTest {
+pub struct SocketXfoldUafTest {
   use Zest.Case
 
   # ------------------------------------------------------------------------
@@ -21,7 +21,7 @@ pub struct SocketXFoldTest {
   fn marker_a() -> String { "AAAA_FOLDA_CHUNK" }
 
   # 48 KiB; first 16 bytes are marker_a.
-  fn payload_a() -> String { SocketXFoldTest.marker_a() <> String.repeat("aaaaaaaaaaaaaaaa", 3071) }
+  fn payload_a() -> String { SocketXfoldUafTest.marker_a() <> String.repeat("aaaaaaaaaaaaaaaa", 3071) }
 
   # 48 KiB of 'B' — different first bytes from marker_a (a clobber is visible),
   # large enough to force fold B to reset several times.
@@ -32,7 +32,7 @@ pub struct SocketXFoldTest {
   fn escaped_from_a() -> {Atom, String} {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> {:err_listen, ""}
-      Result.Ok(listener) -> SocketXFoldTest.a_after_listen(listener)
+      Result.Ok(listener) -> SocketXfoldUafTest.a_after_listen(listener)
     }
   }
 
@@ -44,7 +44,7 @@ pub struct SocketXFoldTest {
           _l = SocketListener.close(listener)
           {:err_connect, ""}
         }
-      Result.Ok(client) -> SocketXFoldTest.a_after_connect(listener, client)
+      Result.Ok(client) -> SocketXfoldUafTest.a_after_connect(listener, client)
     }
   }
 
@@ -56,14 +56,14 @@ pub struct SocketXFoldTest {
           _l = SocketListener.close(listener)
           {:err_accept, ""}
         }
-      Result.Ok(server) -> SocketXFoldTest.a_exchange(listener, client, server)
+      Result.Ok(server) -> SocketXfoldUafTest.a_exchange(listener, client, server)
     }
   }
 
   fn a_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> {Atom, String} {
-    _sent = Socket.send(server, SocketXFoldTest.payload_a())
+    _sent = Socket.send(server, SocketXfoldUafTest.payload_a())
     _shut = Socket.shutdown(server, :write)
-    outcome = Socket.fold(client, {:pending, ""}, 5000, &SocketXFoldTest.keep_first/2)
+    outcome = Socket.fold(client, {:pending, ""}, 5000, &SocketXfoldUafTest.keep_first/2)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
     _c3 = SocketListener.close(listener)
@@ -85,7 +85,7 @@ pub struct SocketXFoldTest {
   fn scalar_fold_b() -> i64 {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> -1
-      Result.Ok(listener) -> SocketXFoldTest.b_after_listen(listener)
+      Result.Ok(listener) -> SocketXfoldUafTest.b_after_listen(listener)
     }
   }
 
@@ -97,7 +97,7 @@ pub struct SocketXFoldTest {
           _l = SocketListener.close(listener)
           -1
         }
-      Result.Ok(client) -> SocketXFoldTest.b_after_connect(listener, client)
+      Result.Ok(client) -> SocketXfoldUafTest.b_after_connect(listener, client)
     }
   }
 
@@ -109,14 +109,14 @@ pub struct SocketXFoldTest {
           _l = SocketListener.close(listener)
           -1
         }
-      Result.Ok(server) -> SocketXFoldTest.b_exchange(listener, client, server)
+      Result.Ok(server) -> SocketXfoldUafTest.b_exchange(listener, client, server)
     }
   }
 
   fn b_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> i64 {
-    _sent = Socket.send(server, SocketXFoldTest.payload_b())
+    _sent = Socket.send(server, SocketXfoldUafTest.payload_b())
     _shut = Socket.shutdown(server, :write)
-    outcome = Socket.fold(client, 0, 5000, &SocketXFoldTest.count_bytes/2)
+    outcome = Socket.fold(client, 0, 5000, &SocketXfoldUafTest.count_bytes/2)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
     _c3 = SocketListener.close(listener)
@@ -133,15 +133,15 @@ pub struct SocketXFoldTest {
   # ---- Cross-fold check: x from A must survive B ----
 
   fn cross_fold_check() -> Atom {
-    case SocketXFoldTest.escaped_from_a() {
-      {:got, x} -> SocketXFoldTest.after_escape(x)
+    case SocketXfoldUafTest.escaped_from_a() {
+      {:got, x} -> SocketXfoldUafTest.after_escape(x)
       {_t, _s} -> :fail_setup_a
     }
   }
 
   fn after_escape(x :: String) -> Atom {
-    _total = SocketXFoldTest.scalar_fold_b()
-    case String.starts_with?(x, SocketXFoldTest.marker_a()) {
+    _total = SocketXfoldUafTest.scalar_fold_b()
+    case String.starts_with?(x, SocketXfoldUafTest.marker_a()) {
       true -> :ok
       false -> :fail_clobbered
     }
@@ -152,7 +152,7 @@ pub struct SocketXFoldTest {
   fn escaped_bare_recv() -> {Atom, String} {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> {:err_listen, ""}
-      Result.Ok(listener) -> SocketXFoldTest.br_after_listen(listener)
+      Result.Ok(listener) -> SocketXfoldUafTest.br_after_listen(listener)
     }
   }
 
@@ -164,7 +164,7 @@ pub struct SocketXFoldTest {
           _l = SocketListener.close(listener)
           {:err_connect, ""}
         }
-      Result.Ok(client) -> SocketXFoldTest.br_after_connect(listener, client)
+      Result.Ok(client) -> SocketXfoldUafTest.br_after_connect(listener, client)
     }
   }
 
@@ -176,14 +176,14 @@ pub struct SocketXFoldTest {
           _l = SocketListener.close(listener)
           {:err_accept, ""}
         }
-      Result.Ok(server) -> SocketXFoldTest.br_exchange(listener, client, server)
+      Result.Ok(server) -> SocketXfoldUafTest.br_exchange(listener, client, server)
     }
   }
 
   fn br_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> {Atom, String} {
-    _sent = Socket.send(server, SocketXFoldTest.payload_a())
+    _sent = Socket.send(server, SocketXfoldUafTest.payload_a())
     _shut = Socket.shutdown(server, :write)
-    got = SocketXFoldTest.first_chunk_of(client)
+    got = SocketXfoldUafTest.first_chunk_of(client)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
     _c3 = SocketListener.close(listener)
@@ -202,15 +202,15 @@ pub struct SocketXFoldTest {
   }
 
   fn bare_recv_check() -> Atom {
-    case SocketXFoldTest.escaped_bare_recv() {
-      {:got, c} -> SocketXFoldTest.after_bare(c)
+    case SocketXfoldUafTest.escaped_bare_recv() {
+      {:got, c} -> SocketXfoldUafTest.after_bare(c)
       {_t, _s} -> :fail_setup_br
     }
   }
 
   fn after_bare(c :: String) -> Atom {
-    _total = SocketXFoldTest.scalar_fold_b()
-    case String.starts_with?(c, SocketXFoldTest.marker_a()) {
+    _total = SocketXfoldUafTest.scalar_fold_b()
+    case String.starts_with?(c, SocketXfoldUafTest.marker_a()) {
       true -> :ok
       false -> :fail_clobbered
     }
@@ -231,7 +231,7 @@ pub struct SocketXFoldTest {
       {:got, saved} -> {:cont, {:got, saved}}
       {_tag, _e} ->
         {
-          _inner = SocketXFoldTest.scalar_fold_b()
+          _inner = SocketXfoldUafTest.scalar_fold_b()
           {:cont, {:got, bytes}}
         }
     }
@@ -240,7 +240,7 @@ pub struct SocketXFoldTest {
   fn nested_from_a() -> {Atom, String} {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> {:err_listen, ""}
-      Result.Ok(listener) -> SocketXFoldTest.nested_after_listen(listener)
+      Result.Ok(listener) -> SocketXfoldUafTest.nested_after_listen(listener)
     }
   }
 
@@ -252,7 +252,7 @@ pub struct SocketXFoldTest {
           _l = SocketListener.close(listener)
           {:err_connect, ""}
         }
-      Result.Ok(client) -> SocketXFoldTest.nested_after_connect(listener, client)
+      Result.Ok(client) -> SocketXfoldUafTest.nested_after_connect(listener, client)
     }
   }
 
@@ -264,14 +264,14 @@ pub struct SocketXFoldTest {
           _l = SocketListener.close(listener)
           {:err_accept, ""}
         }
-      Result.Ok(server) -> SocketXFoldTest.nested_exchange(listener, client, server)
+      Result.Ok(server) -> SocketXfoldUafTest.nested_exchange(listener, client, server)
     }
   }
 
   fn nested_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> {Atom, String} {
-    _sent = Socket.send(server, SocketXFoldTest.payload_a())
+    _sent = Socket.send(server, SocketXfoldUafTest.payload_a())
     _shut = Socket.shutdown(server, :write)
-    outcome = Socket.fold(client, {:pending, ""}, 5000, &SocketXFoldTest.nested_cb/2)
+    outcome = Socket.fold(client, {:pending, ""}, 5000, &SocketXfoldUafTest.nested_cb/2)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
     _c3 = SocketListener.close(listener)
@@ -282,9 +282,9 @@ pub struct SocketXFoldTest {
   }
 
   fn nested_check() -> Atom {
-    case SocketXFoldTest.nested_from_a() {
+    case SocketXfoldUafTest.nested_from_a() {
       {:got, x} ->
-        case String.starts_with?(x, SocketXFoldTest.marker_a()) {
+        case String.starts_with?(x, SocketXfoldUafTest.marker_a()) {
           true -> :ok
           false -> :fail_clobbered
         }
@@ -295,19 +295,19 @@ pub struct SocketXFoldTest {
   describe("Socket cross-fold recv-chunk escape (loop-entry watermark reset)") {
     test("a recv chunk escaping fold A survives a later scalar fold B (no cross-fold UAF)") {
       base = Socket.live_count()
-      assert(SocketXFoldTest.cross_fold_check() == :ok)
+      assert(SocketXfoldUafTest.cross_fold_check() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("a bare Socket.recv chunk survives a later scalar fold B (no cross-fold UAF)") {
       base = Socket.live_count()
-      assert(SocketXFoldTest.bare_recv_check() == :ok)
+      assert(SocketXfoldUafTest.bare_recv_check() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("an outer fold's retained chunk survives an inner fold's watermark resets (nesting)") {
       base = Socket.live_count()
-      assert(SocketXFoldTest.nested_check() == :ok)
+      assert(SocketXfoldUafTest.nested_check() == :ok)
       assert(Socket.live_count() == base)
     }
   }
