@@ -4277,6 +4277,218 @@ test "boxed-existential struct field: PARAMETRIC iterating adapter is leak-free 
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "reached unreachable") == null);
 }
 
+test "boxed Result-element Enumerable: user-callback HOFs are leak-free under Memory.Tracking" {
+    // Regression + leak guard for the union-element callback gap. A custom
+    // `impl Enumerable(Result(String, StreamError))` (the EXACT shape of
+    // `Socket.chunks`' `Enumerable(Result(String, SocketError))`) driven through
+    // the `Enum` HOFs that thread a USER callback over the materialized element
+    // — `reduce`/`each`/`reduce_while` — was UNCOVERED: the box-only fixtures
+    // above use `Enum.to_list`/`take` with NO user callback, and the boxed-
+    // `Callable` corpus (`test/zap/combinator_map_boxed_test.zap`) boxes a `fn`
+    // element out of a plain List, never a union element.
+    //
+    // The gap: a closure whose parameter type is a UNION (`Result(t, e)`) was
+    // emitted as an `anytype` — hence GENERIC — Zig function (`emitTypedParam`
+    // only lowered a `.struct_ref` naming a `struct_def` to its concrete type;
+    // a union/enum name fell through to the `mapParamType` `anytype` fallback).
+    // A generic function has no pointer, so the runtime bare-fn bridge
+    // (`Kernel.callCallableN` -> `callBareN`'s `@call(.auto, &callable, ...)`)
+    // rejected it in PROJECT mode: "generic function being called must be
+    // comptime-known". The fix emits a concrete union/enum parameter type.
+    //
+    // This fixture is the LEAK half: the manager that OBSERVES a leak is
+    // `Memory.Tracking`, selectable only through the `-Dmemory` CLI flag (which
+    // Zest cannot set), so it lives here rather than in a Zest test. Each `Ok`
+    // payload is a heap `String` and each element is a `Result` box — every one
+    // must be released exactly once across the drive-to-`:done` (`reduce`,
+    // `each`), the early-`:halt` (`reduce_while`), and the early-dispose
+    // (`take`) paths. The semantic-correctness half is
+    // `test/zap/boxed_result_element_callback_test.zap`.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmpWithFlags(allocator, &tmp_dir, "boxed_result_cb.zap",
+        \\pub struct StreamError {
+        \\  reason :: Atom
+        \\}
+        \\
+        \\pub struct ChunkSource {
+        \\  remaining :: i64
+        \\}
+        \\
+        \\pub impl Enumerable(Result(String, StreamError)) for ChunkSource {
+        \\  pub fn next(self :: unique ChunkSource) -> {Atom, Result(String, StreamError), ChunkSource} {
+        \\    case self.remaining > 0 {
+        \\      true  -> {:cont, Result(String, StreamError).Ok("chunk"), %ChunkSource{remaining: self.remaining - 1}}
+        \\      false -> {:done, Result(String, StreamError).Ok(""), self}
+        \\    }
+        \\  }
+        \\
+        \\  pub fn dispose(_self :: unique ChunkSource) -> Nil {
+        \\    nil
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  count = Enum.reduce(%ChunkSource{remaining: 4}, 0, fn(accumulator :: i64, chunk :: Result(String, StreamError)) -> i64 {
+        \\    case chunk {
+        \\      Result.Ok(_bytes) -> accumulator + 1
+        \\      Result.Error(_error) -> accumulator
+        \\    }
+        \\  })
+        \\  IO.puts("reduce-count=" <> Integer.to_string(count))
+        \\  Enum.each(%ChunkSource{remaining: 3}, fn(chunk :: Result(String, StreamError)) -> String {
+        \\    case chunk {
+        \\      Result.Ok(_bytes) -> IO.puts("each-visit")
+        \\      Result.Error(_error) -> IO.puts("each-error")
+        \\    }
+        \\  })
+        \\  taken = Enum.take(%ChunkSource{remaining: 5}, 2)
+        \\  IO.puts("take-count=" <> Integer.to_string(List.length(taken)))
+        \\  halted = Enum.reduce_while(%ChunkSource{remaining: 10}, 0, fn(accumulator :: i64, chunk :: Result(String, StreamError)) -> {Atom, i64} {
+        \\    case chunk {
+        \\      Result.Ok(_bytes) ->
+        \\        if accumulator >= 2 {
+        \\          {:halt, accumulator}
+        \\        } else {
+        \\          {:cont, accumulator + 1}
+        \\        }
+        \\      Result.Error(_error) -> {:cont, accumulator}
+        \\    }
+        \\  })
+        \\  IO.puts("reduce-while=" <> Integer.to_string(halted))
+        \\  0
+        \\}
+    , &.{"-Dmemory=Memory.Tracking"}, &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "reduce-count=4") != null);
+    // `each` visited every element (side-effect count): 3 `Ok` chunks.
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, r.stdout, "each-visit"));
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "each-error") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "take-count=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "reduce-while=2") != null);
+    // No per-allocation leak survivor and no double-free/abort under the
+    // leak-checked manager — every boxed `Result` element and its heap `String`
+    // `Ok` payload released exactly once across drive-to-done, early-halt, and
+    // early-dispose.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "memory leak:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "leak summary:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "LEAK:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "reached unreachable") == null);
+}
+
+test "payloadless union / enum parameters compile and dispatch across every shape" {
+    // Canonical-gate guard for the DOTTED-PAYLOADLESS-union (`IO.mode`) HIGH
+    // regression. The GAP-2 fix (`emitTypedParam`) emits a concrete type for a
+    // union/enum PARAMETER instead of `anytype`; a payloadless union/enum
+    // (`enum_def`) must lower to the `u32` ATOM the caller materializes, NOT to a
+    // nominal type. A prior revision emitted the nominal shape for EVERY union/
+    // enum param, which broke `IO.mode` (a top-level DOTTED payloadless-union
+    // param): `@import("IO").Mode` failed to resolve because the function-bearing
+    // `IO` file-struct never re-exports the `Mode` leaf, and a non-dotted enum
+    // emitted `Name.Name` mismatching the `u32` atom ("expected type 'X', found
+    // 'u32'").
+    //
+    // That break was FULL-SUITE-INVISIBLE: `zig build test` — the canonical gate
+    // — does NOT run `test/zap` (only Zig `test{}` blocks), and no compiled
+    // integration test threaded a payloadless-union param. This fixture closes
+    // that hole: it drives a `zap run` program through every payloadless-param
+    // dispatch shape so a regression fails `zig build test`.
+    //
+    //   * `IO.mode(IO.Mode.Normal, fn() -> i64 { 42 })` (IO.mode/2) and
+    //     `IO.mode(IO.Mode.Normal)` (IO.mode/1) — the REAL stdlib canonical
+    //     victims, a top-level DOTTED payloadless-union param, with and without a
+    //     returning callback. Running `Normal` in-process is safe: it restores
+    //     line-buffered mode, a no-op when raw mode was never entered.
+    //   * `Dispatch.relay(fn(_signal :: Signal) -> i64 { ... }, Signal.High)` — a
+    //     custom NON-dotted payloadless-union param threaded BOTH as a direct
+    //     `signal :: Signal` argument AND, inside `relay`, as the parameter of a
+    //     closure dispatched INDIRECTLY through the runtime bare-fn bridge
+    //     (`Kernel.callCallableN` -> `callBareN`). The indirect closure is the
+    //     exact generic-function-dispatch scenario the fix unblocks: a generic
+    //     (`anytype`-param) closure has no pointer, so `@call(.auto, &callable,
+    //     ...)` rejects it ("generic function being called must be
+    //     comptime-known").
+    //   * `Dispatch.shade_identity(Palette.Shade.Dark)` — a custom DOTTED
+    //     payloadless-union param (mirroring `IO.Mode`'s `Namespace.Type` shape)
+    //     round-tripped through a direct call.
+    //
+    // The u32/atom path does not allocate, so this is a plain correctness guard
+    // (no `-Dmemory=Tracking`). The PAYLOAD-union half of GAP-2 is guarded by the
+    // `boxed Result-element Enumerable` fixture above; the Zest-visible semantic
+    // half is `test/zap/dotted_union_enum_param_test.zap`.
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var r = try runScriptInTmp(allocator, &tmp_dir, "payloadless_union_param.zap",
+        \\pub union Signal {
+        \\  High,
+        \\  Low
+        \\}
+        \\
+        \\pub union Palette.Shade {
+        \\  Light,
+        \\  Dark
+        \\}
+        \\
+        \\pub struct Dispatch {
+        \\  pub fn relay(callback :: fn(Signal) -> i64, signal :: Signal) -> i64 {
+        \\    callback(signal)
+        \\  }
+        \\
+        \\  pub fn shade_identity(shade :: Palette.Shade) -> Palette.Shade {
+        \\    shade
+        \\  }
+        \\}
+        \\
+        \\fn main(_args :: [String]) -> u8 {
+        \\  produced = IO.mode(IO.Mode.Normal, fn() -> i64 { 42 })
+        \\  IO.puts("io-mode-2=" <> Integer.to_string(produced))
+        \\
+        \\  restored = IO.mode(IO.Mode.Normal)
+        \\  if restored == IO.Mode.Normal {
+        \\    IO.puts("io-mode-1=normal")
+        \\  } else {
+        \\    IO.puts("io-mode-1=other")
+        \\  }
+        \\
+        \\  relayed = Dispatch.relay(fn(_signal :: Signal) -> i64 { 5 }, Signal.High)
+        \\  IO.puts("relay=" <> Integer.to_string(relayed))
+        \\
+        \\  shade = Dispatch.shade_identity(Palette.Shade.Dark)
+        \\  if shade == Palette.Shade.Dark {
+        \\    IO.puts("shade=dark")
+        \\  } else {
+        \\    IO.puts("shade=other")
+        \\  }
+        \\  0
+        \\}
+    , &.{});
+    defer r.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), r.exit_code);
+    // IO.mode/2: the returning callback's value round-trips through the
+    // dotted-payloadless-union-param arity.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "io-mode-2=42") != null);
+    // IO.mode/1: the `IO.Mode.Normal` atom round-trips as itself (u32 equality),
+    // NOT a nominal-type mismatch.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "io-mode-1=normal") != null);
+    // Non-dotted payloadless-union param threaded through the indirectly-
+    // dispatched closure (callBareN bridge).
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "relay=5") != null);
+    // Custom dotted payloadless-union param round-trips through a direct call.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "shade=dark") != null);
+    // The concrete-type emission must not have degraded into any nominal-type or
+    // generic-dispatch rejection.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "no member named") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "generic function being called must be comptime-known") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "reached unreachable") == null);
+}
+
 test "multi-instantiation boxed parametric adapter is leak-free and crash-free under Memory.Tracking" {
     // Regression for GAP-C: a PARAMETRIC adapter (`Wrap(element)` — a struct
     // carrying a boxed `Enumerable(element)` field and implementing

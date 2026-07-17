@@ -5611,6 +5611,85 @@ pub const ZirDriver = struct {
                 }
             }
         }
+        // A concrete UNION or ENUM parameter is ALSO a `.struct_ref` (Zap has
+        // no distinct `union_ref`/`enum_ref` — every nominal type is referenced
+        // by name), but the `.struct_ref` branch above only accepts names that
+        // resolve via `findStructDef` (i.e. `struct_def`s). A union/enum name
+        // slips past it and reaches the `mapParamType` fallback below, which
+        // emits the parameter as `anytype`. An `anytype` parameter makes the
+        // whole function GENERIC — and a generic function has no pointer
+        // representation, so when such a closure is dispatched INDIRECTLY
+        // through the runtime bare-fn bridge (`Kernel.callCallableN` ->
+        // `callBareN`'s `@call(.auto, &callable, .{...})`), Sema rejects it:
+        // "generic function being called must be comptime-known". A user
+        // callback whose element parameter is a union (e.g. `Result(String, e)`
+        // — every `Socket.chunks` element) therefore fails to compile in
+        // project mode through `Enum.reduce`/`each`, while `for`/`take`/
+        // `to_list` (which never route the element through `callCallableN`) work.
+        // The declared type is a concrete nominal type, so it must be emitted
+        // EXACTLY — but the emission SHAPE differs by whether the type carries a
+        // payload, because Zap represents the two families differently:
+        //
+        //   * A PAYLOADLESS union / enum (`IO.Mode { Raw, Normal }`, `Color
+        //     { Red, Green }`) has NO nominal ZIR type at all. The frontend
+        //     registers it as an `enum_def`; its variant VALUES lower to `u32`
+        //     ATOM IDs (`.enum_literal` -> `atomIntern`), `case` dispatch
+        //     compares those atoms, a payloadless-union RETURN type maps to
+        //     `u32`, `List`/`Map` elements of it use `u32`, and the `:zig.`
+        //     runtime boundary (`IO.set_terminal_mode(mode: u32)`) receives the
+        //     atom as `u32`. The parameter's canonical type is therefore `u32`.
+        //     Routing it through `emitStructTypeRef` instead is WRONG in two
+        //     distinct ways: a top-level DOTTED enum (`IO.Mode`) emits
+        //     `@import("IO").Mode`, but the function-bearing `IO` file-struct
+        //     never re-exports the `Mode` leaf (namespace re-export is skipped
+        //     for function-bearing parents), so Sema rejects it ("root source
+        //     file struct 'IO' has no member named 'Mode'"); a non-dotted enum
+        //     (`Color`) emits the nominal `Color.Color`, which mismatches the
+        //     `u32` atom the caller actually materializes ("expected type
+        //     'Color.Color', found 'u32'"). Emit the `u32` atom type directly —
+        //     the single representation every other enum position already uses.
+        //
+        //   * A PAYLOAD-CARRYING union (`Result(String, e)`, `Option(i64)`) is a
+        //     genuine `union_def`. Its per-instantiation specialization is
+        //     emitted as a synthetic `pub const <Name> = union(enum) {...}`
+        //     top-level file, so `emitStructTypeRef` resolves it exactly as
+        //     `@import(<Name>).<Name>` — the concrete nominal union the boxed
+        //     `Result`-element callback (`Socket.chunks` -> `Enum.reduce`) needs.
+        //     Emit that nominal type through the streaming param-type body; its
+        //     support instructions MUST live INSIDE the param body, because
+        //     Sema's `analyzeInlineBody` walks only the body slice and a Ref
+        //     pointing outside it fails to resolve in `inst_map`.
+        if (std.meta.activeTag(param.type_expr) == .struct_ref and
+            self.findEnumDef(param.type_expr.struct_ref))
+        {
+            const ref = zir_builder_emit_param(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                @intFromEnum(Zir.Inst.Ref.u32_type),
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
+        if (std.meta.activeTag(param.type_expr) == .struct_ref and
+            self.findUnionDef(param.type_expr.struct_ref) != null)
+        {
+            var support: std.ArrayListUnmanaged(u32) = .empty;
+            defer support.deinit(self.allocator);
+            const before = zir_builder_get_body_inst_count(self.handle);
+            const type_ref = try self.emitImportedTypeRef(param.type_expr);
+            try self.captureBodyInsts(before, &support);
+            const ref = zir_builder_emit_param_type_body(
+                self.handle,
+                param.name.ptr,
+                @intCast(param.name.len),
+                support.items.ptr,
+                @intCast(support.items.len),
+                type_ref,
+            );
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
         if (std.meta.activeTag(param.type_expr) == .tuple) {
             return try self.emitTupleParam(param, param.type_expr.tuple);
         }
