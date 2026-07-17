@@ -4105,6 +4105,12 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) callconv(.c) i64;
     extern fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64;
     extern fn zap_socket_endpoint(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
+    // The IPv6-aware endpoint accessors: a 16-byte v6 address cannot fit the
+    // single packed `zap_socket_endpoint` i64, so a v6 endpoint is surfaced as
+    // four 32-bit words + port + scope, reconstructed in `lib/socket/address.zap`.
+    extern fn zap_socket_endpoint_v6_word(process: *anyopaque, handle_bits: u64, kind: i32, word_index: i32) callconv(.c) i64;
+    extern fn zap_socket_endpoint_port(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
+    extern fn zap_socket_endpoint_scope(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
     // P6-J4 (plan item 6.4): the receive-back-edge arena auto-reset — emitted
     // by the compiler ONLY at receive sites whose iteration closure it proved
     // (`src/receive_reset.zig`); `hibernate` — the BEAM-analogue idle park
@@ -7314,10 +7320,11 @@ pub const SocketRuntime = struct {
             @panic("zap: Socket operation on a closed or stale Socket handle");
     }
 
-    /// Pack a `SocketEndpoint` as the runtime's endpoint encoding
+    /// Pack a `SocketEndpoint` as the runtime's v4 endpoint encoding
     /// (`((((a*256+b)*256+c)*256+d)*65536)+port`, or `-1` when unavailable or
-    /// IPv6) — the gate-OFF twin of `abi.zig`'s `packEndpoint`. The Zap-visible
-    /// `SocketAddress` is IPv4-only in v1, so a v6 endpoint packs as `-1`.
+    /// IPv6) — the gate-OFF twin of `abi.zig`'s `packEndpoint`. A v6 endpoint
+    /// packs as `-1` (a 16-byte address cannot fit one i64) and is surfaced
+    /// through the `endpoint_v6_word`/`endpoint_port`/`endpoint_scope` accessors.
     fn packEndpoint(resolved: socket_io.SocketEndpoint) i64 {
         if (resolved.family != .ip4) return -1;
         const host: i64 = (((@as(i64, resolved.v4[0]) * 256 + resolved.v4[1]) * 256 + resolved.v4[2]) * 256 + resolved.v4[3]);
@@ -7505,6 +7512,66 @@ pub const SocketRuntime = struct {
             const fd = gateOffFd(handle_bits);
             const address = if (kind == 0) socket_io.localAddress(fd) else socket_io.peerAddress(fd);
             return packEndpoint(address);
+        }
+    }
+
+    /// `Socket.endpoint_v6_word`: the 32-bit big-endian word (`word_index`
+    /// `0..3`) of the v6 endpoint (`kind == 0` local, else peer) of a socket
+    /// this program owns, or `-1` when the endpoint is not IPv6 (IPv4 or
+    /// unavailable) / not owned — the IPv6 companion to `endpoint`. A 16-byte v6
+    /// address cannot fit the single packed `endpoint` i64; `lib/socket.zap`
+    /// takes this accessor path ONLY when `endpoint` already returned `-1` (a
+    /// non-v4 endpoint), so the v4 path stays byte-identical. The `-1` return
+    /// also doubles as the "not v6" sentinel the Zap decoder uses to tell a real
+    /// v6 endpoint (words always `>= 0`) from a truly `:unavailable` one.
+    pub fn endpoint_v6_word(handle_bits: u64, kind: i64, word_index: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_endpoint_v6_word(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                @intCast(kind),
+                @intCast(word_index),
+            );
+        } else {
+            const fd = gateOffFd(handle_bits);
+            const address = if (kind == 0) socket_io.localAddress(fd) else socket_io.peerAddress(fd);
+            return socket_io.endpointV6Word(address, @intCast(word_index));
+        }
+    }
+
+    /// `Socket.endpoint_port`: the port of the endpoint (`kind == 0` local, else
+    /// peer) of a socket this program owns, or `-1` when not owned — the v6
+    /// decode's port source (the v4 path reads the port out of the packed
+    /// `endpoint` code). Panics on a closed/stale handle gate-OFF (the
+    /// single-owner discipline), like `endpoint`.
+    pub fn endpoint_port(handle_bits: u64, kind: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_endpoint_port(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                @intCast(kind),
+            );
+        } else {
+            const fd = gateOffFd(handle_bits);
+            const address = if (kind == 0) socket_io.localAddress(fd) else socket_io.peerAddress(fd);
+            return socket_io.endpointPortValue(address);
+        }
+    }
+
+    /// `Socket.endpoint_scope`: the IPv6 zone/scope id of the endpoint (`kind ==
+    /// 0` local, else peer) of a socket this program owns (`0` = none), or `-1`
+    /// when not owned. Panics on a closed/stale handle gate-OFF, like `endpoint`.
+    pub fn endpoint_scope(handle_bits: u64, kind: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_endpoint_scope(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                @intCast(kind),
+            );
+        } else {
+            const fd = gateOffFd(handle_bits);
+            const address = if (kind == 0) socket_io.localAddress(fd) else socket_io.peerAddress(fd);
+            return socket_io.endpointScopeValue(address);
         }
     }
 

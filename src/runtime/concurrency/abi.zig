@@ -3115,20 +3115,62 @@ export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c
 /// a `SocketAddress` with plain integer division (no bitwise ops in Zap).
 export fn zap_socket_endpoint(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64 {
     const context = contextFromHandle(process);
-    if (!context.socketLedger().contains(handle_bits)) return -1;
-    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
-        return -1;
-    const address = if (kind == 0)
-        concurrency.socket_io.localAddress(fd)
-    else
-        concurrency.socket_io.peerAddress(fd);
+    const address = ownedEndpoint(context, handle_bits, kind) orelse return -1;
     return packEndpoint(address);
 }
 
+/// The 32-bit big-endian word (`word_index` `0..3`) of the v6 endpoint (`kind ==
+/// 0` local, else peer) of a socket the caller OWNS, or `-1` when the endpoint
+/// is not IPv6 (IPv4/unavailable) or the handle is not owned. The IPv6 twin of
+/// `zap_socket_endpoint`: a 16-byte v6 address cannot fit one `i64`, so the Zap
+/// `SocketAddress` reconstructs it from the four words (see `endpointV6Word`).
+/// The v4 packed path on `zap_socket_endpoint` is untouched and byte-identical.
+export fn zap_socket_endpoint_v6_word(process: *anyopaque, handle_bits: u64, kind: i32, word_index: i32) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    const address = ownedEndpoint(context, handle_bits, kind) orelse return -1;
+    return concurrency.socket_io.endpointV6Word(address, @intCast(word_index));
+}
+
+/// The port of the endpoint (`kind == 0` local, else peer) of a socket the
+/// caller OWNS, or `-1` when not owned — the v6 decode's port source (the v4
+/// path reads the port out of the packed `zap_socket_endpoint` code instead).
+export fn zap_socket_endpoint_port(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    const address = ownedEndpoint(context, handle_bits, kind) orelse return -1;
+    return concurrency.socket_io.endpointPortValue(address);
+}
+
+/// The IPv6 zone/scope id of the endpoint (`kind == 0` local, else peer) of a
+/// socket the caller OWNS, or `-1` when not owned (`0` = no scope).
+export fn zap_socket_endpoint_scope(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    const address = ownedEndpoint(context, handle_bits, kind) orelse return -1;
+    return concurrency.socket_io.endpointScopeValue(address);
+}
+
+/// The resolved `SocketEndpoint` (local for `kind == 0`, else peer) of a socket
+/// the caller OWNS, or `null` when the handle is not this process's or has no
+/// backing fd — the shared ownership-and-resolve gate behind
+/// `zap_socket_endpoint` and its v6 accessor family (one gate, one `getsockname`
+/// per call). An owned-but-unbound socket resolves to `SocketEndpoint.none`
+/// (family `unavailable`), NOT `null`, so the accessors report `:unavailable`
+/// rather than a not-owned `-1` — the ownership gate and the availability state
+/// stay distinct.
+fn ownedEndpoint(context: *concurrency.ProcessContext, handle_bits: u64, kind: i32) ?concurrency.socket_io.SocketEndpoint {
+    if (!context.socketLedger().contains(handle_bits)) return null;
+    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+        return null;
+    return if (kind == 0)
+        concurrency.socket_io.localAddress(fd)
+    else
+        concurrency.socket_io.peerAddress(fd);
+}
+
 /// Pack a `SocketEndpoint` as `((((a*256+b)*256+c)*256+d)*65536)+port` or `-1`.
-/// The Zap-visible `SocketAddress` is IPv4-only in v1, so a v6 (or unavailable)
-/// endpoint packs as `-1` (`:unavailable`) — a real v6 endpoint never crosses
-/// the ABI into Zap; it is surfaced only on the runtime side.
+/// The v4 endpoint encoding — a single i64 the Zap `SocketAddress.from_packed`
+/// decodes with integer division. A v6 (or unavailable) endpoint packs as `-1`
+/// (a 16-byte v6 address cannot fit one i64); a v6 endpoint is surfaced through
+/// the `zap_socket_endpoint_v6_word`/`_port`/`_scope` accessors instead.
 fn packEndpoint(endpoint: concurrency.socket_io.SocketEndpoint) i64 {
     if (endpoint.family != .ip4) return -1;
     const host: i64 = (((@as(i64, endpoint.v4[0]) * 256 + endpoint.v4[1]) * 256 + endpoint.v4[2]) * 256 + endpoint.v4[3]);

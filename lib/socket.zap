@@ -588,7 +588,10 @@ pub struct Socket {
   @doc = """
     Returns the LOCAL (bound) `SocketAddress` of a connected socket via
     `getsockname` — the local endpoint the OS assigned (e.g. the ephemeral
-    source port of an outbound connection). Panics on a stale handle.
+    source port of an outbound connection). An IPv4 connection yields an `:ip4`
+    address; a connection that won over IPv6 (a `connect_host` Happy-Eyeballs
+    race) yields a real `:ip6` address; `:unavailable` only when the socket is
+    genuinely unbound. Panics on a stale handle.
 
     ## Examples
 
@@ -598,12 +601,14 @@ pub struct Socket {
   @available_on(:network)
 
   pub fn local_address(socket :: Socket) -> SocketAddress {
-    SocketAddress.from_packed(:zig.SocketRuntime.endpoint(socket.zap_socket_handle, 0))
+    Socket.address_of(socket.zap_socket_handle, 0)
   }
 
   @doc = """
     Returns the REMOTE (peer) `SocketAddress` of a connected socket via
-    `getpeername`. Panics on a stale handle.
+    `getpeername` — an `:ip4` address for an IPv4 connection, a real `:ip6`
+    address for one that won over IPv6 (a `connect_host` Happy-Eyeballs race),
+    or `:unavailable` only when genuinely unconnected. Panics on a stale handle.
 
     ## Examples
 
@@ -613,7 +618,48 @@ pub struct Socket {
   @available_on(:network)
 
   pub fn peer_address(socket :: Socket) -> SocketAddress {
-    SocketAddress.from_packed(:zig.SocketRuntime.endpoint(socket.zap_socket_handle, 1))
+    Socket.address_of(socket.zap_socket_handle, 1)
+  }
+
+  @doc = """
+    Resolves the endpoint (`which` `0` = local/`getsockname`, `1` = peer/
+    `getpeername`) of a socket handle into a `SocketAddress`, transparently
+    across address families. The v4 fast path is BYTE-IDENTICAL to the original
+    packed decode — `:zig.SocketRuntime.endpoint` returns the packed i64 code and
+    `SocketAddress.from_packed` unpacks it, with NO extra runtime call for a v4
+    connection. A 16-byte IPv6 address cannot fit that single i64, so the packed
+    code is `-1` for a non-v4 endpoint; the v6 accessor path then reads the four
+    32-bit address words (`endpoint_v6_word`). The first word being `-1` (the
+    "not IPv6" sentinel) distinguishes a truly `:unavailable` endpoint from a
+    genuine v6 one — a real v6 word is always `>= 0`, even for `::1` whose first
+    three words are `0` — so no separate family round-trip is needed. Only a v6
+    endpoint incurs the extra accessor reads; the peer/local `port` helpers layer
+    on top unchanged.
+    """
+
+  @available_on(:network)
+
+  fn address_of(handle_bits :: u64, which :: i64) -> SocketAddress {
+    packed = :zig.SocketRuntime.endpoint(handle_bits, which)
+    case packed < 0 {
+      false -> SocketAddress.from_packed(packed)
+      true ->
+        {
+          word0 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 0)
+          case word0 < 0 {
+            true -> %SocketAddress{family: :unavailable}
+            false ->
+              {
+                word1 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 1)
+                word2 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 2)
+                word3 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 3)
+                scope_id = :zig.SocketRuntime.endpoint_scope(handle_bits, which)
+                port = :zig.SocketRuntime.endpoint_port(handle_bits, which)
+                SocketAddress.ip6_from_words(word0, word1, word2, word3, scope_id, port)
+              }
+          }
+        }
+    }
   }
 
   @doc = """

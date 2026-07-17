@@ -1591,6 +1591,68 @@ pub fn peerAddress(fd: Fd) SocketEndpoint {
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint → ABI accessors (the IPv6-aware `local_address`/`peer_address` seam)
+//
+// A single `i64` STRUCTURALLY cannot carry a 16-byte IPv6 address, so the
+// Zap-visible `SocketAddress` reconstructs a v6 endpoint from a small set of
+// plain-integer accessors instead of one packed code. These pure extractors are
+// the SINGLE SOURCE the gate-ON (`abi.zig`) and gate-OFF (`runtime.zig`)
+// accessor exports both call — one byte-order contract, unit-tested here in
+// isolation. The v4 packed-i64 path (`packEndpoint`) is UNTOUCHED and stays
+// byte-identical; these are reached only for a non-v4 endpoint.
+// ---------------------------------------------------------------------------
+
+/// The ABI family code for a resolved endpoint: `0` unavailable, `4` IPv4,
+/// `6` IPv6. The Zap decoder never needs this directly (the v4 packed code is
+/// `>= 0`, and a non-v4 endpoint is disambiguated by `endpointV6Word` returning
+/// `-1` for anything but v6), but it is the honest, self-describing companion
+/// the seam tests assert against.
+pub fn endpointFamilyCode(endpoint: SocketEndpoint) i64 {
+    return switch (endpoint.family) {
+        .unavailable => 0,
+        .ip4 => 4,
+        .ip6 => 6,
+    };
+}
+
+/// The 32-bit big-endian word at `word_index` (`0..3`) of a v6 endpoint's
+/// 16-byte address, returned as a NON-NEGATIVE `i64` in `[0, 2^32)` — four
+/// network-order address bytes packed `b0*2^24 + b1*2^16 + b2*2^8 + b3`.
+///
+/// The 128-bit address is surfaced as four 32-bit words (never the two 64-bit
+/// halves) precisely so every value fits a non-negative `i64`: a 64-bit half
+/// whose top bit is set would bitcast to a NEGATIVE `i64`, and Zap — which has
+/// only integer division/remainder, no bitwise ops and no unsigned-64
+/// arithmetic — could not then recover the bytes. With 32-bit words the Zap side
+/// splits each word into its two hextets with `word / 65536` and
+/// `remainder(word, 65536)`, no sign juggling and no String-byte extraction.
+///
+/// Returns `-1` for any non-IPv6 endpoint (IPv4, or unavailable). That is the
+/// sentinel the Zap decoder relies on to distinguish a genuine v6 endpoint —
+/// whose words are always `>= 0`, even `::1` whose first three words are `0` —
+/// from a truly `:unavailable` one, WITHOUT a separate family round-trip.
+pub fn endpointV6Word(endpoint: SocketEndpoint, word_index: usize) i64 {
+    if (endpoint.family != .ip6) return -1;
+    const base = word_index * 4;
+    const b0: i64 = endpoint.v6[base];
+    const b1: i64 = endpoint.v6[base + 1];
+    const b2: i64 = endpoint.v6[base + 2];
+    const b3: i64 = endpoint.v6[base + 3];
+    return ((b0 * 256 + b1) * 256 + b2) * 256 + b3;
+}
+
+/// The endpoint's port as an `i64` (native-endian, `0..65535`).
+pub fn endpointPortValue(endpoint: SocketEndpoint) i64 {
+    return endpoint.port;
+}
+
+/// The endpoint's IPv6 zone/scope id as an `i64` (`0` = none; meaningful only
+/// for a v6 endpoint — a v4 or unavailable endpoint carries `0`).
+pub fn endpointScopeValue(endpoint: SocketEndpoint) i64 {
+    return endpoint.scope_id;
+}
+
+// ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
 
@@ -2322,6 +2384,61 @@ test "socket_io: connectIp6 connects to an IPv6 loopback listener; peerAddress s
     // The local endpoint of an IPv6 socket is also v6-aware.
     const local = localAddress(outcome.fd);
     try testing.expectEqual(SocketEndpoint.Family.ip6, local.family);
+}
+
+test "socket_io: endpoint v6 accessors reconstruct ::1 words + port end-to-end (the Zap decode contract)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const listener = listenIp6ForTest(0) orelse return error.SkipZigTest; // no IPv6 loopback here
+    defer closeFd(listener.fd);
+
+    const outcome = connectIp6(loopback_ip6, listener.port, 0, 0, 5000, null);
+    try testing.expectEqual(Reason.ok, outcome.reason);
+    defer closeFd(outcome.fd);
+
+    // The exact values the Zap `SocketAddress.ip6_from_words` decode receives
+    // over the ABI: the four 32-bit big-endian words of ::1 are 0, 0, 0, 1;
+    // family is 6; the port is the listener's; the scope id is 0.
+    const peer = peerAddress(outcome.fd);
+    try testing.expectEqual(@as(i64, 6), endpointFamilyCode(peer));
+    try testing.expectEqual(@as(i64, 0), endpointV6Word(peer, 0));
+    try testing.expectEqual(@as(i64, 0), endpointV6Word(peer, 1));
+    try testing.expectEqual(@as(i64, 0), endpointV6Word(peer, 2));
+    try testing.expectEqual(@as(i64, 1), endpointV6Word(peer, 3));
+    try testing.expectEqual(@as(i64, listener.port), endpointPortValue(peer));
+    try testing.expectEqual(@as(i64, 0), endpointScopeValue(peer));
+}
+
+test "socket_io: endpoint v6 word extractor packs an arbitrary address in network order; -1 for non-v6" {
+    // A full address 2001:0db8:85a3:0000:0000:8a2e:0370:7334 (no zero-run edge
+    // cases) — proves the 32-bit-word byte order the Zap hextet decode assumes.
+    const full = SocketEndpoint{
+        .family = .ip6,
+        .v4 = .{ 0, 0, 0, 0 },
+        .v6 = .{ 0x20, 0x01, 0x0d, 0xb8, 0x85, 0xa3, 0x00, 0x00, 0x00, 0x00, 0x8a, 0x2e, 0x03, 0x70, 0x73, 0x34 },
+        .port = 443,
+        .scope_id = 7,
+    };
+    try testing.expectEqual(@as(i64, 6), endpointFamilyCode(full));
+    // word = b0*2^24 + b1*2^16 + b2*2^8 + b3.
+    try testing.expectEqual(@as(i64, 0x2001_0db8), endpointV6Word(full, 0));
+    try testing.expectEqual(@as(i64, 0x85a3_0000), endpointV6Word(full, 1));
+    try testing.expectEqual(@as(i64, 0x0000_8a2e), endpointV6Word(full, 2));
+    try testing.expectEqual(@as(i64, 0x0370_7334), endpointV6Word(full, 3));
+    try testing.expectEqual(@as(i64, 443), endpointPortValue(full));
+    try testing.expectEqual(@as(i64, 7), endpointScopeValue(full));
+
+    // The high-bit-set word 0x85a3_0000 stays a non-negative i64 (no bitcast to
+    // negative) — the whole reason the address is split into 32-bit words.
+    try testing.expect(endpointV6Word(full, 1) >= 0);
+
+    // A v4 or unavailable endpoint yields the -1 non-v6 sentinel on the word
+    // accessor (family/port/scope still answer honestly).
+    const v4 = SocketEndpoint{ .family = .ip4, .v4 = .{ 127, 0, 0, 1 }, .v6 = @splat(0), .port = 8080, .scope_id = 0 };
+    try testing.expectEqual(@as(i64, 4), endpointFamilyCode(v4));
+    try testing.expectEqual(@as(i64, -1), endpointV6Word(v4, 0));
+    try testing.expectEqual(@as(i64, 0), endpointFamilyCode(SocketEndpoint.none));
+    try testing.expectEqual(@as(i64, -1), endpointV6Word(SocketEndpoint.none, 0));
 }
 
 test "socket_io: happy-eyeballs races a dead IPv6 first, connects to the live IPv4, and leaks no loser fd" {
