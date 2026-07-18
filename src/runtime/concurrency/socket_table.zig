@@ -223,6 +223,16 @@ const Slot = struct {
     local_port: u16,
     /// Whether this is a plaintext or TLS socket (reserved for S4/S5).
     kind: SocketKind,
+    /// The TLS session bound to this socket when `kind == .tls_session`, else
+    /// `null` (Phase S4). STORED and RETURNED (by `close`) but NEVER
+    /// DEREFERENCED here — the pure table treats it exactly like the opaque
+    /// `fd`, so the module stays free of the TLS/crypto/I-O the bridge owns
+    /// (`abi.zig` gate-ON, `SocketRuntime` gate-OFF cast it back to the
+    /// concrete `*TlsSession`). Set by `attachTls` (fresh TLS connect) or
+    /// `upgradeToTls` (STARTTLS), carried across a cross-process move by
+    /// `beginHandoff`, and handed back on EVERY close path so the session is
+    /// scrubbed + freed exactly once (the no-key-residue / no-leak guarantee).
+    tls_state: ?*anyopaque,
     /// Intrusive free-list link (slot index; guarded by the domain lock).
     next_free: u32,
 };
@@ -340,6 +350,9 @@ pub const SocketDomain = struct {
         acquired.slot.owner_pid_bits = owner_pid_bits;
         acquired.slot.local_port = local_port;
         acquired.slot.kind = socket_kind;
+        // A freshly opened socket carries no TLS session; the handshake path
+        // (`attachTls`) or a STARTTLS `upgradeToTls` sets it later.
+        acquired.slot.tls_state = null;
         // Publish: occupied, this generation. `.release` orders the
         // fd/owner/kind writes above before any acquire-load of the state —
         // a reader that validates the generation is guaranteed to see them.
@@ -391,14 +404,42 @@ pub const SocketDomain = struct {
         return slot.local_port;
     }
 
+    /// The opaque TLS session bound to a live handle (Phase S4), or null when
+    /// the handle is stale OR the socket is plaintext (`tls_state == null`).
+    /// The bridge calls this AFTER `kind(handle) == .tls_session` to recover
+    /// the session pointer it casts back to `*TlsSession`; for a `.tls_session`
+    /// slot the pointer is guaranteed non-null (set atomically with the kind
+    /// flip by `attachTls`/`upgradeToTls`). Reads only the type-stable slot —
+    /// never faults, never dereferences the session.
+    pub fn tlsState(domain: *SocketDomain, handle: SocketHandle) ?*anyopaque {
+        const slot = domain.slotPointer(handle) orelse return null;
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        if (state.occupancy != .occupied or state.generation != handle.generation) return null;
+        return slot.tls_state;
+    }
+
+    /// What a successful `close` hands back to the bridge: the fd it must now
+    /// close via the I/O seam, plus the TLS session (if any) it must scrub +
+    /// free. Returning them TOGETHER makes the no-leak / no-key-residue
+    /// guarantee structural: every close path (explicit close, kill/crash
+    /// sweep, handoff-undo, dead-letter reclaim) receives the session and frees
+    /// it in lockstep with the fd — the socket's fd is closed exactly once, so
+    /// its session is freed exactly once (the single-owner invariant). A plain
+    /// socket returns `tls_state == null`.
+    pub const ClosedSocket = struct {
+        fd: Fd,
+        tls_state: ?*anyopaque,
+    };
+
     /// Close a handle: validate its generation, bump the generation (which
     /// invalidates EVERY outstanding copy of this handle in one store),
     /// recycle the slot (or retire it at generation exhaustion), and return
-    /// the fd the caller must now close via the I/O seam. Returns null when
-    /// the handle is already stale (closed / forged / wrong generation) —
-    /// the surface turns that into a use-after-close panic. The fd is
-    /// returned rather than closed here to keep this module free of I/O.
-    pub fn close(domain: *SocketDomain, handle: SocketHandle) ?Fd {
+    /// the fd the caller must now close via the I/O seam ALONGSIDE the TLS
+    /// session (if any) it must scrub + free. Returns null when the handle is
+    /// already stale (closed / forged / wrong generation) — the surface turns
+    /// that into a use-after-close panic. The fd/session are returned rather
+    /// than acted on here to keep this module free of I/O and crypto.
+    pub fn close(domain: *SocketDomain, handle: SocketHandle) ?ClosedSocket {
         const slot = domain.slotPointer(handle) orelse return null;
         // Validate the generation and recycle the slot ATOMICALLY under the
         // domain lock (MED-2). Reading the state, deciding the handle is live,
@@ -419,9 +460,119 @@ pub const SocketDomain = struct {
             return null;
         }
         const closed_fd = slot.fd;
+        const closed_tls_state = slot.tls_state;
         domain.recycleSlotLocked(handle.slot, slot, state.generation);
         domain.domain_lock.unlock();
-        return closed_fd;
+        return .{ .fd = closed_fd, .tls_state = closed_tls_state };
+    }
+
+    // -- TLS binding (S4) --------------------------------------------------
+
+    /// Bind a TLS session to a LIVE handle after a successful handshake on a
+    /// FRESH TLS connection (the `Tls.connect` path): validate generation +
+    /// occupancy + ownership by `from_pid_bits`, then set `tls_state` and flip
+    /// `kind` to `.tls_session` as ONE atomic step under `domain_lock`. The
+    /// generation is NOT bumped — the SAME handle keeps naming the socket, now
+    /// TLS (a fresh connect's handle was never used for plaintext I/O, so there
+    /// is nothing to invalidate — UNLIKE `upgradeToTls`). Returns true on
+    /// success; false when the handle is stale/forged or not owned by
+    /// `from_pid_bits` (defense in depth over the caller's ledger gate), leaving
+    /// the slot UNTOUCHED. The `.release` re-store of the (unchanged) state word
+    /// orders the `tls_state`/`kind` writes before any later acquire-load.
+    pub fn attachTls(
+        domain: *SocketDomain,
+        handle: SocketHandle,
+        from_pid_bits: u64,
+        tls_state: *anyopaque,
+    ) bool {
+        const slot = domain.slotPointer(handle) orelse return false;
+        domain.lockDomain();
+        defer domain.domain_lock.unlock();
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        if (state.occupancy != .occupied or state.generation != handle.generation) return false;
+        if (slot.owner_pid_bits != from_pid_bits) return false;
+        slot.tls_state = tls_state;
+        slot.kind = .tls_session;
+        slot.state.store(@bitCast(state), .release);
+        return true;
+    }
+
+    /// STARTTLS upgrade (the `Tls.upgrade` path): CONSUME the plaintext handle
+    /// and mint a TLS SUCCESSOR on the same slot/fd. Validate generation +
+    /// occupancy + ownership by `from_pid_bits`, bind `tls_state`, flip `kind`
+    /// to `.tls_session`, and BUMP THE GENERATION IN PLACE — so the caller's
+    /// OLD plaintext handle goes stale EVERYWHERE the instant the upgrade
+    /// commits (a use-after-upgrade fails the generation check = a loud panic,
+    /// never accidental plaintext I/O over a now-encrypted socket; the OQ2
+    /// consume floor). The owner is UNCHANGED (this is not a cross-process
+    /// handoff — no `in_flight`, the same process keeps owning). Returns the
+    /// successor handle, or null when the handle is stale/forged or not owned
+    /// by `from_pid_bits`, leaving the slot UNTOUCHED (the retire-edge carve is
+    /// the only fallible step and runs before ANY mutation — the "did not mutate
+    /// on failure" contract, exactly like `beginHandoff`). At the generation-
+    /// exhaustion retire edge the SAME fd is re-homed on a fresh slot (the old
+    /// slot retired, never reissued) so a `{slot, generation}` pair is never
+    /// reused and the fd never closes. `live_socket_count` is conserved across
+    /// the re-home (no fd opened/closed — the same socket, now TLS).
+    pub fn upgradeToTls(
+        domain: *SocketDomain,
+        handle: SocketHandle,
+        from_pid_bits: u64,
+        tls_state: *anyopaque,
+    ) ?SocketHandle {
+        const slot = domain.slotPointer(handle) orelse return null;
+        domain.lockDomain();
+        defer domain.domain_lock.unlock();
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        if (state.occupancy != .occupied or state.generation != handle.generation) return null;
+        if (slot.owner_pid_bits != from_pid_bits) return null;
+
+        if (state.generation == retired_generation - 1) {
+            // Generation space exhausted on this slot: re-home the SAME fd on a
+            // fresh slot (the socket stays live — no fd close, no live-count
+            // change) and retire the old slot. CARVE FIRST, before any mutation
+            // of the old slot (the carve is the only fallible step; this module
+            // is pure, so "did not mutate on failure" holds — on carve failure
+            // the old plaintext handle is still valid and the caller's undo
+            // closes it exactly once). Correct the transient double-count and
+            // restore the pre-carve peak, exactly as `beginHandoff` does.
+            const peak_before_rehome = domain.live_socket_peak;
+            const acquired = domain.acquireSlotLocked() catch return null;
+            std.debug.assert(domain.live_socket_count > 0);
+            domain.live_socket_count -= 1;
+            domain.live_socket_peak = peak_before_rehome;
+
+            const preserved_fd = slot.fd;
+            const preserved_port = slot.local_port;
+            slot.state.store(@bitCast(SlotState{
+                .generation = retired_generation,
+                .occupancy = .retired,
+            }), .release);
+            domain.retired_slot_count += 1;
+            acquired.slot.fd = preserved_fd;
+            acquired.slot.owner_pid_bits = from_pid_bits; // same owner (not a handoff)
+            acquired.slot.local_port = preserved_port;
+            acquired.slot.kind = .tls_session;
+            acquired.slot.tls_state = tls_state;
+            acquired.slot.state.store(@bitCast(SlotState{
+                .generation = acquired.handle.generation,
+                .occupancy = .occupied,
+            }), .release);
+            return acquired.handle;
+        }
+
+        // In-place generation bump: same slot/fd, next generation, same owner,
+        // now a TLS session. `.release` orders the tls_state/kind writes before
+        // any acquire-load of the new state word; the old handle's generation
+        // is now stale everywhere.
+        slot.kind = .tls_session;
+        slot.tls_state = tls_state;
+        const successor_generation = state.generation + 1;
+        slot.state.store(@bitCast(SlotState{
+            .generation = successor_generation,
+            .occupancy = .occupied,
+        }), .release);
+        return SocketHandle{ .slot = handle.slot, .generation = successor_generation };
     }
 
     // -- cross-process handoff (S3) ----------------------------------------
@@ -499,6 +650,13 @@ pub const SocketDomain = struct {
             const preserved_fd = slot.fd;
             const preserved_port = slot.local_port;
             const preserved_kind = slot.kind;
+            // A moved TLS socket CARRIES its session across the process boundary
+            // (Phase S4): the session heap-box is process-agnostic, so the
+            // successor slot re-homes the same `tls_state` — the receiver's
+            // later recv decrypts into ITS recv-arena, and whichever process
+            // ultimately closes the successor scrubs + frees the one session
+            // exactly once (never two processes sharing it).
+            const preserved_tls_state = slot.tls_state;
             slot.state.store(@bitCast(SlotState{
                 .generation = retired_generation,
                 .occupancy = .retired,
@@ -508,6 +666,7 @@ pub const SocketDomain = struct {
             acquired.slot.owner_pid_bits = to_pid_bits;
             acquired.slot.local_port = preserved_port;
             acquired.slot.kind = preserved_kind;
+            acquired.slot.tls_state = preserved_tls_state;
             acquired.slot.state.store(@bitCast(SlotState{
                 .generation = acquired.handle.generation,
                 .occupancy = .occupied,
@@ -622,6 +781,7 @@ pub const SocketDomain = struct {
             .owner_pid_bits = 0,
             .local_port = 0,
             .kind = .plain,
+            .tls_state = null,
             .next_free = no_free_slot,
         };
         // Publish the carve AFTER the slot (and its segment pointer) are
@@ -641,6 +801,12 @@ pub const SocketDomain = struct {
     /// return it to the free list, or retire it at generation exhaustion.
     /// `current_generation` is the validated live generation.
     fn recycleSlotLocked(domain: *SocketDomain, slot_index: u32, slot: *Slot, current_generation: u32) void {
+        // Clear the TLS binding as the slot leaves service — `close` already
+        // captured it to hand back, and a recycled/retired slot must never
+        // carry a stale session pointer into its next life (a fresh `open`
+        // re-nulls it too; this is defense in depth so an inspecting reader
+        // never sees a dangling pointer on a free/retired slot).
+        slot.tls_state = null;
         const retiring = current_generation == retired_generation - 1;
         if (retiring) {
             // Generation space exhausted: park the slot permanently so the
@@ -808,6 +974,19 @@ pub const SocketLedger = struct {
 
 const testing = std.testing;
 
+/// Assert a `close` result: `expected == null` requires a stale-handle null;
+/// `expected == fd` requires a live close returning that fd. The `tls_state`
+/// (Phase S4) is asserted separately by the TLS tests — most tests close plain
+/// sockets and only care that the fd comes back exactly once.
+fn expectClosedFd(expected: ?Fd, closed: ?SocketDomain.ClosedSocket) !void {
+    if (expected) |fd| {
+        try testing.expect(closed != null);
+        try testing.expectEqual(fd, closed.?.fd);
+    } else {
+        try testing.expect(closed == null);
+    }
+}
+
 test "SocketDomain: open records fd/owner/kind; reads see them; close frees leak-exactly" {
     var domain = SocketDomain.init();
     defer domain.deinit();
@@ -820,13 +999,13 @@ test "SocketDomain: open records fd/owner/kind; reads see them; close frees leak
     try testing.expectEqual(@as(u32, 1), domain.statistics().live_socket_count);
 
     // Close returns the fd for the bridge to close, and frees the slot.
-    try testing.expectEqual(@as(?Fd, 7), domain.close(handle));
+    try expectClosedFd(7, domain.close(handle));
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
 
     // The closed handle is stale everywhere: generation bumped on close.
     try testing.expect(!domain.isLive(handle));
     try testing.expectEqual(@as(?Fd, null), domain.fd(handle));
-    try testing.expectEqual(@as(?Fd, null), domain.close(handle));
+    try expectClosedFd(null, domain.close(handle));
 }
 
 test "SocketDomain: slot reuse bumps the generation and keeps stale handles dead" {
@@ -857,7 +1036,7 @@ test "SocketDomain: a forged handle (never-carved slot) never faults" {
     try testing.expect(!domain.isLive(forged));
     try testing.expectEqual(@as(?Fd, null), domain.fd(forged));
     try testing.expectEqual(@as(?u64, null), domain.owner(forged));
-    try testing.expectEqual(@as(?Fd, null), domain.close(forged));
+    try expectClosedFd(null, domain.close(forged));
 
     // The invalid (all-zero) handle likewise never resolves.
     try testing.expect(!domain.isLive(SocketHandle.invalid));
@@ -951,11 +1130,11 @@ test "SocketDomain.beginHandoff: bumps the generation, re-points the owner, sets
     try testing.expect(!domain.isLive(original));
     try testing.expectEqual(@as(?Fd, null), domain.fd(original));
     try testing.expectEqual(@as(?u64, null), domain.owner(original));
-    try testing.expectEqual(@as(?Fd, null), domain.close(original));
+    try expectClosedFd(null, domain.close(original));
 
     // Complete + close leak-exactly.
     try testing.expect(domain.completeHandoff(successor, 0xBBBB));
-    try testing.expectEqual(@as(?Fd, 42), domain.close(successor));
+    try expectClosedFd(42, domain.close(successor));
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
 }
 
@@ -1039,7 +1218,7 @@ test "SocketDomain.beginHandoff: a chained handoff A->B->C re-points each time; 
     try testing.expect(domain.isLive(c_handle));
     try testing.expectEqual(@as(?u64, 0xC), domain.owner(c_handle));
     try testing.expect(domain.completeHandoff(c_handle, 0xC));
-    try testing.expectEqual(@as(?Fd, 21), domain.close(c_handle));
+    try expectClosedFd(21, domain.close(c_handle));
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
 }
 
@@ -1082,7 +1261,7 @@ test "SocketDomain.beginHandoff: the generation-exhaustion retire edge re-homes 
     try testing.expectEqual(@as(?SocketHandle, null), domain.beginHandoff(edge_handle, 0xAAAA, 0xCCCC));
 
     try testing.expect(domain.completeHandoff(successor, 0xBBBB));
-    try testing.expectEqual(@as(?Fd, 42), domain.close(successor));
+    try expectClosedFd(42, domain.close(successor));
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
 }
 
@@ -1143,7 +1322,7 @@ test "SocketDomain.beginHandoff: a carve FAILURE at the retire edge leaves the o
 
     // NO fd LEAK: the caller's undo closes the ORIGINAL handle exactly once and
     // the live count returns to baseline (this close retires the exhausted slot).
-    try testing.expectEqual(@as(?Fd, 42), domain.close(edge_handle));
+    try expectClosedFd(42, domain.close(edge_handle));
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
     try testing.expectEqual(retired_before + 1, domain.statistics().retired_slot_count);
 }
@@ -1245,4 +1424,193 @@ test "SocketLedger: ownedHandles reflects the live set for the teardown sweep" {
     try testing.expectEqual(@as(usize, 2), owned.len);
     try testing.expectEqual(@as(u64, 0xAA), owned[0]);
     try testing.expectEqual(@as(u64, 0xBB), owned[1]);
+}
+
+// ---------------------------------------------------------------------------
+// Phase S4 — the TLS domain primitives (`tls_state`, `attachTls`,
+// `upgradeToTls`, `close`-returns-the-session, `beginHandoff` preserves the
+// session). The session pointer is an OPAQUE sentinel here — the pure table
+// never dereferences it (the bridge's `*TlsSession` cast is exercised by the
+// abi/socket_io suites), so these tests use throwaway `*anyopaque` markers.
+// ---------------------------------------------------------------------------
+
+/// A distinct non-null opaque marker standing in for a `*TlsSession` (the table
+/// stores/returns it verbatim, never dereferences it).
+fn fakeTlsState(tag: usize) *anyopaque {
+    return @ptrFromInt(0x1000 + tag);
+}
+
+test "SocketDomain.attachTls: binds a session + flips kind to tls_session WITHOUT bumping the generation (fresh-connect path)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(7, 0xAB, 0, .plain);
+    try testing.expectEqual(@as(?SocketKind, .plain), domain.kind(handle));
+    try testing.expectEqual(@as(?*anyopaque, null), domain.tlsState(handle));
+
+    const session = fakeTlsState(1);
+    try testing.expect(domain.attachTls(handle, 0xAB, session));
+
+    // SAME handle still names the socket — now TLS, with the session bound.
+    try testing.expect(domain.isLive(handle));
+    try testing.expectEqual(@as(?SocketKind, .tls_session), domain.kind(handle));
+    try testing.expectEqual(@as(?*anyopaque, session), domain.tlsState(handle));
+
+    // A wrong-owner attach is refused (defense in depth); the slot is untouched.
+    try testing.expect(!domain.attachTls(handle, 0x99, fakeTlsState(2)));
+    try testing.expectEqual(@as(?*anyopaque, session), domain.tlsState(handle));
+
+    // close hands the session back ALONGSIDE the fd (the no-leak seam).
+    const closed = domain.close(handle) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(Fd, 7), closed.fd);
+    try testing.expectEqual(@as(?*anyopaque, session), closed.tls_state);
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.attachTls: a stale/forged handle is refused (no bind)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(7, 0, 0, .plain);
+    _ = domain.close(handle); // now stale
+    try testing.expect(!domain.attachTls(handle, 0, fakeTlsState(1)));
+
+    const forged = SocketHandle{ .slot = 4242, .generation = 5 };
+    try testing.expect(!domain.attachTls(forged, 0, fakeTlsState(2)));
+}
+
+test "SocketDomain.upgradeToTls: gen-bump consumes the plaintext handle; use-after-upgrade is stale (STARTTLS)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const plaintext = try domain.open(9, 0xCD, 4444, .plain);
+    const session = fakeTlsState(3);
+
+    const upgraded = domain.upgradeToTls(plaintext, 0xCD, session) orelse
+        return error.TestUnexpectedResult;
+
+    // Same slot/fd, generation bumped: the OLD plaintext handle is stale
+    // everywhere (no accidental plaintext I/O over the now-encrypted socket).
+    try testing.expectEqual(plaintext.slot, upgraded.slot);
+    try testing.expectEqual(plaintext.generation + 1, upgraded.generation);
+    try testing.expect(!domain.isLive(plaintext));
+    try testing.expectEqual(@as(?Fd, null), domain.fd(plaintext));
+    try testing.expectEqual(@as(?*anyopaque, null), domain.tlsState(plaintext));
+
+    // The successor is a live TLS socket on the same fd, owned by the same pid.
+    try testing.expect(domain.isLive(upgraded));
+    try testing.expectEqual(@as(?Fd, 9), domain.fd(upgraded));
+    try testing.expectEqual(@as(?u64, 0xCD), domain.owner(upgraded));
+    try testing.expectEqual(@as(?SocketKind, .tls_session), domain.kind(upgraded));
+    try testing.expectEqual(@as(?*anyopaque, session), domain.tlsState(upgraded));
+    // Live-count CONSERVED — the upgrade opens/closes no fd.
+    try testing.expectEqual(@as(u32, 1), domain.statistics().live_socket_count);
+
+    const closed = domain.close(upgraded) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(Fd, 9), closed.fd);
+    try testing.expectEqual(@as(?*anyopaque, session), closed.tls_state);
+}
+
+test "SocketDomain.upgradeToTls: wrong owner / stale handle is refused, slot untouched" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(9, 0xCD, 0, .plain);
+    // Wrong owner: refused, slot untouched (still a live plaintext socket).
+    try testing.expectEqual(@as(?SocketHandle, null), domain.upgradeToTls(handle, 0x99, fakeTlsState(1)));
+    try testing.expect(domain.isLive(handle));
+    try testing.expectEqual(@as(?SocketKind, .plain), domain.kind(handle));
+    try testing.expectEqual(@as(?*anyopaque, null), domain.tlsState(handle));
+
+    _ = domain.close(handle); // now stale
+    try testing.expectEqual(@as(?SocketHandle, null), domain.upgradeToTls(handle, 0xCD, fakeTlsState(2)));
+}
+
+test "SocketDomain.upgradeToTls: the generation-exhaustion retire edge re-homes the fd as TLS, live-count conserved" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(42, 0xAAAA, 1234, .plain);
+    const edge_slot = domain.slotPointerUnchecked(handle.slot);
+    edge_slot.state.store(@bitCast(SlotState{
+        .generation = retired_generation - 1,
+        .occupancy = .occupied,
+    }), .release);
+    const edge_handle = SocketHandle{ .slot = handle.slot, .generation = retired_generation - 1 };
+
+    const live_before = domain.statistics().live_socket_count;
+    const peak_before = domain.statistics().live_socket_peak;
+    const retired_before = domain.statistics().retired_slot_count;
+
+    const session = fakeTlsState(7);
+    const successor = domain.upgradeToTls(edge_handle, 0xAAAA, session) orelse
+        return error.TestUnexpectedResult;
+
+    // The fd re-homed on a DIFFERENT slot, now a TLS socket owned by the SAME
+    // pid (not a handoff), the session bound, the exhausted slot retired.
+    try testing.expect(successor.slot != handle.slot);
+    try testing.expectEqual(@as(?Fd, 42), domain.fd(successor));
+    try testing.expectEqual(@as(?u64, 0xAAAA), domain.owner(successor));
+    try testing.expectEqual(@as(?SocketKind, .tls_session), domain.kind(successor));
+    try testing.expectEqual(@as(?*anyopaque, session), domain.tlsState(successor));
+    try testing.expectEqual(@as(?u16, 1234), domain.localPort(successor));
+    // Live-count + peak CONSERVED; one slot retired; old edge handle stale.
+    try testing.expectEqual(live_before, domain.statistics().live_socket_count);
+    try testing.expectEqual(peak_before, domain.statistics().live_socket_peak);
+    try testing.expectEqual(retired_before + 1, domain.statistics().retired_slot_count);
+    try testing.expect(!domain.isLive(edge_handle));
+
+    try expectClosedFd(42, domain.close(successor));
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.beginHandoff: a moved TLS socket CARRIES its session to the successor (in-place bump)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(11, 0xA, 0, .plain);
+    const session = fakeTlsState(5);
+    try testing.expect(domain.attachTls(handle, 0xA, session));
+
+    const successor = domain.beginHandoff(handle, 0xA, 0xB) orelse
+        return error.TestUnexpectedResult;
+
+    // The successor carries the SAME session across the move (kind + tls_state
+    // preserved); the sender's old handle is stale everywhere.
+    try testing.expect(!domain.isLive(handle));
+    try testing.expectEqual(@as(?SocketKind, .tls_session), domain.kind(successor));
+    try testing.expectEqual(@as(?*anyopaque, session), domain.tlsState(successor));
+
+    try testing.expect(domain.completeHandoff(successor, 0xB));
+    const closed = domain.close(successor) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(Fd, 11), closed.fd);
+    try testing.expectEqual(@as(?*anyopaque, session), closed.tls_state);
+}
+
+test "SocketDomain.beginHandoff: the retire edge preserves the TLS session on the re-homed slot" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(11, 0xAAAA, 0, .plain);
+    const session = fakeTlsState(6);
+    try testing.expect(domain.attachTls(handle, 0xAAAA, session));
+
+    // Advance the slot to the retire edge, then move it: the re-home must carry
+    // the session onto the fresh slot.
+    const edge_slot = domain.slotPointerUnchecked(handle.slot);
+    edge_slot.state.store(@bitCast(SlotState{
+        .generation = retired_generation - 1,
+        .occupancy = .occupied,
+    }), .release);
+    const edge_handle = SocketHandle{ .slot = handle.slot, .generation = retired_generation - 1 };
+
+    const successor = domain.beginHandoff(edge_handle, 0xAAAA, 0xBBBB) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(successor.slot != handle.slot);
+    try testing.expectEqual(@as(?SocketKind, .tls_session), domain.kind(successor));
+    try testing.expectEqual(@as(?*anyopaque, session), domain.tlsState(successor));
+
+    try testing.expect(domain.completeHandoff(successor, 0xBBBB));
+    const closed = domain.close(successor) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(?*anyopaque, session), closed.tls_state);
 }

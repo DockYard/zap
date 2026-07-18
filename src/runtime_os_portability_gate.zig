@@ -611,6 +611,14 @@ const kernel_seam_allowlist = [_]KernelSeam{
             "std.c.clock_gettime",
             "std.c.CLOCK",
             "std.os.wasi",
+            // Phase S4 TLS: the OS CSPRNG for the mandatory 240-byte handshake
+            // entropy (`secureRandomBytes`) — Linux `getrandom(2)` (no libc
+            // dependency), macOS/BSD `arc4random_buf` (the kernel CSPRNG). A
+            // weak/predictable source is a critical TLS flaw, and there is no
+            // portable `std` surface (`std.crypto.random` is not reachable from
+            // the embedded runtime), so the seam sources it per-OS.
+            "std.os.linux.getrandom",
+            "std.c.arc4random_buf",
         },
         .reason =
         \\`socket_io.zig` IS the socket syscall seam (Decision C) — the ONE
@@ -636,6 +644,11 @@ const kernel_seam_allowlist = [_]KernelSeam{
         \\portable MSG_TRUNC truncation flag + the `msghdr`/`iovec` types), and a
         \\raw `accept(2)` for the Unix-domain listener whose AF_UNIX peer the
         \\fork's `netAccept` cannot represent.
+        \\The Phase S4 TLS client sources the mandatory handshake entropy from
+        \\the OS CSPRNG (`getrandom(2)` on Linux, `arc4random_buf` on macOS/BSD)
+        \\— there is no portable `std.crypto.random` in the embedded runtime and
+        \\weak entropy is a critical TLS flaw, so the seam sources it per-OS and
+        \\fails closed where no secure source exists.
         \\The needles enumerate exactly those primitives — a NEW, unrelated
         \\per-OS call here (e.g. `std.posix.fork`, `std.os.linux.*`) matches no
         \\needle and fails the gate, so whole-file trust is NOT implied.

@@ -2335,6 +2335,17 @@ fn socketConnectBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c)
 /// then frees the ledger storage. Reached from the node via
 /// `@fieldParentPtr` (the node is embedded in the PCB, so this only ever
 /// closes THIS process's sockets — never a sibling that reused a slot).
+/// Act on a domain-`close` result: close the fd through the I/O seam AND, when
+/// the slot carried a TLS session, scrub + free it (best-effort `close_notify`
+/// inside `tlsFreeSession`). Funnelling EVERY close path through here makes the
+/// no-leak / no-key-residue guarantee structural — a TLS socket closed on any
+/// path (explicit close, kill/crash sweep, handoff-undo, dead-letter reclaim)
+/// frees its session exactly once (the fd is closed exactly once).
+fn closeResolvedSocket(closed: concurrency.socket_table.SocketDomain.ClosedSocket) void {
+    concurrency.socket_io.closeFd(closed.fd);
+    if (closed.tls_state) |session| concurrency.socket_io.tlsFreeSession(session);
+}
+
 fn socketSweepDestructor(node: *process_module.DropListNode) void {
     const pcb: *process_module.ProcessControlBlock = @fieldParentPtr("socket_sweep_node", node);
     // An IN-FLIGHT Stage-1 DNS resolve (the process was killed while parked in
@@ -2368,8 +2379,8 @@ fn socketSweepDestructor(node: *process_module.DropListNode) void {
         pcb.socket_pending_fd = concurrency.socket_table.no_pending_socket_fd;
     }
     for (pcb.socket_ledger.ownedHandles()) |handle_bits| {
-        if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |fd| {
-            concurrency.socket_io.closeFd(fd);
+        if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |closed| {
+            closeResolvedSocket(closed);
         }
     }
     pcb.socket_ledger.releaseStorage();
@@ -2441,7 +2452,7 @@ export fn zap_socket_connect(
         return socketConnectFailed(context, .out_of_memory);
     };
     context.socketLedger().append(handle.toBits()) catch {
-        if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
+        if (runtime_state.socket_domain.close(handle)) |closed| closeResolvedSocket(closed);
         return socketConnectFailed(context, .out_of_memory);
     };
     return handle.toBits();
@@ -2548,7 +2559,7 @@ fn promoteConnectedFd(context: *concurrency.ProcessContext, fd: concurrency.sock
         return socketConnectFailed(context, .out_of_memory);
     };
     context.socketLedger().append(handle.toBits()) catch {
-        if (runtime_state.socket_domain.close(handle)) |slot_fd| concurrency.socket_io.closeFd(slot_fd);
+        if (runtime_state.socket_domain.close(handle)) |closed| closeResolvedSocket(closed);
         return socketConnectFailed(context, .out_of_memory);
     };
     return handle.toBits();
@@ -2738,7 +2749,7 @@ fn promoteListener(context: *concurrency.ProcessContext, outcome: concurrency.so
         return socketConnectFailed(context, .out_of_memory);
     };
     context.socketLedger().append(handle.toBits()) catch {
-        if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
+        if (runtime_state.socket_domain.close(handle)) |closed| closeResolvedSocket(closed);
         return socketConnectFailed(context, .out_of_memory);
     };
     context.ensureSocketSweep(socketSweepDestructor);
@@ -2774,10 +2785,10 @@ export fn zap_socket_last_error(process: *anyopaque) callconv(.c) i32 {
 export fn zap_socket_close(process: *anyopaque, handle_bits: u64) callconv(.c) i32 {
     const context = contextFromHandle(process);
     if (!context.socketLedger().contains(handle_bits)) return ZapProcStatus.socket_not_owned;
-    const fd = runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits)) orelse
+    const closed = runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits)) orelse
         return ZapProcStatus.socket_not_owned;
     _ = context.socketLedger().removeOne(handle_bits);
-    concurrency.socket_io.closeFd(fd);
+    closeResolvedSocket(closed);
     return ZapProcStatus.ok;
 }
 
@@ -2832,8 +2843,8 @@ export fn zap_socket_live_count() callconv(.c) i64 {
 fn socketFlightReclaim(payload_pointer: [*]const u8) callconv(.c) void {
     var handle_bits: u64 = 0;
     @memcpy(std.mem.asBytes(&handle_bits), payload_pointer[0..@sizeOf(u64)]);
-    if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |fd| {
-        concurrency.socket_io.closeFd(fd);
+    if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |closed| {
+        closeResolvedSocket(closed);
     }
     runtime_state.ledger.free(LedgerBlock.fromBodyPointer(payload_pointer));
 }
@@ -2883,15 +2894,15 @@ export fn zap_socket_handoff_send(
         // generation-exhaustion carve OOM. Either way the fd is no longer in any
         // ledger, so it must not leak: close it through the original handle
         // (still live — `beginHandoff` did not mutate on failure).
-        if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |fd| {
-            concurrency.socket_io.closeFd(fd);
+        if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |closed| {
+            closeResolvedSocket(closed);
         }
         return ZapProcStatus.out_of_memory;
     };
     // (4) Allocate the 8-byte flight cell and write the SUCCESSOR bits.
     const cell = runtime_state.ledger.allocate(@sizeOf(u64)) catch {
         // No cell: the successor is owned by nobody — close it.
-        if (runtime_state.socket_domain.close(successor)) |fd| concurrency.socket_io.closeFd(fd);
+        if (runtime_state.socket_domain.close(successor)) |closed| closeResolvedSocket(closed);
         return ZapProcStatus.out_of_memory;
     };
     const successor_bits = successor.toBits();
@@ -2906,7 +2917,7 @@ export fn zap_socket_handoff_send(
     );
     if (status == ZapProcStatus.ok) return ZapProcStatus.ok;
     // (6) Not delivered — undo: close the slot, close the fd, free the cell.
-    if (runtime_state.socket_domain.close(successor)) |fd| concurrency.socket_io.closeFd(fd);
+    if (runtime_state.socket_domain.close(successor)) |closed| closeResolvedSocket(closed);
     runtime_state.ledger.free(cell);
     return status;
 }
@@ -2935,7 +2946,7 @@ export fn zap_socket_adopt(process: *anyopaque, payload_pointer: [*]const u8) ca
     // forged/replayed fragments; the take_moved fragment-clear is the first
     // no-double-adopt guard, this in-flight clear under the lock is the second).
     if (!runtime_state.socket_domain.completeHandoff(successor, context.selfPid().toBits())) {
-        if (runtime_state.socket_domain.close(successor)) |fd| concurrency.socket_io.closeFd(fd);
+        if (runtime_state.socket_domain.close(successor)) |closed| closeResolvedSocket(closed);
         runtime_state.ledger.free(LedgerBlock.fromBodyPointer(payload_pointer));
         @panic("zap: adopted a socket that is not an in-flight handoff to this process (protocol violation — a forged or replayed moved fragment)");
     }
@@ -2945,7 +2956,7 @@ export fn zap_socket_adopt(process: *anyopaque, payload_pointer: [*]const u8) ca
     // Record ownership. On OOM the socket is owned by nobody (in-flight already
     // cleared) — close it, free the cell, and report 0 (the runtime panics).
     context.socketLedger().append(successor_bits) catch {
-        if (runtime_state.socket_domain.close(successor)) |fd| concurrency.socket_io.closeFd(fd);
+        if (runtime_state.socket_domain.close(successor)) |closed| closeResolvedSocket(closed);
         runtime_state.ledger.free(LedgerBlock.fromBodyPointer(payload_pointer));
         return 0;
     };
@@ -2983,6 +2994,62 @@ const SocketRecvRequest = struct {
     kill_flag: ?*std.atomic.Value(bool),
     outcome: ?concurrency.socket_io.RecvOutcome,
 };
+
+/// A TLS `recv`'s blocking request: the opaque `*TlsSession` (resolved on-core
+/// from the domain slot), the per-process recv-arena allocator the DECRYPTED
+/// plaintext is COPIED into (never the session's own buffers — UAF-safe), the
+/// receive shape, the timeout, and the kill flag. The leaf drives the record
+/// decrypt off-core into `outcome`; `outcome` is null iff the arena allocation
+/// failed (OOM).
+const SocketTlsRecvRequest = struct {
+    session: *anyopaque,
+    allocator: std.mem.Allocator,
+    exact_target: usize,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    outcome: ?concurrency.socket_io.RecvOutcome,
+};
+
+fn socketTlsRecvBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketTlsRecvRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.tlsRecv(
+        request.session,
+        request.allocator,
+        request.exact_target,
+        socket_recv_next_available_capacity,
+        request.timeout_ms,
+        request.kill_flag,
+    ) catch null;
+    return null;
+}
+
+/// The `.tls_session` arm of `zap_socket_recv`: offload the record decrypt +
+/// arena copy off-core, then publish the CHUNK/CLOSED/FAILED status and the
+/// chunk backing exactly like the plain path.
+fn socketTlsRecv(
+    context: *concurrency.ProcessContext,
+    session: *anyopaque,
+    byte_count: i64,
+    timeout_ms: i64,
+    out_chunk_ptr: *?[*]const u8,
+) i64 {
+    var request = SocketTlsRecvRequest{
+        .session = session,
+        .allocator = context.socketRecvArena().allocator(),
+        .exact_target = if (byte_count > 0) @intCast(byte_count) else 0,
+        .timeout_ms = timeout_ms,
+        .kill_flag = context.pendingKillFlag(),
+        .outcome = null,
+    };
+    _ = context.blocking(socketTlsRecvBlockingTrampoline, &request);
+    if (request.outcome) |outcome| {
+        context.socketLedger().last_recv_status = outcome.status;
+        out_chunk_ptr.* = if (outcome.bytes_filled == 0) null else outcome.buffer.ptr;
+        return @intCast(outcome.bytes_filled);
+    }
+    context.socketLedger().last_recv_status = @intFromEnum(concurrency.socket_io.Reason.out_of_memory);
+    return 0;
+}
 
 fn socketRecvBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
     const request: *SocketRecvRequest = @ptrCast(@alignCast(operation_argument.?));
@@ -3026,8 +3093,15 @@ export fn zap_socket_recv(
     const context = contextFromHandle(process);
     out_chunk_ptr.* = null;
     if (!context.socketLedger().contains(handle_bits)) return -1;
-    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
-        return -1;
+    const handle = concurrency.SocketHandle.fromBits(handle_bits);
+    // Branch on the socket kind: a TLS session decrypts + arena-copies via the
+    // TLS leaf; a plaintext socket takes the raw recv path unchanged.
+    const socket_kind = runtime_state.socket_domain.kind(handle) orelse return -1;
+    if (socket_kind == .tls_session) {
+        const session = runtime_state.socket_domain.tlsState(handle) orelse return -1;
+        return socketTlsRecv(context, session, byte_count, timeout_ms, out_chunk_ptr);
+    }
+    const fd = runtime_state.socket_domain.fd(handle) orelse return -1;
     var request = SocketRecvRequest{
         // Captured on-core: the arena pointer (`&pcb.socket_recv_arena`) is
         // stable across the offload (the PCB is pinned), and the leaf's
@@ -3102,6 +3176,23 @@ fn socketSendBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*
     return null;
 }
 
+/// A TLS `send`'s blocking request: the opaque `*TlsSession`, the caller-owned
+/// plaintext payload, the timeout, and the kill flag. The leaf encrypts +
+/// double-flushes off-core into `outcome`.
+const SocketTlsSendRequest = struct {
+    session: *anyopaque,
+    bytes: []const u8,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    outcome: concurrency.socket_io.SendOutcome,
+};
+
+fn socketTlsSendBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketTlsSendRequest = @ptrCast(@alignCast(operation_argument.?));
+    request.outcome = concurrency.socket_io.tlsSend(request.session, request.bytes, request.timeout_ms, request.kill_flag);
+    return null;
+}
+
 /// Send `bytes_ptr[0..bytes_len]`, offloading the poll-quantum-bounded write
 /// off-core (Decision D). `all != 0` is all-or-error (`Socket.send`); `all ==
 /// 0` is one write (`Socket.send_some`). `timeout_ms` (`0` = no deadline)
@@ -3121,8 +3212,25 @@ export fn zap_socket_send(
 ) callconv(.c) i64 {
     const context = contextFromHandle(process);
     if (!context.socketLedger().contains(handle_bits)) return -1;
-    const fd = runtime_state.socket_domain.fd(concurrency.SocketHandle.fromBits(handle_bits)) orelse
-        return -1;
+    const handle = concurrency.SocketHandle.fromBits(handle_bits);
+    // Branch on the socket kind: a TLS session encrypts + double-flushes via the
+    // TLS leaf; a plaintext socket takes the raw send path unchanged.
+    const socket_kind = runtime_state.socket_domain.kind(handle) orelse return -1;
+    if (socket_kind == .tls_session) {
+        const session = runtime_state.socket_domain.tlsState(handle) orelse return -1;
+        var tls_request = SocketTlsSendRequest{
+            .session = session,
+            .bytes = bytes_ptr[0..bytes_len],
+            .timeout_ms = timeout_ms,
+            .kill_flag = context.pendingKillFlag(),
+            .outcome = undefined,
+        };
+        _ = context.blocking(socketTlsSendBlockingTrampoline, &tls_request);
+        if (tls_request.outcome.reason != .ok)
+            context.socketLedger().last_error = @intFromEnum(tls_request.outcome.reason);
+        return @intCast(tls_request.outcome.bytes_sent);
+    }
+    const fd = runtime_state.socket_domain.fd(handle) orelse return -1;
     var request = SocketSendRequest{
         .fd = fd,
         .bytes = bytes_ptr[0..bytes_len],
@@ -3150,6 +3258,153 @@ export fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) c
     const reason = concurrency.socket_io.shutdownFd(fd, how);
     if (reason != .ok) return @intFromEnum(reason);
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// TLS client surface (Phase S4 Jobs 2+3) — the handshake over an already-owned
+// fd, offloaded onto the blocking pool (Decision D) like connect/recv/send.
+// The whole synchronous `Client.init` (which drives verification MANDATORY over
+// the poll-quantum adapter) runs as ONE blocking-pool job bounded by a SINGLE
+// absolute deadline + the process's `kill_flag`, so a slowloris handshake times
+// out and stays killable (§8 DoS). On success the domain binds the opaque
+// session to the handle (fresh-connect → `attachTls`, no gen bump; STARTTLS →
+// `upgradeToTls`, gen-bump-consume). On failure the session is scrubbed + freed
+// on the pool thread and the caller keeps its (still plaintext) fd.
+// ---------------------------------------------------------------------------
+
+/// A TLS handshake's blocking request: the raw fd, the server host name (for
+/// certificate verification), the single absolute-deadline budget, and the
+/// captured kill flag. The pool thread allocates + populates the session box
+/// off-core into `session` (opaque) or records the failure `reason`.
+const SocketTlsHandshakeRequest = struct {
+    fd: concurrency.socket_io.Fd,
+    host: []const u8,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    session: ?*anyopaque,
+    reason: concurrency.socket_io.Reason,
+};
+
+fn socketTlsHandshakeBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketTlsHandshakeRequest = @ptrCast(@alignCast(operation_argument.?));
+    // Allocate the heap-stable session box over the fd (page allocator — the
+    // kernel-memory convention), then run the WHOLE verification handshake.
+    const session = concurrency.socket_io.tlsSessionCreate(request.fd, request.timeout_ms, request.kill_flag) orelse {
+        request.reason = .out_of_memory;
+        return null;
+    };
+    const reason = concurrency.socket_io.tlsHandshake(session, request.host, request.timeout_ms, request.kill_flag);
+    if (reason != .ok) {
+        // Handshake failed (bad cert, timeout, kill, protocol error): scrub +
+        // free the session here (no key residue). The fd is untouched — it is
+        // still owned by the caller's plaintext handle, which stays valid.
+        concurrency.socket_io.tlsFreeSession(session);
+        request.reason = reason;
+        return null;
+    }
+    request.session = session;
+    request.reason = .ok;
+    return null;
+}
+
+/// Run the offloaded verification handshake over the fd of the owned handle,
+/// storing the outcome in `request`. Shared by the fresh-connect (`attachTls`)
+/// and STARTTLS (`upgradeToTls`) exports. Returns the resolved fd or null on a
+/// stale/foreign handle (the caller turns that into `-1`/`0`).
+fn runTlsHandshake(
+    context: *concurrency.ProcessContext,
+    handle: concurrency.SocketHandle,
+    host: []const u8,
+    timeout_ms: i64,
+    request: *SocketTlsHandshakeRequest,
+) bool {
+    const fd = runtime_state.socket_domain.fd(handle) orelse return false;
+    request.* = .{
+        .fd = fd,
+        .host = host,
+        .timeout_ms = timeout_ms,
+        // Captured on-core so the poll-quantum handshake stays kill-responsive.
+        .kill_flag = context.pendingKillFlag(),
+        .session = null,
+        .reason = .ok,
+    };
+    _ = context.blocking(socketTlsHandshakeBlockingTrampoline, request);
+    return true;
+}
+
+/// Establish TLS over an OWNED plaintext socket (the `Tls.connect` fresh-connect
+/// path): run the verification handshake off-core, and on success BIND the
+/// session to the SAME handle (`attachTls`, no generation bump — the handle was
+/// never used for plaintext I/O). Returns `0` on success (the handle is now a
+/// TLS socket, same bits), a positive `Reason` code on handshake failure (also
+/// recorded in the process last-error), or `-1` when the caller does not own a
+/// live handle (a use-after-close / foreign-handle bug → panic at the surface).
+export fn zap_socket_tls_handshake(
+    process: *anyopaque,
+    handle_bits: u64,
+    host_ptr: [*]const u8,
+    host_len: usize,
+    timeout_ms: i64,
+) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    const handle = concurrency.SocketHandle.fromBits(handle_bits);
+    var request: SocketTlsHandshakeRequest = undefined;
+    if (!runTlsHandshake(context, handle, host_ptr[0..host_len], timeout_ms, &request)) return -1;
+    if (request.reason != .ok) {
+        context.socketLedger().last_error = @intFromEnum(request.reason);
+        return @intFromEnum(request.reason);
+    }
+    const session = request.session.?;
+    // Bind the session to the handle. Ownership was validated on-core and this
+    // path does not park between, so a failure would be a kernel invariant
+    // breach — free the orphaned session (the fd stays with the plaintext
+    // handle) and surface it rather than leak.
+    if (!runtime_state.socket_domain.attachTls(handle, context.selfPid().toBits(), session)) {
+        concurrency.socket_io.tlsFreeSession(session);
+        context.socketLedger().last_error = @intFromEnum(concurrency.socket_io.Reason.other);
+        return @intFromEnum(concurrency.socket_io.Reason.other);
+    }
+    return 0;
+}
+
+/// Upgrade an OWNED plaintext socket to TLS in place (STARTTLS — the
+/// `Tls.upgrade` path): run the verification handshake off-core, and on success
+/// CONSUME the plaintext handle via `upgradeToTls` (gen-bump — the old handle
+/// goes stale everywhere, so no accidental plaintext I/O over the now-encrypted
+/// socket) and re-record the SUCCESSOR in the ledger. Returns the successor
+/// handle bits (never `0`) on success, or `0` on failure with the reason in the
+/// process last-error; returns the invalid handle (`0`) likewise when the
+/// caller does not own the handle. The fd is preserved across the upgrade.
+export fn zap_socket_tls_upgrade(
+    process: *anyopaque,
+    handle_bits: u64,
+    host_ptr: [*]const u8,
+    host_len: usize,
+    timeout_ms: i64,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return socketConnectFailed(context, .invalid_argument);
+    const handle = concurrency.SocketHandle.fromBits(handle_bits);
+    var request: SocketTlsHandshakeRequest = undefined;
+    if (!runTlsHandshake(context, handle, host_ptr[0..host_len], timeout_ms, &request))
+        return socketConnectFailed(context, .invalid_argument);
+    if (request.reason != .ok) return socketConnectFailed(context, request.reason);
+    const session = request.session.?;
+    // Consume the plaintext handle → TLS successor (same slot/fd, gen bumped).
+    const successor = runtime_state.socket_domain.upgradeToTls(handle, context.selfPid().toBits(), session) orelse {
+        concurrency.socket_io.tlsFreeSession(session);
+        return socketConnectFailed(context, .other);
+    };
+    // Re-home the ledger: the old handle is consumed, the successor owns the
+    // fd + session now. On OOM the successor is owned by nobody — close it
+    // (which frees the session) and report failure.
+    _ = context.socketLedger().removeOne(handle_bits);
+    context.socketLedger().append(successor.toBits()) catch {
+        if (runtime_state.socket_domain.close(successor)) |closed| closeResolvedSocket(closed);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    return successor.toBits();
 }
 
 /// Apply a curated socket option (`option_code` → `socket_io.SocketOption`) to
@@ -3267,7 +3522,7 @@ fn socketAcceptImpl(process: *anyopaque, listener_bits: u64, timeout_ms: i64) u6
         return socketConnectFailed(context, .out_of_memory);
     };
     context.socketLedger().append(handle.toBits()) catch {
-        if (runtime_state.socket_domain.close(handle)) |fd| concurrency.socket_io.closeFd(fd);
+        if (runtime_state.socket_domain.close(handle)) |closed| closeResolvedSocket(closed);
         return socketConnectFailed(context, .out_of_memory);
     };
     return handle.toBits();

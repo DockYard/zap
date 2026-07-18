@@ -4109,6 +4109,11 @@ const ZapConcurrencyKernel = struct {
         timeout_ms: i64,
     ) callconv(.c) i64;
     extern fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) callconv(.c) i64;
+    // Phase S4 — the TLS client handshake over an owned fd. `tls_handshake`
+    // binds the session to the SAME handle (fresh-connect); `tls_upgrade`
+    // consumes the plaintext handle and returns the TLS successor (STARTTLS).
+    extern fn zap_socket_tls_handshake(process: *anyopaque, handle_bits: u64, host_ptr: [*]const u8, host_len: usize, timeout_ms: i64) callconv(.c) i32;
+    extern fn zap_socket_tls_upgrade(process: *anyopaque, handle_bits: u64, host_ptr: [*]const u8, host_len: usize, timeout_ms: i64) callconv(.c) u64;
     extern fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64;
     extern fn zap_socket_accept_timeout(process: *anyopaque, listener_bits: u64, timeout_ms: i64) callconv(.c) u64;
     extern fn zap_socket_endpoint(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
@@ -7335,10 +7340,94 @@ pub const SocketRuntime = struct {
             );
             return true;
         } else {
-            const fd = gateOffDomain().close(socket_table.SocketHandle.fromBits(handle_bits)) orelse
+            const closed = gateOffDomain().close(socket_table.SocketHandle.fromBits(handle_bits)) orelse
                 @panic("zap: Socket.close of a closed or stale Socket handle");
-            socket_io.closeFd(fd);
+            socket_io.closeFd(closed.fd);
+            // A TLS socket carries its session — scrub + free it on close (the
+            // gate-OFF twin of `abi.zig`'s `closeResolvedSocket`).
+            if (closed.tls_state) |session| socket_io.tlsFreeSession(session);
             return true;
+        }
+    }
+
+    /// `Tls.connect`'s handshake leg: run the MANDATORY-verification TLS
+    /// handshake over an OWNED plaintext socket and, on success, bind the TLS
+    /// session to the SAME handle (no generation bump — the fresh-connect
+    /// handle was never used for plaintext I/O). Returns `0` on success (the
+    /// handle is now a TLS socket, same bits) or a positive `Reason` code on
+    /// handshake failure (also stored in the last-error slot). Gate-ON offloads
+    /// the whole handshake onto the blocking pool (Decision D); gate-OFF runs it
+    /// inline on the single OS thread. Panics on a foreign/stale handle.
+    pub fn tls_handshake(handle_bits: u64, host: []const u8, timeout_ms: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            const result = ZapConcurrencyKernel.zap_socket_tls_handshake(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                host.ptr,
+                host.len,
+                timeout_ms,
+            );
+            if (result < 0) @panic(
+                "zap: TLS handshake on a socket this process does not own (a closed or stale Socket handle)",
+            );
+            return result;
+        } else {
+            const handle = socket_table.SocketHandle.fromBits(handle_bits);
+            const fd = gateOffFd(handle_bits);
+            const session = socket_io.tlsSessionCreate(fd, timeout_ms, null) orelse {
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return @intFromEnum(socket_io.Reason.out_of_memory);
+            };
+            const reason = socket_io.tlsHandshake(session, host, timeout_ms, null);
+            if (reason != .ok) {
+                socket_io.tlsFreeSession(session);
+                gate_off_last_error = @intFromEnum(reason);
+                return @intFromEnum(reason);
+            }
+            if (!gateOffDomain().attachTls(handle, 0, session)) {
+                socket_io.tlsFreeSession(session);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.other);
+                return @intFromEnum(socket_io.Reason.other);
+            }
+            return 0;
+        }
+    }
+
+    /// `Tls.upgrade`'s handshake leg (STARTTLS): run the MANDATORY-verification
+    /// handshake over an OWNED plaintext socket and, on success, CONSUME the
+    /// plaintext handle (`upgradeToTls`, generation bumped — the old handle is
+    /// stale everywhere) and return the TLS successor handle bits (never `0`).
+    /// Returns `0` on failure with the reason in the last-error slot. Gate-ON
+    /// offloads; gate-OFF runs inline (no ledger to re-home). Panics on a
+    /// foreign/stale handle gate-OFF via `gateOffFd`.
+    pub fn tls_upgrade(handle_bits: u64, host: []const u8, timeout_ms: i64) u64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_tls_upgrade(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                host.ptr,
+                host.len,
+                timeout_ms,
+            );
+        } else {
+            const handle = socket_table.SocketHandle.fromBits(handle_bits);
+            const fd = gateOffFd(handle_bits);
+            const session = socket_io.tlsSessionCreate(fd, timeout_ms, null) orelse {
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            const reason = socket_io.tlsHandshake(session, host, timeout_ms, null);
+            if (reason != .ok) {
+                socket_io.tlsFreeSession(session);
+                gate_off_last_error = @intFromEnum(reason);
+                return 0;
+            }
+            const successor = gateOffDomain().upgradeToTls(handle, 0, session) orelse {
+                socket_io.tlsFreeSession(session);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.other);
+                return 0;
+            };
+            return successor.toBits();
         }
     }
 
@@ -7456,7 +7545,28 @@ pub const SocketRuntime = struct {
             return chunk_ptr.?[0..received_len];
         } else {
             const exact_target: usize = if (byte_count > 0) @intCast(byte_count) else 0;
-            const outcome = socket_io.recv(
+            const handle = socket_table.SocketHandle.fromBits(handle_bits);
+            const socket_kind = gateOffDomain().kind(handle) orelse
+                @panic("zap: Socket.recv on a closed or stale Socket handle");
+            // A TLS session decrypts + arena-copies; a plaintext socket takes
+            // the raw recv path. The decrypted plaintext lands in the SAME
+            // resettable `gate_off_recv_arena` as a plain chunk (never the
+            // session's own buffer — UAF-safe).
+            const outcome = if (socket_kind == .tls_session) blk: {
+                const session = gateOffDomain().tlsState(handle) orelse
+                    @panic("zap: Socket.recv on a closed or stale Socket handle");
+                break :blk socket_io.tlsRecv(
+                    session,
+                    gate_off_recv_arena.allocator(),
+                    exact_target,
+                    default_recv_chunk_len,
+                    timeout_ms,
+                    null,
+                ) catch {
+                    gate_off_last_recv_status = @intFromEnum(socket_io.Reason.out_of_memory);
+                    return &.{};
+                };
+            } else socket_io.recv(
                 gate_off_recv_arena.allocator(),
                 gateOffFd(handle_bits),
                 exact_target,
@@ -7517,7 +7627,17 @@ pub const SocketRuntime = struct {
             );
             return sent;
         } else {
-            const outcome = if (all)
+            const handle = socket_table.SocketHandle.fromBits(handle_bits);
+            const socket_kind = gateOffDomain().kind(handle) orelse
+                @panic("zap: Socket.send on a closed or stale Socket handle");
+            const outcome = if (socket_kind == .tls_session) blk: {
+                const session = gateOffDomain().tlsState(handle) orelse
+                    @panic("zap: Socket.send on a closed or stale Socket handle");
+                // TLS is a stream — `send_some`'s partial semantics do not apply
+                // to an atomic record, so both `send`/`send_some` encrypt the
+                // whole payload and double-flush.
+                break :blk socket_io.tlsSend(session, bytes, timeout_ms, null);
+            } else if (all)
                 socket_io.send(gateOffFd(handle_bits), bytes, timeout_ms, null)
             else
                 socket_io.sendSome(gateOffFd(handle_bits), bytes, timeout_ms, null);
