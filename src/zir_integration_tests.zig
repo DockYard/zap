@@ -6919,6 +6919,36 @@ test "ZIR concurrency: a Socket move-sends cleanly — Process.send_move of a so
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
 }
 
+test "ZIR concurrency: Process.send_move consumes a Socket — a use after the handoff is a compile error (Phase S3)" {
+    // The cross-process handoff's compile-time TOOTH: a `Socket`/`SocketListener`
+    // is a single-owner MOVE-ONLY handle (`zap_socket_handle`, `.unique`
+    // ownership), so `Process.send_move` CONSUMES it — Phase S3 re-parents the
+    // kernel socket-ledger entry to the receiver, handing the underlying fd
+    // across the process boundary. Reusing the handle after the move is a
+    // use-after-move, caught by the type checker's move tracking. This is the
+    // SURFACE guarantee that makes the exactly-one-owner invariant hold across
+    // processes: two live references to one fd is the data race the model
+    // forbids, and the sender cannot keep one after handing it off. WRITTEN, not
+    // run here (`zig build zir-test` is driven separately).
+    try expectGatedCompileFailsWithDiagnostic(
+        \\pub struct TestProg {
+        \\  pub fn main() -> u8 {
+        \\    case Socket.listen(SocketAddress.loopback(0), 1) {
+        \\      Result.Ok(listener) -> {
+        \\        echo = (Pid.of(Process.self()) :: Pid(SocketListener))
+        \\        _sent = Process.send_move(echo, listener)
+        \\        _reuse = SocketListener.close(listener)
+        \\        0
+        \\      }
+        \\      Result.Error(_e) -> 0
+        \\    }
+        \\  }
+        \\}
+    ,
+        "already moved",
+    );
+}
+
 test "ZIR concurrency: Socket.fold recv-arena back-edge gate is UAF-safe across every accumulator aliasing shape (Pass 2c Part 2)" {
     // The soundness gate for the Part-2c recv-memory bound: the loopified
     // `Socket.fold` back-edge resets the process recv arena to O(chunk) UNLESS a

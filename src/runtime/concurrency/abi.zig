@@ -2798,6 +2798,162 @@ export fn zap_socket_live_count() callconv(.c) i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-process socket handoff (Phase S3) — the send/reclaim/adopt trio, an
+// EXACT mirror of the Blob flight/adopt pair (`zap_blob_flight_retain` /
+// `zap_blob_flight_release` / `zap_blob_adopt`) applied to a MOVE-ONLY
+// kernel-domain handle. A socket is single-owner: unlike a Blob it is NOT
+// refcount-shared, so the transport carries the SUCCESSOR handle bits (minted
+// by `beginHandoff`'s in-place generation bump) in an 8-byte flight cell
+// rather than sharing a payload by pointer. The exactly-one-owner invariant
+// (socket_table.zig module header) holds across every crash window:
+//
+//   * before send  → the sender's ledger owns it (its teardown sweep closes);
+//   * in flight     → the moved envelope owns it (its reclaim hook closes on a
+//                     dead-letter or a receiver-teardown mailbox drain);
+//   * after adopt   → the receiver's ledger owns it (its teardown sweep closes).
+//
+// RELINQUISH-BEFORE-ENQUEUE (step 2 below) is load-bearing: it makes the
+// sender-ledger and in-flight-envelope windows DISJOINT, so a killed sender's
+// sweep can never close a fd the envelope (or the receiver) now owns. The
+// whole `zap_socket_handoff_send` sequence is NON-PARKING straight-line code,
+// so a kill acts only at teardown (off-quantum) — the sender is never torn
+// down mid-handoff.
+// ---------------------------------------------------------------------------
+
+/// Leak-exactness reclaim for an in-flight socket handoff whose moved envelope
+/// is freed WITHOUT the receiver adopting it — a dead-letter, or (the crash
+/// window this closes) a mailbox drained at the receiver's teardown when the
+/// receiver died before dequeuing. Recovers the successor handle bits from the
+/// 8-byte flight cell, CLOSES the domain slot (the in-flight envelope was the
+/// sole owner of the close obligation), closes the fd through the I/O seam, and
+/// frees the cell. Any-thread safe (a teardown drain runs on any core; the
+/// domain close is MED-2 atomic, `closeFd` and the page-allocator free are
+/// self-synchronizing) — the same discipline as `zap_blob_flight_release`.
+fn socketFlightReclaim(payload_pointer: [*]const u8) callconv(.c) void {
+    var handle_bits: u64 = 0;
+    @memcpy(std.mem.asBytes(&handle_bits), payload_pointer[0..@sizeOf(u64)]);
+    if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |fd| {
+        concurrency.socket_io.closeFd(fd);
+    }
+    runtime_state.ledger.free(LedgerBlock.fromBodyPointer(payload_pointer));
+}
+
+/// SEND half of the socket handoff, run by the SENDER (`Process.send_move` of a
+/// `Socket`/`SocketListener`). NON-PARKING straight-line (atomic w.r.t. the
+/// sender's death — a kill acts only at teardown, off-quantum):
+///
+///   1. GATE against the caller's socket ledger — a move of a socket this
+///      process does not own is `socket_not_owned` (the runtime panics; the
+///      compile-time move-only check already precludes it at the surface, so
+///      this is defense in depth — the only-owner-moves security property).
+///   2. RELINQUISH from the ledger BEFORE the enqueue — disjoint ownership
+///      windows, so a killed sender's sweep cannot close the fd the envelope
+///      (or the receiver) now owns.
+///   3. `beginHandoff` — bump the generation in place (the sender's OLD bits go
+///      stale everywhere), re-point ownership to the target, set in-flight.
+///   4. Allocate an 8-byte flight cell and write the SUCCESSOR bits.
+///   5. Ride the moved-envelope transport with `socketFlightReclaim` as the
+///      reclaim hook (the receiver-teardown / drain leak-exactness path).
+///   6. FAILURE UNDO (dead-letter to a dead/stale pid, or OOM): nothing
+///      consumed the flight cell — close the domain slot, close the fd, free
+///      the cell. DOC: a socket moved to a DEAD pid is CLOSED by the runtime
+///      (the Blob analogue — a moved value with no receiver is reclaimed here).
+///
+/// Returns `ZapProcStatus.ok` (delivered), `dead_lettered` (target dead/stale —
+/// the fd was closed by the undo), `out_of_memory`, or `socket_not_owned`.
+export fn zap_socket_handoff_send(
+    process: *anyopaque,
+    target_pid_bits: u64,
+    handle_bits: u64,
+) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    // (1) Ownership gate [SECURITY: only the owner moves a socket].
+    if (!context.socketLedger().contains(handle_bits)) return ZapProcStatus.socket_not_owned;
+    // (2) RELINQUISH before enqueue — the disjoint-ownership-windows invariant.
+    _ = context.socketLedger().removeOne(handle_bits);
+    // (3) Begin the handoff: mint the successor (generation bumped, owner
+    // re-pointed to the target, in-flight set).
+    const successor = runtime_state.socket_domain.beginHandoff(
+        concurrency.SocketHandle.fromBits(handle_bits),
+        context.selfPid().toBits(),
+        target_pid_bits,
+    ) orelse {
+        // The ledger vouched for the handle, so a validation failure here is a
+        // kernel bug (ledger/domain disagreement) — or the astronomically-rare
+        // generation-exhaustion carve OOM. Either way the fd is no longer in any
+        // ledger, so it must not leak: close it through the original handle
+        // (still live — `beginHandoff` did not mutate on failure).
+        if (runtime_state.socket_domain.close(concurrency.SocketHandle.fromBits(handle_bits))) |fd| {
+            concurrency.socket_io.closeFd(fd);
+        }
+        return ZapProcStatus.out_of_memory;
+    };
+    // (4) Allocate the 8-byte flight cell and write the SUCCESSOR bits.
+    const cell = runtime_state.ledger.allocate(@sizeOf(u64)) catch {
+        // No cell: the successor is owned by nobody — close it.
+        if (runtime_state.socket_domain.close(successor)) |fd| concurrency.socket_io.closeFd(fd);
+        return ZapProcStatus.out_of_memory;
+    };
+    const successor_bits = successor.toBits();
+    @memcpy(cell.bodyPointer()[0..@sizeOf(u64)], std.mem.asBytes(&successor_bits));
+    // (5) Ride the moved-envelope transport with the reclaim hook.
+    const status = zap_proc_send_moved(
+        process,
+        target_pid_bits,
+        cell.bodyPointer(),
+        @sizeOf(u64),
+        socketFlightReclaim,
+    );
+    if (status == ZapProcStatus.ok) return ZapProcStatus.ok;
+    // (6) Not delivered — undo: close the slot, close the fd, free the cell.
+    if (runtime_state.socket_domain.close(successor)) |fd| concurrency.socket_io.closeFd(fd);
+    runtime_state.ledger.free(cell);
+    return status;
+}
+
+/// RECEIVE half of the socket handoff, run by the RECEIVER at DELIVERY (the
+/// re-parent point, in `decodeReceivedEnvelope`'s socket arm). `payload_pointer`
+/// is the 8-byte flight cell the moved envelope carried. Reads the successor
+/// bits, COMPLETES the handoff (requires in-flight AND owner == this process —
+/// the no-forged-adoption + no-double-adopt gate; a laundered `u64` fails the
+/// post-bump generation check), records ownership in this process's ledger, and
+/// ENSURES the socket-sweep drop node is registered (REQUIRED — the receiver may
+/// never have opened a socket, and without the node its teardown would not drain
+/// the ledger and the adopted fd would leak). Frees the flight cell.
+///
+/// Returns the successor handle bits, or 0 when the ledger append fails (OOM —
+/// the socket is then owned by nobody, so it is closed and the cell freed; the
+/// runtime panics, the OOM posture). A payload that is NOT a valid in-flight
+/// handoff to this process is a protocol violation: the slot is closed if
+/// somehow live, the cell freed, and the process panics loudly.
+export fn zap_socket_adopt(process: *anyopaque, payload_pointer: [*]const u8) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    var successor_bits: u64 = 0;
+    @memcpy(std.mem.asBytes(&successor_bits), payload_pointer[0..@sizeOf(u64)]);
+    const successor = concurrency.SocketHandle.fromBits(successor_bits);
+    // Complete the handoff: in-flight && owner == this process (defense against
+    // forged/replayed fragments; the take_moved fragment-clear is the first
+    // no-double-adopt guard, this in-flight clear under the lock is the second).
+    if (!runtime_state.socket_domain.completeHandoff(successor, context.selfPid().toBits())) {
+        if (runtime_state.socket_domain.close(successor)) |fd| concurrency.socket_io.closeFd(fd);
+        runtime_state.ledger.free(LedgerBlock.fromBodyPointer(payload_pointer));
+        @panic("zap: adopted a socket that is not an in-flight handoff to this process (protocol violation — a forged or replayed moved fragment)");
+    }
+    // Register the socket-sweep drop node — REQUIRED even if this process never
+    // opened a socket, else its teardown would not drain the ledger below.
+    context.ensureSocketSweep(socketSweepDestructor);
+    // Record ownership. On OOM the socket is owned by nobody (in-flight already
+    // cleared) — close it, free the cell, and report 0 (the runtime panics).
+    context.socketLedger().append(successor_bits) catch {
+        if (runtime_state.socket_domain.close(successor)) |fd| concurrency.socket_io.closeFd(fd);
+        runtime_state.ledger.free(LedgerBlock.fromBodyPointer(payload_pointer));
+        return 0;
+    };
+    runtime_state.ledger.free(LedgerBlock.fromBodyPointer(payload_pointer));
+    return successor_bits;
+}
+
+// ---------------------------------------------------------------------------
 // The Tier-1 stream op surface (Phase S1). Every BLOCKING leaf offloads onto
 // the blocking pool (Decision D — off the process's core), captures the
 // process's `pending_kill` atom on-core so the poll-quantum leaf is kill-
@@ -4578,6 +4734,215 @@ test "abi: repeated kill-during-offload cycles never accumulate fds (no fd-exhau
         if (cycle == 0) baseline = abiCountOpenFds();
         try testing.expectEqual(baseline, abiCountOpenFds());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process socket handoff (Phase S3) — the crash matrix at the kernel
+// level. These are the socket twin of the Blob moved-envelope reclaim tests
+// (`send_moved to a dead pid`, `drained at receiver teardown`, `delivered +
+// adopted`), driving the REAL `zap_socket_handoff_send`/`zap_socket_adopt`
+// pair over real loopback listener fds. Every window asserts EXACTLY-ONCE fd
+// close through two independent oracles: `zap_socket_live_count` (the domain
+// slot) returning to baseline AND `abiCountOpenFds()` (the OS) staying flat.
+// A leak leaves both above baseline; a double-close is structurally excluded
+// (the generation bump makes the second `domain.close` a no-op).
+// ---------------------------------------------------------------------------
+
+/// Shared state threaded between a handoff sender and receiver (single-
+/// scheduler tests, driver-thread only — plain fields, no atomics, exactly
+/// like `MovedAdoptProbe`).
+const SocketHandoffProbe = struct {
+    receiver_pid_bits: u64 = 0,
+    /// The sender's ORIGINAL handle bits (pre-move; stale after the handoff).
+    sender_old_bits: u64 = 0,
+    send_status: i32 = std.math.minInt(i32),
+    /// The receiver's post-move `zap_socket_close` on the sender's OLD bits —
+    /// must be `socket_not_owned` (the sender relinquished + generation bumped).
+    sender_stale_close_status: i32 = std.math.minInt(i32),
+    /// The SUCCESSOR bits the receiver adopted (0 until adopted).
+    receiver_adopted_bits: u64 = 0,
+    /// The receiver's `zap_socket_is_live` on the adopted handle (1 = it owns a
+    /// live socket — it "uses" the socket).
+    receiver_is_live: i32 = -1,
+    receiver_ran: bool = false,
+};
+
+/// Sender: open a loopback listener (a real fd + domain slot it owns), hand it
+/// off to the receiver, then observe that its OLD handle is stale.
+fn handoffSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *SocketHandoffProbe = @ptrCast(@alignCast(argument.?));
+    const listen_bits = zap_socket_listen(process, 127, 0, 0, 1, 0, 4);
+    probe.sender_old_bits = listen_bits;
+    if (listen_bits == concurrency.SocketHandle.invalid.toBits()) return;
+    probe.send_status = zap_socket_handoff_send(process, probe.receiver_pid_bits, listen_bits);
+    probe.sender_stale_close_status = zap_socket_close(process, listen_bits);
+}
+
+/// Receiver: park, take the moved flight cell, ADOPT it (re-parent into this
+/// process's ledger), confirm it now owns a live socket, then CLOSE it (so the
+/// delivered+adopted variant is leak-exact without relying on teardown).
+fn handoffAdoptReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *SocketHandoffProbe = @ptrCast(@alignCast(argument.?));
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    const moved_root = zap_proc_envelope_take_moved(envelope) orelse
+        @panic("handoff receiver expected a MOVED socket envelope, got a copied payload");
+    const adopted = zap_socket_adopt(process, moved_root);
+    probe.receiver_adopted_bits = adopted;
+    probe.receiver_is_live = zap_socket_is_live(process, adopted);
+    zap_proc_envelope_free(envelope);
+    _ = zap_socket_close(process, adopted);
+    probe.receiver_ran = true;
+}
+
+test "abi: a socket handed off is DELIVERED and ADOPTED — the receiver's ledger owns it, the sender's old handle is stale, leak-exact" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    const fd_baseline = abiCountOpenFds();
+    const live_baseline = runtime_state.socket_domain.statistics().live_socket_count;
+
+    var probe = SocketHandoffProbe{};
+    const receiver_bits = zap_proc_spawn(handoffAdoptReceiverEntry, &probe);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.receiver_pid_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(handoffSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // Delivered, adopted, and the receiver observed it owns a LIVE socket.
+    try testing.expectEqual(ZapProcStatus.ok, probe.send_status);
+    try testing.expect(probe.receiver_ran);
+    try testing.expect(probe.sender_old_bits != concurrency.SocketHandle.invalid.toBits());
+    try testing.expect(probe.receiver_adopted_bits != concurrency.SocketHandle.invalid.toBits());
+    try testing.expectEqual(@as(i32, 1), probe.receiver_is_live);
+    // The SUCCESSOR differs from the sender's old bits (the generation bumped).
+    try testing.expect(probe.receiver_adopted_bits != probe.sender_old_bits);
+    // The sender's post-move op on the OLD handle is rejected — stale everywhere.
+    try testing.expectEqual(ZapProcStatus.socket_not_owned, probe.sender_stale_close_status);
+    // Exactly-once close: the receiver closed the (one) socket → both oracles
+    // back to baseline (one fd opened by the sender, closed by the receiver).
+    try testing.expectEqual(live_baseline, runtime_state.socket_domain.statistics().live_socket_count);
+    try testing.expectEqual(fd_baseline, abiCountOpenFds());
+}
+
+/// Receiver that receives exactly ONE plain marker then exits — leaving a
+/// later-queued moved socket envelope for the teardown mailbox drain.
+fn handoffDrainReceiverEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    _ = argument;
+    var payload_pointer: ?[*]const u8 = null;
+    var payload_len: usize = 0;
+    const envelope = zap_proc_receive_park(process, &payload_pointer, &payload_len);
+    zap_proc_envelope_free(envelope);
+}
+
+/// Sender for the teardown-drain window: send a plain marker FIRST (pairwise
+/// FIFO — the receiver consumes it and exits), then hand off the socket, which
+/// stays queued at the receiver's death.
+fn handoffDrainSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *SocketHandoffProbe = @ptrCast(@alignCast(argument.?));
+    const listen_bits = zap_socket_listen(process, 127, 0, 0, 1, 0, 4);
+    probe.sender_old_bits = listen_bits;
+    if (listen_bits == concurrency.SocketHandle.invalid.toBits()) return;
+    _ = zap_proc_send(process, probe.receiver_pid_bits, "m", 1);
+    probe.send_status = zap_socket_handoff_send(process, probe.receiver_pid_bits, listen_bits);
+}
+
+test "abi: an in-flight handoff whose receiver DIES before adopting is reclaimed EXACTLY ONCE by the teardown mailbox drain" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    const fd_baseline = abiCountOpenFds();
+    const live_baseline = runtime_state.socket_domain.statistics().live_socket_count;
+
+    var probe = SocketHandoffProbe{};
+    const receiver_bits = zap_proc_spawn(handoffDrainReceiverEntry, null);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.receiver_pid_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(handoffDrainSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // Delivered; the receiver exited before adopting, so the moved socket
+    // envelope was drained at its teardown → `socketFlightReclaim` closed the
+    // fd exactly once. The sender relinquished BEFORE the enqueue, so its own
+    // sweep closed nothing (disjoint windows). Both oracles at baseline: no
+    // leak, and (generation bump) no double-close.
+    try testing.expectEqual(ZapProcStatus.ok, probe.send_status);
+    try testing.expectEqual(live_baseline, runtime_state.socket_domain.statistics().live_socket_count);
+    try testing.expectEqual(fd_baseline, abiCountOpenFds());
+}
+
+/// Sender that hands the socket to a DEAD (forged) pid — the dead-letter undo
+/// must close the fd.
+fn handoffDeadLetterSenderEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *SocketHandoffProbe = @ptrCast(@alignCast(argument.?));
+    const listen_bits = zap_socket_listen(process, 127, 0, 0, 1, 0, 4);
+    probe.sender_old_bits = listen_bits;
+    if (listen_bits == concurrency.SocketHandle.invalid.toBits()) return;
+    const forged = concurrency.Pid{ .slot = 7, .generation = 999, .model = .refcounted, .node = 0 };
+    probe.send_status = zap_socket_handoff_send(process, forged.toBits(), listen_bits);
+    probe.sender_stale_close_status = zap_socket_close(process, listen_bits);
+}
+
+test "abi: a socket handed off to a DEAD pid dead-letters and the sender undo CLOSES the fd (a dead-lettered socket is not leaked)" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    const fd_baseline = abiCountOpenFds();
+    const live_baseline = runtime_state.socket_domain.statistics().live_socket_count;
+
+    var probe = SocketHandoffProbe{};
+    const sender_bits = zap_proc_spawn(handoffDeadLetterSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    // Nothing consumed the flight cell (dead pid) → the sender undo closed the
+    // domain slot AND the fd. The old handle is stale (relinquished + closed).
+    try testing.expectEqual(ZapProcStatus.dead_lettered, probe.send_status);
+    try testing.expectEqual(ZapProcStatus.socket_not_owned, probe.sender_stale_close_status);
+    try testing.expectEqual(live_baseline, runtime_state.socket_domain.statistics().live_socket_count);
+    try testing.expectEqual(fd_baseline, abiCountOpenFds());
+}
+
+test "abi: a handoff survives the SENDER's death — the receiver adopts and uses the socket after the sender has exited (in-flight A-dies window)" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    const fd_baseline = abiCountOpenFds();
+    const live_baseline = runtime_state.socket_domain.statistics().live_socket_count;
+
+    var probe = SocketHandoffProbe{};
+    const receiver_bits = zap_proc_spawn(handoffAdoptReceiverEntry, &probe);
+    try testing.expect(receiver_bits != concurrency.Pid.invalid.toBits());
+    probe.receiver_pid_bits = receiver_bits;
+    const sender_bits = zap_proc_spawn(handoffSenderEntry, &probe);
+    try testing.expect(sender_bits != concurrency.Pid.invalid.toBits());
+    // Drive the SENDER to full exit FIRST — it opens the socket, hands it off
+    // (relinquish-before-enqueue), and dies. The moved envelope is already in
+    // the receiver's mailbox and must survive the sender's teardown (which
+    // drains only the SENDER's mailbox + its now-empty ledger).
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(sender_bits));
+    // Now let the receiver run: it adopts from the dead sender's envelope, uses
+    // the socket (is_live), and closes it.
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_quiescent());
+
+    try testing.expectEqual(ZapProcStatus.ok, probe.send_status);
+    try testing.expect(probe.receiver_ran);
+    try testing.expectEqual(@as(i32, 1), probe.receiver_is_live);
+    // Leak-exact: the fd survived the sender's death (its sweep skipped the
+    // relinquished handle) and the receiver closed it exactly once.
+    try testing.expectEqual(live_baseline, runtime_state.socket_domain.statistics().live_socket_count);
+    try testing.expectEqual(fd_baseline, abiCountOpenFds());
 }
 
 // ---------------------------------------------------------------------------

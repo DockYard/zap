@@ -4085,6 +4085,12 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_socket_close(process: *anyopaque, handle_bits: u64) callconv(.c) i32;
     extern fn zap_socket_is_live(process: *anyopaque, handle_bits: u64) callconv(.c) i32;
     extern fn zap_socket_live_count() callconv(.c) i64;
+    // Phase S3 — cross-process socket handoff (the move-only twin of the blob
+    // flight/adopt pair): the SEND half re-parents the kernel socket-ledger
+    // entry to the target and rides the moved envelope carrying the successor
+    // handle bits; the RECEIVE half completes the handoff + records ownership.
+    extern fn zap_socket_handoff_send(process: *anyopaque, target_pid_bits: u64, handle_bits: u64) callconv(.c) i32;
+    extern fn zap_socket_adopt(process: *anyopaque, payload_pointer: [*]const u8) callconv(.c) u64;
     // Phase S1 — the Tier-1 stream op surface.
     extern fn zap_socket_recv(
         process: *anyopaque,
@@ -6212,24 +6218,30 @@ pub const ProcessRuntime = struct {
             return delivered;
         }
 
-        // A socket handle MOVE transfers the one-word generational token to the
-        // receiver by bit-copy (a socket is a single `u64`, so the move is a
-        // scalar transfer, never the copy walker — which rejects the socket
-        // shape). The move-only compile check (`Process.send_move` consumes its
+        // A socket handle MOVE re-parents the kernel socket-ledger entry to the
+        // receiver (Phase S3 cross-process handoff): the sender relinquishes the
+        // handle, the domain mints a successor (generation bumped, in-flight),
+        // and it rides a moved envelope carrying the successor bits — the
+        // move-only twin of the blob flight/adopt share (`sendBlobMessage`), and
+        // like it NEVER the copy walker (which rejects the socket shape). The
+        // compile-time move-only check (`Process.send_move` consumes its
         // argument; a use-after-move is a compile error) enforces single
-        // ownership at the SURFACE; the runtime re-parenting of the kernel
-        // socket-ledger entry to the receiver's process lands in Phase S3
-        // (cross-process handoff). S1's guarantee is the compile-enforced
-        // move-only discipline — copy-send rejected here, move-send permitted.
+        // ownership at the SURFACE; `zap_socket_handoff_send` enforces it in the
+        // kernel (the ledger gate). A `socket_not_owned` sentinel is a stale
+        // handle the compile check could not catch (a use-after-close) — a loud
+        // panic, never a silent wrong-fd op; `ok`/`dead_lettered` map through
+        // `interpretSendStatus` (a socket moved to a dead pid is CLOSED by the
+        // runtime, the honest Erlang `false`).
         if (comptime isSocketHandleStruct(MessageType)) {
-            var message_storage: MessageType = message;
-            const payload_bytes = std.mem.asBytes(&message_storage);
-            return interpretSendStatus(ZapConcurrencyKernel.zap_proc_send(
+            const status = ZapConcurrencyKernel.zap_socket_handoff_send(
                 requireCurrentProcessHandle(),
                 target_pid_bits,
-                payload_bytes.ptr,
-                payload_bytes.len,
-            ));
+                @field(message, socket_handle_field_name),
+            );
+            if (status == -7) @panic( // socket_not_owned
+                "zap: Process.send_move of a Socket this process does not own (a closed or stale socket handle)",
+            );
+            return interpretSendStatus(status);
         }
 
         const typed_message: MessageType = message;
@@ -6432,6 +6444,32 @@ pub const ProcessRuntime = struct {
                 );
                 return moved_root[0..payload_len];
             }
+        }
+
+        // `Socket`/`SocketListener` receive (S3 cross-process handoff): a socket
+        // message always arrives as a MOVED envelope carrying the 8-byte flight
+        // cell the sender minted (the successor handle bits). Take the moved
+        // fragment (clearing it so envelope_free does NOT run the reclaim hook),
+        // then ADOPT it — complete the handoff (in-flight → owned), record it in
+        // this process's ledger, register the socket-sweep. take_moved → adopt
+        // must be ADJACENT with no fallible code between: the fragment is cleared
+        // by take_moved, so anything failing before adopt would strand the flight
+        // cell; `zap_socket_adopt` self-closes on its own internal failure. The
+        // move-only twin of the Blob receive arm above.
+        if (comptime isSocketHandleStruct(MessageType)) {
+            const moved_root = ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope) orelse @panic(
+                "zap: Process.receive got a copied payload for a Socket receive type (protocol violation — the sender and receiver message types disagree)",
+            );
+            const handle_bits = ZapConcurrencyKernel.zap_socket_adopt(
+                requireCurrentProcessHandle(),
+                moved_root,
+            );
+            if (handle_bits == 0) @panic(
+                "zap: Process.receive out of memory recording the received Socket reference",
+            );
+            var socket_message: MessageType = undefined;
+            @field(socket_message, socket_handle_field_name) = handle_bits;
+            return socket_message;
         }
 
         if (ZapConcurrencyKernel.zap_proc_envelope_take_moved(envelope)) |moved_root| {

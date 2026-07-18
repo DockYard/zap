@@ -25,6 +25,35 @@
 //! recorded per-process in a `SocketLedger` (the PCB field), the drop-list
 //! discipline (research.md §6.5) applied to the socket tier.
 //!
+//! ## Cross-process handoff — the exactly-one-owner invariant (S3)
+//!
+//! A socket travels between processes by `Process.send_move` (S3). The
+//! transfer is a two-step state machine on the domain slot — `beginHandoff`
+//! (run by the SENDER) and `completeHandoff` (run by the RECEIVER at
+//! delivery) — over a MOVED envelope carrying the successor handle bits (the
+//! `abi.zig` transport, mirroring the Blob flight/adopt pair). The load-
+//! bearing correctness invariant, upheld across BOTH processes and every
+//! crash window:
+//!
+//!   **At any instant EXACTLY ONE party owns the close obligation for a live
+//!   slot** — either (i) exactly one process's `SocketLedger`, or (ii)
+//!   exactly one in-flight moved envelope (whose reclaim hook is the owner),
+//!   never both and never neither.
+//!
+//! `beginHandoff` BUMPS THE GENERATION in place (minting the successor on the
+//! same slot/fd), re-points `owner_pid_bits` to the receiver, and sets the
+//! `in_flight` bit; the sender's OLD handle bits go stale everywhere the
+//! instant the handoff begins (a later op on them fails the generation check —
+//! a loud panic, never a silent wrong-fd op). The sender RELINQUISHES the
+//! handle from its own ledger BEFORE the envelope is enqueued, so the two
+//! ownership windows (sender-ledger and in-flight-envelope) never overlap: a
+//! killed sender's teardown sweep drains only its ledger, which no longer
+//! holds the fd. `completeHandoff` clears the `in_flight` bit as the receiver
+//! records the handle in ITS ledger (the envelope relinquishes; the ledger
+//! assumes the obligation). The fd itself is closed exactly once — by whoever
+//! owns it at that instant: the receiver's ledger sweep, the sender's
+//! dead-letter undo, or the in-flight envelope's reclaim hook.
+//!
 //! ## Memory safety: stale/foreign handles PANIC, never corrupt
 //!
 //! Handles are `{slot, generation}` pairs into a segmented, TYPE-STABLE
@@ -141,7 +170,15 @@ const Occupancy = enum(u8) {
 const SlotState = packed struct(u64) {
     generation: u32,
     occupancy: Occupancy,
-    reserved: u24 = 0,
+    /// Set while this slot's live socket is IN FLIGHT in a cross-process
+    /// handoff — a moved envelope (not any process ledger) owns its close
+    /// obligation (S3, `beginHandoff`/`completeHandoff`); cleared when the
+    /// receiver adopts (`completeHandoff`). Part of the exactly-one-owner
+    /// handoff state machine documented in the module header. Ignored by the
+    /// ordinary validate/close reads (they gate on `occupancy`/`generation`),
+    /// so it never perturbs the S0/S1 lifecycle.
+    in_flight: bool = false,
+    reserved: u23 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -387,6 +424,135 @@ pub const SocketDomain = struct {
         return closed_fd;
     }
 
+    // -- cross-process handoff (S3) ----------------------------------------
+
+    /// Begin a cross-process handoff of a live handle from `from_pid_bits` to
+    /// `to_pid_bits`: mint the SUCCESSOR handle by BUMPING THE GENERATION in
+    /// place on the same slot/fd, re-point the owner to `to_pid_bits`, and set
+    /// the `in_flight` bit — an in-flight moved envelope now owns the close
+    /// obligation (the exactly-one-owner invariant, module header). Returns the
+    /// successor handle, or null when the handle is stale/forged, not occupied,
+    /// or not owned by `from_pid_bits` (defense in depth OVER the caller's
+    /// ledger gate — the only-owner-moves security property). Validated and
+    /// mutated as ONE atomic step under `domain_lock` (MED-2): a concurrent
+    /// begin/close of the same handle resolves to exactly one winner (the loser
+    /// fails the post-bump generation check), so one fd is never double-
+    /// transferred.
+    ///
+    /// The generation bump makes the sender's OLD handle bits stale EVERYWHERE
+    /// the instant the handoff begins: any later op on them fails the
+    /// generation check (a loud panic at the surface, never a silent wrong-fd
+    /// op — the stale-after-handoff property). At the retire edge (a slot whose
+    /// generation would wrap) the in-place bump is REFUSED; the SAME fd is
+    /// re-homed on a fresh slot and the old slot is retired (never reissued),
+    /// so a `{slot, generation}` pair is never reused and the fd never closes.
+    /// A carve failure at that astronomically-rare edge returns null (the
+    /// caller then closes the fd — the handoff could not proceed).
+    pub fn beginHandoff(
+        domain: *SocketDomain,
+        handle: SocketHandle,
+        from_pid_bits: u64,
+        to_pid_bits: u64,
+    ) ?SocketHandle {
+        const slot = domain.slotPointer(handle) orelse return null;
+        domain.lockDomain();
+        defer domain.domain_lock.unlock();
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        // Validate under the lock: live, this generation, owned by `from`.
+        if (state.occupancy != .occupied or state.generation != handle.generation) return null;
+        if (slot.owner_pid_bits != from_pid_bits) return null;
+
+        if (state.generation == retired_generation - 1) {
+            // Generation space exhausted on this slot: refuse the in-place bump
+            // and re-home the SAME fd on a fresh slot (the socket stays live —
+            // no fd close, no live-count change). Retire the old slot so its
+            // `{slot, generation}` pair is never reissued.
+            //
+            // CARVE THE FRESH SLOT FIRST, before ANY mutation of the old slot.
+            // The carve is the ONLY fallible step here, and this module is pure
+            // (it cannot close an fd — Decision D), so `beginHandoff` upholds its
+            // "did not mutate on failure" contract by NOT touching the old slot
+            // until the carve has succeeded. If the carve fails (table exhausted
+            // / OOM) the old slot is left UNTOUCHED and still live at its original
+            // generation, so the caller's undo (`abi.zig`'s handoff-send failure
+            // arm) validly closes the ORIGINAL handle exactly once — no fd leak.
+            // Retiring the old slot BEFORE the carve would strand `preserved_fd`
+            // on carve failure: the original handle's now-stale generation would
+            // fail the caller's `close`, leaking the fd.
+            //
+            // `acquireSlotLocked` counts the carve as a newly opened socket and
+            // may raise `live_socket_peak`, but this is the SAME live socket
+            // re-homed, not a new open: `live_socket_count` is CONSERVED across
+            // the handoff (the leak-exactness gate at `deinit` depends on it), so
+            // correct the double count. The peak must not be spuriously inflated
+            // by the transient double count either, so restore it to its pre-carve
+            // value once the count is corrected.
+            const peak_before_rehome = domain.live_socket_peak;
+            const acquired = domain.acquireSlotLocked() catch return null;
+            std.debug.assert(domain.live_socket_count > 0);
+            domain.live_socket_count -= 1;
+            domain.live_socket_peak = peak_before_rehome;
+
+            // The carve succeeded — the point of no return. Now retire the OLD
+            // slot and re-home the SAME fd/port/kind onto the fresh slot,
+            // re-parented to the receiver and in-flight.
+            const preserved_fd = slot.fd;
+            const preserved_port = slot.local_port;
+            const preserved_kind = slot.kind;
+            slot.state.store(@bitCast(SlotState{
+                .generation = retired_generation,
+                .occupancy = .retired,
+            }), .release);
+            domain.retired_slot_count += 1;
+            acquired.slot.fd = preserved_fd;
+            acquired.slot.owner_pid_bits = to_pid_bits;
+            acquired.slot.local_port = preserved_port;
+            acquired.slot.kind = preserved_kind;
+            acquired.slot.state.store(@bitCast(SlotState{
+                .generation = acquired.handle.generation,
+                .occupancy = .occupied,
+                .in_flight = true,
+            }), .release);
+            return acquired.handle;
+        }
+
+        // In-place bump: same slot, same fd, next generation, re-parented
+        // owner, in-flight. `.release` orders the owner write before any
+        // acquire-load of the new state word.
+        slot.owner_pid_bits = to_pid_bits;
+        const successor_generation = state.generation + 1;
+        slot.state.store(@bitCast(SlotState{
+            .generation = successor_generation,
+            .occupancy = .occupied,
+            .in_flight = true,
+        }), .release);
+        return SocketHandle{ .slot = handle.slot, .generation = successor_generation };
+    }
+
+    /// Complete a cross-process handoff: the receiver `to_pid_bits` adopts the
+    /// in-flight successor `handle`. Validate, require the `in_flight` bit set
+    /// AND the owner already re-pointed to `to_pid_bits` (both established by
+    /// `beginHandoff`), then CLEAR `in_flight` — the receiver's ledger now owns
+    /// the close obligation, the in-flight envelope relinquishes it. Returns
+    /// false when the handle is stale (a laundered/forged/replayed `u64` fails
+    /// the generation check post-bump — the no-forged-adoption gate), NOT in
+    /// flight (already adopted — the no-double-adopt gate), or not in flight to
+    /// `to_pid_bits`. Validated + mutated as one atomic step under `domain_lock`.
+    pub fn completeHandoff(domain: *SocketDomain, handle: SocketHandle, to_pid_bits: u64) bool {
+        const slot = domain.slotPointer(handle) orelse return false;
+        domain.lockDomain();
+        defer domain.domain_lock.unlock();
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        if (state.occupancy != .occupied or state.generation != handle.generation) return false;
+        if (!state.in_flight or slot.owner_pid_bits != to_pid_bits) return false;
+        slot.state.store(@bitCast(SlotState{
+            .generation = state.generation,
+            .occupancy = .occupied,
+            .in_flight = false,
+        }), .release);
+        return true;
+    }
+
     // -- internal ----------------------------------------------------------
 
     const AcquiredSlot = struct {
@@ -398,10 +564,22 @@ pub const SocketDomain = struct {
     /// one segment when exhausted) and mint its next-generation handle. The
     /// returned slot is privately held: its state word still reads
     /// `{free, old generation}` so every concurrent stale probe fails; the
-    /// caller publishes the occupied state after wiring fd/owner/kind.
+    /// caller publishes the occupied state after wiring fd/owner/kind. Takes
+    /// `domain_lock` for the duration; `beginHandoff`'s retire-edge path reuses
+    /// the lock-held body directly (`acquireSlotLocked`).
     fn acquireSlot(domain: *SocketDomain) OpenError!AcquiredSlot {
         domain.lockDomain();
+        defer domain.domain_lock.unlock();
+        return domain.acquireSlotLocked();
+    }
 
+    /// The lock-held body of `acquireSlot` — assumes `domain_lock` is ALREADY
+    /// held and does not release it (so a caller mid-transaction, like
+    /// `beginHandoff`'s generation-exhaustion re-home, can carve a fresh slot
+    /// without dropping the lock). Every mutation it performs (free-list pop,
+    /// segment growth, bump-carve, `live_socket_count`) is guarded by that held
+    /// lock exactly as in the wrapper.
+    fn acquireSlotLocked(domain: *SocketDomain) OpenError!AcquiredSlot {
         while (domain.free_list_head != no_free_slot) {
             const slot_index = domain.free_list_head;
             const slot = domain.slotPointerUnchecked(slot_index);
@@ -415,7 +593,6 @@ pub const SocketDomain = struct {
                 continue;
             }
             domain.noteSocketOpenedLocked();
-            domain.domain_lock.unlock();
             return .{
                 .handle = .{ .slot = slot_index, .generation = state.generation },
                 .slot = slot,
@@ -427,11 +604,9 @@ pub const SocketDomain = struct {
         const carved_count = domain.initialized_slot_count.load(.monotonic);
         if (carved_count == segment_capacity) {
             if (domain.segment_count == max_segment_count) {
-                domain.domain_lock.unlock();
                 return error.SocketTableExhausted;
             }
             const segment = backing_allocator.alloc(Slot, slots_per_segment) catch {
-                domain.domain_lock.unlock();
                 return error.OutOfMemory;
             };
             domain.segments[domain.segment_count] = segment.ptr;
@@ -454,7 +629,6 @@ pub const SocketDomain = struct {
         // makes an admitted index safe to dereference.
         domain.initialized_slot_count.store(slot_index + 1, .release);
         domain.noteSocketOpenedLocked();
-        domain.domain_lock.unlock();
         return .{
             .handle = .{ .slot = slot_index, .generation = 1 },
             .slot = slot,
@@ -750,6 +924,286 @@ test "SocketDomain: concurrent closes of the same handle are exactly-once (MED-2
     // Exactly one close won per handle — no double-close, no lost close.
     for (win_counts) |count| try testing.expectEqual(@as(u32, 1), count.load(.monotonic));
     // Leak-exact: every slot recycled exactly once, the count back to zero.
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.beginHandoff: bumps the generation, re-points the owner, sets in-flight; the sender's OLD handle is stale everywhere" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const original = try domain.open(42, 0xAAAA, 1234, .plain);
+    const successor = domain.beginHandoff(original, 0xAAAA, 0xBBBB) orelse
+        return error.TestUnexpectedResult;
+
+    // Successor: same slot/fd, next generation, re-parented to B, port/kind
+    // preserved — and the socket is STILL live (a re-parent, not a close).
+    try testing.expectEqual(original.slot, successor.slot);
+    try testing.expectEqual(original.generation + 1, successor.generation);
+    try testing.expectEqual(@as(?Fd, 42), domain.fd(successor));
+    try testing.expectEqual(@as(?u64, 0xBBBB), domain.owner(successor));
+    try testing.expectEqual(@as(?u16, 1234), domain.localPort(successor));
+    try testing.expect(domain.isLive(successor));
+    // Live-count conserved (no fd close during the handoff).
+    try testing.expectEqual(@as(u32, 1), domain.statistics().live_socket_count);
+
+    // The sender's OLD handle is stale everywhere the instant the handoff
+    // began — the stale-after-handoff security property.
+    try testing.expect(!domain.isLive(original));
+    try testing.expectEqual(@as(?Fd, null), domain.fd(original));
+    try testing.expectEqual(@as(?u64, null), domain.owner(original));
+    try testing.expectEqual(@as(?Fd, null), domain.close(original));
+
+    // Complete + close leak-exactly.
+    try testing.expect(domain.completeHandoff(successor, 0xBBBB));
+    try testing.expectEqual(@as(?Fd, 42), domain.close(successor));
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.beginHandoff: rejects a wrong-owner move without mutating the slot (only-owner-moves, defense in depth)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(7, 0xAAAA, 0, .plain);
+    // A process that is NOT the owner cannot begin the handoff.
+    try testing.expectEqual(@as(?SocketHandle, null), domain.beginHandoff(handle, 0xDEAD, 0xBBBB));
+    // The slot is untouched: the true owner's handle is still live and owned.
+    try testing.expect(domain.isLive(handle));
+    try testing.expectEqual(@as(?u64, 0xAAAA), domain.owner(handle));
+    _ = domain.close(handle);
+}
+
+test "SocketDomain.beginHandoff: a stale/forged handle never begins a handoff (returns null, never faults)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(9, 0xAAAA, 0, .plain);
+    _ = domain.close(handle);
+    // The closed (generation-bumped) handle can no longer be moved.
+    try testing.expectEqual(@as(?SocketHandle, null), domain.beginHandoff(handle, 0xAAAA, 0xBBBB));
+    // A forged never-carved handle likewise.
+    const forged = SocketHandle{ .slot = 9999, .generation = 3 };
+    try testing.expectEqual(@as(?SocketHandle, null), domain.beginHandoff(forged, 0xAAAA, 0xBBBB));
+}
+
+test "SocketDomain.completeHandoff: no-double-adopt — a second complete of the same successor fails" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const original = try domain.open(11, 0xAAAA, 0, .plain);
+    const successor = domain.beginHandoff(original, 0xAAAA, 0xBBBB).?;
+
+    // First complete clears in-flight (B's ledger now owns the obligation).
+    try testing.expect(domain.completeHandoff(successor, 0xBBBB));
+    // A second complete finds in_flight already cleared → false (no double
+    // adoption of one in-flight fragment).
+    try testing.expect(!domain.completeHandoff(successor, 0xBBBB));
+    // A complete claiming the WRONG receiver fails too (owner mismatch).
+    const again = try domain.open(12, 0xAAAA, 0, .plain);
+    const again_successor = domain.beginHandoff(again, 0xAAAA, 0xBBBB).?;
+    try testing.expect(!domain.completeHandoff(again_successor, 0xCCCC));
+    // The legitimate receiver still can.
+    try testing.expect(domain.completeHandoff(again_successor, 0xBBBB));
+
+    _ = domain.close(successor);
+    _ = domain.close(again_successor);
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.completeHandoff: a laundered successor with the wrong generation fails (no forged adoption)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const original = try domain.open(13, 0xAAAA, 0, .plain);
+    const successor = domain.beginHandoff(original, 0xAAAA, 0xBBBB).?;
+    // A forged u64 on the right slot but a wrong generation cannot be adopted.
+    const laundered = SocketHandle{ .slot = successor.slot, .generation = successor.generation + 7 };
+    try testing.expect(!domain.completeHandoff(laundered, 0xBBBB));
+    // The genuine successor still completes.
+    try testing.expect(domain.completeHandoff(successor, 0xBBBB));
+    _ = domain.close(successor);
+}
+
+test "SocketDomain.beginHandoff: a chained handoff A->B->C re-points each time; only the newest handle is live" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const a_handle = try domain.open(21, 0xA, 0, .plain);
+    const b_handle = domain.beginHandoff(a_handle, 0xA, 0xB).?;
+    try testing.expect(domain.completeHandoff(b_handle, 0xB));
+    // A re-move of the SUCCESSOR from B to C works; the A handle stays dead and
+    // begin on the stale A handle is refused.
+    try testing.expectEqual(@as(?SocketHandle, null), domain.beginHandoff(a_handle, 0xA, 0xC));
+    const c_handle = domain.beginHandoff(b_handle, 0xB, 0xC).?;
+    try testing.expect(!domain.isLive(a_handle));
+    try testing.expect(!domain.isLive(b_handle));
+    try testing.expect(domain.isLive(c_handle));
+    try testing.expectEqual(@as(?u64, 0xC), domain.owner(c_handle));
+    try testing.expect(domain.completeHandoff(c_handle, 0xC));
+    try testing.expectEqual(@as(?Fd, 21), domain.close(c_handle));
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.beginHandoff: the generation-exhaustion retire edge re-homes the fd on a fresh slot, live-count conserved" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    // Open a socket, then artificially advance its slot to the retire edge
+    // (a real slot would need ~4 billion open/close cycles). White-box: the
+    // test shares the module, so it reaches the slot word directly.
+    const handle = try domain.open(42, 0xAAAA, 1234, .plain);
+    const edge_slot = domain.slotPointerUnchecked(handle.slot);
+    edge_slot.state.store(@bitCast(SlotState{
+        .generation = retired_generation - 1,
+        .occupancy = .occupied,
+    }), .release);
+    const edge_handle = SocketHandle{ .slot = handle.slot, .generation = retired_generation - 1 };
+
+    const live_before = domain.statistics().live_socket_count;
+    const peak_before = domain.statistics().live_socket_peak;
+    const retired_before = domain.statistics().retired_slot_count;
+
+    const successor = domain.beginHandoff(edge_handle, 0xAAAA, 0xBBBB) orelse
+        return error.TestUnexpectedResult;
+
+    // The fd is re-homed on a DIFFERENT slot (the exhausted slot retired), the
+    // SAME fd/port carried over, re-parented to B.
+    try testing.expect(successor.slot != handle.slot);
+    try testing.expectEqual(@as(?Fd, 42), domain.fd(successor));
+    try testing.expectEqual(@as(?u64, 0xBBBB), domain.owner(successor));
+    try testing.expectEqual(@as(?u16, 1234), domain.localPort(successor));
+    // Live-count CONSERVED (still one live socket); one slot retired.
+    try testing.expectEqual(live_before, domain.statistics().live_socket_count);
+    try testing.expectEqual(retired_before + 1, domain.statistics().retired_slot_count);
+    // Peak CONSERVED too: a re-home opens no new socket, so the transient
+    // carve-count bump inside `acquireSlotLocked` must not inflate the peak.
+    try testing.expectEqual(peak_before, domain.statistics().live_socket_peak);
+    // The retired edge handle is stale everywhere.
+    try testing.expect(!domain.isLive(edge_handle));
+    try testing.expectEqual(@as(?SocketHandle, null), domain.beginHandoff(edge_handle, 0xAAAA, 0xCCCC));
+
+    try testing.expect(domain.completeHandoff(successor, 0xBBBB));
+    try testing.expectEqual(@as(?Fd, 42), domain.close(successor));
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.beginHandoff: a carve FAILURE at the retire edge leaves the old slot UNTOUCHED — the original handle stays live and closeable (no fd leak)" {
+    // The retire edge re-homes the fd onto a FRESH slot; carving that slot is
+    // the ONLY fallible step. If it fails (table exhausted / OOM) `beginHandoff`
+    // must honour its "did not mutate on failure" contract at THIS edge too: the
+    // OLD slot must be left UNTOUCHED and still live at its original generation,
+    // so the caller's undo (`abi.zig`'s `zap_socket_handoff_send` failure arm)
+    // validly closes the ORIGINAL handle exactly once. Before the carve-first
+    // reorder the old slot was RETIRED before the failing carve, stranding its
+    // fd: the original handle's now-stale generation failed the caller's `close`,
+    // which returned null, and the fd LEAKED (a pure one-fd DoS leak).
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    // A live socket whose slot is advanced to the retire edge (white-box: the
+    // test shares the module, so it reaches the slot word directly).
+    const handle = try domain.open(42, 0xAAAA, 1234, .plain);
+    const edge_slot = domain.slotPointerUnchecked(handle.slot);
+    edge_slot.state.store(@bitCast(SlotState{
+        .generation = retired_generation - 1,
+        .occupancy = .occupied,
+    }), .release);
+    const edge_handle = SocketHandle{ .slot = handle.slot, .generation = retired_generation - 1 };
+
+    // Force the re-home carve to fail with `error.SocketTableExhausted`: the free
+    // list is empty (the one slot is occupied), so drive the bump-carve cursor to
+    // the fixed segment ceiling. White-box geometry, restored below so `deinit`
+    // (which walks `segments[0..segment_count]`) stays sound on every exit.
+    std.debug.assert(domain.free_list_head == no_free_slot);
+    const saved_segment_count = domain.segment_count;
+    const saved_initialized = domain.initialized_slot_count.load(.monotonic);
+    domain.segment_count = max_segment_count;
+    domain.initialized_slot_count.store(max_segment_count * slots_per_segment, .monotonic);
+
+    const live_before = domain.statistics().live_socket_count;
+    const peak_before = domain.statistics().live_socket_peak;
+    const retired_before = domain.statistics().retired_slot_count;
+
+    // The handoff cannot proceed — the re-home carve fails.
+    try testing.expectEqual(@as(?SocketHandle, null), domain.beginHandoff(edge_handle, 0xAAAA, 0xBBBB));
+
+    // Restore the faked table geometry BEFORE any fallible assertion so `deinit`
+    // stays sound regardless of which assertion (if any) trips.
+    domain.segment_count = saved_segment_count;
+    domain.initialized_slot_count.store(saved_initialized, .monotonic);
+
+    // CONTRACT: the failed handoff did not mutate the old slot. The ORIGINAL
+    // handle is still live, still owned by the sender, still naming fd 42 — and
+    // nothing was retired or double-counted along the way.
+    try testing.expect(domain.isLive(edge_handle));
+    try testing.expectEqual(@as(?Fd, 42), domain.fd(edge_handle));
+    try testing.expectEqual(@as(?u64, 0xAAAA), domain.owner(edge_handle));
+    try testing.expectEqual(live_before, domain.statistics().live_socket_count);
+    try testing.expectEqual(peak_before, domain.statistics().live_socket_peak);
+    try testing.expectEqual(retired_before, domain.statistics().retired_slot_count);
+
+    // NO fd LEAK: the caller's undo closes the ORIGINAL handle exactly once and
+    // the live count returns to baseline (this close retires the exhausted slot).
+    try testing.expectEqual(@as(?Fd, 42), domain.close(edge_handle));
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+    try testing.expectEqual(retired_before + 1, domain.statistics().retired_slot_count);
+}
+
+test "SocketDomain: concurrent beginHandoff of one handle mints exactly ONE successor (atomic under domain_lock)" {
+    // The handoff analogue of the MED-2 concurrent-close proof: if two threads
+    // both `beginHandoff` the SAME live handle, exactly ONE may win (bump the
+    // generation, mint the successor, set in-flight); every other must fail the
+    // post-bump generation check and return null. Two winners would double-
+    // transfer one fd — two in-flight envelopes owning one close obligation, a
+    // guaranteed double-close/leak. The atomic validate+bump under `domain_lock`
+    // closes that window.
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle_count = 64;
+    var handles: [handle_count]SocketHandle = undefined;
+    for (&handles, 0..) |*handle, index| handle.* = try domain.open(@intCast(1000 + index), 0xA, 0, .plain);
+
+    var win_counts: [handle_count]std.atomic.Value(u32) = undefined;
+    for (&win_counts) |*count| count.* = .init(0);
+    var successors: [handle_count]std.atomic.Value(u64) = undefined;
+    for (&successors) |*successor| successor.* = .init(0);
+
+    const Beginner = struct {
+        domain: *SocketDomain,
+        handles: []const SocketHandle,
+        win_counts: []std.atomic.Value(u32),
+        successors: []std.atomic.Value(u64),
+
+        fn run(beginner: @This()) void {
+            for (beginner.handles, 0..) |handle, index| {
+                if (beginner.domain.beginHandoff(handle, 0xA, 0xB)) |successor| {
+                    _ = beginner.win_counts[index].fetchAdd(1, .monotonic);
+                    beginner.successors[index].store(successor.toBits(), .monotonic);
+                }
+            }
+        }
+    };
+
+    const thread_count = 8;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Beginner.run, .{Beginner{
+            .domain = &domain,
+            .handles = handles[0..],
+            .win_counts = win_counts[0..],
+            .successors = successors[0..],
+        }});
+    }
+    for (threads) |thread| thread.join();
+
+    // Exactly one begin won per handle; complete + close each minted successor —
+    // leak-exact back to zero (no fd double-transferred, none lost).
+    for (win_counts, 0..) |count, index| {
+        try testing.expectEqual(@as(u32, 1), count.load(.monotonic));
+        const successor = SocketHandle.fromBits(successors[index].load(.monotonic));
+        try testing.expect(domain.completeHandoff(successor, 0xB));
+        try testing.expect(domain.close(successor) != null);
+    }
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
 }
 

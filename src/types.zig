@@ -5962,6 +5962,16 @@ pub const TypeChecker = struct {
 
         const message_type = self.store.getType(scrutinee_type);
         if (message_type != .tagged_union) {
+            // A MOVE-ONLY socket handle (`Socket`/`SocketListener`) is admitted
+            // as a TOP-LEVEL receive scrutinee (S3 cross-process handoff): it
+            // rides the move-only adopt path (`decodeReceivedEnvelope`'s socket
+            // arm), NEVER the copy walker — so `typeIsWalkerSendable` rejects it
+            // at every depth (`typeIsWalkerSendableBudgeted` must keep doing so,
+            // since it also guards copy-send + nested positions). Accept it here
+            // at the top level ONLY (the `receive Socket { s -> s }` handoff
+            // shape), mirroring the runtime's `isTopLevelSendable` admission of
+            // the socket handle struct.
+            if (self.typeIsSocketHandle(scrutinee_type)) return;
             // Not the scalar early-out and not a union. Accept any OTHER
             // walker-sendable message type — `String`, `List`, `Map`, or a
             // by-value struct of sendable fields — none of which carry a
