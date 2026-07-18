@@ -4110,6 +4110,7 @@ const ZapConcurrencyKernel = struct {
     ) callconv(.c) i64;
     extern fn zap_socket_shutdown(process: *anyopaque, handle_bits: u64, how: i32) callconv(.c) i64;
     extern fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64;
+    extern fn zap_socket_accept_timeout(process: *anyopaque, listener_bits: u64, timeout_ms: i64) callconv(.c) u64;
     extern fn zap_socket_endpoint(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
     // The IPv6-aware endpoint accessors: a 16-byte v6 address cannot fit the
     // single packed `zap_socket_endpoint` i64, so a v6 endpoint is surfaced as
@@ -7553,6 +7554,30 @@ pub const SocketRuntime = struct {
             return ZapConcurrencyKernel.zap_socket_accept(requireCurrentProcessHandle(), listener_bits);
         } else {
             const outcome = socket_io.accept(gateOffFd(listener_bits), null);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, outcome.peer.port, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
+    /// `Socket.accept/2`: accept one connection BOUNDED by `timeout_ms` (Job 2).
+    /// Returns the accepted socket's handle bits (never `0`) or `0` when the
+    /// deadline expires before a connection arrives (last-error `timed_out`, code
+    /// 2 → `:etimedout`) or on failure. `timeout_ms <= 0` is the infinite
+    /// `accept/1` behavior. The bounded wait is the primitive a TRAPPING acceptor
+    /// needs to observe a cooperative `:shutdown` within a poll quantum.
+    pub fn accept_timeout(listener_bits: u64, timeout_ms: i64) u64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_accept_timeout(requireCurrentProcessHandle(), listener_bits, timeout_ms);
+        } else {
+            const outcome = socket_io.acceptTimeout(gateOffFd(listener_bits), null, timeout_ms);
             if (outcome.reason != .ok) {
                 gate_off_last_error = @intFromEnum(outcome.reason);
                 return 0;

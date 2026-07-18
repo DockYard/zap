@@ -36,6 +36,26 @@
   poll-quantum-bounded (§6.1), never `SO_RCVTIMEO`, and a timeout never closes
   the socket.
 
+  ## Cross-process handoff — `controlling_process` (S3)
+
+  Because a `Socket` is single-owner and move-only, changing which process serves
+  a connection is a `Process.send_move` of the handle — the `controlling_process`
+  operation, executed BY the current owner:
+
+      handler = Process.spawn_link(&MyServer.handler_entry/0)
+      _moved = Process.send_move((Pid.of(handler) :: Pid(Socket)), connection)
+
+  The receiver ADOPTS it through a top-level `receive Socket { s -> s }` and then
+  owns it outright (the sender's handle is consumed — a use after the move is a
+  compile error). This is exactly how the acceptor/handler server pattern hands
+  each accepted connection to a per-connection handler.
+
+  DEAD-LETTER RULE: if the target pid is already dead, `send_move` returns
+  `false` and the runtime CLOSES the socket — a handed-off connection never
+  leaks its fd, whether it is adopted, dropped at the receiver's teardown, or
+  dead-lettered. The caller performs NO cleanup on a `false` return (the fd is
+  already closed).
+
   ## Examples
 
       case Socket.listen(SocketAddress.loopback(0), 128) {
@@ -151,11 +171,18 @@ pub struct Socket {
     Accepts the next inbound connection on `listener`, parking the fiber until
     one arrives (offloaded off the process's core gate-ON, inline gate-OFF).
     Returns `Result.Ok(socket)` — a data `Socket` that INHERITS the listener's
-    options — or `Result.Error(%SocketError{...})`. Safe to call from many
-    green processes on one listener (kernel-FIFO fairness). You cannot `accept`
-    a data `Socket` (the parameter is a `SocketListener`) nor `send`/`recv` a
-    listener — the distinct types make both a compile error. Panics on a closed
-    or stale listener handle.
+    options — or `Result.Error(%SocketError{...})`. You cannot `accept` a data
+    `Socket` (the parameter is a `SocketListener`) nor `send`/`recv` a listener —
+    the distinct types make both a compile error. Panics on a closed or stale
+    listener handle.
+
+    A `SocketListener` is single-owner like every socket handle (Decision B): it
+    is `accept`ed by the ONE process that owns it, not shared. The
+    acceptor/handler server pattern is therefore ONE process looping `accept` and
+    handing each accepted `Socket` to a fresh handler by `Process.send_move`
+    (`controlling_process` — owner-executed handoff); `lib/socket/server.zap`
+    (`SocketServer`) is the policy scaffold, and `SocketListener.close` (or the
+    owner's death) is what stops it.
 
     ## Examples
 
@@ -169,6 +196,42 @@ pub struct Socket {
 
   pub fn accept(listener :: SocketListener) -> Result(Socket, SocketError) {
     case :zig.SocketRuntime.accept(listener.zap_socket_handle) {
+      0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
+    }
+  }
+
+  @doc = """
+    Accepts the next inbound connection on `listener`, BOUNDED by `timeout_ms`
+    (Phase S3, Job 2): if no connection arrives within `timeout_ms` milliseconds
+    the call returns `Result.Error(%SocketError{reason: :etimedout})` instead of
+    parking forever. `timeout_ms <= 0` is the infinite `accept/1` behavior.
+
+    The deadline is poll-quantum-bounded against an ABSOLUTE monotonic instant
+    (§6.1), never `SO_RCVTIMEO`, and a timeout never closes the listener — the
+    next `accept` resumes normally. This is the primitive a TRAPPING acceptor
+    (the server pattern's connection mini-supervisor) needs: parked in an
+    infinite `accept` it would never observe a cooperative `:shutdown` signal
+    (a trapped signal sets no pending-kill), so it loops on the short deadline,
+    checking for shutdown/reaping handler exits each time it wakes.
+
+    A timed-out `accept` produced no connection, so it leaks NO fd; a kill during
+    a bounded `accept` reclaims any just-accepted fd exactly as `accept/1` does
+    (the same teardown-visible pending-fd slot).
+
+    ## Examples
+
+        case Socket.accept(listener, 50) {
+          Result.Ok(connection)                       -> dispatch(connection)
+          Result.Error(%SocketError{reason: :etimedout}) -> keep_serving()
+          Result.Error(_error)                        -> :accept_failed
+        }
+    """
+
+  @available_on(:network)
+
+  pub fn accept(listener :: SocketListener, timeout_ms :: i64) -> Result(Socket, SocketError) {
+    case :zig.SocketRuntime.accept_timeout(listener.zap_socket_handle, timeout_ms) {
       0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
       handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
     }

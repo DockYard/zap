@@ -3194,6 +3194,10 @@ export fn zap_socket_get_option(process: *anyopaque, handle_bits: u64, option_co
 const SocketAcceptRequest = struct {
     fd: concurrency.socket_io.Fd,
     kill_flag: ?*std.atomic.Value(bool),
+    /// The accept deadline in ms (`0` = infinite — the `accept/1` behavior;
+    /// `> 0` = bounded, Job 2). A bounded accept that expires returns
+    /// `.timed_out` having produced NO fd (nothing to reclaim).
+    timeout_ms: i64,
     /// The process's teardown-visible pending-fd slot (HIGH-1) — see
     /// `SocketConnectRequest.pending_fd_slot`.
     pending_fd_slot: *concurrency.socket_io.Fd,
@@ -3202,25 +3206,29 @@ const SocketAcceptRequest = struct {
 
 fn socketAcceptBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
     const request: *SocketAcceptRequest = @ptrCast(@alignCast(operation_argument.?));
-    request.outcome = concurrency.socket_io.accept(request.fd, request.kill_flag);
+    request.outcome = concurrency.socket_io.acceptTimeout(request.fd, request.kill_flag, request.timeout_ms);
     // HIGH-1: park a just-accepted fd in the process's teardown-visible slot
     // before re-attach, so a kill skipping the continuation still reclaims it
     // via the socket-sweep. Only a successful accept yields a live fd (accept's
     // own post-accept kill check already closed the fd on the pool thread when
-    // it observed the kill, returning a non-`.ok` reason).
+    // it observed the kill, returning a non-`.ok` reason; a timed-out accept
+    // never produced one).
     if (request.outcome.reason == .ok) request.pending_fd_slot.* = request.outcome.fd;
     return null;
 }
 
-/// Accept a connection from a listening socket, offloading the blocking accept
-/// off-core (kill-responsive). Registers the accepted fd as a NEW handle owned
-/// by the caller (appended to its ledger, sweep node ensured — the accepted
-/// socket inherits crash-safe fd lifetime), and returns its handle bits. On
-/// failure returns the invalid handle with the reason recorded in the caller's
-/// ledger `last_error`; a non-owned/stale listener is surfaced the same way
-/// (the runtime turns its sentinel reason into a panic — a program bug, not
-/// a recoverable error).
-export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64 {
+/// The shared accept implementation behind `zap_socket_accept` (`timeout_ms ==
+/// 0`, infinite) and `zap_socket_accept_timeout` (`timeout_ms > 0`, bounded).
+/// One body → the pending-fd reclamation discipline (HIGH-1) cannot drift
+/// between the two exports. Offloads the blocking accept off-core
+/// (kill-responsive). Registers the accepted fd as a NEW handle owned by the
+/// caller (appended to its ledger, sweep node ensured — the accepted socket
+/// inherits crash-safe fd lifetime), and returns its handle bits. On failure
+/// (including a bounded timeout) returns the invalid handle with the reason
+/// recorded in the caller's ledger `last_error`; a non-owned/stale listener is
+/// surfaced the same way (the runtime turns its sentinel reason into a panic —
+/// a program bug, not a recoverable error).
+fn socketAcceptImpl(process: *anyopaque, listener_bits: u64, timeout_ms: i64) u64 {
     const context = contextFromHandle(process);
     // A non-owned / stale listener is a program bug: surface it as the invalid
     // handle with a sentinel reason the runtime turns into a panic.
@@ -3235,6 +3243,7 @@ export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c
     var request = SocketAcceptRequest{
         .fd = listener_fd,
         .kill_flag = context.pendingKillFlag(),
+        .timeout_ms = timeout_ms,
         // Teardown-visible pending-fd slot (HIGH-1); see `zap_socket_connect`.
         .pending_fd_slot = context.socketPendingFdSlot(),
         .outcome = undefined,
@@ -3262,6 +3271,24 @@ export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c
         return socketConnectFailed(context, .out_of_memory);
     };
     return handle.toBits();
+}
+
+/// Accept a connection from a listening socket, parking indefinitely until one
+/// arrives (the `Socket.accept/1` surface). Thin wrapper over `socketAcceptImpl`
+/// with an infinite deadline.
+export fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64 {
+    return socketAcceptImpl(process, listener_bits, 0);
+}
+
+/// Accept a connection bounded by `timeout_ms` (Job 2 — the `Socket.accept/2`
+/// surface). Returns the invalid handle with `last_error == timed_out` (Reason
+/// code 2) when the deadline expires before a connection arrives — the primitive
+/// a TRAPPING acceptor needs so a cooperative `:shutdown` is observed within a
+/// poll quantum instead of never (a parked infinite accept sees no trapped
+/// signal). A timed-out accept produced no fd, so nothing leaks; a kill
+/// mid-accept reclaims via the same pending-fd slot as `zap_socket_accept`.
+export fn zap_socket_accept_timeout(process: *anyopaque, listener_bits: u64, timeout_ms: i64) callconv(.c) u64 {
+    return socketAcceptImpl(process, listener_bits, timeout_ms);
 }
 
 /// The peer (`kind != 0`) or local (`kind == 0`) IPv4 endpoint of a socket the
@@ -4734,6 +4761,55 @@ test "abi: repeated kill-during-offload cycles never accumulate fds (no fd-exhau
         if (cycle == 0) baseline = abiCountOpenFds();
         try testing.expectEqual(baseline, abiCountOpenFds());
     }
+}
+
+/// The observations a bounded-accept worker records: the handle
+/// `zap_socket_accept_timeout` returned (invalid on timeout), the resulting
+/// `last_error`, and whether the worker completed.
+const SocketAcceptTimeoutProbe = struct {
+    accept_bits: u64 = 0xdead_beef,
+    last_error: i32 = std.math.minInt(i32),
+    ran: bool = false,
+};
+
+/// Worker: open a loopback listener, then `accept` it with a SHORT deadline and
+/// NOTHING connecting. The bounded accept must return the invalid handle with
+/// `last_error == timed_out` (never park forever), and — having produced no fd —
+/// leak nothing. Closes the listener so the only surviving fd would be a leaked
+/// accept.
+fn socketAcceptTimeoutProbeEntry(process: *anyopaque, argument: ?*anyopaque) callconv(.c) void {
+    const probe: *SocketAcceptTimeoutProbe = @ptrCast(@alignCast(argument.?));
+    const listen_bits = zap_socket_listen(process, 127, 0, 0, 1, 0, 4);
+    if (listen_bits == concurrency.SocketHandle.invalid.toBits()) return;
+    probe.accept_bits = zap_socket_accept_timeout(process, listen_bits, 150);
+    probe.last_error = zap_socket_last_error(process);
+    _ = zap_socket_close(process, listen_bits);
+    probe.ran = true;
+}
+
+test "abi: zap_socket_accept_timeout with no connection TIMES OUT (invalid handle, etimedout), leaking no fd" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_runtime_init());
+    defer zap_proc_runtime_deinit();
+    bindTestManager();
+
+    const fd_baseline = abiCountOpenFds();
+    const live_baseline = runtime_state.socket_domain.statistics().live_socket_count;
+
+    var probe = SocketAcceptTimeoutProbe{};
+    const worker_bits = zap_proc_spawn(socketAcceptTimeoutProbeEntry, &probe);
+    try testing.expect(worker_bits != concurrency.Pid.invalid.toBits());
+    try testing.expectEqual(ZapProcStatus.ok, zap_proc_run_until_exit(worker_bits));
+
+    // It ran to completion (never parked forever), returned the invalid handle,
+    // and recorded the timed_out reason (Reason code 2 → Zap `:etimedout`).
+    try testing.expect(probe.ran);
+    try testing.expectEqual(concurrency.SocketHandle.invalid.toBits(), probe.accept_bits);
+    try testing.expectEqual(@as(i32, @intFromEnum(concurrency.socket_io.Reason.timed_out)), probe.last_error);
+    // No fd was ever accepted; both oracles are back at baseline — a bounded
+    // accept that times out cannot leak an fd (no DoS surface).
+    try testing.expectEqual(live_baseline, runtime_state.socket_domain.statistics().live_socket_count);
+    try testing.expectEqual(fd_baseline, abiCountOpenFds());
 }
 
 // ---------------------------------------------------------------------------

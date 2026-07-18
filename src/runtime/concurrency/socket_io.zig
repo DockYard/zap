@@ -1505,6 +1505,17 @@ var test_after_accept_hook: ?*const fn () void = null;
 /// connection is set `O_NONBLOCK` for its whole life (the always-non-blocking
 /// discipline) so `recv`/`send` on it need no per-operation mode flip.
 pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
+    return acceptTimeout(fd, kill_flag, 0);
+}
+
+/// Accept one connection, bounded by `timeout_ms` (`0` = infinite, the `accept`
+/// behavior). The family-probing router `accept` delegates to: an AF_UNIX
+/// listener routes to the raw-`accept(2)` `acceptAny` path, an IPv4/IPv6
+/// listener to the S1 `netAccept` `acceptInet` path, and `timeout_ms` threads to
+/// whichever path is chosen so BOTH honor the same absolute-monotonic deadline
+/// (§6.1). A timed-out accept produced NO fd, so it leaks nothing; the accepted
+/// connection (on success) is `O_NONBLOCK` for its whole life.
+pub fn acceptTimeout(fd: Fd, kill_flag: ?*std.atomic.Value(bool), timeout_ms: i64) AcceptOutcome {
     if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
         // One cheap, non-blocking `getsockname` (nanoseconds) before the
         // BLOCKING accept — negligible relative to the accept itself — routes a
@@ -1514,24 +1525,36 @@ pub fn accept(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
         var address_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
         if (std.posix.errno(std.posix.system.getsockname(handle, @ptrCast(&storage), &address_len)) == .SUCCESS) {
             const family: *const std.posix.sockaddr = @ptrCast(&storage);
-            if (family.family == std.posix.AF.UNIX) return acceptAny(fd, kill_flag);
+            if (family.family == std.posix.AF.UNIX) return acceptAny(fd, kill_flag, timeout_ms);
         }
     }
-    return acceptInet(fd, kill_flag);
+    return acceptInet(fd, kill_flag, timeout_ms);
 }
 
 /// The IPv4/IPv6 accept path (the byte-identical S1 `netAccept` implementation,
-/// now producing a `SocketEndpoint` peer). Reached from `accept` for a non-Unix
-/// listener.
-fn acceptInet(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
+/// now producing a `SocketEndpoint` peer). Reached from `acceptTimeout` for a
+/// non-Unix listener. `timeout_ms > 0` bounds the wait against an ABSOLUTE
+/// monotonic deadline (the `awaitConnect` discipline): the poll quantum is
+/// clamped so the deadline is observed within one quantum, and expiry returns
+/// `.timed_out` (no fd was produced, so nothing leaks). `timeout_ms <= 0` keeps
+/// the S1 infinite behavior (poll-quantum-bounded only by the kill flag).
+fn acceptInet(fd: Fd, kill_flag: ?*std.atomic.Value(bool), timeout_ms: i64) AcceptOutcome {
     const the_io = io();
     const listen_handle = fdFromBits(fd);
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
     while (true) {
         if (kill_flag) |flag| {
             if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
         }
-        switch (waitReadable(listen_handle, poll_quantum_ms)) {
-            .timeout => continue,
+        var quantum: i32 = poll_quantum_ms;
+        if (has_deadline) {
+            const remaining = deadline_ms - monotonicMillis();
+            if (remaining <= 0) return .{ .reason = .timed_out, .fd = 0, .peer = SocketEndpoint.none };
+            if (remaining < quantum) quantum = @intCast(remaining);
+        }
+        switch (waitReadable(listen_handle, quantum)) {
+            .timeout => continue, // re-check deadline + kill
             .failed => return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none },
             .ready => {},
         }
@@ -2634,17 +2657,25 @@ pub fn connectUnix(path: []const u8, timeout_ms: i64, kill_flag: ?*std.atomic.Va
 /// accepted fd on THIS thread (never handed to a tearing-down process — the
 /// HIGH-1 discipline). This is the seam for Unix-domain stream accept; the
 /// IPv4/IPv6 path keeps the byte-identical `accept` (`netAccept`) above.
-pub fn acceptAny(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
+pub fn acceptAny(fd: Fd, kill_flag: ?*std.atomic.Value(bool), timeout_ms: i64) AcceptOutcome {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
     }
     const listen_handle = fdFromBits(fd);
+    const has_deadline = timeout_ms > 0;
+    const deadline_ms: i64 = if (has_deadline) checkedDeadline(monotonicMillis(), timeout_ms) else 0;
     while (true) {
         if (kill_flag) |flag| {
             if (flag.load(.acquire)) return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
         }
-        switch (waitReadable(listen_handle, poll_quantum_ms)) {
-            .timeout => continue,
+        var quantum: i32 = poll_quantum_ms;
+        if (has_deadline) {
+            const remaining = deadline_ms - monotonicMillis();
+            if (remaining <= 0) return .{ .reason = .timed_out, .fd = 0, .peer = SocketEndpoint.none };
+            if (remaining < quantum) quantum = @intCast(remaining);
+        }
+        switch (waitReadable(listen_handle, quantum)) {
+            .timeout => continue, // re-check deadline + kill
             .failed => return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none },
             .ready => {},
         }
@@ -2861,6 +2892,101 @@ test "socket_io: accept DETERMINISTICALLY closes a just-accepted fd when a kill 
     try testing.expect(kill_flag.load(.acquire));
     // The server-side fd `netAccept` opened was closed by the branch — no leak.
     try testing.expectEqual(before, after);
+}
+
+test "socket_io: bounded accept with NO incoming connection TIMES OUT promptly, leaking no fd" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // A listener with nothing connecting: an INFINITE accept would park forever
+    // (only a kill wakes it — the trapping-acceptor problem Job 2 fixes). A
+    // BOUNDED accept must return `.timed_out` at ~`timeout_ms`, and because it
+    // timed out BEFORE accepting, it produced NO fd — the OS fd count is flat.
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+
+    const before = countOpenFds();
+    const before_ms = monotonicMillis();
+    const outcome = acceptTimeout(listener.fd, null, 150);
+    const elapsed_ms = monotonicMillis() - before_ms;
+    const after = countOpenFds();
+
+    // It timed out (never hung) with the dedicated reason and a zero fd.
+    try testing.expectEqual(Reason.timed_out, outcome.reason);
+    try testing.expectEqual(@as(Fd, 0), outcome.fd);
+    try testing.expectEqual(SocketEndpoint.Family.unavailable, outcome.peer.family);
+    // Bounded by the ~150ms deadline, never ~forever.
+    try testing.expect(elapsed_ms < 4000);
+    // No fd was ever accepted, so nothing leaked.
+    try testing.expectEqual(before, after);
+}
+
+test "socket_io: bounded accept still returns a PENDING connection well before its deadline" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // A generous timeout must NOT change the happy path: a connection already in
+    // the backlog is accepted immediately (peer surfaced), long before the
+    // deadline — bounded accept degrades to ordinary accept when work is ready.
+    const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+
+    const before_ms = monotonicMillis();
+    const outcome = acceptTimeout(listener.fd, null, 5000);
+    const elapsed_ms = monotonicMillis() - before_ms;
+
+    try testing.expectEqual(Reason.ok, outcome.reason);
+    try testing.expect(outcome.fd != 0);
+    try testing.expectEqual(SocketEndpoint.Family.ip4, outcome.peer.family);
+    // Accepted promptly — nowhere near the 5000ms deadline.
+    try testing.expect(elapsed_ms < 1000);
+    closeFd(outcome.fd);
+}
+
+test "socket_io: a kill mid-bounded-accept reclaims — never orphans a just-accepted fd (OS fd count stable)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // The bounded-accept twin of the kill-racing reclamation test: a background
+    // thread flips the kill shortly after `acceptTimeout` begins, racing a queued
+    // connection's arrival. On some iterations the kill wins at the top of the
+    // loop, on some AFTER `netAccept` (the post-accept close-on-kill path), on
+    // some the accept wins outright. The non-zero timeout exercises the SAME
+    // HIGH-1 discipline as the infinite path — no path may orphan a fd, proven by
+    // the OS fd count returning to baseline after every cycle.
+    const KillSetter = struct {
+        flag: *std.atomic.Value(bool),
+        fn run(setter: @This()) void {
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            setter.flag.store(true, .release);
+        }
+    };
+
+    const baseline = countOpenFds();
+    var iteration: usize = 0;
+    while (iteration < 64) : (iteration += 1) {
+        const listener = listenIp4(.{ 127, 0, 0, 1 }, 0, 8);
+        try testing.expectEqual(Reason.ok, listener.reason);
+        const client = connectIp4(.{ 127, 0, 0, 1 }, listener.bound_port, 5000, null);
+        try testing.expectEqual(Reason.ok, client.reason);
+
+        var kill_flag = std.atomic.Value(bool).init(false);
+        const setter = try std.Thread.spawn(.{}, KillSetter.run, .{KillSetter{ .flag = &kill_flag }});
+        // A generous deadline so the KILL — not the timeout — is what ends the
+        // wait on the no-connection iterations (isolating the reclamation path).
+        const outcome = acceptTimeout(listener.fd, &kill_flag, 5000);
+        setter.join();
+
+        if (outcome.reason == .ok) closeFd(outcome.fd);
+        closeFd(client.fd);
+        closeFd(listener.fd);
+    }
+
+    // Across 64 kill-racing bounded-accept cycles the OS fd count is UNCHANGED.
+    try testing.expectEqual(baseline, countOpenFds());
 }
 
 test "socket_io: loopback listen + connect + close round-trips on an ephemeral port" {
@@ -3998,7 +4124,7 @@ test "socket_io: Unix STREAM local/peer address surface the bound PATH via getso
     const client = connectUnix(path, 5000, null);
     try testing.expectEqual(Reason.ok, client.reason);
     defer closeFd(client.fd);
-    const accepted = acceptAny(listener.fd, null);
+    const accepted = acceptAny(listener.fd, null, 0);
     try testing.expectEqual(Reason.ok, accepted.reason);
     defer closeFd(accepted.fd);
 
