@@ -146,6 +146,14 @@ pub const SocketKind = enum(u8) {
     plain = 0,
     /// A TLS session riding the same handle (S4/S5; reserved in S0).
     tls_session = 1,
+    /// A TLS SERVER LISTENER (Phase S5): a plaintext listening socket whose
+    /// `tls_state` holds an opaque `*TlsServerConfig` (the per-listener cert
+    /// chain + private key + ALPN list) instead of a session. The socket does
+    /// NOT itself carry TLS traffic — each accepted connection runs its own
+    /// server handshake — but the tag distinguishes the config from a session on
+    /// the close path, so teardown frees it through `tlsFreeServerConfig` (not
+    /// `tlsFreeSession`).
+    tls_listener = 2,
 };
 
 /// Reserved generation marking a retired slot (never reissued): a slot
@@ -426,9 +434,17 @@ pub const SocketDomain = struct {
     /// it in lockstep with the fd — the socket's fd is closed exactly once, so
     /// its session is freed exactly once (the single-owner invariant). A plain
     /// socket returns `tls_state == null`.
+    ///
+    /// `kind` tells the bridge WHAT the opaque `tls_state` is (Phase S5), so it
+    /// can free it correctly: a `.tls_session` connection frees via
+    /// `tlsFreeSession`, a `.tls_listener` frees its `*TlsServerConfig` via
+    /// `tlsFreeServerConfig`, and a `.plain` socket has a null `tls_state`
+    /// (nothing to free). Without the tag the two erased pointer types would be
+    /// indistinguishable on the shared close path.
     pub const ClosedSocket = struct {
         fd: Fd,
         tls_state: ?*anyopaque,
+        kind: SocketKind,
     };
 
     /// Close a handle: validate its generation, bump the generation (which
@@ -461,9 +477,10 @@ pub const SocketDomain = struct {
         }
         const closed_fd = slot.fd;
         const closed_tls_state = slot.tls_state;
+        const closed_kind = slot.kind;
         domain.recycleSlotLocked(handle.slot, slot, state.generation);
         domain.domain_lock.unlock();
-        return .{ .fd = closed_fd, .tls_state = closed_tls_state };
+        return .{ .fd = closed_fd, .tls_state = closed_tls_state, .kind = closed_kind };
     }
 
     // -- TLS binding (S4) --------------------------------------------------
@@ -493,6 +510,37 @@ pub const SocketDomain = struct {
         if (slot.owner_pid_bits != from_pid_bits) return false;
         slot.tls_state = tls_state;
         slot.kind = .tls_session;
+        slot.state.store(@bitCast(state), .release);
+        return true;
+    }
+
+    /// Bind a per-listener `*TlsServerConfig` to a LIVE plaintext listener handle
+    /// (the `Tls.listen` path, Phase S5): validate generation + occupancy +
+    /// ownership by `from_pid_bits`, then set `tls_state` (the erased config) and
+    /// flip `kind` to `.tls_listener` as ONE atomic step under `domain_lock`. The
+    /// generation is NOT bumped — the SAME listener handle keeps naming the
+    /// socket, now a TLS listener (a fresh listener was never used for anything
+    /// else, so there is nothing to invalidate — the fresh-connect `attachTls`
+    /// posture). Returns true on success; false when the handle is stale/forged
+    /// or not owned by `from_pid_bits` (defense in depth over the caller's ledger
+    /// gate), leaving the slot UNTOUCHED. The `.release` re-store of the
+    /// (unchanged) state word orders the `tls_state`/`kind` writes before any
+    /// later acquire-load — so the accept path sees the config and the close path
+    /// sees the `.tls_listener` kind.
+    pub fn attachServerConfig(
+        domain: *SocketDomain,
+        handle: SocketHandle,
+        from_pid_bits: u64,
+        server_config: *anyopaque,
+    ) bool {
+        const slot = domain.slotPointer(handle) orelse return false;
+        domain.lockDomain();
+        defer domain.domain_lock.unlock();
+        const state: SlotState = @bitCast(slot.state.load(.acquire));
+        if (state.occupancy != .occupied or state.generation != handle.generation) return false;
+        if (slot.owner_pid_bits != from_pid_bits) return false;
+        slot.tls_state = server_config;
+        slot.kind = .tls_listener;
         slot.state.store(@bitCast(state), .release);
         return true;
     }
@@ -1464,7 +1512,49 @@ test "SocketDomain.attachTls: binds a session + flips kind to tls_session WITHOU
     const closed = domain.close(handle) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(Fd, 7), closed.fd);
     try testing.expectEqual(@as(?*anyopaque, session), closed.tls_state);
+    try testing.expectEqual(@as(SocketKind, .tls_session), closed.kind);
     try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.attachServerConfig: binds a config + flips kind to tls_listener WITHOUT bumping the generation; close returns the config + tls_listener kind (Phase S5)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(9, 0xCD, 4321, .plain);
+    try testing.expectEqual(@as(?SocketKind, .plain), domain.kind(handle));
+
+    const config = fakeTlsState(7);
+    try testing.expect(domain.attachServerConfig(handle, 0xCD, config));
+
+    // SAME handle still names the listener — now a TLS listener, config bound.
+    try testing.expect(domain.isLive(handle));
+    try testing.expectEqual(@as(?SocketKind, .tls_listener), domain.kind(handle));
+    try testing.expectEqual(@as(?*anyopaque, config), domain.tlsState(handle));
+
+    // A wrong-owner attach is refused (defense in depth); the slot is untouched.
+    try testing.expect(!domain.attachServerConfig(handle, 0x99, fakeTlsState(8)));
+    try testing.expectEqual(@as(?*anyopaque, config), domain.tlsState(handle));
+
+    // close hands the config back ALONGSIDE the fd WITH the `.tls_listener` kind,
+    // so the bridge frees it as a config (not a session) — the disambiguation
+    // the whole `kind`-on-`ClosedSocket` addition exists for.
+    const closed = domain.close(handle) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(Fd, 9), closed.fd);
+    try testing.expectEqual(@as(?*anyopaque, config), closed.tls_state);
+    try testing.expectEqual(@as(SocketKind, .tls_listener), closed.kind);
+    try testing.expectEqual(@as(u32, 0), domain.statistics().live_socket_count);
+}
+
+test "SocketDomain.attachServerConfig: a stale/forged handle is refused (no bind)" {
+    var domain = SocketDomain.init();
+    defer domain.deinit();
+
+    const handle = try domain.open(9, 0, 0, .plain);
+    _ = domain.close(handle); // now stale
+    try testing.expect(!domain.attachServerConfig(handle, 0, fakeTlsState(1)));
+
+    const forged = SocketHandle{ .slot = 4242, .generation = 5 };
+    try testing.expect(!domain.attachServerConfig(forged, 0, fakeTlsState(2)));
 }
 
 test "SocketDomain.attachTls: a stale/forged handle is refused (no bind)" {

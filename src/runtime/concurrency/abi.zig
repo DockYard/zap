@@ -948,6 +948,18 @@ fn installSignalRuntime() void {
 /// becomes the driver thread (module doc, threading contract).
 ///
 /// Returns `ZapProcStatus.ok`, `already_initialized`, or `out_of_memory`.
+/// Usable bytes per PRODUCTION fiber stack (1 MiB). Larger than the stack
+/// pool's `default_usable_size` (256 KiB) because offloaded blocking operations
+/// run on the fiber's own stack, and the heaviest of them — the TLS 1.3 server
+/// handshake — needs well over 256 KiB (the fork's `std.crypto.tls.Server.init`
+/// frames a 64 KiB handshake-flight buffer plus several `max_ciphertext_record_len`
+/// record buffers, ~130 KiB, on top of the accept/blocking calling chain). Only
+/// the production `SchedulerPool` uses this; the deterministic/seeded backends
+/// and the kernel unit tests keep their own explicit (smaller) sizes. Lazily
+/// paged, so this bounds the VIRTUAL reservation, not the resident footprint of
+/// a shallow process.
+const production_fiber_stack_size: usize = 1024 * 1024;
+
 export fn zap_proc_runtime_init() callconv(.c) i32 {
     if (runtime_initialized) return ZapProcStatus.already_initialized;
 
@@ -1024,6 +1036,23 @@ export fn zap_proc_runtime_init() callconv(.c) i32 {
                     // P6-J6: the deadlock detector's post-report action
                     // (default: report to stderr once, keep parking).
                     .deadlock_action = readDeadlockAction(),
+                    // PRODUCTION fiber stack size. The blocking pool runs an
+                    // offloaded operation ON THE FIBER'S OWN STACK (see
+                    // `blocking_pool.zig`: the op resumes the fiber, which uses
+                    // its fiber stack), so a blocking op's stack footprint is
+                    // bounded by this size — and blocking ops are exactly the
+                    // heavy work the runtime is meant to offload (blocking FFI,
+                    // CPU-bound work, and the TLS 1.3 handshake, whose
+                    // `std.crypto.tls.Server.init` alone frames ~130 KiB of
+                    // record/flight buffers). The `default_usable_size` (256 KiB)
+                    // is too tight for that plus the calling chain, so a TLS
+                    // server handshake overflowed the fiber stack guard page.
+                    // Provision a real stack for offloaded work here (production
+                    // only; the deterministic/seeded/test backends keep their
+                    // own smaller sizes). Stacks are lazily paged, so the larger
+                    // VIRTUAL size costs RSS only for fibers that actually run
+                    // deep — an idle process still pays only the pages it touches.
+                    .stack_usable_size = production_fiber_stack_size,
                 },
                 // Phase S0: the socket layer's blocking offloads run on this
                 // pool; `ZAP_BLOCKING_MAX_THREADS` tunes its ceiling.
@@ -2343,7 +2372,15 @@ fn socketConnectBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c)
 /// frees its session exactly once (the fd is closed exactly once).
 fn closeResolvedSocket(closed: concurrency.socket_table.SocketDomain.ClosedSocket) void {
     concurrency.socket_io.closeFd(closed.fd);
-    if (closed.tls_state) |session| concurrency.socket_io.tlsFreeSession(session);
+    if (closed.tls_state) |state| switch (closed.kind) {
+        // A TLS SERVER LISTENER's opaque state is a `*TlsServerConfig` (its
+        // long-lived cert chain + private key) — scrub + free it as a config.
+        .tls_listener => concurrency.socket_io.tlsFreeServerConfig(state),
+        // A TLS CONNECTION's opaque state is a `*TlsSession` — scrub + free it
+        // (best-effort `close_notify` inside). `.plain` never reaches here
+        // (null `tls_state`), so `else` is the connection case.
+        else => concurrency.socket_io.tlsFreeSession(state),
+    };
 }
 
 fn socketSweepDestructor(node: *process_module.DropListNode) void {
@@ -3441,6 +3478,259 @@ export fn zap_socket_tls_upgrade(
     // Re-home the ledger: the old handle is consumed, the successor owns the
     // fd + session now. On OOM the successor is owned by nobody — close it
     // (which frees the session) and report failure.
+    _ = context.socketLedger().removeOne(handle_bits);
+    context.socketLedger().append(successor.toBits()) catch {
+        if (runtime_state.socket_domain.close(successor)) |closed| closeResolvedSocket(closed);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    return successor.toBits();
+}
+
+// ---------------------------------------------------------------------------
+// TLS SERVER surface (Phase S5) — `Tls.listen`/`Tls.accept`/`Tls.upgrade_server`.
+// A listener carries a per-listener `*TlsServerConfig` (its cert chain + private
+// key + ALPN list, parsed ONCE at listen). Each `Tls.accept` accepts a plaintext
+// connection (reusing `socketAcceptImpl`), runs the server handshake off-core
+// under the SAME single-deadline + kill discipline as the client, then attaches
+// the established `.server` session to the accepted handle (`attachTls`, no gen
+// bump — the accepted fd never did plaintext I/O). Mirrors the client bridge with
+// the roles swapped.
+// ---------------------------------------------------------------------------
+
+/// A server handshake's blocking request: the raw accepted fd, the erased
+/// `*TlsServerConfig` (cert chain + private key + ALPN), the single
+/// absolute-deadline budget, and the captured kill flag. The pool thread
+/// allocates + populates the session box off-core into `session` (opaque) or
+/// records the failure `reason`.
+const SocketTlsServerHandshakeRequest = struct {
+    fd: concurrency.socket_io.Fd,
+    config: *anyopaque,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+    session: ?*anyopaque,
+    reason: concurrency.socket_io.Reason,
+};
+
+fn socketTlsServerHandshakeBlockingTrampoline(operation_argument: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const request: *SocketTlsServerHandshakeRequest = @ptrCast(@alignCast(operation_argument.?));
+    // Allocate the heap-stable session box over the accepted fd, then run the
+    // WHOLE server handshake using the listener's cert chain + private key.
+    const session = concurrency.socket_io.tlsSessionCreate(request.fd, request.timeout_ms, request.kill_flag) orelse {
+        request.reason = .out_of_memory;
+        return null;
+    };
+    const reason = concurrency.socket_io.tlsServerHandshake(session, request.config, request.timeout_ms, request.kill_flag);
+    if (reason != .ok) {
+        // Handshake failed (bad ClientHello, timeout, kill, no usable cert):
+        // scrub + free the session here (no key residue). The fd is untouched —
+        // still owned by the accepted handle, closed by the caller on this path.
+        concurrency.socket_io.tlsFreeSession(session);
+        request.reason = reason;
+        return null;
+    }
+    request.session = session;
+    request.reason = .ok;
+    return null;
+}
+
+/// Establish a TLS SERVER listener (`Tls.listen`): parse + OWN the certificate
+/// chain + private key + ALPN list up front (a bad cert/key → `tls_config_invalid`
+/// BEFORE any fd is bound), then bind + listen exactly like `zap_socket_listen`,
+/// then bind the config to the listener slot (`attachServerConfig`, no gen bump —
+/// the fd becomes a `.tls_listener`). Returns the listener handle bits on success
+/// (a live handle is never `0`), or `0` on failure with the reason in the
+/// process last-error. Closing the listener (or its owner's death) frees the
+/// config through the shared close funnel.
+export fn zap_socket_tls_listen(
+    process: *anyopaque,
+    ip0: u8,
+    ip1: u8,
+    ip2: u8,
+    ip3: u8,
+    port: u16,
+    backlog: u32,
+    cert_ptr: [*]const u8,
+    cert_len: usize,
+    key_ptr: [*]const u8,
+    key_len: usize,
+    alpn_ptr: [*]const u8,
+    alpn_len: usize,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    // Parse + own the config FIRST, so a bad cert/key fails at listen time with
+    // no fd allocated.
+    const config_outcome = concurrency.socket_io.tlsServerConfigCreate(
+        cert_ptr[0..cert_len],
+        key_ptr[0..key_len],
+        alpn_ptr[0..alpn_len],
+    );
+    if (config_outcome.reason != .ok) return socketConnectFailed(context, config_outcome.reason);
+    const config = config_outcome.config.?;
+
+    const outcome = concurrency.socket_io.listenIp4(.{ ip0, ip1, ip2, ip3 }, port, @intCast(backlog));
+    if (outcome.reason != .ok) {
+        concurrency.socket_io.tlsFreeServerConfig(config);
+        return socketConnectFailed(context, outcome.reason);
+    }
+    const handle = runtime_state.socket_domain.open(
+        outcome.fd,
+        context.selfPid().toBits(),
+        outcome.bound_port,
+        .plain,
+    ) catch {
+        concurrency.socket_io.closeFd(outcome.fd);
+        concurrency.socket_io.tlsFreeServerConfig(config);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.socketLedger().append(handle.toBits()) catch {
+        // The config is not yet attached (slot is `.plain`), so `close` will NOT
+        // free it — free it explicitly alongside closing the fd.
+        if (runtime_state.socket_domain.close(handle)) |closed| closeResolvedSocket(closed);
+        concurrency.socket_io.tlsFreeServerConfig(config);
+        return socketConnectFailed(context, .out_of_memory);
+    };
+    context.ensureSocketSweep(socketSweepDestructor);
+    // Bind the config → the listener is now a `.tls_listener`; every close path
+    // now frees the config. Ownership was validated on-core and nothing parks
+    // between open and here, so a failure is a kernel invariant breach: free the
+    // (un-attached) config, close the fd, drop the ledger entry, surface it.
+    if (!runtime_state.socket_domain.attachServerConfig(handle, context.selfPid().toBits(), config)) {
+        concurrency.socket_io.tlsFreeServerConfig(config);
+        if (runtime_state.socket_domain.close(handle)) |closed| closeResolvedSocket(closed);
+        _ = context.socketLedger().removeOne(handle.toBits());
+        return socketConnectFailed(context, .other);
+    }
+    return handle.toBits();
+}
+
+/// Accept the next connection on a TLS listener and complete its server
+/// handshake (`Tls.accept`): reuse `socketAcceptImpl` for the plaintext accept
+/// (bounded by `timeout_ms`, kill-responsive, crash-safe fd lifetime), fetch the
+/// listener's `*TlsServerConfig`, run the server handshake off-core, and on
+/// success BIND the established `.server` session to the SAME accepted handle
+/// (`attachTls`, no generation bump — the accepted fd never did plaintext I/O).
+/// Returns the accepted handle bits (now a TLS socket, same bits) on success, or
+/// `0` on failure (accept timeout/error OR handshake failure) with the reason in
+/// the process last-error; a handshake failure closes the accepted fd before
+/// returning (no leak). A non-owned listener, or a plaintext (non-TLS) listener,
+/// surfaces the invalid handle with a recorded reason.
+export fn zap_socket_tls_accept(process: *anyopaque, listener_bits: u64, timeout_ms: i64) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    // Validate the listener + fetch its config BEFORE accepting (the listener is
+    // single-owner and stays open across the offloaded accept + handshake).
+    if (!context.socketLedger().contains(listener_bits)) {
+        context.socketLedger().last_error = @intFromEnum(concurrency.socket_io.Reason.other);
+        return concurrency.SocketHandle.invalid.toBits();
+    }
+    const listener_handle = concurrency.SocketHandle.fromBits(listener_bits);
+    if (runtime_state.socket_domain.kind(listener_handle) != .tls_listener)
+        return socketConnectFailed(context, .tls_config_invalid);
+    const config = runtime_state.socket_domain.tlsState(listener_handle) orelse
+        return socketConnectFailed(context, .other);
+
+    // The plaintext accept (reused verbatim): opens the accepted fd as a `.plain`
+    // handle owned by this process, appended to its ledger. Failure (timeout or
+    // error) already recorded the reason.
+    const accepted_bits = socketAcceptImpl(process, listener_bits, timeout_ms);
+    if (accepted_bits == concurrency.SocketHandle.invalid.toBits()) return accepted_bits;
+
+    const accepted_handle = concurrency.SocketHandle.fromBits(accepted_bits);
+    const fd = runtime_state.socket_domain.fd(accepted_handle) orelse {
+        // A just-opened handle we own resolving to no fd would be a kernel
+        // invariant breach — close it and surface.
+        if (runtime_state.socket_domain.close(accepted_handle)) |closed| closeResolvedSocket(closed);
+        _ = context.socketLedger().removeOne(accepted_bits);
+        return socketConnectFailed(context, .other);
+    };
+    var request = SocketTlsServerHandshakeRequest{
+        .fd = fd,
+        .config = config,
+        .timeout_ms = timeout_ms,
+        // Captured on-core so the poll-quantum handshake stays kill-responsive.
+        .kill_flag = context.pendingKillFlag(),
+        .session = null,
+        .reason = .ok,
+    };
+    _ = context.blocking(socketTlsServerHandshakeBlockingTrampoline, &request);
+    if (request.reason != .ok) {
+        // Handshake failed: the session was scrubbed + freed on the pool thread;
+        // close the accepted handle (reclaims the fd) and drop it from the ledger.
+        context.socketLedger().last_error = @intFromEnum(request.reason);
+        if (runtime_state.socket_domain.close(accepted_handle)) |closed| closeResolvedSocket(closed);
+        _ = context.socketLedger().removeOne(accepted_bits);
+        return concurrency.SocketHandle.invalid.toBits();
+    }
+    const session = request.session.?;
+    // Bind the server session to the SAME accepted handle (no gen bump). Failure
+    // would be a kernel invariant breach — free the session, close the fd, drop
+    // the ledger entry.
+    if (!runtime_state.socket_domain.attachTls(accepted_handle, context.selfPid().toBits(), session)) {
+        concurrency.socket_io.tlsFreeSession(session);
+        context.socketLedger().last_error = @intFromEnum(concurrency.socket_io.Reason.other);
+        if (runtime_state.socket_domain.close(accepted_handle)) |closed| closeResolvedSocket(closed);
+        _ = context.socketLedger().removeOne(accepted_bits);
+        return concurrency.SocketHandle.invalid.toBits();
+    }
+    return accepted_bits;
+}
+
+/// Upgrade an OWNED plaintext socket to a TLS SERVER session in place (server
+/// STARTTLS — `Tls.upgrade_server`): parse a one-shot `*TlsServerConfig` from the
+/// supplied cert/key/ALPN, run the server handshake off-core, and on success
+/// CONSUME the plaintext handle via `upgradeToTls` (gen-bump — the old handle
+/// goes stale everywhere, so no accidental plaintext I/O over the now-encrypted
+/// socket) and re-record the SUCCESSOR in the ledger. The config is used ONLY for
+/// the handshake and FREED immediately after (the session keeps only the
+/// ephemeral/derived secrets — the long-lived private key never outlives this
+/// call). Returns the successor handle bits (never `0`) on success, or `0` on
+/// failure with the reason in the process last-error. The fd is preserved.
+export fn zap_socket_tls_server_upgrade(
+    process: *anyopaque,
+    handle_bits: u64,
+    cert_ptr: [*]const u8,
+    cert_len: usize,
+    key_ptr: [*]const u8,
+    key_len: usize,
+    alpn_ptr: [*]const u8,
+    alpn_len: usize,
+    timeout_ms: i64,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return socketConnectFailed(context, .invalid_argument);
+    const config_outcome = concurrency.socket_io.tlsServerConfigCreate(
+        cert_ptr[0..cert_len],
+        key_ptr[0..key_len],
+        alpn_ptr[0..alpn_len],
+    );
+    if (config_outcome.reason != .ok) return socketConnectFailed(context, config_outcome.reason);
+    const config = config_outcome.config.?;
+
+    const handle = concurrency.SocketHandle.fromBits(handle_bits);
+    const fd = runtime_state.socket_domain.fd(handle) orelse {
+        concurrency.socket_io.tlsFreeServerConfig(config);
+        return socketConnectFailed(context, .invalid_argument);
+    };
+    var request = SocketTlsServerHandshakeRequest{
+        .fd = fd,
+        .config = config,
+        .timeout_ms = timeout_ms,
+        .kill_flag = context.pendingKillFlag(),
+        .session = null,
+        .reason = .ok,
+    };
+    _ = context.blocking(socketTlsServerHandshakeBlockingTrampoline, &request);
+    // The handshake is complete (the fiber un-parked): the config's job is done.
+    // Free it NOW — the session holds only the derived secrets, so the long-lived
+    // private key is scrubbed the instant the handshake ends.
+    concurrency.socket_io.tlsFreeServerConfig(config);
+    if (request.reason != .ok) return socketConnectFailed(context, request.reason);
+    const session = request.session.?;
+
+    // Consume the plaintext handle → TLS successor (same slot/fd, gen bumped).
+    const successor = runtime_state.socket_domain.upgradeToTls(handle, context.selfPid().toBits(), session) orelse {
+        concurrency.socket_io.tlsFreeSession(session);
+        return socketConnectFailed(context, .other);
+    };
     _ = context.socketLedger().removeOne(handle_bits);
     context.socketLedger().append(successor.toBits()) catch {
         if (runtime_state.socket_domain.close(successor)) |closed| closeResolvedSocket(closed);

@@ -1,8 +1,69 @@
 @doc = """
-  `Tls` — the value-threaded TLS client surface (Phase S4): a mandatory-
-  verification TLS handshake layered over the `Socket` transport, so an
-  outbound HTTPS connection is one call and every subsequent `Socket.recv` /
+  `TlsServerConfig` — a TLS server's certificate material (Phase S5): the PEM
+  certificate chain, the PEM leaf private key, and the ALPN protocol preference
+  list a `Tls.listen` listener (or a `Tls.upgrade_server` STARTTLS upgrade)
+  presents to every connecting client.
+
+  - `cert_pem` — the server certificate chain as PEM, LEAF FIRST (one or more
+    `-----BEGIN CERTIFICATE-----` blocks). Only the leaf is used for
+    authentication in this phase; the whole chain is sent in the Certificate
+    message.
+  - `key_pem` — the leaf's private key as PEM: SEC1 (`EC PRIVATE KEY`), PKCS#8
+    (`PRIVATE KEY`), or PKCS#1 (`RSA PRIVATE KEY`). ECDSA (P-256/P-384),
+    Ed25519, and RSA (RSASSA-PSS) leaf keys are supported. The key is parsed and
+    validated against the leaf certificate ONCE at `Tls.listen` time — a
+    mismatched or unparseable key fails with `:tls_config_invalid` at bind time,
+    never mysteriously mid-handshake. The private key lives ONLY in the runtime's
+    per-listener store; it is NEVER copied into a per-connection session (a
+    session holds only the ephemeral/derived traffic secrets), and it is scrubbed
+    from memory when the listener closes.
+  - `alpn` — the server's ALPN protocol IDs (e.g. `["h2", "http/1.1"]`) in
+    PREFERENCE order; the server selects the first entry the client also offers
+    and echoes it. An empty list negotiates no ALPN. Read the negotiated protocol
+    off the accepted `Socket` once per-connection ALPN read-back lands.
+
+  ## Single-certificate scope (S5d)
+
+  This phase serves the ONE configured certificate to every client regardless of
+  the client's SNI (server_name) — SNI-based multi-certificate selection needs a
+  fork cert-selection hook and is a planned follow-up. A single default cert
+  covers the common single-domain server.
+
+  ## Examples
+
+      %TlsServerConfig{cert_pem: cert, key_pem: key, alpn: ["http/1.1"]}
+  """
+
+@available_on(:network)
+
+pub struct TlsServerConfig {
+  cert_pem :: String
+  key_pem :: String
+  alpn :: List(String)
+}
+
+@doc = """
+  `Tls` — the value-threaded TLS client AND server surface: a mandatory-
+  verification TLS client handshake (Phase S4) and a TLS 1.3 server (Phase S5)
+  layered over the `Socket` transport, so an outbound HTTPS connection or an
+  inbound TLS accept is one call and every subsequent `Socket.recv` /
   `Socket.send` transparently decrypts / encrypts.
+
+  ## The server surface (Phase S5)
+
+  `Tls.listen(address, config, backlog)` binds a TLS listener carrying a
+  `TlsServerConfig` (cert chain + private key + ALPN), and `Tls.accept(listener,
+  timeout_ms)` accepts the next connection AND completes its TLS 1.3 server
+  handshake, yielding a TLS `Socket` over which `Socket.recv`/`send`/`chunks`/
+  `fold` transparently decrypt/encrypt via the SAME record layer the client uses.
+  The accepted TLS `Socket` is an ordinary single-owner `Socket`: it composes
+  with the `SocketServer` acceptor/handler pattern (`Process.send_move` a TLS
+  `Socket` to a per-connection handler exactly like a plaintext one — the session
+  travels with the handle). `Tls.upgrade_server(socket, config, timeout_ms)` is
+  the server-side STARTTLS. A bad cert/key fails `Tls.listen` at bind time with
+  `:tls_config_invalid`; a client with no usable cert/signature scheme fails the
+  handshake with `:tls_no_matching_cert`. The server is TLS 1.3-only (no 1.2
+  fallback, no renegotiation).
 
   ## A TLS socket IS a `Socket`
 
@@ -232,6 +293,124 @@ pub struct Tls {
 
   pub fn upgrade(socket :: Socket, host :: String, timeout_ms :: i64) -> Result(Socket, SocketError) {
     case :zig.SocketRuntime.tls_upgrade(socket.zap_socket_handle, host, timeout_ms) {
+      0 -> {
+        _closed = Socket.close(socket)
+        Result(Socket, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(:zig.SocketRuntime.last_error())})
+      }
+      successor_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: successor_bits})
+    }
+  }
+
+  @doc = """
+    Binds a TLS SERVER LISTENER on `address` (an IPv4 endpoint; port `0` → an
+    ephemeral port, discoverable via `SocketListener.local_port`) presenting the
+    certificate material in `config`. The certificate chain, private key, and
+    ALPN list are parsed and validated ONCE here — a bad, unparseable, or
+    key-mismatched certificate fails IMMEDIATELY with
+    `Result.Error(%SocketError{reason: :tls_config_invalid})`, before the socket
+    binds, so a mis-configured server never silently accepts connections it
+    cannot serve. Returns `Result.Ok(listener)` — a `SocketListener` you `accept`
+    with `Tls.accept/2` — or `Result.Error(%SocketError{...})` with a transport
+    reason (`:eaddrinuse`, `:eacces`, …) from the bind.
+
+    The returned listener is an ordinary single-owner `SocketListener`: close it
+    with `SocketListener.close` (which also scrubs + frees the stored private
+    key), and drive it with the `SocketServer` acceptor/handler pattern exactly
+    like a plaintext listener — only swap `Socket.accept` for `Tls.accept`.
+
+    ## Examples
+
+        config = %TlsServerConfig{cert_pem: cert, key_pem: key, alpn: ["http/1.1"]}
+        case Tls.listen(SocketAddress.loopback(0), config, 128) {
+          Result.Ok(listener) -> SocketListener.local_port(listener)
+          Result.Error(%SocketError{reason: :tls_config_invalid}) -> -1
+          Result.Error(_error) -> 0
+        }
+    """
+
+  @available_on(:network)
+
+  pub fn listen(address :: SocketAddress, config :: TlsServerConfig, backlog :: i64) -> Result(SocketListener, SocketError) {
+    alpn_wire = String.join(config.alpn, "\n")
+    case :zig.SocketRuntime.tls_listen(address.a, address.b, address.c, address.d, address.port, backlog, config.cert_pem, config.key_pem, alpn_wire) {
+      0 -> Result(SocketListener, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(SocketListener, SocketError).Ok(%SocketListener{zap_socket_handle: handle_bits})
+    }
+  }
+
+  @doc = """
+    Accepts the next inbound connection on a TLS `listener` AND completes its
+    TLS 1.3 SERVER handshake, BOUNDED by `timeout_ms` (`0` = infinite; the same
+    bounded-accept the trapping acceptor loop needs to stay shutdown-responsive).
+    Returns `Result.Ok(socket)` — a TLS `Socket` over which `Socket.recv`/`send`/
+    `chunks`/`fold` transparently decrypt/encrypt (the SAME record layer the
+    client uses; there is no separate `Tls.recv`/`send`) — or
+    `Result.Error(%SocketError{...})`: `:etimedout` when no connection arrives
+    within the deadline, `:tls_no_matching_cert` when the client offers no
+    signature scheme the configured leaf key can produce,
+    `:tls_handshake_failed` for any other handshake failure (a fatal alert, a
+    malformed/truncated ClientHello, a record-layer failure, or the transport
+    failing mid-handshake), or a transport reason from the accept.
+
+    The whole handshake runs under ONE absolute deadline across its round trips,
+    so a slowloris handshake times out and stays killable (it can never pin a
+    blocking-pool thread). On a handshake failure the accepted fd is CLOSED
+    before returning — a failed TLS accept leaks no socket. The accepted TLS
+    `Socket` is single-owner and move-only: `Process.send_move` it to a
+    per-connection handler (the `SocketServer` pattern) and the session travels
+    with the handle.
+
+    ## Examples
+
+        case Tls.accept(listener, 50) {
+          Result.Ok(connection)                          -> dispatch(connection)
+          Result.Error(%SocketError{reason: :etimedout}) -> keep_serving()
+          Result.Error(_error)                           -> :accept_failed
+        }
+    """
+
+  @available_on(:network)
+
+  pub fn accept(listener :: SocketListener, timeout_ms :: i64) -> Result(Socket, SocketError) {
+    case :zig.SocketRuntime.tls_accept(listener.zap_socket_handle, timeout_ms) {
+      0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
+    }
+  }
+
+  @doc = """
+    SERVER STARTTLS — upgrades an already-accepted plaintext `Socket` to a TLS
+    SERVER session in place (the server side of the opportunistic-encryption
+    pattern), presenting the certificate material in `config`. Runs a TLS 1.3
+    server handshake over the SAME fd, waiting at most `timeout_ms` milliseconds
+    (`0` = no deadline). This is the server counterpart to the client
+    `Tls.upgrade/3` (which takes a `host`); it is named distinctly because it
+    plays the SERVER role and takes a `TlsServerConfig`, not a verification host.
+
+    CONSUMES its `socket` argument: on success the runtime bumps the handle's
+    generation in place, so the passed-in plaintext handle is STALE everywhere
+    and ONLY the returned TLS `Socket` is valid — using the old handle after a
+    successful upgrade is a compile error (move) or a stale-handle panic. Returns
+    `Result.Ok(tls_socket)` on success, or `Result.Error(%SocketError{...})` —
+    `:tls_config_invalid` for a bad cert/key, `:tls_no_matching_cert` /
+    `:tls_handshake_failed` for a handshake failure, or a transport reason — on
+    failure, in which case the underlying socket is CLOSED (the argument was
+    consumed by the move, so it is torn down rather than leaked).
+
+    ## Examples
+
+        # After the plaintext protocol negotiates STARTTLS server-side:
+        case Tls.upgrade_server(socket, config, 5000) {
+          Result.Ok(secure)   -> secure
+          Result.Error(_error) -> :starttls_failed
+        }
+    """
+
+  @available_on(:network)
+
+  pub fn upgrade_server(socket :: Socket, config :: TlsServerConfig, timeout_ms :: i64) -> Result(Socket, SocketError) {
+    alpn_wire = String.join(config.alpn, "\n")
+    case :zig.SocketRuntime.tls_server_upgrade(socket.zap_socket_handle, config.cert_pem, config.key_pem, alpn_wire, timeout_ms) {
       0 -> {
         _closed = Socket.close(socket)
         Result(Socket, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(:zig.SocketRuntime.last_error())})

@@ -103,6 +103,23 @@ pub const Reason = enum(i32) {
     /// read/write failing mid-handshake. Everything `mapTlsInitError` does not
     /// classify as a certificate failure maps here.
     tls_handshake_failed = 15,
+    /// A TLS SERVER handshake could not present a usable certificate for the
+    /// client's request (Phase S5): the client's SNI names no configured
+    /// certificate, or the client advertised no signature scheme the leaf key
+    /// can produce. Distinct from `tls_handshake_failed` so a server operator
+    /// can tell "no matching certificate for this client" from a generic
+    /// protocol failure. Produced by `mapTlsServerInitError` for the fork
+    /// server's `TlsHandshakeFailure`.
+    tls_no_matching_cert = 16,
+    /// A TLS SERVER's certificate/key configuration is itself unusable (Phase
+    /// S5) — surfaced at `Tls.listen`/`Tls.upgrade` time, BEFORE any client
+    /// connects: an empty/malformed certificate chain, an unparseable or
+    /// unsupported private key, or a private key that does not match the leaf
+    /// certificate's public key. A distinct, typed reason so a mis-configured
+    /// server fails loudly at bind time rather than mysteriously at handshake
+    /// time. Produced by `tlsServerConfigCreate` and by the fork server's
+    /// `TlsConfigInvalid`.
+    tls_config_invalid = 17,
     other = 99,
 };
 
@@ -3324,14 +3341,44 @@ pub const tls_session_buffer_len: usize = tls_min_buffer_len;
 /// `zap_socket_io` module — which cannot resolve cross-file relative imports —
 /// gets the whole TLS surface from its own `socket_io` instance.
 ///
-/// SECURITY: `deinit` `secureZero`s the entire `Client` (the negotiated
-/// `application_cipher` keys + sequence numbers) AND every buffer BEFORE freeing
-/// them, so no key or plaintext residue survives in the freed pages.
-pub const TlsSession = struct {
-    /// The record-layer client. RESERVED at `create`; the handshake
-    /// (`tlsHandshake` → `Client.init`) populates it. `deinit` scrubs it
-    /// unconditionally, so an un-populated session is still safe to free.
+/// SECURITY: `deinit` `secureZero`s the entire established endpoint (the
+/// negotiated `application_cipher` keys + sequence numbers, whichever role) AND
+/// every buffer BEFORE freeing them, so no key or plaintext residue survives in
+/// the freed pages.
+///
+/// The record-layer endpoint behind a `TlsSession`: a `tls.Client` (Phase S4
+/// outbound) or a `tls.Server` (Phase S5 inbound), or `.unestablished` before
+/// the handshake completes. Both established arms expose the identical
+/// record-layer surface — `.reader` (decrypted inbound), `.writer` (encrypt
+/// outbound), and `.end` (`close_notify`) — so `tlsRecv`/`tlsSend`/`tlsFreeSession`
+/// are role-symmetric and switch only to pick the arm.
+pub const TlsSessionRole = union(enum) {
+    /// Before the handshake populates an arm. Zero-size payload, so the
+    /// `TlsSession` box is safe to allocate and `secureZero`/free even if the
+    /// handshake never runs.
+    unestablished: void,
+    /// An outbound (client) session — `Tls.connect`/`connect_host`/`upgrade`.
     client: tls.Client,
+    /// An inbound (server) session — `Tls.accept`/`Tls.upgrade` (STARTTLS).
+    server: tls.Server,
+};
+
+pub const TlsSession = struct {
+    const Role = TlsSessionRole;
+
+    /// The record-layer endpoint — a CLIENT (`Tls.connect`, Phase S4) or a
+    /// SERVER (`Tls.accept`/`Tls.upgrade`, Phase S5) session over the SAME
+    /// heap-stable box + adapter. `.unestablished` until the handshake succeeds
+    /// (`tlsHandshake` populates `.client`, `tlsServerHandshake` populates
+    /// `.server`). The established-session data path (`tlsRecv`/`tlsSend`) and
+    /// teardown (`tlsFreeSession`/`zeroizeSecrets`) switch on the arm; both
+    /// `tls.Client` and `tls.Server` expose the SAME record-layer surface
+    /// (`.reader`/`.writer`/`.end`), so the data path is role-symmetric. The
+    /// arm's `@fieldParentPtr` recovery (each embeds a `reader`/`writer` whose
+    /// vtable recovers the parent) stays valid because the box never moves — the
+    /// active arm lives at a stable address inside it, exactly as the bare
+    /// `client` field did.
+    role: Role,
 
     /// The raw-fd transport adapter (`input`/`output` for `Client.init`). Lives
     /// INSIDE the box so its embedded reader/writer keep a stable address for
@@ -3352,9 +3399,9 @@ pub const TlsSession = struct {
     /// a unit test: the testing allocator, so a leak is caught).
     allocator: std.mem.Allocator,
 
-    /// Whether the handshake has populated `client`. `deinit` scrubs regardless;
-    /// this gates `close_notify` on teardown and lets the recv/send drivers
-    /// assert a usable session.
+    /// Whether the handshake has populated an endpoint arm (`role` is `.client`
+    /// or `.server`). `deinit` scrubs regardless; this gates `close_notify` on
+    /// teardown and lets the recv/send drivers assert a usable session.
     handshake_complete: bool = false,
 
     /// Allocate a heap-stable `TlsSession` and wire its four record-layer
@@ -3380,7 +3427,7 @@ pub const TlsSession = struct {
         errdefer allocator.free(plaintext_out);
 
         session.* = .{
-            .client = undefined,
+            .role = .unestablished,
             .stream = SocketStream.init(handle, timeout_ms, kill_flag, encrypted_in, encrypted_out),
             .encrypted_in = encrypted_in,
             .encrypted_out = encrypted_out,
@@ -3392,13 +3439,52 @@ pub const TlsSession = struct {
         return session;
     }
 
+    /// The decrypted-inbound `Reader` of the established endpoint (client OR
+    /// server arm) — the role-symmetric read surface `tlsRecv` drives. Callable
+    /// ONLY after a successful handshake (`handshake_complete`); an
+    /// `.unestablished` session has no reader.
+    pub fn establishedReader(session: *TlsSession) *std.Io.Reader {
+        return switch (session.role) {
+            .client => |*client_endpoint| &client_endpoint.reader,
+            .server => |*server_endpoint| &server_endpoint.reader,
+            .unestablished => unreachable,
+        };
+    }
+
+    /// The encrypt-outbound `Writer` of the established endpoint (client OR
+    /// server arm) — the role-symmetric write surface `tlsSend` drives. Callable
+    /// ONLY after a successful handshake.
+    pub fn establishedWriter(session: *TlsSession) *std.Io.Writer {
+        return switch (session.role) {
+            .client => |*client_endpoint| &client_endpoint.writer,
+            .server => |*server_endpoint| &server_endpoint.writer,
+            .unestablished => unreachable,
+        };
+    }
+
+    /// Best-effort graceful `close_notify` over the established endpoint (client
+    /// OR server arm) — `client.end()` / `server.end()` both flush buffered
+    /// plaintext and append the alert into the adapter's output buffer. A no-op
+    /// on an `.unestablished` session. The caller flushes the adapter afterward.
+    fn endEstablished(session: *TlsSession) void {
+        switch (session.role) {
+            .client => |*client_endpoint| client_endpoint.end() catch {},
+            .server => |*server_endpoint| server_endpoint.end() catch {},
+            .unestablished => {},
+        }
+    }
+
     /// SECURITY: overwrite every byte of key-bearing memory with zeroes — the
     /// whole `Client` (negotiated keys + sequence numbers) plus all four buffers
     /// (plaintext/ciphertext residue). `std.crypto.secureZero` is not elided.
     /// Split out so a unit test can assert the region is zeroed while it is
     /// still readable (before the free).
     pub fn zeroizeSecrets(session: *TlsSession) void {
-        std.crypto.secureZero(u8, std.mem.asBytes(&session.client));
+        // Scrub the WHOLE role union storage (its size is the larger of the
+        // client/server arms), so whichever endpoint's negotiated keys +
+        // sequence numbers are resident are overwritten regardless of the active
+        // arm — and an `.unestablished` session scrubs harmlessly.
+        std.crypto.secureZero(u8, std.mem.asBytes(&session.role));
         std.crypto.secureZero(u8, session.encrypted_in);
         std.crypto.secureZero(u8, session.encrypted_out);
         std.crypto.secureZero(u8, session.plaintext_in);
@@ -3496,7 +3582,7 @@ pub fn tlsHandshake(
             error.WriteFailed => if (session.stream.write_reason != .ok) session.stream.write_reason else .tls_handshake_failed,
             else => mapTlsInitError(err),
         };
-        session.client = insecure_client;
+        session.role = .{ .client = insecure_client };
         session.handshake_complete = true;
         return .ok;
     }
@@ -3530,7 +3616,7 @@ pub fn tlsHandshake(
         else => mapTlsInitError(err),
     };
 
-    session.client = client;
+    session.role = .{ .client = client };
     session.handshake_complete = true;
     return .ok;
 }
@@ -3558,7 +3644,7 @@ pub fn tlsRecv(
 ) error{OutOfMemory}!RecvOutcome {
     const session: *TlsSession = @ptrCast(@alignCast(session_opaque));
     session.stream.rearm(timeout_ms, kill_flag);
-    const reader: *std.Io.Reader = &session.client.reader;
+    const reader: *std.Io.Reader = session.establishedReader();
 
     const exact = exact_target > 0;
     const initial_capacity: usize = if (exact)
@@ -3638,7 +3724,7 @@ pub fn tlsSend(
 ) SendOutcome {
     const session: *TlsSession = @ptrCast(@alignCast(session_opaque));
     session.stream.rearm(timeout_ms, kill_flag);
-    const writer: *std.Io.Writer = &session.client.writer;
+    const writer: *std.Io.Writer = session.establishedWriter();
 
     writer.writeAll(bytes) catch return .{ .reason = tlsWriteReason(session), .bytes_sent = 0 };
     // (2) encrypt the buffered plaintext, then (3) push the ciphertext.
@@ -3659,13 +3745,357 @@ pub fn tlsFreeSession(session_opaque: *anyopaque) void {
     const session: *TlsSession = @ptrCast(@alignCast(session_opaque));
     if (session.handshake_complete) {
         session.stream.rearm(close_notify_budget_ms, null);
-        // `client.end` flushes buffered plaintext + appends the `close_notify`
-        // alert into the adapter's output buffer; the adapter flush pushes it to
-        // the wire (the same double-flush). Best-effort — ignore any failure.
-        session.client.end() catch {};
+        // `client.end`/`server.end` flush buffered plaintext + append the
+        // `close_notify` alert into the adapter's output buffer; the adapter
+        // flush pushes it to the wire (the same double-flush). Best-effort —
+        // ignore any failure (a torn-down peer, a dangling move, etc.).
+        session.endEstablished();
         session.stream.outputWriter().flush() catch {};
     }
     session.deinit();
+}
+
+// ---------------------------------------------------------------------------
+// TLS SERVER surface (Phase S5) — the per-listener certificate/key store and
+// the server-handshake trampoline. Mirrors the client path with the roles
+// swapped: a listener carries a `TlsServerConfig` (its long-lived cert chain +
+// private key + ALPN list, parsed ONCE at listen time); each accepted
+// connection runs `tls.Server.init` over the SAME poll-quantum adapter as the
+// client, offloaded under the SAME single-absolute-deadline + per-quantum
+// kill-flag discipline, then attaches the established `.server` session to the
+// accepted handle.
+//
+// SECURITY: the long-lived private key lives ONLY in the per-listener
+// `TlsServerConfig` and is NEVER copied into a session — a `TlsSession` holds
+// only the ephemeral/derived secrets (scrubbed by `zeroizeSecrets`). The config
+// itself scrubs the private key on free.
+// ---------------------------------------------------------------------------
+
+/// Classify a `tls.Server.InitError` into a stable, gate-crossing `Reason`
+/// (Phase S5). `TlsConfigInvalid` and every server-certificate-parse failure
+/// mean the SERVER's OWN certificate/key configuration is unusable →
+/// `tls_config_invalid` (pre-validated at listen time, so a handshake-time
+/// occurrence is a belt-and-suspenders map). `TlsHandshakeFailure` — no
+/// mutually-supported cipher / key-exchange group / SIGNATURE SCHEME — is the
+/// fork's "could not present a usable certificate for this client" outcome
+/// (for a TLS-1.3-only server every client supports AES-128-GCM + x25519, so in
+/// practice this is a signature-scheme/cert mismatch): → `tls_no_matching_cert`.
+/// `InsufficientEntropy` and everything else (a fatal alert, an unexpected /
+/// mal-formed / truncated ClientHello, a record-layer decrypt failure, the
+/// transport failing mid-handshake, a signing failure) → `tls_handshake_failed`.
+pub fn mapTlsServerInitError(err: tls.Server.InitError) Reason {
+    return switch (err) {
+        error.TlsConfigInvalid,
+        error.CertificateFieldHasInvalidLength,
+        error.CertificateFieldHasWrongDataType,
+        error.CertificateHasUnrecognizedObjectId,
+        error.CertificateHasInvalidBitString,
+        error.UnsupportedCertificateVersion,
+        error.CertificateTimeInvalid,
+        => .tls_config_invalid,
+        error.TlsHandshakeFailure => .tls_no_matching_cert,
+        else => .tls_handshake_failed,
+    };
+}
+
+/// A single-cert TLS server's per-listener configuration: the certificate chain
+/// (leaf first) + the leaf private key + the ALPN preference list, parsed ONCE
+/// at `Tls.listen` time and stored addressable from the accept path (bound to
+/// the listener slot's opaque `tls_state`, `SocketKind.tls_listener`). Heap-box,
+/// referenced only through the erased pointer; the socket domain treats it as
+/// opaque exactly like a `TlsSession`, and every listener-close path frees it
+/// through `tlsFreeServerConfig`.
+///
+/// SECURITY: `private_key` is the LONG-LIVED secret. It is held ONLY here and
+/// NEVER copied into a per-connection `TlsSession` (`tls.Server.init` reads it
+/// to sign the CertificateVerify in place and emits only the signature bytes;
+/// the session keeps only the ephemeral/derived traffic secrets). It is scrubbed
+/// on free.
+pub const TlsServerConfig = struct {
+    /// Concatenated DER bytes of the certificate chain (leaf first). Owned; the
+    /// `cert_chain` `Certificate`s index INTO this buffer.
+    cert_bytes: []u8,
+    /// The chain as `Certificate`s (leaf first), each `.buffer = cert_bytes`
+    /// with its own `.index`. `tls.Server.init` reads only the leaf in this
+    /// phase but the whole chain is sent in the Certificate message.
+    cert_chain: []Certificate,
+    /// The leaf private key. The long-lived secret — scrubbed on free, NEVER
+    /// copied into a session.
+    private_key: tls.Server.PrivateKey,
+    /// Owned backing storage the `alpn_protocols` slices point into (the
+    /// newline-joined wire the Zap surface passed, copied).
+    alpn_storage: []u8,
+    /// The server's ALPN protocol list in preference order, pointing into
+    /// `alpn_storage`; empty when the listener configured no ALPN.
+    alpn_protocols: [][]const u8,
+    /// The allocator the box + all owned slices came from.
+    allocator: std.mem.Allocator,
+
+    /// Scrub the private key (`secureZero`) then FREE the box + every owned
+    /// slice. Called on EVERY listener-close path so the long-lived key never
+    /// survives in freed pages and nothing leaks. Called exactly once per config
+    /// (the listener fd is closed exactly once).
+    pub fn deinit(config: *TlsServerConfig) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(&config.private_key));
+        const allocator = config.allocator;
+        allocator.free(config.cert_bytes);
+        allocator.free(config.cert_chain);
+        allocator.free(config.alpn_storage);
+        allocator.free(config.alpn_protocols);
+        allocator.destroy(config);
+    }
+};
+
+/// The outcome of `tlsServerConfigCreate`: the erased `*TlsServerConfig` on
+/// success (`reason == .ok`), else the classified failure with a null config.
+pub const ServerConfigOutcome = struct {
+    reason: Reason,
+    config: ?*anyopaque,
+};
+
+/// Decode every `-----BEGIN CERTIFICATE-----`/`-----END CERTIFICATE-----` block
+/// of `cert_pem` (leaf first) into one contiguous owned DER buffer and build the
+/// `[]Certificate` chain indexing into it. The decoded DER is always smaller
+/// than its base64 PEM, so the buffer is sized to `cert_pem.len` then shrunk to
+/// the exact decoded length. Returns `error.MalformedCertPem` when no complete
+/// block is present, propagates `error.OutOfMemory`.
+fn decodeCertChain(
+    allocator: std.mem.Allocator,
+    cert_pem: []const u8,
+) error{ OutOfMemory, MalformedCertPem }!struct { bytes: []u8, chain: []Certificate } {
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+    const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+
+    // Pass 1: count complete blocks so the chain array is sized exactly.
+    var block_count: usize = 0;
+    {
+        var scan: usize = 0;
+        while (std.mem.indexOfPos(u8, cert_pem, scan, begin_marker)) |begin_start| {
+            const body_start = begin_start + begin_marker.len;
+            const body_end = std.mem.indexOfPos(u8, cert_pem, body_start, end_marker) orelse break;
+            block_count += 1;
+            scan = body_end + end_marker.len;
+        }
+    }
+    if (block_count == 0) return error.MalformedCertPem;
+
+    var bytes = try allocator.alloc(u8, cert_pem.len);
+    errdefer allocator.free(bytes);
+    const chain = try allocator.alloc(Certificate, block_count);
+    errdefer allocator.free(chain);
+
+    // Pass 2: decode each block into `bytes`, recording the start offset.
+    var written: usize = 0;
+    var chain_index: usize = 0;
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, cert_pem, scan, begin_marker)) |begin_start| {
+        const body_start = begin_start + begin_marker.len;
+        const body_end = std.mem.indexOfPos(u8, cert_pem, body_start, end_marker) orelse break;
+        const encoded = std.mem.trim(u8, cert_pem[body_start..body_end], " \t\r\n");
+        const decoded_start = written;
+        const decoded_len = decoder.decode(bytes[written..], encoded) catch return error.MalformedCertPem;
+        written += decoded_len;
+        chain[chain_index] = .{ .buffer = bytes[0..written], .index = @intCast(decoded_start) };
+        chain_index += 1;
+        scan = body_end + end_marker.len;
+    }
+
+    // Shrink the DER buffer to the exact decoded length; re-point every chain
+    // entry's `buffer` at the resized (possibly moved) allocation.
+    if (written != bytes.len) bytes = try allocator.realloc(bytes, written);
+    for (chain) |*cert| cert.buffer = bytes;
+    return .{ .bytes = bytes, .chain = chain };
+}
+
+/// Split the newline-joined ALPN wire `alpn_wire` (the format the Zap surface
+/// builds with `String.join(protocols, "\n")`) into an owned `[][]const u8`
+/// preference list, skipping empty segments. The slices point into an owned copy
+/// of the wire so they outlive the caller's buffer. An empty/whitespace wire
+/// yields an empty list (no ALPN).
+fn parseAlpnList(
+    allocator: std.mem.Allocator,
+    alpn_wire: []const u8,
+) error{OutOfMemory}!struct { storage: []u8, protocols: [][]const u8 } {
+    const storage = try allocator.dupe(u8, alpn_wire);
+    errdefer allocator.free(storage);
+
+    var count: usize = 0;
+    var counter = std.mem.splitScalar(u8, storage, '\n');
+    while (counter.next()) |segment| {
+        if (segment.len != 0) count += 1;
+    }
+
+    const protocols = try allocator.alloc([]const u8, count);
+    errdefer allocator.free(protocols);
+    var index: usize = 0;
+    var splitter = std.mem.splitScalar(u8, storage, '\n');
+    while (splitter.next()) |segment| {
+        if (segment.len != 0) {
+            protocols[index] = segment;
+            index += 1;
+        }
+    }
+    return .{ .storage = storage, .protocols = protocols };
+}
+
+/// Parse a TLS server's certificate chain (`cert_pem`, PEM, leaf first), leaf
+/// private key (`key_pem`, PEM — SEC1 `EC PRIVATE KEY`, PKCS#8 `PRIVATE KEY`, or
+/// PKCS#1 `RSA PRIVATE KEY`), and newline-joined ALPN list (`alpn_wire`) into a
+/// heap-stable `TlsServerConfig` ERASED to `*anyopaque`. Validates the key
+/// matches the leaf certificate's public key up front, so a mis-configuration is
+/// caught at `Tls.listen` time (→ `tls_config_invalid`), NEVER surfacing
+/// mysteriously mid-handshake. On ANY parse/validation failure everything
+/// already allocated is freed (no leak) and `reason` is set with a null config.
+/// The page allocator (kernel-memory convention) is used in production.
+pub fn tlsServerConfigCreate(
+    cert_pem: []const u8,
+    key_pem: []const u8,
+    alpn_wire: []const u8,
+) ServerConfigOutcome {
+    return tlsServerConfigCreateAlloc(std.heap.page_allocator, cert_pem, key_pem, alpn_wire);
+}
+
+/// The allocator-explicit body of `tlsServerConfigCreate` (a unit test passes
+/// the testing allocator so a leak is caught). Wraps the error-union builder and
+/// maps its failure to a `Reason` — `OutOfMemory` → `out_of_memory`, every
+/// parse/validation failure → `tls_config_invalid`.
+pub fn tlsServerConfigCreateAlloc(
+    allocator: std.mem.Allocator,
+    cert_pem: []const u8,
+    key_pem: []const u8,
+    alpn_wire: []const u8,
+) ServerConfigOutcome {
+    const config = buildServerConfig(allocator, cert_pem, key_pem, alpn_wire) catch |err| return .{
+        .reason = switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .tls_config_invalid,
+        },
+        .config = null,
+    };
+    return .{ .reason = .ok, .config = @ptrCast(config) };
+}
+
+/// Build the heap-stable `TlsServerConfig` or return a typed error. An
+/// error-union return so `errdefer` cleanly reclaims every partially-built slice
+/// (and scrubs the parsed private key) on ANY failure — the correct pattern for
+/// fallible multi-step construction, no manual cleanup ladder.
+fn buildServerConfig(
+    allocator: std.mem.Allocator,
+    cert_pem: []const u8,
+    key_pem: []const u8,
+    alpn_wire: []const u8,
+) error{ OutOfMemory, TlsConfigInvalid }!*TlsServerConfig {
+    const decoded = decodeCertChain(allocator, cert_pem) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MalformedCertPem => return error.TlsConfigInvalid,
+    };
+    errdefer allocator.free(decoded.bytes);
+    errdefer allocator.free(decoded.chain);
+
+    // The leaf must parse and its public key must match the private key — the
+    // whole `tls.Server.init` config precondition, checked HERE so a bad pairing
+    // fails at listen, not at the first accept.
+    const leaf_parsed = decoded.chain[0].parse() catch return error.TlsConfigInvalid;
+    var private_key = tls.Server.PrivateKey.fromPem(key_pem) catch return error.TlsConfigInvalid;
+    // Scrub the stack copy of the private key on EVERY exit (on success it has
+    // already been copied into the heap box; on failure it never reached one).
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&private_key));
+    if (!private_key.matchesCertificatePublicKey(leaf_parsed)) return error.TlsConfigInvalid;
+
+    const alpn = try parseAlpnList(allocator, alpn_wire);
+    errdefer allocator.free(alpn.storage);
+    errdefer allocator.free(alpn.protocols);
+
+    const config = try allocator.create(TlsServerConfig);
+    config.* = .{
+        .cert_bytes = decoded.bytes,
+        .cert_chain = decoded.chain,
+        .private_key = private_key,
+        .alpn_storage = alpn.storage,
+        .alpn_protocols = alpn.protocols,
+        .allocator = allocator,
+    };
+    return config;
+}
+
+/// SECURITY: scrub the private key + free a `TlsServerConfig` on ANY
+/// listener-close path (explicit close, kill/crash sweep, handoff-undo). The
+/// listener-slot twin of `tlsFreeSession`; the socket domain hands the opaque
+/// config pointer back on close (`SocketKind.tls_listener`), and the bridge
+/// routes it here so the long-lived key is scrubbed exactly once.
+pub fn tlsFreeServerConfig(config_opaque: *anyopaque) void {
+    const config: *TlsServerConfig = @ptrCast(@alignCast(config_opaque));
+    config.deinit();
+}
+
+/// Run the SYNCHRONOUS TLS SERVER handshake over `session_opaque`'s adapter
+/// using `config_opaque`'s certificate chain + private key + ALPN list, bounded
+/// by ONE absolute deadline (`timeout_ms`, re-armed here) and the owning
+/// process's `kill_flag` — a slowloris handshake times out and stays killable
+/// (§8 DoS), exactly like the client path. On success the session's `.server`
+/// arm is populated, `handshake_complete` is set, and `.ok` is returned. On
+/// failure returns a mapped `Reason`: a transport timeout/kill → the stashed
+/// transport reason; no usable cert/sig for the client → `tls_no_matching_cert`;
+/// a bad server config that slipped past listen-time validation →
+/// `tls_config_invalid`; everything else TLS → `tls_handshake_failed`. The
+/// session is NOT freed here (the caller frees it — it still holds the fd).
+///
+/// The 240 handshake-entropy bytes come from the OS CSPRNG and are scrubbed on
+/// the way out; a session with no secure entropy source FAILS CLOSED. RSA PSS
+/// salt + signing blinding are drawn from a ChaCha DRBG SEEDED from the OS
+/// CSPRNG (also fail-closed) — a sound, non-failing randomness source for the
+/// in-place CertificateVerify signing — and the DRBG state is scrubbed too. The
+/// long-lived private key is read from the config to sign in place; only the
+/// signature bytes leave, never the key.
+pub fn tlsServerHandshake(
+    session_opaque: *anyopaque,
+    config_opaque: *anyopaque,
+    timeout_ms: i64,
+    kill_flag: ?*std.atomic.Value(bool),
+) Reason {
+    const session: *TlsSession = @ptrCast(@alignCast(session_opaque));
+    const config: *TlsServerConfig = @ptrCast(@alignCast(config_opaque));
+    session.stream.rearm(timeout_ms, kill_flag);
+
+    var entropy: [tls.Server.Options.entropy_len]u8 = undefined;
+    // Scrub the entropy no matter how we exit — it seeds the ServerHello random,
+    // the ephemeral key share, and the ML-KEM encapsulation.
+    defer std.crypto.secureZero(u8, &entropy);
+    if (!secureRandomBytes(&entropy)) return .tls_handshake_failed;
+
+    // A ChaCha DRBG seeded from the OS CSPRNG backs the RSA PSS salt + signing
+    // blinding (`Options.random`). Seeding fail-closed keeps RSA signing off a
+    // weak source; the DRBG itself never fails mid-signing, so PSS can never be
+    // fed predictable/zero salt. Scrub the seed AND the DRBG state on exit.
+    var csprng_seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &csprng_seed);
+    if (!secureRandomBytes(&csprng_seed)) return .tls_handshake_failed;
+    var csprng = std.Random.DefaultCsprng.init(csprng_seed);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&csprng));
+
+    const now = std.Io.Clock.now(.real, io());
+    const server = tls.Server.init(session.stream.inputReader(), session.stream.outputWriter(), .{
+        .cert_chain = config.cert_chain,
+        .private_key = config.private_key,
+        .alpn_protocols = config.alpn_protocols,
+        .write_buffer = session.plaintext_out,
+        .read_buffer = session.plaintext_in,
+        .entropy = &entropy,
+        .random = csprng.random(),
+        .realtime_now = now,
+    }) catch |err| return switch (err) {
+        // A transport read/write that failed mid-handshake stashed the precise
+        // reason out-of-band (deadline → timed_out, kill → other, reset, …);
+        // prefer it so a slowloris handshake surfaces `timed_out`.
+        error.ReadFailed => if (session.stream.read_reason != .ok) session.stream.read_reason else .tls_handshake_failed,
+        error.WriteFailed => if (session.stream.write_reason != .ok) session.stream.write_reason else .tls_handshake_failed,
+        else => mapTlsServerInitError(err),
+    };
+
+    session.role = .{ .server = server };
+    session.handshake_complete = true;
+    return .ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -3694,6 +4124,159 @@ fn countOpenFds() usize {
             return count;
         },
     }
+}
+
+// The S5 TLS-server fixtures: a self-signed P-256 ECDSA leaf for `localhost`
+// (SAN DNS:localhost, IP:127.0.0.1) + its SEC1 private key, plus a SECOND,
+// UNRELATED EC key that does NOT match the cert (the mismatch negative). These
+// are the exact bytes of `test/fixtures/tls/ec_cert.pem` / `ec_key.pem` /
+// `ec_key_other.pem`, embedded so the config parser is proven with no file I/O.
+const test_ec_cert_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBmjCCAT+gAwIBAgIUMMaoyKUPtk7DddXMceDO4Ct8JHkwCgYIKoZIzj0EAwIw
+    \\FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcxODE5Mjc0MFoXDTM2MDcxNTE5
+    \\Mjc0MFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+    \\AQcDQgAEB2lsyvra4RAWZq/DqY2o0mxFVhRTYqCNHQepl87hKcH+FvAKtYvMBaeT
+    \\vEdS1EHOoOmcVGvIPFV3JIf4K4+gTqNvMG0wHQYDVR0OBBYEFLyBFnPNF3GlffBT
+    \\AixjsBkC5VSvMB8GA1UdIwQYMBaAFLyBFnPNF3GlffBTAixjsBkC5VSvMA8GA1Ud
+    \\EwEB/wQFMAMBAf8wGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49
+    \\BAMCA0kAMEYCIQDQKSD7MMuxS+Vr1sRd0xlrZR8QSNSEne+zFc+MVdALoAIhAJQN
+    \\kxKtmLXPi6qM6KTlgO9hDglv/Qhl4YFCte+fZJAM
+    \\-----END CERTIFICATE-----
+;
+const test_ec_key_pem =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MHcCAQEEILFOeSNPKzUGGtZB1xBhwiKdj5ofWZ8eqpouy+3I/h60oAoGCCqGSM49
+    \\AwEHoUQDQgAEB2lsyvra4RAWZq/DqY2o0mxFVhRTYqCNHQepl87hKcH+FvAKtYvM
+    \\BaeTvEdS1EHOoOmcVGvIPFV3JIf4K4+gTg==
+    \\-----END EC PRIVATE KEY-----
+;
+const test_ec_key_other_pem =
+    \\-----BEGIN EC PRIVATE KEY-----
+    \\MHcCAQEEIP5hU4QR/m6RPjPegL1e87Te38LT+GSOvoPcwhhLD/DuoAoGCCqGSM49
+    \\AwEHoUQDQgAEvgTzXp1tN6aYf29oz9lGCjsojHy5pBnWctWDyAPOvOTpuXDMTaZw
+    \\rOgtpYZ3KbQJH9OlhFYdB/7C2V8vl2OCBQ==
+    \\-----END EC PRIVATE KEY-----
+;
+
+test "socket_io: tlsServerConfigCreateAlloc parses a valid ECDSA cert+key+ALPN and frees leak-exact" {
+    const outcome = tlsServerConfigCreateAlloc(testing.allocator, test_ec_cert_pem, test_ec_key_pem, "h2\nhttp/1.1");
+    try testing.expectEqual(Reason.ok, outcome.reason);
+    const config: *TlsServerConfig = @ptrCast(@alignCast(outcome.config.?));
+    // One leaf certificate, indexed at 0, parseable.
+    try testing.expectEqual(@as(usize, 1), config.cert_chain.len);
+    _ = try config.cert_chain[0].parse();
+    // The ALPN preference list decoded from the newline wire, in order.
+    try testing.expectEqual(@as(usize, 2), config.alpn_protocols.len);
+    try testing.expectEqualStrings("h2", config.alpn_protocols[0]);
+    try testing.expectEqualStrings("http/1.1", config.alpn_protocols[1]);
+    // The testing allocator asserts no leak across the scrub-and-free.
+    tlsFreeServerConfig(@ptrCast(config));
+}
+
+test "socket_io: tlsServerConfigCreateAlloc accepts an empty ALPN list (no ALPN)" {
+    const outcome = tlsServerConfigCreateAlloc(testing.allocator, test_ec_cert_pem, test_ec_key_pem, "");
+    try testing.expectEqual(Reason.ok, outcome.reason);
+    const config: *TlsServerConfig = @ptrCast(@alignCast(outcome.config.?));
+    try testing.expectEqual(@as(usize, 0), config.alpn_protocols.len);
+    tlsFreeServerConfig(@ptrCast(config));
+}
+
+test "socket_io: tlsServerConfigCreateAlloc rejects a malformed cert PEM with tls_config_invalid, no config, leak-exact" {
+    const outcome = tlsServerConfigCreateAlloc(testing.allocator, "not a certificate", test_ec_key_pem, "");
+    try testing.expectEqual(Reason.tls_config_invalid, outcome.reason);
+    try testing.expectEqual(@as(?*anyopaque, null), outcome.config);
+}
+
+test "socket_io: tlsServerConfigCreateAlloc rejects a malformed private key with tls_config_invalid, leak-exact" {
+    const outcome = tlsServerConfigCreateAlloc(testing.allocator, test_ec_cert_pem, "not a key", "");
+    try testing.expectEqual(Reason.tls_config_invalid, outcome.reason);
+    try testing.expectEqual(@as(?*anyopaque, null), outcome.config);
+}
+
+test "socket_io: tlsServerConfigCreateAlloc rejects a key that does not match the leaf cert with tls_config_invalid, leak-exact" {
+    const outcome = tlsServerConfigCreateAlloc(testing.allocator, test_ec_cert_pem, test_ec_key_other_pem, "");
+    try testing.expectEqual(Reason.tls_config_invalid, outcome.reason);
+    try testing.expectEqual(@as(?*anyopaque, null), outcome.config);
+}
+
+test "socket_io/tls: SERVER handshake completes against an in-process insecure client over a socketpair, app data both ways (S5)" {
+    const pair = try testSocketpairNonblocking();
+
+    const config_outcome = tlsServerConfigCreateAlloc(testing.allocator, test_ec_cert_pem, test_ec_key_pem, "");
+    try testing.expectEqual(Reason.ok, config_outcome.reason);
+    const config = config_outcome.config.?;
+    defer tlsFreeServerConfig(config);
+
+    const server_session = try TlsSession.create(testing.allocator, pair.a, 5000, null);
+    defer server_session.deinit();
+    defer closeFd(pair.a);
+    const client_session = try TlsSession.create(testing.allocator, pair.b, 5000, null);
+    defer client_session.deinit();
+    defer closeFd(pair.b);
+
+    // The handshake is a synchronous request/response, so drive the two ends on
+    // two threads: the insecure client (proven S4 path) drives one fd, the
+    // server the other. Both must return `.ok`.
+    const ServerCtx = struct {
+        session: *TlsSession,
+        config: *anyopaque,
+        reason: Reason = .other,
+        fn run(ctx: *@This()) void {
+            ctx.reason = tlsServerHandshake(ctx.session, ctx.config, 5000, null);
+        }
+    };
+    const ClientCtx = struct {
+        session: *TlsSession,
+        reason: Reason = .other,
+        fn run(ctx: *@This()) void {
+            ctx.reason = tlsHandshake(ctx.session, "localhost", 5000, null, true);
+        }
+    };
+    var server_ctx = ServerCtx{ .session = server_session, .config = config };
+    var client_ctx = ClientCtx{ .session = client_session };
+    const server_thread = try std.Thread.spawn(.{}, ServerCtx.run, .{&server_ctx});
+    const client_thread = try std.Thread.spawn(.{}, ClientCtx.run, .{&client_ctx});
+    server_thread.join();
+    client_thread.join();
+
+    try testing.expectEqual(Reason.ok, client_ctx.reason);
+    try testing.expectEqual(Reason.ok, server_ctx.reason);
+    try testing.expect(server_session.role == .server);
+    try testing.expect(client_session.role == .client);
+
+    // App data both ways over the established sessions (single-threaded now — the
+    // socket buffers hold each record until the peer reads it): client -> server,
+    // server echoes -> client, byte-exact through the record layer.
+    const message = "hello over tls 1.3 server";
+    const send_out = tlsSend(client_session, message, 5000, null);
+    try testing.expectEqual(Reason.ok, send_out.reason);
+
+    const server_recv = try tlsRecv(server_session, testing.allocator, message.len, tls_session_buffer_len, 5000, null);
+    defer testing.allocator.free(server_recv.buffer);
+    try testing.expectEqual(recv_status_chunk, server_recv.status);
+    try testing.expectEqualStrings(message, server_recv.buffer[0..server_recv.bytes_filled]);
+
+    const echo_out = tlsSend(server_session, server_recv.buffer[0..server_recv.bytes_filled], 5000, null);
+    try testing.expectEqual(Reason.ok, echo_out.reason);
+
+    const client_recv = try tlsRecv(client_session, testing.allocator, message.len, tls_session_buffer_len, 5000, null);
+    defer testing.allocator.free(client_recv.buffer);
+    try testing.expectEqual(recv_status_chunk, client_recv.status);
+    try testing.expectEqualStrings(message, client_recv.buffer[0..client_recv.bytes_filled]);
+}
+
+test "socket_io: a fresh TlsSession is .unestablished and frees leak-exact without a handshake" {
+    const pair = try testSocketpairNonblocking();
+    defer closeFd(pair.a);
+    defer closeFd(pair.b);
+    const session = try TlsSession.create(testing.allocator, pair.a, 100, null);
+    // No handshake ran: the role is the zero-payload `.unestablished` arm, so
+    // `zeroizeSecrets`/`deinit` are safe and leak-exact.
+    try testing.expect(session.role == .unestablished);
+    try testing.expect(!session.handshake_complete);
+    session.zeroizeSecrets(); // proves scrubbing an unestablished union is safe
+    session.deinit();
 }
 
 test "socket_io: Reason integer values are the pinned ABI contract mirrored by lib/socket/error.zap reason_from_code" {
@@ -3725,6 +4308,12 @@ test "socket_io: Reason integer values are the pinned ABI contract mirrored by l
     // with the Zap surface in Job 4).
     try testing.expectEqual(@as(i32, 14), @intFromEnum(Reason.tls_cert_invalid));
     try testing.expectEqual(@as(i32, 15), @intFromEnum(Reason.tls_handshake_failed));
+    // Phase S5 (TLS server): APPEND-ONLY additions — same lockstep contract.
+    // A renumber breaks the build here and forces `lib/socket/error.zap`'s
+    // `reason_from_code` to move in lockstep (`:tls_no_matching_cert` /
+    // `:tls_config_invalid`).
+    try testing.expectEqual(@as(i32, 16), @intFromEnum(Reason.tls_no_matching_cert));
+    try testing.expectEqual(@as(i32, 17), @intFromEnum(Reason.tls_config_invalid));
     try testing.expectEqual(@as(i32, 99), @intFromEnum(Reason.other));
 }
 

@@ -54,15 +54,17 @@ test "tls_session: create allocates a heap-stable, leak-free session and deinit 
     session.deinit(); // testing.allocator asserts no leak at test end
 }
 
-test "tls_session: zeroizeSecrets scrubs the whole client + every buffer before free (no key residue)" {
+test "tls_session: zeroizeSecrets scrubs the whole role union + every buffer before free (no key residue)" {
     const gpa = testing.allocator;
     const session = try TlsSession.create(gpa, 3, 5000, null);
     defer session.deinit(); // frees (a second scrub in deinit is harmless)
 
     // Simulate a populated session: stamp every key-bearing region with a
-    // recognizable non-zero pattern (as if the handshake had written keys and
-    // the buffers held cipher/plaintext).
-    @memset(std.mem.asBytes(&session.client), 0xAA);
+    // recognizable non-zero pattern (as if the handshake had written the
+    // negotiated keys into the endpoint arm and the buffers held cipher/
+    // plaintext). The role is a client/server tagged union (Phase S5), so its
+    // WHOLE storage — whichever arm is resident — is the key-bearing region.
+    @memset(std.mem.asBytes(&session.role), 0xAA);
     @memset(session.encrypted_in, 0xAA);
     @memset(session.encrypted_out, 0xAA);
     @memset(session.plaintext_in, 0xAA);
@@ -71,7 +73,7 @@ test "tls_session: zeroizeSecrets scrubs the whole client + every buffer before 
     session.zeroizeSecrets();
 
     // PROVE no residue survives while the memory is still readable (pre-free).
-    for (std.mem.asBytes(&session.client)) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    for (std.mem.asBytes(&session.role)) |byte| try testing.expectEqual(@as(u8, 0), byte);
     for (session.encrypted_in) |byte| try testing.expectEqual(@as(u8, 0), byte);
     for (session.encrypted_out) |byte| try testing.expectEqual(@as(u8, 0), byte);
     for (session.plaintext_in) |byte| try testing.expectEqual(@as(u8, 0), byte);

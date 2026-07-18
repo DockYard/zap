@@ -28,6 +28,18 @@
     reason (Phase S4): a fatal alert, an unexpected/mal-formed handshake
     message, a record-layer decrypt failure, insufficient entropy, or the
     underlying transport failing mid-handshake.
+  * `:tls_no_matching_cert` — a TLS SERVER handshake (Phase S5) could not
+    present a usable certificate for the client's request: the client advertised
+    no signature scheme the configured leaf key can produce (or, once per-SNI
+    cert selection lands, no configured certificate matched the client's SNI). A
+    distinct reason so a server operator can tell "no matching certificate for
+    this client" from a generic protocol failure.
+  * `:tls_config_invalid` — a TLS SERVER's own certificate/key configuration is
+    unusable (Phase S5), surfaced at `Tls.listen` / `Tls.upgrade_server` time
+    BEFORE any client connects: an empty/malformed certificate chain, an
+    unparseable or unsupported private key, or a private key that does not match
+    the leaf certificate's public key. A mis-configured server fails loudly at
+    bind time rather than mysteriously at handshake time.
   * `:closed` — a config op (`set_options`) ran against a socket this program
     no longer owns (a closed or foreign handle): the ownership gate, surfaced
     as a recoverable error rather than a panic. It comes from that gate, NOT
@@ -86,11 +98,20 @@ pub error SocketError {
     its own POSIX arm (e.g. `2 -> :etimedout`), because `tlsHandshake` prefers
     the stashed transport reason over the generic TLS code.
 
+    The Phase S5 TLS SERVER arms (`16 -> :tls_no_matching_cert`, `17 ->
+    :tls_config_invalid`) decode the two `socket_io.Reason` values the server
+    path produces: `mapTlsServerInitError` maps "no usable cert/signature scheme
+    for this client" to `:tls_no_matching_cert`, and `tlsServerConfigCreate` (at
+    `Tls.listen`) plus a bad-config handshake map an unusable cert/key
+    configuration to `:tls_config_invalid`.
+
     ## Examples
 
         SocketError.reason_from_code(1)    # => :econnrefused
         SocketError.reason_from_code(14)   # => :tls_cert_invalid
         SocketError.reason_from_code(15)   # => :tls_handshake_failed
+        SocketError.reason_from_code(16)   # => :tls_no_matching_cert
+        SocketError.reason_from_code(17)   # => :tls_config_invalid
     """
 
   pub fn reason_from_code(code :: i64) -> Atom {
@@ -110,6 +131,8 @@ pub error SocketError {
       13 -> :einval
       14 -> :tls_cert_invalid
       15 -> :tls_handshake_failed
+      16 -> :tls_no_matching_cert
+      17 -> :tls_config_invalid
       _ -> :unknown
     }
   }

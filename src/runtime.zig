@@ -4118,6 +4118,13 @@ const ZapConcurrencyKernel = struct {
     // default path can never be weakened; reached only via `Tls.*_insecure`.
     extern fn zap_socket_tls_handshake_insecure(process: *anyopaque, handle_bits: u64, host_ptr: [*]const u8, host_len: usize, timeout_ms: i64) callconv(.c) i32;
     extern fn zap_socket_tls_upgrade(process: *anyopaque, handle_bits: u64, host_ptr: [*]const u8, host_len: usize, timeout_ms: i64) callconv(.c) u64;
+    // Phase S5 — the TLS SERVER surface. `tls_listen` parses + owns the cert
+    // chain/key/ALPN and binds a `.tls_listener`; `tls_accept` accepts +
+    // completes the server handshake and attaches the session to the SAME
+    // handle; `tls_server_upgrade` is the server STARTTLS (gen-bump-consume).
+    extern fn zap_socket_tls_listen(process: *anyopaque, ip0: u8, ip1: u8, ip2: u8, ip3: u8, port: u16, backlog: u32, cert_ptr: [*]const u8, cert_len: usize, key_ptr: [*]const u8, key_len: usize, alpn_ptr: [*]const u8, alpn_len: usize) callconv(.c) u64;
+    extern fn zap_socket_tls_accept(process: *anyopaque, listener_bits: u64, timeout_ms: i64) callconv(.c) u64;
+    extern fn zap_socket_tls_server_upgrade(process: *anyopaque, handle_bits: u64, cert_ptr: [*]const u8, cert_len: usize, key_ptr: [*]const u8, key_len: usize, alpn_ptr: [*]const u8, alpn_len: usize, timeout_ms: i64) callconv(.c) u64;
     extern fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64;
     extern fn zap_socket_accept_timeout(process: *anyopaque, listener_bits: u64, timeout_ms: i64) callconv(.c) u64;
     extern fn zap_socket_endpoint(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
@@ -7347,9 +7354,14 @@ pub const SocketRuntime = struct {
             const closed = gateOffDomain().close(socket_table.SocketHandle.fromBits(handle_bits)) orelse
                 @panic("zap: Socket.close of a closed or stale Socket handle");
             socket_io.closeFd(closed.fd);
-            // A TLS socket carries its session — scrub + free it on close (the
-            // gate-OFF twin of `abi.zig`'s `closeResolvedSocket`).
-            if (closed.tls_state) |session| socket_io.tlsFreeSession(session);
+            // A TLS socket carries its session/config — scrub + free it on close
+            // (the gate-OFF twin of `abi.zig`'s `closeResolvedSocket`): a
+            // `.tls_listener` frees its `*TlsServerConfig`, a `.tls_session`
+            // frees its `*TlsSession`, a `.plain` has nothing to free.
+            if (closed.tls_state) |state| switch (closed.kind) {
+                .tls_listener => socket_io.tlsFreeServerConfig(state),
+                else => socket_io.tlsFreeSession(state),
+            };
             return true;
         }
     }
@@ -7458,6 +7470,167 @@ pub const SocketRuntime = struct {
                 return 0;
             };
             const reason = socket_io.tlsHandshake(session, host, timeout_ms, null, false);
+            if (reason != .ok) {
+                socket_io.tlsFreeSession(session);
+                gate_off_last_error = @intFromEnum(reason);
+                return 0;
+            }
+            const successor = gateOffDomain().upgradeToTls(handle, 0, session) orelse {
+                socket_io.tlsFreeSession(session);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.other);
+                return 0;
+            };
+            return successor.toBits();
+        }
+    }
+
+    /// `Tls.listen`'s bind leg (Phase S5): parse + OWN the certificate chain +
+    /// private key + ALPN list (a bad cert/key → `tls_config_invalid`, before any
+    /// fd), bind + listen an IPv4 stream socket, then bind the config to the
+    /// listener slot (`attachServerConfig`, no gen bump — the fd becomes a
+    /// `.tls_listener`). Returns the listener handle bits on success, or `0` on
+    /// failure (reason in the last-error slot). Gate-ON delegates to the kernel;
+    /// gate-OFF runs it inline on the single OS thread. Closing the listener frees
+    /// the config.
+    pub fn tls_listen(a: i64, b: i64, c: i64, d: i64, port: i64, backlog: i64, cert_pem: []const u8, key_pem: []const u8, alpn_wire: []const u8) u64 {
+        const ip = [4]u8{ octet(a), octet(b), octet(c), octet(d) };
+        const port16: u16 = checkedPort(port);
+        const backlog32: u32 = checkedBacklog(backlog);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_tls_listen(
+                requireCurrentProcessHandle(),
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3],
+                port16,
+                backlog32,
+                cert_pem.ptr,
+                cert_pem.len,
+                key_pem.ptr,
+                key_pem.len,
+                alpn_wire.ptr,
+                alpn_wire.len,
+            );
+        } else {
+            const config_outcome = socket_io.tlsServerConfigCreate(cert_pem, key_pem, alpn_wire);
+            if (config_outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(config_outcome.reason);
+                return 0;
+            }
+            const config = config_outcome.config.?;
+            const outcome = socket_io.listenIp4(ip, port16, @intCast(backlog32));
+            if (outcome.reason != .ok) {
+                socket_io.tlsFreeServerConfig(config);
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, outcome.bound_port, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                socket_io.tlsFreeServerConfig(config);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            if (!gateOffDomain().attachServerConfig(handle, 0, config)) {
+                socket_io.tlsFreeServerConfig(config);
+                if (gateOffDomain().close(handle)) |closed| socket_io.closeFd(closed.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.other);
+                return 0;
+            }
+            return handle.toBits();
+        }
+    }
+
+    /// `Tls.accept`'s accept+handshake leg (Phase S5): accept the next connection
+    /// on a TLS listener (bounded by `timeout_ms`), run the server handshake using
+    /// the listener's config, and on success bind the established `.server`
+    /// session to the SAME accepted handle (`attachTls`, no gen bump). Returns the
+    /// accepted handle bits (now a TLS socket) on success, or `0` on failure
+    /// (reason in the last-error slot); a handshake failure closes the accepted fd
+    /// before returning. Gate-ON offloads accept + handshake off-core; gate-OFF
+    /// runs both inline.
+    pub fn tls_accept(listener_bits: u64, timeout_ms: i64) u64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_tls_accept(requireCurrentProcessHandle(), listener_bits, timeout_ms);
+        } else {
+            const listener_handle = socket_table.SocketHandle.fromBits(listener_bits);
+            if (gateOffDomain().kind(listener_handle) != .tls_listener) {
+                gate_off_last_error = @intFromEnum(socket_io.Reason.tls_config_invalid);
+                return 0;
+            }
+            const config = gateOffDomain().tlsState(listener_handle) orelse {
+                gate_off_last_error = @intFromEnum(socket_io.Reason.other);
+                return 0;
+            };
+            const outcome = socket_io.acceptTimeout(gateOffFd(listener_bits), null, timeout_ms);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const accepted = gateOffDomain().open(outcome.fd, 0, outcome.peer.port, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            const session = socket_io.tlsSessionCreate(outcome.fd, timeout_ms, null) orelse {
+                if (gateOffDomain().close(accepted)) |closed| socket_io.closeFd(closed.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            const reason = socket_io.tlsServerHandshake(session, config, timeout_ms, null);
+            if (reason != .ok) {
+                socket_io.tlsFreeSession(session);
+                if (gateOffDomain().close(accepted)) |closed| socket_io.closeFd(closed.fd);
+                gate_off_last_error = @intFromEnum(reason);
+                return 0;
+            }
+            if (!gateOffDomain().attachTls(accepted, 0, session)) {
+                socket_io.tlsFreeSession(session);
+                if (gateOffDomain().close(accepted)) |closed| socket_io.closeFd(closed.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.other);
+                return 0;
+            }
+            return accepted.toBits();
+        }
+    }
+
+    /// `Tls.upgrade_server`'s handshake leg (server STARTTLS, Phase S5): parse a
+    /// one-shot config from the supplied cert/key/ALPN, run the server handshake
+    /// over an OWNED plaintext socket, FREE the config immediately after (the
+    /// session keeps only the derived secrets — the long-lived key never
+    /// outlives the call), and on success CONSUME the plaintext handle
+    /// (`upgradeToTls`, gen bumped) returning the TLS successor bits (never `0`).
+    /// Returns `0` on failure with the reason in the last-error slot. Gate-ON
+    /// offloads; gate-OFF runs inline.
+    pub fn tls_server_upgrade(handle_bits: u64, cert_pem: []const u8, key_pem: []const u8, alpn_wire: []const u8, timeout_ms: i64) u64 {
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_tls_server_upgrade(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                cert_pem.ptr,
+                cert_pem.len,
+                key_pem.ptr,
+                key_pem.len,
+                alpn_wire.ptr,
+                alpn_wire.len,
+                timeout_ms,
+            );
+        } else {
+            const config_outcome = socket_io.tlsServerConfigCreate(cert_pem, key_pem, alpn_wire);
+            if (config_outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(config_outcome.reason);
+                return 0;
+            }
+            const config = config_outcome.config.?;
+            const handle = socket_table.SocketHandle.fromBits(handle_bits);
+            const fd = gateOffFd(handle_bits);
+            const session = socket_io.tlsSessionCreate(fd, timeout_ms, null) orelse {
+                socket_io.tlsFreeServerConfig(config);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            const reason = socket_io.tlsServerHandshake(session, config, timeout_ms, null);
+            socket_io.tlsFreeServerConfig(config);
             if (reason != .ok) {
                 socket_io.tlsFreeSession(session);
                 gate_off_last_error = @intFromEnum(reason);

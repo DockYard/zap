@@ -28,6 +28,31 @@ pub struct TlsTest {
       error = SocketError.from_code(14)
       assert(error.reason == :tls_cert_invalid)
     }
+
+    test("16 -> :tls_no_matching_cert and 17 -> :tls_config_invalid (the S5 server arms) round-trip") {
+      assert(SocketError.reason_from_code(16) == :tls_no_matching_cert)
+      assert(SocketError.reason_from_code(17) == :tls_config_invalid)
+    }
+  }
+
+  describe("Tls.listen validates its TlsServerConfig at bind time (gate-OFF, no network)") {
+    test("a valid ECDSA cert+key binds a TLS listener; closing it frees the config, leak-exact") {
+      base = Socket.live_count()
+      assert(TlsTest.listen_valid_binds_and_closes())
+      assert(Socket.live_count() == base)
+    }
+
+    test("a malformed certificate PEM fails Tls.listen with :tls_config_invalid, no listener, leak-exact") {
+      base = Socket.live_count()
+      assert(TlsTest.listen_reason(%TlsServerConfig{cert_pem: "not a cert", key_pem: TlsTest.key_pem(), alpn: ([] :: List(String))}) == :tls_config_invalid)
+      assert(Socket.live_count() == base)
+    }
+
+    test("a private key that does not match the leaf certificate fails with :tls_config_invalid, leak-exact") {
+      base = Socket.live_count()
+      assert(TlsTest.listen_reason(%TlsServerConfig{cert_pem: TlsTest.cert_pem(), key_pem: TlsTest.other_key_pem(), alpn: ([] :: List(String))}) == :tls_config_invalid)
+      assert(Socket.live_count() == base)
+    }
   }
 
   describe("Tls.connect / connect_host compose over Socket and never leak (gate-OFF)") {
@@ -178,6 +203,77 @@ pub struct TlsTest {
             }
         }
     }
+  }
+
+  # ---- S5 (TLS server) helpers + fixtures ----
+
+  # A valid config binds a TLS listener (a real loopback socket + the parsed
+  # config), which we then close — proving the config-attach + close-frees-config
+  # lifecycle end to end WITHOUT a handshake (a handshake needs a concurrent
+  # client, exercised by the gate-ON `test_concurrency/tls_server_test.zap`).
+  fn listen_valid_binds_and_closes() -> Bool {
+    config = %TlsServerConfig{cert_pem: TlsTest.cert_pem(), key_pem: TlsTest.key_pem(), alpn: ["http/1.1"]}
+    case Tls.listen(SocketAddress.loopback(0), config, 16) {
+      Result.Error(_e) -> false
+      Result.Ok(listener) ->
+        {
+          _closed = SocketListener.close(listener)
+          true
+        }
+    }
+  }
+
+  # The reason atom Tls.listen fails with for a given (bad) config — or
+  # :unexpected_ok if it wrongly bound a listener.
+  fn listen_reason(config :: TlsServerConfig) -> Atom {
+    case Tls.listen(SocketAddress.loopback(0), config, 16) {
+      Result.Ok(listener) ->
+        {
+          _closed = SocketListener.close(listener)
+          :unexpected_ok
+        }
+      Result.Error(error) -> error.reason
+    }
+  }
+
+  # The self-signed P-256 ECDSA leaf for localhost (SAN DNS:localhost,
+  # IP:127.0.0.1) + its SEC1 key, and a SECOND unrelated EC key that does NOT
+  # match the cert. The base64 decoder ignores heredoc indentation whitespace, so
+  # these embed the fixtures directly (`test/fixtures/tls/*.pem`).
+  fn cert_pem() -> String {
+    """
+    -----BEGIN CERTIFICATE-----
+    MIIBmjCCAT+gAwIBAgIUMMaoyKUPtk7DddXMceDO4Ct8JHkwCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcxODE5Mjc0MFoXDTM2MDcxNTE5
+    Mjc0MFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+    AQcDQgAEB2lsyvra4RAWZq/DqY2o0mxFVhRTYqCNHQepl87hKcH+FvAKtYvMBaeT
+    vEdS1EHOoOmcVGvIPFV3JIf4K4+gTqNvMG0wHQYDVR0OBBYEFLyBFnPNF3GlffBT
+    AixjsBkC5VSvMB8GA1UdIwQYMBaAFLyBFnPNF3GlffBTAixjsBkC5VSvMA8GA1Ud
+    EwEB/wQFMAMBAf8wGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49
+    BAMCA0kAMEYCIQDQKSD7MMuxS+Vr1sRd0xlrZR8QSNSEne+zFc+MVdALoAIhAJQN
+    kxKtmLXPi6qM6KTlgO9hDglv/Qhl4YFCte+fZJAM
+    -----END CERTIFICATE-----
+    """
+  }
+
+  fn key_pem() -> String {
+    """
+    -----BEGIN EC PRIVATE KEY-----
+    MHcCAQEEILFOeSNPKzUGGtZB1xBhwiKdj5ofWZ8eqpouy+3I/h60oAoGCCqGSM49
+    AwEHoUQDQgAEB2lsyvra4RAWZq/DqY2o0mxFVhRTYqCNHQepl87hKcH+FvAKtYvM
+    BaeTvEdS1EHOoOmcVGvIPFV3JIf4K4+gTg==
+    -----END EC PRIVATE KEY-----
+    """
+  }
+
+  fn other_key_pem() -> String {
+    """
+    -----BEGIN EC PRIVATE KEY-----
+    MHcCAQEEIP5hU4QR/m6RPjPegL1e87Te38LT+GSOvoPcwhhLD/DuoAoGCCqGSM49
+    AwEHoUQDQgAEvgTzXp1tN6aYf29oz9lGCjsojHy5pBnWctWDyAPOvOTpuXDMTaZw
+    rOgtpYZ3KbQJH9OlhFYdB/7C2V8vl2OCBQ==
+    -----END EC PRIVATE KEY-----
+    """
   }
 
 }
