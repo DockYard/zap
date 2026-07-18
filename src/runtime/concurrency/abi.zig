@@ -3177,6 +3177,39 @@ fn packEndpoint(endpoint: concurrency.socket_io.SocketEndpoint) i64 {
     return host * 65536 + @as(i64, endpoint.port);
 }
 
+/// Copy a Unix-domain `path` (≤ `max_unix_path`) into the caller's PRIVATE recv
+/// arena and surface it through the recv byte channel — the datagram-peer /
+/// endpoint PATH readback (Phase S2 follow-up b). Writes the backing pointer to
+/// `out_chunk_ptr` (null for an empty path) and returns the byte length. The
+/// path rides the SAME per-process recv arena the datagram bytes do, so the
+/// resulting Zap String is valid until the owning process tears down / the arena
+/// resets when unaliased (a `[]const u8` is a zero-copy String, so a transient
+/// buffer would be a use-after-free). An empty path (an unnamed/unbound Unix
+/// endpoint, or a non-Unix endpoint) or an arena OOM returns `0` (→
+/// `:unavailable` in the Zap layer) — a path readback never fails the caller.
+fn surfaceUnixPath(context: *concurrency.ProcessContext, path: []const u8, out_chunk_ptr: *?[*]const u8) i64 {
+    out_chunk_ptr.* = null;
+    if (path.len == 0) return 0;
+    const copy = context.socketRecvArena().allocator().alloc(u8, path.len) catch return 0;
+    @memcpy(copy, path);
+    out_chunk_ptr.* = copy.ptr;
+    return @intCast(copy.len);
+}
+
+/// The Unix-domain PATH of the endpoint (`kind == 0` local/`getsockname`, else
+/// peer/`getpeername`) of a socket the caller OWNS, surfaced through the recv
+/// byte channel (`out_chunk_ptr` + returned length). Returns `-1` when the
+/// handle is not owned; `0` (empty path) for a non-Unix or unnamed endpoint (→
+/// `:unavailable`). The Unix twin of `zap_socket_endpoint`'s v4/v6 accessors —
+/// a `sun_path` is a byte string, not a packable integer, so it crosses as
+/// bytes → a Zap String → `SocketAddress.unix`.
+export fn zap_socket_endpoint_unix_path(process: *anyopaque, handle_bits: u64, kind: i32, out_chunk_ptr: *?[*]const u8) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    out_chunk_ptr.* = null;
+    const address = ownedEndpoint(context, handle_bits, kind) orelse return -1;
+    return surfaceUnixPath(context, concurrency.socket_io.endpointUnixPath(&address), out_chunk_ptr);
+}
+
 // ---------------------------------------------------------------------------
 // Phase S2 — Datagram (UDP) + Unix-domain bridge. UDP bind/connect and Unix
 // stream listen are non-blocking leaf ops (bind/connect on a datagram socket,
@@ -3217,6 +3250,29 @@ export fn zap_socket_bind_udp_unix(
     return promoteListener(context, outcome);
 }
 
+/// Bind a UDP (`SOCK_DGRAM`) socket of the IPv6 family on the eight hextets
+/// `h0`..`h7` (`scope_id` zone, `port` — port 0 → ephemeral). The IPv6 twin of
+/// `zap_socket_bind_udp`; the hextets become the 16 seam address bytes via
+/// `v6BytesFromHextets`. Returns the handle bits or `0`. Inline (bind is a leaf).
+export fn zap_socket_bind_udp6(
+    process: *anyopaque,
+    h0: u16,
+    h1: u16,
+    h2: u16,
+    h3: u16,
+    h4: u16,
+    h5: u16,
+    h6: u16,
+    h7: u16,
+    scope_id: u32,
+    port: u16,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    const addr = concurrency.socket_io.v6BytesFromHextets(.{ h0, h1, h2, h3, h4, h5, h6, h7 });
+    const outcome = concurrency.socket_io.bindUdp6(addr, port, scope_id, 0);
+    return promoteListener(context, outcome);
+}
+
 /// Connect a UDP socket to `ip0.ip1.ip2.ip3:port` (`connect(2)` on a datagram
 /// socket completes immediately — the kernel then FILTERS inbound datagrams to
 /// that peer and `send`/`recv` address it). Returns the handle bits or `0`.
@@ -3232,6 +3288,30 @@ export fn zap_socket_connect_udp(
     const context = contextFromHandle(process);
     context.ensureSocketSweep(socketSweepDestructor);
     const outcome = concurrency.socket_io.connectUdpIp4(.{ ip0, ip1, ip2, ip3 }, port);
+    if (outcome.reason != .ok) return socketConnectFailed(context, outcome.reason);
+    return promoteConnectedFd(context, outcome.fd);
+}
+
+/// Connect a UDP socket to the IPv6 endpoint on the eight hextets `h0`..`h7`
+/// (`scope_id` zone, `port`) — the IPv6 twin of `zap_socket_connect_udp`
+/// (immediate, no poll loop). Returns the handle bits or `0`.
+export fn zap_socket_connect_udp6(
+    process: *anyopaque,
+    h0: u16,
+    h1: u16,
+    h2: u16,
+    h3: u16,
+    h4: u16,
+    h5: u16,
+    h6: u16,
+    h7: u16,
+    scope_id: u32,
+    port: u16,
+) callconv(.c) u64 {
+    const context = contextFromHandle(process);
+    context.ensureSocketSweep(socketSweepDestructor);
+    const addr = concurrency.socket_io.v6BytesFromHextets(.{ h0, h1, h2, h3, h4, h5, h6, h7 });
+    const outcome = concurrency.socket_io.connectUdpIp6(addr, port, scope_id, 0);
     if (outcome.reason != .ok) return socketConnectFailed(context, outcome.reason);
     return promoteConnectedFd(context, outcome.fd);
 }
@@ -3367,6 +3447,31 @@ export fn zap_socket_send_to_ip4(
     return sendToCommon(context, handle_bits, bytes_ptr[0..bytes_len], .{ .ip4 = .{ .ip = .{ ip0, ip1, ip2, ip3 }, .port = port } }, timeout_ms);
 }
 
+/// Send one datagram to the IPv6 endpoint on the eight hextets `h0`..`h7`
+/// (`scope_id` zone, `port`). The IPv6 twin of `zap_socket_send_to_ip4`; the
+/// hextets become the 16 seam address bytes via `v6BytesFromHextets`.
+export fn zap_socket_send_to_ip6(
+    process: *anyopaque,
+    handle_bits: u64,
+    h0: u16,
+    h1: u16,
+    h2: u16,
+    h3: u16,
+    h4: u16,
+    h5: u16,
+    h6: u16,
+    h7: u16,
+    scope_id: u32,
+    port: u16,
+    bytes_ptr: [*]const u8,
+    bytes_len: usize,
+    timeout_ms: i64,
+) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    const addr = concurrency.socket_io.v6BytesFromHextets(.{ h0, h1, h2, h3, h4, h5, h6, h7 });
+    return sendToCommon(context, handle_bits, bytes_ptr[0..bytes_len], .{ .ip6 = .{ .addr = addr, .port = port, .scope_id = scope_id, .flow = 0 } }, timeout_ms);
+}
+
 /// Send one Unix-domain datagram to `path_ptr[0..path_len]`.
 export fn zap_socket_send_to_unix(
     process: *anyopaque,
@@ -3485,6 +3590,16 @@ export fn zap_socket_recv_peer_port(process: *anyopaque) callconv(.c) i64 {
 /// `recv_from` (`0` = none).
 export fn zap_socket_recv_peer_scope(process: *anyopaque) callconv(.c) i64 {
     return concurrency.socket_io.endpointScopeValue(contextFromHandle(process).socketLastRecvPeer().*);
+}
+
+/// The Unix-domain PATH of the sender endpoint of the caller's most recent
+/// `recv_from`, surfaced through the recv byte channel (`out_chunk_ptr` +
+/// returned length) — a bound Unix datagram sender's reply address. `0` (empty)
+/// for a non-Unix or UNBOUND sender (→ `:unavailable` in the Zap layer). The
+/// datagram-peer twin of `zap_socket_endpoint_unix_path`.
+export fn zap_socket_recv_peer_path(process: *anyopaque, out_chunk_ptr: *?[*]const u8) callconv(.c) i64 {
+    const context = contextFromHandle(process);
+    return surfaceUnixPath(context, concurrency.socket_io.endpointUnixPath(context.socketLastRecvPeer()), out_chunk_ptr);
 }
 
 /// Terminate the calling process NORMALLY (reason `normal`, P5-J1): the same

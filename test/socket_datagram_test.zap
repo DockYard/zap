@@ -291,6 +291,225 @@ pub struct SocketDatagramTest {
     result
   }
 
+  # ---- IPv6 UDP loopback roundtrip (::1), peer surfaced as :ip6 ------------
+
+  fn udp6_roundtrip() -> Atom {
+    case SocketDatagram.bind(SocketAddress.ip6_loopback(0)) {
+      Result.Error(_e) -> :bind_failed
+      Result.Ok(receiver) -> SocketDatagramTest.udp6_after_receiver(receiver)
+    }
+  }
+
+  fn udp6_after_receiver(receiver :: SocketDatagram) -> Atom {
+    port = SocketDatagram.local_port(receiver)
+    case SocketDatagram.bind(SocketAddress.ip6_loopback(0)) {
+      Result.Error(_e) ->
+        {
+          _c = SocketDatagram.close(receiver)
+          :sender_bind_failed
+        }
+      Result.Ok(sender) -> SocketDatagramTest.udp6_exchange(receiver, sender, port)
+    }
+  }
+
+  fn udp6_exchange(receiver :: SocketDatagram, sender :: SocketDatagram, port :: i64) -> Atom {
+    payload = "v6\x00\xfed"
+    _sent = SocketDatagram.send_to(sender, SocketAddress.ip6_loopback(port), payload)
+    result = case SocketDatagram.recv_from(receiver, 65536, 5000) {
+      SocketDatagramRecv.Datagram(d) -> SocketDatagramTest.check_v6_peer(d, payload)
+      SocketDatagramRecv.Truncated(_d) -> :unexpected_truncated
+      SocketDatagramRecv.TimedOut -> :unexpected_timeout
+      SocketDatagramRecv.Failed(_e) -> :recv_failed
+    }
+    _c1 = SocketDatagram.close(sender)
+    _c2 = SocketDatagram.close(receiver)
+    result
+  }
+
+  fn check_v6_peer(d :: SocketDatagramData, payload :: String) -> Atom {
+    case d.data == payload {
+      false -> :mismatch
+      true ->
+        case d.peer.family == :ip6 {
+          false -> :peer_wrong
+          # ::1 → h0..h6 are 0 and h7 is 1.
+          true ->
+            case d.peer.h0 == 0 {
+              false -> :peer_addr_wrong
+              true ->
+                case d.peer.h7 == 1 {
+                  true -> :ok
+                  false -> :peer_addr_wrong
+                }
+            }
+        }
+    }
+  }
+
+  # ---- connected IPv6 UDP filters to the connected v6 peer -----------------
+
+  fn connected_udp6() -> Atom {
+    case SocketDatagram.bind(SocketAddress.ip6_loopback(0)) {
+      Result.Error(_e) -> :bind_failed
+      Result.Ok(peer) -> SocketDatagramTest.connected6_after_peer(peer)
+    }
+  }
+
+  fn connected6_after_peer(peer :: SocketDatagram) -> Atom {
+    peer_port = SocketDatagram.local_port(peer)
+    case SocketDatagram.connect(SocketAddress.ip6(0, 0, 0, 0, 0, 0, 0, 1, 0, peer_port)) {
+      Result.Error(_e) ->
+        {
+          _c = SocketDatagram.close(peer)
+          :connect_failed
+        }
+      Result.Ok(connected) -> SocketDatagramTest.connected6_exchange(peer, connected)
+    }
+  }
+
+  fn connected6_exchange(peer :: SocketDatagram, connected :: SocketDatagram) -> Atom {
+    connected_port = SocketDatagram.local_port(connected)
+    _sent = SocketDatagram.send_to(peer, SocketAddress.ip6_loopback(connected_port), "v6-peer")
+    delivered = case SocketDatagram.recv(connected, 65536, 5000) {
+      SocketDatagramRecv.Datagram(d) ->
+        case d.data == "v6-peer" {
+          true -> :ok
+          false -> :mismatch
+        }
+      SocketDatagramRecv.Truncated(_d) -> :unexpected_truncated
+      SocketDatagramRecv.TimedOut -> :not_delivered
+      SocketDatagramRecv.Failed(_e) -> :recv_failed
+    }
+    _c1 = SocketDatagram.close(connected)
+    _c2 = SocketDatagram.close(peer)
+    delivered
+  }
+
+  # ---- Unix DATAGRAM reply-to-sender: recv_from surfaces the sender PATH ----
+
+  fn unix_dgram_reply() -> Atom {
+    server_path = SocketDatagramTest.unique_unix_path("zap-s2-reply-srv")
+    _rm = File.rm(server_path)
+    case SocketDatagram.bind(SocketAddress.unix(server_path)) {
+      Result.Error(_e) -> :server_bind_failed
+      Result.Ok(server) -> SocketDatagramTest.reply_after_server(server, server_path)
+    }
+  }
+
+  fn reply_after_server(server :: SocketDatagram, server_path :: String) -> Atom {
+    client_path = SocketDatagramTest.unique_unix_path("zap-s2-reply-cli")
+    _rm = File.rm(client_path)
+    result = case SocketDatagram.bind(SocketAddress.unix(client_path)) {
+      Result.Error(_e) -> :client_bind_failed
+      Result.Ok(client) -> SocketDatagramTest.reply_exchange(server, client, server_path, client_path)
+    }
+    _c = SocketDatagram.close(server)
+    _r1 = File.rm(server_path)
+    _r2 = File.rm(client_path)
+    result
+  }
+
+  fn reply_exchange(server :: SocketDatagram, client :: SocketDatagram, server_path :: String, client_path :: String) -> Atom {
+    _sent = SocketDatagram.send_to(client, SocketAddress.unix(server_path), "ping")
+    result = case SocketDatagram.recv_from(server, 65536, 5000) {
+      SocketDatagramRecv.Datagram(d) -> SocketDatagramTest.reply_to_peer(server, d, client, client_path)
+      SocketDatagramRecv.Truncated(_d) -> :unexpected_truncated
+      SocketDatagramRecv.TimedOut -> :unexpected_timeout
+      SocketDatagramRecv.Failed(_e) -> :recv_failed
+    }
+    _c = SocketDatagram.close(client)
+    result
+  }
+
+  fn reply_to_peer(server :: SocketDatagram, d :: SocketDatagramData, client :: SocketDatagram, client_path :: String) -> Atom {
+    case d.peer.family == :unix {
+      false -> :peer_not_unix
+      true ->
+        case d.peer.path == client_path {
+          false -> :peer_path_wrong
+          # Reply STRAIGHT BACK to the sender's surfaced path.
+          true -> SocketDatagramTest.deliver_reply(server, d.peer, client)
+        }
+    }
+  }
+
+  fn deliver_reply(server :: SocketDatagram, peer :: SocketAddress, client :: SocketDatagram) -> Atom {
+    _sent = SocketDatagram.send_to(server, peer, "pong")
+    case SocketDatagram.recv_from(client, 65536, 5000) {
+      SocketDatagramRecv.Datagram(d) ->
+        case d.data == "pong" {
+          true -> :ok
+          false -> :reply_mismatch
+        }
+      SocketDatagramRecv.Truncated(_d) -> :unexpected_truncated
+      SocketDatagramRecv.TimedOut -> :reply_not_delivered
+      SocketDatagramRecv.Failed(_e) -> :reply_failed
+    }
+  }
+
+  # ---- Unix STREAM local/peer address surface the bound PATH ----------------
+
+  fn unix_stream_paths() -> Atom {
+    path = SocketDatagramTest.unique_unix_path("zap-s2-spath")
+    _rm = File.rm(path)
+    case Socket.listen(SocketAddress.unix(path), 8) {
+      Result.Error(_e) -> :listen_failed
+      Result.Ok(listener) -> SocketDatagramTest.spath_after_listen(listener, path)
+    }
+  }
+
+  fn spath_after_listen(listener :: SocketListener, path :: String) -> Atom {
+    result = case Socket.connect(SocketAddress.unix(path), 5000) {
+      Result.Error(_e) -> :connect_failed
+      Result.Ok(client) -> SocketDatagramTest.spath_after_connect(listener, client, path)
+    }
+    _rm = File.rm(path)
+    result
+  }
+
+  fn spath_after_connect(listener :: SocketListener, client :: Socket, path :: String) -> Atom {
+    case Socket.accept(listener) {
+      Result.Error(_e) ->
+        {
+          _c = Socket.close(client)
+          _l = SocketListener.close(listener)
+          :accept_failed
+        }
+      Result.Ok(server) -> SocketDatagramTest.spath_check(listener, client, server, path)
+    }
+  }
+
+  fn spath_check(listener :: SocketListener, client :: Socket, server :: Socket, path :: String) -> Atom {
+    # The client's PEER (getpeername) is the server's listen path; the accepted
+    # server's LOCAL (getsockname) is that same bound listen path.
+    client_peer = Socket.peer_address(client)
+    server_local = Socket.local_address(server)
+    result = SocketDatagramTest.spath_verdict(client_peer, server_local, path)
+    _c1 = Socket.close(server)
+    _c2 = Socket.close(client)
+    _c3 = SocketListener.close(listener)
+    result
+  }
+
+  fn spath_verdict(client_peer :: SocketAddress, server_local :: SocketAddress, path :: String) -> Atom {
+    case client_peer.family == :unix {
+      false -> :client_peer_not_unix
+      true ->
+        case client_peer.path == path {
+          false -> :client_peer_path_wrong
+          true ->
+            case server_local.family == :unix {
+              false -> :server_local_not_unix
+              true ->
+                case server_local.path == path {
+                  true -> :ok
+                  false -> :server_local_path_wrong
+                }
+            }
+        }
+    }
+  }
+
   # ------------------------------------------------------------------------
 
   describe("Socket datagram + Unix-domain (gate-OFF)") {
@@ -321,6 +540,30 @@ pub struct SocketDatagramTest {
     test("Unix-domain datagram roundtrip, leak-exact") {
       base = Socket.live_count()
       assert(SocketDatagramTest.unix_dgram_roundtrip() == :ok)
+      assert(Socket.live_count() == base)
+    }
+
+    test("IPv6 UDP loopback (::1) roundtrip surfaces a :ip6 peer, leak-exact") {
+      base = Socket.live_count()
+      assert(SocketDatagramTest.udp6_roundtrip() == :ok)
+      assert(Socket.live_count() == base)
+    }
+
+    test("a connected IPv6 UDP socket delivers its connected v6 peer, leak-exact") {
+      base = Socket.live_count()
+      assert(SocketDatagramTest.connected_udp6() == :ok)
+      assert(Socket.live_count() == base)
+    }
+
+    test("a Unix datagram server recv_from surfaces the sender PATH and can reply to it") {
+      base = Socket.live_count()
+      assert(SocketDatagramTest.unix_dgram_reply() == :ok)
+      assert(Socket.live_count() == base)
+    }
+
+    test("Unix stream local/peer_address surface the bound PATH") {
+      base = Socket.live_count()
+      assert(SocketDatagramTest.unix_stream_paths() == :ok)
       assert(Socket.live_count() == base)
     }
   }

@@ -1607,15 +1607,24 @@ pub const SocketEndpoint = struct {
     port: u16,
     /// IPv6 zone/scope id (meaningful iff `family == .ip6`; `0` = none).
     scope_id: u32,
+    /// The Unix-domain path (meaningful iff `family == .unix`), in the
+    /// Zap-visible representation: a filesystem path verbatim, or a Linux
+    /// abstract-namespace name with its leading NUL rendered as the `@` prefix
+    /// (`SocketAddress.unix`'s convention). `unix_path_len` is its byte length;
+    /// `0` marks an UNNAMED/unbound Unix endpoint (surfaced to Zap as
+    /// `:unavailable`). Bounded by `max_unix_path`, so it never allocates.
+    /// Defaults let the non-Unix literals (`ip4`/`ip6`/`unavailable`) omit it.
+    unix_path: [max_unix_path]u8 = @splat(0),
+    unix_path_len: usize = 0,
 
     /// The endpoint's address family. `.unix` (Phase S2) marks an AF_UNIX
-    /// endpoint: a socket bound/connected over the Unix-domain. The path is
-    /// NOT carried in this struct (a Unix path readback across the ABI as a
-    /// String is a documented S2 follow-up — the datagram peer / stream
-    /// `local_address`/`peer_address` of a Unix socket surface `:unix` /
-    /// `:unavailable`, while the CONSTRUCTION side — `bind`/`connect`/`listen`/
-    /// `send_to` taking a path — is fully supported), so `.unix` is a family
-    /// marker only.
+    /// endpoint: a socket bound/connected over the Unix-domain. Its `unix_path`
+    /// carries the socket path — decoded from the `sun_path` by `nameAddress`
+    /// (stream/datagram `local_address`/`peer_address`) and `decodeSockaddr`
+    /// (the datagram `recv_from` sender / a Unix `accept`ed peer) — so a bound
+    /// Unix endpoint surfaces its path across the ABI (a `recv_peer_path`/
+    /// `endpoint_unix_path` accessor → a Zap String → `SocketAddress.unix`), and
+    /// only an UNNAMED endpoint (`unix_path_len == 0`) reports `:unavailable`.
     pub const Family = enum { unavailable, ip4, ip6, unix };
 
     pub const none = SocketEndpoint{
@@ -1624,17 +1633,21 @@ pub const SocketEndpoint = struct {
         .v6 = @splat(0),
         .port = 0,
         .scope_id = 0,
+        .unix_path = @splat(0),
+        .unix_path_len = 0,
     };
 
-    /// A bare AF_UNIX endpoint marker (no IP address, no port). The Unix
-    /// datagram sender's path is not surfaced across the ABI in S2 (see
-    /// `Family`), so a Unix peer/local endpoint carries only the family tag.
+    /// A bare AF_UNIX endpoint marker (no IP address, no port) with an EMPTY
+    /// path — the base an UNNAMED Unix endpoint keeps and a named one overwrites
+    /// (`nameAddress`/`decodeSockaddr` decode the `sun_path` into `unix_path`).
     pub const unix_endpoint = SocketEndpoint{
         .family = .unix,
         .v4 = .{ 0, 0, 0, 0 },
         .v6 = @splat(0),
         .port = 0,
         .scope_id = 0,
+        .unix_path = @splat(0),
+        .unix_path_len = 0,
     };
 };
 
@@ -1875,11 +1888,11 @@ fn nameAddress(fd: Fd, kind: NameKind) SocketEndpoint {
             .scope_id = in6.scope_id,
         };
     }
-    // AF_UNIX (Phase S2): a bound/connected Unix-domain endpoint. The path is
-    // present in `storage` but NOT surfaced across the ABI in S2 (see
-    // `SocketEndpoint.Family`); the endpoint is reported as the `.unix` family
-    // marker — honest ("this is a Unix endpoint") without the path channel.
-    if (sockaddr_ptr.family == std.posix.AF.UNIX) return SocketEndpoint.unix_endpoint;
+    // AF_UNIX (Phase S2): a bound/connected Unix-domain endpoint. Decode its
+    // `sun_path` (bounded by `address_len`) into the endpoint's path, so a Unix
+    // socket's `local_address`/`peer_address` surface the bound path across the
+    // ABI; an unbound endpoint keeps an empty path (→ `:unavailable`).
+    if (sockaddr_ptr.family == std.posix.AF.UNIX) return unixEndpoint(&storage, address_len);
     return SocketEndpoint.none;
 }
 
@@ -2043,6 +2056,65 @@ fn buildUnixSockAddr(path: []const u8) UnixSockAddr {
     return result;
 }
 
+/// Decode the `sun_path` of an AF_UNIX `sockaddr` (`addr_len` is the
+/// `getsockname`/`getpeername`/`recvmsg` reported address length) into the
+/// Zap-visible path representation written to `out_path`, returning its length.
+/// The DECODE twin of `buildUnixSockAddr`: a Linux abstract-namespace name
+/// (leading NUL in `sun_path`) is reconstructed with the Zap `@` prefix; a
+/// filesystem path is the bytes up to the first NUL. An UNNAMED endpoint
+/// (`addr_len` at/below the `sun_path` offset — an unbound Unix datagram sender,
+/// or a socket with no bound path) yields `0`, which the bridges surface as
+/// `:unavailable`. The write is bounded by `max_unix_path` (a foreign path
+/// longer than the portable cap is clamped — a readback approximation; a Zap
+/// path is always within the cap), so it never overflows `out_path`.
+fn decodeUnixPath(storage: *const std.posix.sockaddr.storage, addr_len: std.posix.socklen_t, out_path: *[max_unix_path]u8) usize {
+    const un: *const std.posix.sockaddr.un = @ptrCast(@alignCast(storage));
+    const sun_path_offset = @offsetOf(std.posix.sockaddr.un, "path");
+    const reported: usize = @intCast(addr_len);
+    if (reported <= sun_path_offset) return 0; // unnamed / unbound
+    const field_len: usize = @min(reported - sun_path_offset, un.path.len);
+    if (field_len == 0) return 0;
+    // Abstract namespace (Linux only): the leading NUL selects it and the name
+    // is the remaining bytes, surfaced with the Zap `@` prefix.
+    if (comptime builtin.os.tag == .linux) {
+        if (un.path[0] == 0) {
+            const name = un.path[1..field_len];
+            const copy_len = @min(name.len, max_unix_path - 1);
+            out_path[0] = '@';
+            @memcpy(out_path[1 .. 1 + copy_len], name[0..copy_len]);
+            return 1 + copy_len;
+        }
+    }
+    // Filesystem path: the bytes up to the first NUL within the reported field.
+    var length: usize = 0;
+    while (length < field_len and length < max_unix_path and un.path[length] != 0) : (length += 1) {}
+    @memcpy(out_path[0..length], un.path[0..length]);
+    return length;
+}
+
+/// Build a `.unix` `SocketEndpoint` from an AF_UNIX `sockaddr` (length
+/// `addr_len`), decoding its `sun_path` into the endpoint's `unix_path` — the
+/// shared Unix-endpoint constructor for `nameAddress` (getsockname/getpeername)
+/// and `decodeSockaddr` (the recvmsg sender / a Unix `accept`ed peer). An
+/// unnamed endpoint keeps an empty path (`unix_path_len == 0`).
+fn unixEndpoint(storage: *const std.posix.sockaddr.storage, addr_len: std.posix.socklen_t) SocketEndpoint {
+    var endpoint = SocketEndpoint.unix_endpoint;
+    endpoint.unix_path_len = decodeUnixPath(storage, addr_len, &endpoint.unix_path);
+    return endpoint;
+}
+
+/// The Unix-domain path of `endpoint` as a byte slice into its `unix_path`
+/// (empty for a non-Unix or UNNAMED endpoint) — the source the Unix-path ABI
+/// accessors (`zap_socket_recv_peer_path`/`zap_socket_endpoint_unix_path`) copy
+/// into the caller's transient recv arena before handing it to Zap as a String.
+/// Takes a pointer so the returned slice views the CALLER's endpoint storage
+/// (never a dangling by-value copy); the caller must copy it out before that
+/// storage is reused.
+pub fn endpointUnixPath(endpoint: *const SocketEndpoint) []const u8 {
+    if (endpoint.family != .unix) return &.{};
+    return endpoint.unix_path[0..endpoint.unix_path_len];
+}
+
 // -- UDP bind ---------------------------------------------------------------
 
 /// Bind a UDP (`SOCK_DGRAM`) socket to `ip:port` (port 0 → an ephemeral port
@@ -2079,6 +2151,67 @@ pub fn bindUdp(ip: [4]u8, port: u16) ListenOutcome {
     }
     var bound = std.mem.zeroes(std.posix.sockaddr.in);
     var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(handle, @ptrCast(&bound), &bound_len)) != .SUCCESS) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    return .{ .reason = .ok, .fd = fdToBits(handle), .bound_port = std.mem.bigToNative(u16, bound.port) };
+}
+
+/// Assemble the 16-byte big-endian IPv6 address (`Ip6Address.bytes` layout,
+/// network order) from the eight hextets `h0`..`h7` (each a 16-bit group,
+/// most-significant first) — the EXACT inverse of `endpointV6Word`'s
+/// bytes→word packing and the Zap `SocketAddress.ip6_from_words`/`ip6` decode.
+/// It is the ONE place a Zap-side v6 hextet address becomes seam address bytes,
+/// shared by the v6 datagram bind/connect/send bridges (`abi.zig` gate-ON,
+/// `runtime.zig` gate-OFF) so the byte order is single-sourced. `h0` fills
+/// bytes `[0..2]`, `h7` fills bytes `[14..16]`, so `::1` (`h0..h6 = 0`,
+/// `h7 = 1`) becomes `{0,…,0,1}`.
+pub fn v6BytesFromHextets(hextets: [8]u16) [16]u8 {
+    var bytes: [16]u8 = undefined;
+    for (hextets, 0..) |hextet, index| {
+        bytes[index * 2] = @intCast(hextet >> 8);
+        bytes[index * 2 + 1] = @intCast(hextet & 0xff);
+    }
+    return bytes;
+}
+
+/// Bind a UDP (`SOCK_DGRAM`) socket of the IPv6 family to `bytes:port` (port 0 →
+/// an ephemeral port the kernel chooses, reported as `bound_port`) — the IPv6
+/// twin of `bindUdp`. `bytes` is the big-endian 16-byte address
+/// (`v6BytesFromHextets`), `scope_id` the link-local zone index (`0` = none),
+/// `flow` the flow label (`0` for an explicitly-dialed endpoint). The fd is set
+/// `O_NONBLOCK` for its whole life; a create/bind failure closes the transient
+/// fd (never leaked). The poll-less targets (Windows/wasi — not in v1 run scope)
+/// return `.other`, matching `bindUdp` (the posix path names `sockaddr.in6`,
+/// `void` on wasi, so it is comptime-dead there).
+pub fn bindUdp6(bytes: [16]u8, port: u16, scope_id: u32, flow: u32) ListenOutcome {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    const socket_rc = std.posix.system.socket(std.posix.AF.INET6, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+    if (std.posix.errno(socket_rc) != .SUCCESS)
+        return .{ .reason = mapSocketCreateErrno(socket_rc), .fd = 0, .bound_port = 0 };
+    const handle: net.Socket.Handle = @intCast(socket_rc);
+    if (!setNonBlocking(handle)) {
+        _ = std.posix.system.close(handle);
+        return .{ .reason = .other, .fd = 0, .bound_port = 0 };
+    }
+    var bind_addr = std.mem.zeroInit(std.posix.sockaddr.in6, .{
+        .family = std.posix.AF.INET6,
+        .port = std.mem.nativeToBig(u16, port),
+        .flowinfo = flow,
+        .addr = bytes, // already big-endian
+        .scope_id = scope_id,
+    });
+    const bind_rc = std.posix.system.bind(handle, @ptrCast(&bind_addr), @sizeOf(std.posix.sockaddr.in6));
+    if (std.posix.errno(bind_rc) != .SUCCESS) {
+        const reason = mapListenErrno(std.posix.errno(bind_rc));
+        _ = std.posix.system.close(handle);
+        return .{ .reason = reason, .fd = 0, .bound_port = 0 };
+    }
+    var bound = std.mem.zeroes(std.posix.sockaddr.in6);
+    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in6);
     if (std.posix.errno(std.posix.system.getsockname(handle, @ptrCast(&bound), &bound_len)) != .SUCCESS) {
         _ = std.posix.system.close(handle);
         return .{ .reason = .other, .fd = 0, .bound_port = 0 };
@@ -2315,7 +2448,9 @@ pub fn recvFrom(
                 // datagram_len: the true length where known (Linux `returned`),
                 // else the captured floor (macOS). Never less than `captured`.
                 const datagram_len: usize = @max(returned, captured);
-                const peer = decodeSockaddr(&peer_storage);
+                // `msg_namelen` is updated by `recvmsg` to the sender address's
+                // true length — the bound it takes to decode a Unix `sun_path`.
+                const peer = decodeSockaddr(&peer_storage, @intCast(message.namelen));
                 return shrinkRecvFrom(allocator, buffer, recv_status_chunk, captured, truncated, datagram_len, peer);
             },
             // Spurious readable wake / competing reader / interrupted — re-poll.
@@ -2348,13 +2483,14 @@ fn shrinkRecvFrom(
     return .{ .status = status, .buffer = shrunk, .bytes_filled = filled, .truncated = truncated, .datagram_len = datagram_len, .peer = peer };
 }
 
-/// Decode a filled `sockaddr.storage` (the sender of a received datagram) into
-/// a `SocketEndpoint` — the recvmsg-name twin of `nameAddress`'s decode. An
-/// AF_UNIX sender surfaces the `.unix` family marker (its path is not carried
-/// across the ABI in S2 — see `SocketEndpoint.Family`); an unnamed sender
-/// (`family == AF_UNSPEC`, common for an unbound Unix datagram sender) surfaces
-/// `.unavailable`.
-fn decodeSockaddr(storage: *const std.posix.sockaddr.storage) SocketEndpoint {
+/// Decode a filled `sockaddr.storage` (the sender of a received datagram, or a
+/// Unix `accept`ed peer) of reported length `addr_len` into a `SocketEndpoint` —
+/// the recvmsg-name twin of `nameAddress`'s decode. An AF_UNIX sender carries
+/// its bound `sun_path` (decoded into the endpoint's path via `unixEndpoint`);
+/// an unnamed sender (`family == AF_UNSPEC` / a zero-length name, common for an
+/// UNBOUND Unix datagram sender) surfaces `.unavailable` (a bound sender's path
+/// lets a Unix datagram server reply to it).
+fn decodeSockaddr(storage: *const std.posix.sockaddr.storage, addr_len: std.posix.socklen_t) SocketEndpoint {
     const sockaddr_ptr: *const std.posix.sockaddr = @ptrCast(storage);
     if (sockaddr_ptr.family == std.posix.AF.INET) {
         const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(storage));
@@ -2365,7 +2501,7 @@ fn decodeSockaddr(storage: *const std.posix.sockaddr.storage) SocketEndpoint {
         const in6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(storage));
         return .{ .family = .ip6, .v4 = .{ 0, 0, 0, 0 }, .v6 = in6.addr, .port = std.mem.bigToNative(u16, in6.port), .scope_id = in6.scope_id };
     }
-    if (sockaddr_ptr.family == std.posix.AF.UNIX) return SocketEndpoint.unix_endpoint;
+    if (sockaddr_ptr.family == std.posix.AF.UNIX) return unixEndpoint(storage, addr_len);
     return SocketEndpoint.none;
 }
 
@@ -2539,7 +2675,7 @@ pub fn acceptAny(fd: Fd, kill_flag: ?*std.atomic.Value(bool)) AcceptOutcome {
             _ = std.posix.system.close(accepted_handle);
             return .{ .reason = .other, .fd = 0, .peer = SocketEndpoint.none };
         }
-        return .{ .reason = .ok, .fd = fdToBits(accepted_handle), .peer = decodeSockaddr(&peer_storage) };
+        return .{ .reason = .ok, .fd = fdToBits(accepted_handle), .peer = decodeSockaddr(&peer_storage, peer_len) };
     }
 }
 
@@ -3698,6 +3834,210 @@ test "socket_io: Unix-domain DATAGRAM roundtrip — bindUnixDatagram + sendToUni
     try testing.expectEqualSlices(u8, payload[0..], got.buffer[0..got.bytes_filled]);
     // A bound Unix datagram sender surfaces as the `.unix` family marker.
     try testing.expectEqual(SocketEndpoint.Family.unix, got.peer.family);
+}
+
+// -- Phase S2 follow-up (a): IPv6 UDP dialing at the datagram seam -----------
+
+test "socket_io: v6BytesFromHextets packs hextets big-endian (::1 and 2001:db8::1)" {
+    // `::1` = h0..h6 = 0, h7 = 1 → the {0,…,0,1} loopback bytes.
+    try testing.expectEqualSlices(u8, loopback_ip6[0..], v6BytesFromHextets(.{ 0, 0, 0, 0, 0, 0, 0, 1 })[0..]);
+    // `2001:db8::1` → 0x2001 0x0db8 … 0x0001, most-significant byte first.
+    const db8 = v6BytesFromHextets(.{ 0x2001, 0x0db8, 0, 0, 0, 0, 0, 1 });
+    try testing.expectEqualSlices(u8, &[16]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, db8[0..]);
+    // Round-trips through the readback packer: the four v6 words reconstruct it.
+    const endpoint = SocketEndpoint{ .family = .ip6, .v4 = .{ 0, 0, 0, 0 }, .v6 = db8, .port = 443, .scope_id = 0 };
+    try testing.expectEqual(@as(i64, 0x2001_0db8), endpointV6Word(endpoint, 0));
+    try testing.expectEqual(@as(i64, 1), endpointV6Word(endpoint, 3));
+}
+
+test "socket_io: IPv6 UDP loopback roundtrip — bindUdp6 + sendToIp6 + recvFrom surfaces a :ip6 peer" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    // Two bound v6 UDP sockets on ::1. A create/bind failure means the host has
+    // no usable IPv6 loopback (e.g. IPv6-disabled CI) — the test then skips.
+    const receiver = bindUdp6(loopback_ip6, 0, 0, 0);
+    if (receiver.reason != .ok) return error.SkipZigTest;
+    try testing.expect(receiver.bound_port != 0);
+    defer closeFd(receiver.fd);
+
+    const sender = bindUdp6(loopback_ip6, 0, 0, 0);
+    try testing.expectEqual(Reason.ok, sender.reason);
+    try testing.expect(sender.bound_port != 0);
+    defer closeFd(sender.fd);
+
+    // Binary-safe payload: embedded NUL + a non-UTF-8 byte.
+    const payload = [_]u8{ 'v', '6', 0, 0xFE, 'd' };
+    const sent = sendToIp6(sender.fd, loopback_ip6, receiver.bound_port, 0, 0, payload[0..], 5000, null);
+    try testing.expectEqual(Reason.ok, sent.reason);
+    try testing.expectEqual(payload.len, sent.bytes_sent);
+
+    const got = try recvFrom(testing.allocator, receiver.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(got.buffer);
+    try testing.expectEqual(@as(i32, recv_status_chunk), got.status);
+    try testing.expect(!got.truncated);
+    try testing.expectEqualSlices(u8, payload[0..], got.buffer[0..got.bytes_filled]);
+    // The sender is surfaced as a REAL v6 peer — the ::1 bytes and the sender
+    // port, NOT `.unavailable`. This is the recv v6-peer surfacing (the four-word
+    // ABI readback path the datagram Zap layer reconstructs into a `:ip6`).
+    try testing.expectEqual(SocketEndpoint.Family.ip6, got.peer.family);
+    try testing.expectEqualSlices(u8, loopback_ip6[0..], got.peer.v6[0..]);
+    try testing.expectEqual(sender.bound_port, got.peer.port);
+    try testing.expectEqual(@as(i64, 0), endpointV6Word(got.peer, 0));
+    try testing.expectEqual(@as(i64, 1), endpointV6Word(got.peer, 3));
+}
+
+test "socket_io: connected IPv6 UDP — connectUdpIp6 filters datagrams to the connected v6 peer" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const sender = bindUdp6(loopback_ip6, 0, 0, 0);
+    if (sender.reason != .ok) return error.SkipZigTest; // no IPv6 loopback here
+    defer closeFd(sender.fd);
+
+    // Connect a v6 UDP socket back to `sender` (immediate — no handshake). Its
+    // ephemeral source port is discoverable via getsockname.
+    const connected = connectUdpIp6(loopback_ip6, sender.bound_port, 0, 0);
+    try testing.expectEqual(Reason.ok, connected.reason);
+    defer closeFd(connected.fd);
+    const connected_local = localAddress(connected.fd);
+    try testing.expectEqual(SocketEndpoint.Family.ip6, connected_local.family);
+
+    const sent = sendToIp6(sender.fd, loopback_ip6, connected_local.port, 0, 0, "v6-peer", 5000, null);
+    try testing.expectEqual(Reason.ok, sent.reason);
+    const got = try recvFrom(testing.allocator, connected.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(got.buffer);
+    try testing.expectEqualSlices(u8, "v6-peer", got.buffer[0..got.bytes_filled]);
+    try testing.expectEqual(SocketEndpoint.Family.ip6, got.peer.family);
+    try testing.expectEqual(sender.bound_port, got.peer.port);
+}
+
+// -- Phase S2 follow-up (b): Unix peer/local PATH readback ------------------
+
+test "socket_io: Unix DATAGRAM recvFrom surfaces the BOUND sender's PATH (reply-to-sender)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var receiver_path_buffer: [max_unix_path]u8 = undefined;
+    const receiver_path = try uniqueUnixPath(receiver_path_buffer[0..], "dgpath-rx");
+    defer _ = std.posix.system.unlink(receiver_path.ptr);
+    var sender_path_buffer: [max_unix_path]u8 = undefined;
+    const sender_path = try uniqueUnixPath(sender_path_buffer[0..], "dgpath-tx");
+    defer _ = std.posix.system.unlink(sender_path.ptr);
+
+    const receiver = bindUnixDatagram(receiver_path);
+    try testing.expectEqual(Reason.ok, receiver.reason);
+    defer closeFd(receiver.fd);
+    const sender = bindUnixDatagram(sender_path);
+    try testing.expectEqual(Reason.ok, sender.reason);
+    defer closeFd(sender.fd);
+
+    const sent = sendToUnix(sender.fd, receiver_path, "reply-me", 5000, null);
+    try testing.expectEqual(Reason.ok, sent.reason);
+    const got = try recvFrom(testing.allocator, receiver.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(got.buffer);
+    try testing.expectEqualSlices(u8, "reply-me", got.buffer[0..got.bytes_filled]);
+    // The peer is the SENDER's Unix path — NOT `:unavailable`. A server can now
+    // reply straight back to this path.
+    try testing.expectEqual(SocketEndpoint.Family.unix, got.peer.family);
+    try testing.expectEqualSlices(u8, sender_path, endpointUnixPath(&got.peer));
+
+    // Reply-to-sender: the receiver sends BACK to the surfaced path and the
+    // original sender receives it (round-trip closed on the readback path).
+    const reply = sendToUnix(receiver.fd, endpointUnixPath(&got.peer), "pong", 5000, null);
+    try testing.expectEqual(Reason.ok, reply.reason);
+    const back = try recvFrom(testing.allocator, sender.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(back.buffer);
+    try testing.expectEqualSlices(u8, "pong", back.buffer[0..back.bytes_filled]);
+    try testing.expectEqualSlices(u8, receiver_path, endpointUnixPath(&back.peer));
+}
+
+test "socket_io: Unix DATAGRAM recvFrom from an UNBOUND sender surfaces no path" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var receiver_path_buffer: [max_unix_path]u8 = undefined;
+    const receiver_path = try uniqueUnixPath(receiver_path_buffer[0..], "dgpath-anon");
+    defer _ = std.posix.system.unlink(receiver_path.ptr);
+
+    const receiver = bindUnixDatagram(receiver_path);
+    try testing.expectEqual(Reason.ok, receiver.reason);
+    defer closeFd(receiver.fd);
+
+    // A sender that NEVER binds has no reply address. On Linux a datagram send
+    // may autobind it to an abstract name; on macOS it stays unnamed. Either way
+    // the surfaced path is NOT a filesystem path the receiver bound, and an
+    // unnamed sender surfaces an empty path (→ `:unavailable` in the Zap layer).
+    const sender_rc = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.DGRAM, 0);
+    try testing.expect(std.posix.errno(sender_rc) == .SUCCESS);
+    const sender_fd: Fd = @intCast(sender_rc);
+    defer closeFd(sender_fd);
+
+    const sent = sendToUnix(sender_fd, receiver_path, "anon", 5000, null);
+    try testing.expectEqual(Reason.ok, sent.reason);
+    const got = try recvFrom(testing.allocator, receiver.fd, max_datagram_bytes, 5000, null);
+    defer testing.allocator.free(got.buffer);
+    try testing.expectEqualSlices(u8, "anon", got.buffer[0..got.bytes_filled]);
+    // macOS: an unnamed sender → `.unavailable`/empty path. Linux: an abstract
+    // autobind name (a `@`-prefixed path) MAY appear, but never the receiver's
+    // filesystem path. The invariant that matters: the peer is not a bogus
+    // reply target that equals the receiver.
+    if (got.peer.family == .unix) {
+        try testing.expect(!std.mem.eql(u8, receiver_path, endpointUnixPath(&got.peer)));
+    } else {
+        try testing.expectEqual(SocketEndpoint.Family.unavailable, got.peer.family);
+    }
+}
+
+test "socket_io: Unix STREAM local/peer address surface the bound PATH via getsockname/getpeername" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var path_buffer: [max_unix_path]u8 = undefined;
+    const path = try uniqueUnixPath(path_buffer[0..], "streampath");
+    defer _ = std.posix.system.unlink(path.ptr);
+
+    const listener = listenUnix(path, 8);
+    try testing.expectEqual(Reason.ok, listener.reason);
+    defer closeFd(listener.fd);
+    const client = connectUnix(path, 5000, null);
+    try testing.expectEqual(Reason.ok, client.reason);
+    defer closeFd(client.fd);
+    const accepted = acceptAny(listener.fd, null);
+    try testing.expectEqual(Reason.ok, accepted.reason);
+    defer closeFd(accepted.fd);
+
+    // The listener's LOCAL address is the bound path.
+    const listener_local = localAddress(listener.fd);
+    try testing.expectEqual(SocketEndpoint.Family.unix, listener_local.family);
+    try testing.expectEqualSlices(u8, path, endpointUnixPath(&listener_local));
+
+    // The accepted server socket is bound to the same listen path (getsockname).
+    const server_local = localAddress(accepted.fd);
+    try testing.expectEqual(SocketEndpoint.Family.unix, server_local.family);
+    try testing.expectEqualSlices(u8, path, endpointUnixPath(&server_local));
+
+    // The client's PEER (getpeername) is the server's listen path.
+    const client_peer = peerAddress(client.fd);
+    try testing.expectEqual(SocketEndpoint.Family.unix, client_peer.family);
+    try testing.expectEqualSlices(u8, path, endpointUnixPath(&client_peer));
+
+    // The client itself never bound a path — its LOCAL address is a Unix
+    // endpoint with an EMPTY path (→ `:unavailable` in the Zap layer).
+    const client_local = localAddress(client.fd);
+    if (client_local.family == .unix) {
+        try testing.expectEqual(@as(usize, 0), client_local.unix_path_len);
+    } else {
+        try testing.expectEqual(SocketEndpoint.Family.unavailable, client_local.family);
+    }
+}
+
+test "socket_io: decodeUnixPath reconstructs a Linux abstract name with the @ prefix" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    // Build an abstract-namespace sockaddr (`@zap-abs`) via the encode side, then
+    // decode it back — the reconstructed Zap path re-adds the `@` prefix.
+    const built = buildUnixSockAddr("@zap-abs");
+    try testing.expectEqual(Reason.ok, built.reason);
+    var storage = built.storage;
+    var out: [max_unix_path]u8 = undefined;
+    const decoded_len = decodeUnixPath(&storage, built.len, &out);
+    try testing.expectEqualSlices(u8, "@zap-abs", out[0..decoded_len]);
 }
 
 test "socket_io: recvFrom idle-timeout returns timed_out WITHOUT closing the socket" {

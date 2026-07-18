@@ -4111,13 +4111,20 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_socket_endpoint_v6_word(process: *anyopaque, handle_bits: u64, kind: i32, word_index: i32) callconv(.c) i64;
     extern fn zap_socket_endpoint_port(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
     extern fn zap_socket_endpoint_scope(process: *anyopaque, handle_bits: u64, kind: i32) callconv(.c) i64;
+    // The Unix-domain path readback (Phase S2 follow-up b): a `sun_path` is a
+    // byte string, not a packable integer, so it crosses through the recv byte
+    // channel as bytes → a Zap String → `SocketAddress.unix`.
+    extern fn zap_socket_endpoint_unix_path(process: *anyopaque, handle_bits: u64, kind: i32, out_chunk_ptr: *?[*]const u8) callconv(.c) i64;
     // Phase S2 — datagram (UDP) + Unix-domain.
     extern fn zap_socket_bind_udp(process: *anyopaque, ip0: u8, ip1: u8, ip2: u8, ip3: u8, port: u16) callconv(.c) u64;
+    extern fn zap_socket_bind_udp6(process: *anyopaque, h0: u16, h1: u16, h2: u16, h3: u16, h4: u16, h5: u16, h6: u16, h7: u16, scope_id: u32, port: u16) callconv(.c) u64;
     extern fn zap_socket_bind_udp_unix(process: *anyopaque, path_ptr: [*]const u8, path_len: usize) callconv(.c) u64;
     extern fn zap_socket_connect_udp(process: *anyopaque, ip0: u8, ip1: u8, ip2: u8, ip3: u8, port: u16) callconv(.c) u64;
+    extern fn zap_socket_connect_udp6(process: *anyopaque, h0: u16, h1: u16, h2: u16, h3: u16, h4: u16, h5: u16, h6: u16, h7: u16, scope_id: u32, port: u16) callconv(.c) u64;
     extern fn zap_socket_listen_unix(process: *anyopaque, path_ptr: [*]const u8, path_len: usize, backlog: u32) callconv(.c) u64;
     extern fn zap_socket_connect_unix(process: *anyopaque, path_ptr: [*]const u8, path_len: usize, timeout_ms: i64) callconv(.c) u64;
     extern fn zap_socket_send_to_ip4(process: *anyopaque, handle_bits: u64, ip0: u8, ip1: u8, ip2: u8, ip3: u8, port: u16, bytes_ptr: [*]const u8, bytes_len: usize, timeout_ms: i64) callconv(.c) i64;
+    extern fn zap_socket_send_to_ip6(process: *anyopaque, handle_bits: u64, h0: u16, h1: u16, h2: u16, h3: u16, h4: u16, h5: u16, h6: u16, h7: u16, scope_id: u32, port: u16, bytes_ptr: [*]const u8, bytes_len: usize, timeout_ms: i64) callconv(.c) i64;
     extern fn zap_socket_send_to_unix(process: *anyopaque, handle_bits: u64, path_ptr: [*]const u8, path_len: usize, bytes_ptr: [*]const u8, bytes_len: usize, timeout_ms: i64) callconv(.c) i64;
     extern fn zap_socket_recv_from(process: *anyopaque, handle_bits: u64, max_bytes: i64, timeout_ms: i64, out_chunk_ptr: *?[*]const u8) callconv(.c) i64;
     extern fn zap_socket_recv_truncated(process: *anyopaque) callconv(.c) i32;
@@ -4126,6 +4133,7 @@ const ZapConcurrencyKernel = struct {
     extern fn zap_socket_recv_peer_v6_word(process: *anyopaque, word_index: i32) callconv(.c) i64;
     extern fn zap_socket_recv_peer_port(process: *anyopaque) callconv(.c) i64;
     extern fn zap_socket_recv_peer_scope(process: *anyopaque) callconv(.c) i64;
+    extern fn zap_socket_recv_peer_path(process: *anyopaque, out_chunk_ptr: *?[*]const u8) callconv(.c) i64;
     // P6-J4 (plan item 6.4): the receive-back-edge arena auto-reset — emitted
     // by the compiler ONLY at receive sites whose iteration closure it proved
     // (`src/receive_reset.zig`); `hibernate` — the BEAM-analogue idle park
@@ -7598,6 +7606,44 @@ pub const SocketRuntime = struct {
         }
     }
 
+    /// `Socket.endpoint_unix_path`: the Unix-domain PATH of the endpoint
+    /// (`kind == 0` local/`getsockname`, else peer/`getpeername`) of a socket
+    /// this program owns, as a fresh transient String — empty for a non-Unix or
+    /// unnamed endpoint (→ `:unavailable`). A `sun_path` is a byte string, not a
+    /// packable integer, so it rides the recv byte channel exactly as a datagram
+    /// chunk does (the same per-process/gate-OFF recv arena + lifetime). Panics
+    /// on a closed/stale handle gate-OFF (the single-owner discipline).
+    pub fn endpoint_unix_path(handle_bits: u64, kind: i64) []const u8 {
+        if (comptime runtime_concurrency_active) {
+            var chunk_ptr: ?[*]const u8 = null;
+            const len = ZapConcurrencyKernel.zap_socket_endpoint_unix_path(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                @intCast(kind),
+                &chunk_ptr,
+            );
+            if (len <= 0) return &.{};
+            return chunk_ptr.?[0..@intCast(len)];
+        } else {
+            const fd = gateOffFd(handle_bits);
+            const address = if (kind == 0) socket_io.localAddress(fd) else socket_io.peerAddress(fd);
+            return gateOffSurfaceUnixPath(socket_io.endpointUnixPath(&address));
+        }
+    }
+
+    /// Copy a Unix-domain `path` into the gate-OFF recv arena and return the
+    /// slice — the gate-OFF twin of `abi.zig`'s `surfaceUnixPath`. A `[]const u8`
+    /// is a zero-copy Zap String, so the bytes must outlive the String; the recv
+    /// arena is the same alias-gated, teardown-reclaimed home a datagram chunk
+    /// rides. An empty path or arena OOM returns an empty slice (→
+    /// `:unavailable`) — a path readback never fails the caller.
+    fn gateOffSurfaceUnixPath(path: []const u8) []const u8 {
+        if (path.len == 0) return &.{};
+        const copy = gate_off_recv_arena.allocator().alloc(u8, path.len) catch return &.{};
+        @memcpy(copy, path);
+        return copy;
+    }
+
     // -- Phase S2: datagram (UDP) + Unix-domain --------------------------
 
     /// `SocketDatagram.bind`: bind a UDP socket on `a.b.c.d:port` (port 0 → an
@@ -7610,6 +7656,21 @@ pub const SocketRuntime = struct {
             return ZapConcurrencyKernel.zap_socket_bind_udp(requireCurrentProcessHandle(), ip[0], ip[1], ip[2], ip[3], port16);
         } else {
             const outcome = socket_io.bindUdp(ip, port16);
+            return promoteGateOff(outcome);
+        }
+    }
+
+    /// `SocketDatagram.bind` for an IPv6 UDP socket on the eight hextets
+    /// `h0`..`h7` (`scope_id` zone, `port` — port 0 → ephemeral). Returns the
+    /// handle bits or `0` on failure (reason in the process last-error).
+    pub fn bind_udp6(h0: i64, h1: i64, h2: i64, h3: i64, h4: i64, h5: i64, h6: i64, h7: i64, scope_id: i64, port: i64) u64 {
+        const hextets = [8]u16{ hextet16(h0), hextet16(h1), hextet16(h2), hextet16(h3), hextet16(h4), hextet16(h5), hextet16(h6), hextet16(h7) };
+        const scope32: u32 = scopeId(scope_id);
+        const port16: u16 = checkedPort(port);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_bind_udp6(requireCurrentProcessHandle(), hextets[0], hextets[1], hextets[2], hextets[3], hextets[4], hextets[5], hextets[6], hextets[7], scope32, port16);
+        } else {
+            const outcome = socket_io.bindUdp6(socket_io.v6BytesFromHextets(hextets), port16, scope32, 0);
             return promoteGateOff(outcome);
         }
     }
@@ -7634,6 +7695,31 @@ pub const SocketRuntime = struct {
             return ZapConcurrencyKernel.zap_socket_connect_udp(requireCurrentProcessHandle(), ip[0], ip[1], ip[2], ip[3], port16);
         } else {
             const outcome = socket_io.connectUdpIp4(ip, port16);
+            if (outcome.reason != .ok) {
+                gate_off_last_error = @intFromEnum(outcome.reason);
+                return 0;
+            }
+            const handle = gateOffDomain().open(outcome.fd, 0, 0, .plain) catch {
+                socket_io.closeFd(outcome.fd);
+                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+                return 0;
+            };
+            return handle.toBits();
+        }
+    }
+
+    /// `SocketDatagram.connect` for an IPv6 UDP socket to the eight hextets
+    /// `h0`..`h7` (`scope_id` zone, `port`) — the datagram connect completes
+    /// immediately; the kernel then filters inbound datagrams to that peer.
+    /// Returns the handle bits or `0` on failure.
+    pub fn connect_udp6(h0: i64, h1: i64, h2: i64, h3: i64, h4: i64, h5: i64, h6: i64, h7: i64, scope_id: i64, port: i64) u64 {
+        const hextets = [8]u16{ hextet16(h0), hextet16(h1), hextet16(h2), hextet16(h3), hextet16(h4), hextet16(h5), hextet16(h6), hextet16(h7) };
+        const scope32: u32 = scopeId(scope_id);
+        const port16: u16 = checkedPort(port);
+        if (comptime runtime_concurrency_active) {
+            return ZapConcurrencyKernel.zap_socket_connect_udp6(requireCurrentProcessHandle(), hextets[0], hextets[1], hextets[2], hextets[3], hextets[4], hextets[5], hextets[6], hextets[7], scope32, port16);
+        } else {
+            const outcome = socket_io.connectUdpIp6(socket_io.v6BytesFromHextets(hextets), port16, scope32, 0);
             if (outcome.reason != .ok) {
                 gate_off_last_error = @intFromEnum(outcome.reason);
                 return 0;
@@ -7707,6 +7793,24 @@ pub const SocketRuntime = struct {
             return sent;
         } else {
             const outcome = socket_io.sendToIp4(gateOffFd(handle_bits), ip, port16, bytes, timeout_ms, null);
+            if (outcome.reason != .ok) gate_off_last_error = @intFromEnum(outcome.reason);
+            return @intCast(outcome.bytes_sent);
+        }
+    }
+
+    /// `SocketDatagram.send_to` for an IPv6 datagram to the eight hextets
+    /// `h0`..`h7` (`scope_id` zone, `port`). Returns the bytes sent
+    /// (`== bytes.len` on success), with the reason in the last-error slot.
+    pub fn send_to_ip6(handle_bits: u64, h0: i64, h1: i64, h2: i64, h3: i64, h4: i64, h5: i64, h6: i64, h7: i64, scope_id: i64, port: i64, bytes: []const u8, timeout_ms: i64) i64 {
+        const hextets = [8]u16{ hextet16(h0), hextet16(h1), hextet16(h2), hextet16(h3), hextet16(h4), hextet16(h5), hextet16(h6), hextet16(h7) };
+        const scope32: u32 = scopeId(scope_id);
+        const port16: u16 = checkedPort(port);
+        if (comptime runtime_concurrency_active) {
+            const sent = ZapConcurrencyKernel.zap_socket_send_to_ip6(requireCurrentProcessHandle(), handle_bits, hextets[0], hextets[1], hextets[2], hextets[3], hextets[4], hextets[5], hextets[6], hextets[7], scope32, port16, bytes.ptr, bytes.len, timeout_ms);
+            if (sent < 0) @panic("zap: SocketDatagram.send_to on a socket this process does not own (a closed or stale handle)");
+            return sent;
+        } else {
+            const outcome = socket_io.sendToIp6(gateOffFd(handle_bits), socket_io.v6BytesFromHextets(hextets), port16, scope32, 0, bytes, timeout_ms, null);
             if (outcome.reason != .ok) gate_off_last_error = @intFromEnum(outcome.reason);
             return @intCast(outcome.bytes_sent);
         }
@@ -7828,6 +7932,21 @@ pub const SocketRuntime = struct {
         }
     }
 
+    /// The Unix-domain PATH of the sender endpoint of the most recent
+    /// `recv_from`, as a fresh transient String — a bound Unix datagram sender's
+    /// reply address; empty for a non-Unix or UNBOUND sender (→ `:unavailable`).
+    /// Rides the recv byte channel exactly as the datagram chunk does.
+    pub fn recv_peer_path() []const u8 {
+        if (comptime runtime_concurrency_active) {
+            var chunk_ptr: ?[*]const u8 = null;
+            const len = ZapConcurrencyKernel.zap_socket_recv_peer_path(requireCurrentProcessHandle(), &chunk_ptr);
+            if (len <= 0) return &.{};
+            return chunk_ptr.?[0..@intCast(len)];
+        } else {
+            return gateOffSurfaceUnixPath(socket_io.endpointUnixPath(&gate_off_last_recv_peer));
+        }
+    }
+
     /// Narrow a Zap `i64` address octet to a byte, panicking on an
     /// out-of-range value (a malformed `Socket.Address` is a program bug).
     fn octet(value: i64) u8 {
@@ -7857,6 +7976,21 @@ pub const SocketRuntime = struct {
     /// out-of-range backlog (MED-4).
     fn checkedBacklog(value: i64) u32 {
         if (value < 0 or value > max_backlog) @panic("zap: Socket backlog out of range (0-65535)");
+        return @intCast(value);
+    }
+
+    /// Narrow a Zap `i64` IPv6 hextet to a `u16`, panicking on an out-of-range
+    /// value (a malformed `SocketAddress` hextet is a program bug) — the
+    /// range-checked twin of `octet` for the v6 datagram bind/connect/send.
+    fn hextet16(value: i64) u16 {
+        if (value < 0 or value > 65535) @panic("zap: Socket address hextet out of range (0-65535)");
+        return @intCast(value);
+    }
+
+    /// Narrow a Zap `i64` IPv6 zone/scope id to a `u32`, panicking on an
+    /// out-of-range value — the range-checked twin of `octet` for the v6 scope.
+    fn scopeId(value: i64) u32 {
+        if (value < 0 or value > 4294967295) @panic("zap: Socket IPv6 scope id out of range");
         return @intCast(value);
     }
 };

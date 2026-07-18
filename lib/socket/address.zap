@@ -215,6 +215,69 @@ pub struct SocketAddress {
   }
 
   @doc = """
+    Resolves the endpoint (`which` `0` = local/`getsockname`, `1` = peer/
+    `getpeername`) of a socket `handle_bits` into a `SocketAddress`,
+    transparently across ALL address families — the SINGLE decode point every
+    `local_address`/`peer_address` routes through (both the stream `Socket` and
+    the `SocketDatagram`). The v4 fast path is BYTE-IDENTICAL to the packed
+    decode (`endpoint` → `from_packed`, NO extra runtime call); a non-v4 endpoint
+    packs as `-1`, and the accessor path then disambiguates: a v6 endpoint
+    reconstructs from the four 32-bit words (`endpoint_v6_word`, the first word
+    `-1` = "not v6"), and a Unix endpoint surfaces its `sun_path`
+    (`endpoint_unix_path` → a String → `unix_from_path`). An unnamed/unbound
+    endpoint (no v4, no v6, empty path) is `:unavailable`. Only a non-v4 endpoint
+    incurs the extra accessor reads.
+
+    ## Examples
+
+        SocketAddress.of_handle(handle, 0)   # the local endpoint
+    """
+
+  @available_on(:network)
+
+  pub fn of_handle(handle_bits :: u64, which :: i64) -> SocketAddress {
+    packed = :zig.SocketRuntime.endpoint(handle_bits, which)
+    case packed < 0 {
+      false -> SocketAddress.from_packed(packed)
+      true ->
+        {
+          word0 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 0)
+          case word0 < 0 {
+            false ->
+              {
+                word1 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 1)
+                word2 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 2)
+                word3 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 3)
+                scope_id = :zig.SocketRuntime.endpoint_scope(handle_bits, which)
+                port = :zig.SocketRuntime.endpoint_port(handle_bits, which)
+                SocketAddress.ip6_from_words(word0, word1, word2, word3, scope_id, port)
+              }
+            true -> SocketAddress.of_unix_handle(handle_bits, which)
+          }
+        }
+    }
+  }
+
+  @doc = """
+    Resolves a non-v4/non-v6 endpoint (`which` `0` local, `1` peer) of
+    `handle_bits` to a `:unix` `SocketAddress` carrying the socket `sun_path`, or
+    `:unavailable` when the endpoint has no path (an unnamed/unbound Unix socket,
+    or a genuinely unavailable endpoint). The `sun_path` crosses the ABI as bytes
+    → a Zap String (`endpoint_unix_path`) → `unix_from_path` — the stream/datagram
+    twin of the datagram `recv_from` peer-path readback.
+    """
+
+  @available_on(:network)
+
+  fn of_unix_handle(handle_bits :: u64, which :: i64) -> SocketAddress {
+    path = :zig.SocketRuntime.endpoint_unix_path(handle_bits, which)
+    case String.length(path) == 0 {
+      true -> %SocketAddress{family: :unavailable}
+      false -> SocketAddress.unix_from_path(path)
+    }
+  }
+
+  @doc = """
     Renders a `SocketAddress` as its canonical textual form with the port:
     `"a.b.c.d:port"` for `:ip4`, the bracketed RFC 5952 form `"[address]:port"`
     for `:ip6` (lowercase hextets, no leading zeros, the longest run of zero

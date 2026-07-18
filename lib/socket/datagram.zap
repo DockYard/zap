@@ -25,9 +25,10 @@
     address it.
 
   Works in BOTH concurrent (gate-ON) and plain-script (gate-OFF) programs
-  (Decision D). S2 surfaces `:ip4` UDP and `:unix` datagram; `:ip6` UDP is a
-  documented follow-up (`send_to`/`bind` on a non-`:ip4`/`:unix` address returns
-  `:einval`).
+  (Decision D). S2 surfaces `:ip4` UDP, `:ip6` UDP (including a `:ip6` sender
+  peer on `recv_from`), and `:unix` datagram (including the sender's reply PATH
+  on `recv_from`); `bind`/`connect`/`send_to` on a genuinely-unsupported family
+  return `:einval`.
 
   ## Availability
 
@@ -62,16 +63,17 @@ pub struct SocketDatagram {
   zap_socket_handle :: u64
 
   @doc = """
-    Binds a datagram socket to `address` (an `:ip4` UDP socket, or a `:unix`
-    Unix-domain datagram socket at the address's path). Port 0 (`:ip4`) → an
-    ephemeral port, discoverable via `local_port`. Returns `Result.Ok(socket)`
-    or `Result.Error(%SocketError{...})`. For a Unix filesystem path, unlink any
-    stale socket file before binding (Decision 4 — caller-managed cleanup). A
-    non-`:ip4`/`:unix` address returns `:einval` (`:ip6` UDP is a follow-up).
+    Binds a datagram socket to `address` (an `:ip4` or `:ip6` UDP socket, or a
+    `:unix` Unix-domain datagram socket at the address's path). Port 0 (`:ip4`/
+    `:ip6`) → an ephemeral port, discoverable via `local_port`. Returns
+    `Result.Ok(socket)` or `Result.Error(%SocketError{...})`. For a Unix
+    filesystem path, unlink any stale socket file before binding (Decision 4 —
+    caller-managed cleanup). A genuinely-unsupported family returns `:einval`.
 
     ## Examples
 
         SocketDatagram.bind(SocketAddress.loopback(0))
+        SocketDatagram.bind(SocketAddress.ip6_loopback(0))
         SocketDatagram.bind(SocketAddress.unix("/tmp/app.sock"))
     """
 
@@ -80,22 +82,24 @@ pub struct SocketDatagram {
   pub fn bind(address :: SocketAddress) -> Result(SocketDatagram, SocketError) {
     case address.family {
       :ip4 -> SocketDatagram.result_from_handle(:zig.SocketRuntime.bind_udp(address.a, address.b, address.c, address.d, address.port))
+      :ip6 -> SocketDatagram.result_from_handle(:zig.SocketRuntime.bind_udp6(address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port))
       :unix -> SocketDatagram.result_from_handle(:zig.SocketRuntime.bind_udp_unix(address.path))
       _ -> Result(SocketDatagram, SocketError).Error(%SocketError{reason: :einval})
     }
   }
 
   @doc = """
-    Connects a UDP datagram socket to `address` (an `:ip4` endpoint) — sets a
-    DEFAULT peer so the kernel filters inbound datagrams to it and `send`/`recv`
-    (no explicit address) address it. Returns `Result.Ok(socket)` or
-    `Result.Error(%SocketError{...})`. Unlike a stream connect this completes
-    immediately (a datagram has no handshake). A non-`:ip4` address returns
-    `:einval`.
+    Connects a UDP datagram socket to `address` (an `:ip4` or `:ip6` endpoint) —
+    sets a DEFAULT peer so the kernel filters inbound datagrams to it and
+    `send`/`recv` (no explicit address) address it. Returns `Result.Ok(socket)`
+    or `Result.Error(%SocketError{...})`. Unlike a stream connect this completes
+    immediately (a datagram has no handshake). A genuinely-unsupported family
+    returns `:einval`.
 
     ## Examples
 
         SocketDatagram.connect(SocketAddress.ip4(127, 0, 0, 1, 9000))
+        SocketDatagram.connect(SocketAddress.ip6_loopback(9000))
     """
 
   @available_on(:network)
@@ -103,6 +107,7 @@ pub struct SocketDatagram {
   pub fn connect(address :: SocketAddress) -> Result(SocketDatagram, SocketError) {
     case address.family {
       :ip4 -> SocketDatagram.result_from_handle(:zig.SocketRuntime.connect_udp(address.a, address.b, address.c, address.d, address.port))
+      :ip6 -> SocketDatagram.result_from_handle(:zig.SocketRuntime.connect_udp6(address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port))
       _ -> Result(SocketDatagram, SocketError).Error(%SocketError{reason: :einval})
     }
   }
@@ -145,8 +150,8 @@ pub struct SocketDatagram {
     datagram is ATOMIC — delivered whole or not at all — so on success the whole
     payload is sent (`Result.Ok(String.length(bytes))`); an oversize payload
     fails with `:einval` (`EMSGSIZE`), never a partial. Binary-safe. Dispatches
-    on `address.family` (`:ip4` UDP or `:unix` Unix datagram); a non-`:ip4`/
-    `:unix` address returns `:einval`. Panics on a stale handle.
+    on `address.family` (`:ip4`/`:ip6` UDP or `:unix` Unix datagram); a
+    genuinely-unsupported family returns `:einval`. Panics on a stale handle.
 
     ## Examples
 
@@ -159,6 +164,7 @@ pub struct SocketDatagram {
     total = String.length(bytes)
     case address.family {
       :ip4 -> SocketDatagram.classify_send(:zig.SocketRuntime.send_to_ip4(datagram.zap_socket_handle, address.a, address.b, address.c, address.d, address.port, bytes, timeout_ms), total)
+      :ip6 -> SocketDatagram.classify_send(:zig.SocketRuntime.send_to_ip6(datagram.zap_socket_handle, address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port, bytes, timeout_ms), total)
       :unix -> SocketDatagram.classify_send(:zig.SocketRuntime.send_to_unix(datagram.zap_socket_handle, address.path, bytes, timeout_ms), total)
       _ -> Result(i64, SocketError).Error(%SocketError{reason: :einval})
     }
@@ -264,10 +270,12 @@ pub struct SocketDatagram {
 
   @doc = """
     Reconstructs the SENDER's `SocketAddress` from the recv-peer accessor slots
-    (the datagram-peer twin of `Socket.local_address`'s decode): the packed v4
-    fast path, else the four v6 words (`-1` first word = `:unavailable`). A
-    Unix-domain sender surfaces `:unavailable` in S2 (the path is not carried
-    across the peer channel — a documented follow-up).
+    (the datagram-peer twin of `SocketAddress.of_handle`'s decode): the packed v4
+    fast path, else the four v6 words (a real `:ip6` sender surfaces its address),
+    else the Unix `sun_path` (`recv_peer_path` → a String → `unix_from_path`), so
+    a BOUND Unix datagram sender surfaces a `:unix` reply address the server can
+    `send_to`. Only an UNNAMED/unbound sender (no v4, no v6, empty path) surfaces
+    `:unavailable`.
     """
 
   @available_on(:network)
@@ -280,7 +288,7 @@ pub struct SocketDatagram {
         {
           word0 = :zig.SocketRuntime.recv_peer_v6_word(0)
           case word0 < 0 {
-            true -> %SocketAddress{family: :unavailable}
+            true -> SocketDatagram.recv_peer_unix()
             false ->
               {
                 word1 = :zig.SocketRuntime.recv_peer_v6_word(1)
@@ -296,6 +304,24 @@ pub struct SocketDatagram {
   }
 
   @doc = """
+    Resolves a non-v4/non-v6 `recv_from` sender to a `:unix` `SocketAddress`
+    carrying the sender's `sun_path` (`recv_peer_path` → a String →
+    `unix_from_path`), or `:unavailable` when the sender is UNBOUND (empty path —
+    it has no reply address). The datagram-recv twin of
+    `SocketAddress.of_unix_handle`.
+    """
+
+  @available_on(:network)
+
+  fn recv_peer_unix() -> SocketAddress {
+    path = :zig.SocketRuntime.recv_peer_path()
+    case String.length(path) == 0 {
+      true -> %SocketAddress{family: :unavailable}
+      false -> SocketAddress.unix_from_path(path)
+    }
+  }
+
+  @doc = """
     Returns the LOCAL (bound) `SocketAddress` of the datagram socket via
     `getsockname`. Panics on a stale handle.
 
@@ -307,7 +333,7 @@ pub struct SocketDatagram {
   @available_on(:network)
 
   pub fn local_address(datagram :: SocketDatagram) -> SocketAddress {
-    SocketAddress.from_packed(:zig.SocketRuntime.endpoint(datagram.zap_socket_handle, 0))
+    SocketAddress.of_handle(datagram.zap_socket_handle, 0)
   }
 
   @doc = """
@@ -343,7 +369,7 @@ pub struct SocketDatagram {
   @available_on(:network)
 
   pub fn peer_address(datagram :: SocketDatagram) -> SocketAddress {
-    SocketAddress.from_packed(:zig.SocketRuntime.endpoint(datagram.zap_socket_handle, 1))
+    SocketAddress.of_handle(datagram.zap_socket_handle, 1)
   }
 
   @doc = """
