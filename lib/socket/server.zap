@@ -95,6 +95,16 @@ pub struct SocketServerState {
           }
       }
 
+  Write the loop as a SINGLE self-recursive function — every "keep serving" step
+  a tail call to the loop ITSELF, exactly as above. The compiler loopifies a
+  self-tail-call into a CONSTANT-STACK loop, so one acceptor serves an UNBOUNDED
+  number of connections without growing its fiber stack. Do NOT split the turn
+  into two mutually-recursive functions (a `loop` ⇄ `accept_next` pair): a tail
+  call to a DIFFERENT function is not tail-call-optimized (the compiler rewrites
+  only a self-tail-call), so it stays an ordinary `call + ret` that grows one
+  fiber-stack frame per accept — a long-lived acceptor then OVERFLOWS its stack
+  at high connection counts (a latent denial of service).
+
   Each accepted `Socket` is handed to a FRESH handler by `Process.send_move`
   (`controlling_process` — owner-executed handoff); the handler ADOPTS it with a
   top-level `receive Socket { s -> s }` and serves it. Handlers do NOT trap: a
@@ -128,6 +138,40 @@ pub struct SocketServerState {
     `wait_for_slot` (STOP ACCEPTING) until a handler EXIT frees a slot, so served
     concurrency never exceeds the cap and bursts are absorbed by the kernel
     backlog rather than accepted-then-reset.
+
+  ## Running a reuse_port acceptor pool (Job 6)
+
+  One acceptor is a single core of accept throughput. To scale accepts across
+  cores WITHOUT a shared listener (which would need listener multi-ownership —
+  deferred), run a POOL of N acceptors, each OWNING ITS OWN listener fd bound to
+  the SAME port via `SO_REUSEPORT` (`Socket.listen(address, backlog,
+  %SocketOptions{reuse_port: true})`). Single-owner Decision B still holds — each
+  acceptor owns its own fd; nothing is shared, and no kernel change is needed.
+
+  - **Port coordination** — the FIRST acceptor binds port `0` (an ephemeral port)
+    with `reuse_port` and reports the OS-assigned port; the REST bind that SAME
+    port with `reuse_port`. A parent/pool-supervisor binds the first, learns the
+    port, and passes it to the rest.
+  - **Each acceptor runs the SAME loop** — the identical bounded-accept +
+    `spawn_link`/`send_move` handler dispatch above, on ITS OWN listener. All the
+    Jobs 2-5 behavior (bounded accept, drain, capacity) is per-acceptor.
+  - **Supervision** — the N acceptors are supervised workers; an acceptor crash
+    reclaims its listener + linked handlers' fds (the drop-list) and the pool
+    KEEPS SERVING on the surviving acceptors' listeners.
+  - **Pool drain** — a pool-wide drain closes EVERY acceptor's listener: signal
+    each acceptor and each runs its OWN Job-4 drain (close its listener, let its
+    in-flight handlers finish, force-kill stragglers).
+  - **max_connections** — a per-acceptor quota (`SocketServer.per_acceptor_cap`,
+    `max / N`); an exact GLOBAL cap is a future counter-process refinement.
+
+  ### Platform balance caveat
+
+  Linux hash-balances inbound connections across the reuse_port listeners, so the
+  pool load-balances evenly. Darwin/macOS ACCEPTS the multi-bind but does NOT
+  guarantee balanced distribution (it often favors the newest listener).
+  CORRECTNESS — every connection served, drain, crash-safety — holds on BOTH; only
+  BALANCE is Linux-grade. Code and tests must therefore assert TOTALS (every
+  connection served across the pool), never per-acceptor distribution.
   """
 
 @available_on(:network)
@@ -152,6 +196,57 @@ pub struct SocketServer {
 
   pub fn default_options() -> SocketServerOptions {
     SocketServer.options(50, 0, 5000)
+  }
+
+  @doc = """
+    The per-acceptor `max_connections` quota for a `SO_REUSEPORT` acceptor POOL
+    (Job 6) of `pool_size` acceptors sharing a global `total_max` admission
+    budget — the "each acceptor caps at `max / N`" policy. Give each acceptor's
+    `SocketServerOptions` this value (as its `max_connections`) so the pool's
+    aggregate served concurrency stays near `total_max` WITHOUT any cross-acceptor
+    coordination.
+
+    - `total_max <= 0` (unbounded) → `0` — each acceptor is unbounded;
+    - `pool_size <= 0` (degenerate) → `total_max` — treat it as a single acceptor;
+    - otherwise `total_max / pool_size` (integer floor), but never below `1` when
+      `total_max > 0`, so no acceptor is dead-capped to zero.
+
+    This is an APPROXIMATE global cap: because each acceptor sheds INDEPENDENTLY,
+    the pool's true ceiling is `per_acceptor_cap * pool_size`, which can exceed
+    `total_max` by up to `pool_size - 1` (floor rounding) — an EXACT global cap
+    needs a shared counter process and is a future refinement (out of Job 6
+    scope). On Linux the kernel hash-balances connections across the pool so the
+    per-acceptor caps bite evenly; on Darwin distribution is not guaranteed
+    balanced (the multi-bind still works and every connection is served — only
+    balance is Linux-grade), so the per-acceptor cap there is a coarse local
+    limit rather than an even split.
+
+    ## Examples
+
+        SocketServer.per_acceptor_cap(9, 3)    # => 3
+        SocketServer.per_acceptor_cap(10, 3)   # => 3   (floor)
+        SocketServer.per_acceptor_cap(2, 4)    # => 1   (never zero when max > 0)
+        SocketServer.per_acceptor_cap(0, 4)    # => 0   (unbounded)
+    """
+
+  @available_on(:network)
+
+  pub fn per_acceptor_cap(total_max :: i64, pool_size :: i64) -> i64 {
+    case total_max <= 0 {
+      true -> 0
+      false ->
+        case pool_size <= 0 {
+          true -> total_max
+          false ->
+            {
+              quota = total_max / pool_size
+              case quota <= 0 {
+                true -> 1
+                false -> quota
+              }
+            }
+        }
+    }
   }
 
   @doc = """
