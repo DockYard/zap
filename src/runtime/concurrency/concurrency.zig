@@ -187,6 +187,7 @@ pub const registry = @import("registry.zig");
 pub const blob = @import("blob.zig");
 pub const socket_table = @import("socket_table.zig");
 pub const socket_io = @import("socket_io.zig");
+pub const tls_session = @import("tls_session.zig");
 pub const envelope_pool = @import("envelope_pool.zig");
 pub const timing_wheel = @import("timing_wheel.zig");
 pub const scheduler = @import("scheduler.zig");
@@ -298,6 +299,10 @@ test {
     // Phase S0: the portable `std.Io.net` socket-syscall seam (a real
     // loopback listen/connect/close runs in its tests).
     _ = socket_io;
+    // Phase S4 Job 1: the TLS-client session box (alloc/scrub/free lifecycle;
+    // the SocketStream adapter + trust store + mapTlsInitError live in
+    // socket_io.zig, tested there).
+    _ = tls_session;
     _ = envelope_pool;
     _ = timing_wheel;
     _ = scheduler;

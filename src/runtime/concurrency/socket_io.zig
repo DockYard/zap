@@ -39,6 +39,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const net = std.Io.net;
+// TLS (Phase S4). The client record layer and the OS trust store are pure
+// `std.crypto` — no relative import, so `socket_io` stays registerable as the
+// embedded, staged struct-source module. Referencing these types does NOT
+// force `Client.init` codegen (that is instantiated only where it is CALLED —
+// the handshake trampoline, Phase S4 Job 3); Job 1 provides only the composable
+// pieces: the raw-fd `Reader`/`Writer` adapter, the lazy trust-store singleton,
+// and the `InitError` → `Reason` classifier.
+const tls = std.crypto.tls;
+const Certificate = std.crypto.Certificate;
 
 /// Opaque fd storage — the same `i64` as `socket_table.Fd`. Declared
 /// locally (not imported) so this module has NO relative import: it must
@@ -80,6 +89,20 @@ pub const Reason = enum(i32) {
     /// The supplied host name is syntactically invalid (RFC 1123) — rejected
     /// at the seam before any resolver call.
     invalid_argument = 13,
+    /// TLS server-certificate verification FAILED (Phase S4): host mismatch,
+    /// expired / not-yet-valid, an untrusted issuer, or a bad certificate
+    /// signature. A distinct, typed reason so a verification failure is NEVER
+    /// silently folded into a generic transport error — the caller can surface
+    /// "the peer's certificate is not trusted" precisely. Produced by
+    /// `mapTlsInitError` for every `Certificate*` / `TlsCertificateNotVerified`
+    /// handshake error.
+    tls_cert_invalid = 14,
+    /// The TLS handshake failed for a NON-certificate reason (Phase S4): a
+    /// fatal alert, an unexpected/mal-formed handshake message, a record-layer
+    /// decrypt failure, insufficient entropy, or the underlying transport
+    /// read/write failing mid-handshake. Everything `mapTlsInitError` does not
+    /// classify as a certificate failure maps here.
+    tls_handshake_failed = 15,
     other = 99,
 };
 
@@ -2724,6 +2747,484 @@ fn mapAcceptErrno(err: std.posix.E) Reason {
 }
 
 // ---------------------------------------------------------------------------
+// TLS foundation (Phase S4 Job 1) — the composable pieces the TLS-client
+// handshake (Job 3) and the Zap `Tls` surface (Job 4) build on. THREE parts:
+//
+//   1. `SocketStream` — a `std.Io.Reader` + `std.Io.Writer` adapter over the
+//      RAW, always-`O_NONBLOCK` fd, so `std.crypto.tls.Client.init` (which is
+//      SYNCHRONOUS and drives the handshake inline over caller-supplied
+//      Reader/Writer) can run as ONE blocking-offload job. Every fill/drain is
+//      poll-quantum bounded and re-checks a SINGLE absolute-monotonic deadline
+//      + the owning process's `kill_flag`, so a slowloris handshake times out
+//      and stays killable (§8 DoS — the HIGH-2/HIGH-3 discipline).
+//   2. `trustStore` — the lazy, process-global OS trust-store singleton
+//      (`Certificate.Bundle.rescan`), populated ONCE and shared across
+//      concurrent handshakes under an `Io.RwLock`. MANDATORY verification is a
+//      Job-3/4 policy; this just supplies the CA bundle.
+//   3. `mapTlsInitError` — classify a `Client.InitError` into a stable
+//      `Reason`: certificate failures → `tls_cert_invalid`, everything else →
+//      `tls_handshake_failed`, so a verification failure is always distinct and
+//      typed, never silently generic.
+//
+// SEAM LEGITIMACY: the raw `recv(2)`/`send(2)`/`poll(2)` here are the SAME
+// always-non-blocking syscalls the S1 `recv`/`send` already issue in this file
+// (this module IS the socket-syscall seam; the runtime OS-portability gate
+// scans only `src/runtime.zig`). The poll-less targets (Windows/wasi — not in
+// v1 run scope) degrade to the fork's blocking `netRead`/`netWrite`, the same
+// posture the rest of the seam takes.
+// ---------------------------------------------------------------------------
+
+/// The mandatory minimum buffer capacity for every TLS I/O buffer:
+/// `std.crypto.tls.Client.init` ASSERTS the input reader's buffer is at least
+/// this large (one whole ciphertext record + header, `16645` bytes), and the
+/// client's `drain`/`flush` demand the same contiguous room from the output
+/// writer. Sizing all four TLS buffers (encrypted-in, encrypted-out, and the
+/// two plaintext scratch buffers in `tls_session.zig`) to this constant keeps
+/// the record layer within its documented bounds.
+pub const tls_min_buffer_len: usize = tls.max_ciphertext_record_len;
+
+/// A `std.Io.Reader` + `std.Io.Writer` pair over ONE raw, always-`O_NONBLOCK`
+/// socket fd — the transport `std.crypto.tls.Client` reads encrypted records
+/// FROM (`inputReader`) and writes encrypted records TO (`outputWriter`). It
+/// deliberately does NOT reuse the fork's `net.Stream.Reader`/`Writer`: those
+/// call the fork's BLOCKING `netRead`/`netWrite`, which hit `EAGAIN` on the
+/// always-non-blocking fd. Instead each fill/drain runs the exact poll-quantum
+/// loop the S1 `recv`/`send` use, re-checking a single absolute deadline + the
+/// kill flag every quantum.
+///
+/// LIFETIME: the vtable callbacks recover `*SocketStream` from the embedded
+/// interface via `@fieldParentPtr`, so a `SocketStream` MUST live at a stable
+/// address for as long as the `Client` (or any reader/writer) holds a pointer
+/// into it — the `TlsSession` heap-box (`tls_session.zig`) provides that
+/// stability in production; a stack `var` provides it in a unit test.
+///
+/// DEADLINE: `deadline_ms` is ONE ABSOLUTE monotonic deadline computed at
+/// `init` from the caller's relative `timeout_ms`. Because the whole handshake
+/// shares this single deadline (rather than each fill/drain restarting a
+/// relative timer), a peer that dribbles one byte per quantum still hits the
+/// deadline — the slowloris-handshake bound (HIGH-3).
+///
+/// FAILURE STASH: on a kill/timeout/transport error the vtable returns the
+/// std `error.ReadFailed`/`error.WriteFailed` (all `Client.init` propagates),
+/// and the classified `Reason` is stashed OUT-OF-BAND in `read_reason`/
+/// `write_reason` (the connect-path last-error pattern) so the offload
+/// trampoline can recover WHY after the error unwinds.
+pub const SocketStream = struct {
+    /// The raw socket fd (always `O_NONBLOCK` for its whole life).
+    handle: Fd,
+    /// The ABSOLUTE monotonic deadline (ms) for the WHOLE session's I/O; `0`
+    /// means no deadline (the leaf still wakes each quantum to honour a kill).
+    deadline_ms: i64,
+    /// The owning process's `pending_kill` atomic (captured on-core before the
+    /// offload), observed once per poll quantum; `null` = not kill-bounded.
+    kill_flag: ?*std.atomic.Value(bool),
+    /// The encrypted-from-server reader interface handed to `Client.init` as
+    /// `input`. Its buffer MUST be `>= tls_min_buffer_len`.
+    reader_interface: std.Io.Reader,
+    /// The encrypted-to-server writer interface handed to `Client.init` as
+    /// `output`. Its buffer MUST be `>= tls_min_buffer_len`.
+    writer_interface: std.Io.Writer,
+    /// Out-of-band classification of the LAST reader failure (kill → `other`,
+    /// deadline → `timed_out`, else the mapped `recv(2)` reason).
+    read_reason: Reason = .ok,
+    /// Out-of-band classification of the LAST writer failure.
+    write_reason: Reason = .ok,
+
+    /// Build a `SocketStream` over `handle` (which must already be
+    /// `O_NONBLOCK`). `timeout_ms` is a RELATIVE budget for the whole session's
+    /// I/O (`<= 0` → no deadline), converted ONCE to an absolute monotonic
+    /// deadline so every subsequent fill/drain shares it. `read_buffer` is the
+    /// encrypted-from-server buffer (`Client.init` asserts `>= tls_min_buffer_len`)
+    /// and `write_buffer` the encrypted-to-server buffer (the client's drain
+    /// asserts the same); both are borrowed, never owned.
+    pub fn init(
+        handle: Fd,
+        timeout_ms: i64,
+        kill_flag: ?*std.atomic.Value(bool),
+        read_buffer: []u8,
+        write_buffer: []u8,
+    ) SocketStream {
+        return .{
+            .handle = handle,
+            .deadline_ms = if (timeout_ms > 0) checkedDeadline(monotonicMillis(), timeout_ms) else 0,
+            .kill_flag = kill_flag,
+            .reader_interface = .{
+                .buffer = read_buffer,
+                .vtable = &.{
+                    .stream = readerStream,
+                    .readVec = readerReadVec,
+                },
+                .seek = 0,
+                .end = 0,
+            },
+            .writer_interface = .{
+                .buffer = write_buffer,
+                .vtable = &.{
+                    .drain = writerDrain,
+                    .flush = writerFlush,
+                },
+            },
+        };
+    }
+
+    /// The encrypted-from-server `Reader` to pass as `Client.init`'s `input`.
+    pub fn inputReader(self: *SocketStream) *std.Io.Reader {
+        return &self.reader_interface;
+    }
+
+    /// The encrypted-to-server `Writer` to pass as `Client.init`'s `output`.
+    pub fn outputWriter(self: *SocketStream) *std.Io.Writer {
+        return &self.writer_interface;
+    }
+
+    /// POLL-QUANTUM-bounded, deadline+kill-checked NON-BLOCKING `recv(2)` into
+    /// `dest` (`dest.len >= 1`). Returns the bytes read (`>= 1`), `EndOfStream`
+    /// on a clean EOF (`recv() == 0`), or `ReadFailed` on kill/timeout/error —
+    /// stashing the classified `Reason` in `read_reason` first. Tolerates
+    /// `EAGAIN`/`EWOULDBLOCK`/`EINTR` by re-polling (the always-non-blocking fd
+    /// can wake spuriously readable), re-checking the absolute deadline + kill
+    /// each quantum. Poll-less targets fall back to the fork's blocking
+    /// `netRead` (timeout/kill a documented no-op there).
+    fn recvInto(self: *SocketStream, dest: []u8) std.Io.Reader.Error!usize {
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            const the_io = io();
+            const handle = fdFromBits(self.handle);
+            var iovec = [1][]u8{dest};
+            const n = the_io.vtable.netRead(the_io.userdata, handle, iovec[0..]) catch |err| {
+                self.read_reason = mapReadError(err);
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            return n;
+        }
+        const handle = fdFromBits(self.handle);
+        const has_deadline = self.deadline_ms > 0;
+        while (true) {
+            if (self.kill_flag) |flag| {
+                if (flag.load(.acquire)) {
+                    self.read_reason = .other;
+                    return error.ReadFailed;
+                }
+            }
+            var quantum: i32 = poll_quantum_ms;
+            if (has_deadline) {
+                const remaining = self.deadline_ms - monotonicMillis();
+                if (remaining <= 0) {
+                    self.read_reason = .timed_out;
+                    return error.ReadFailed;
+                }
+                if (remaining < quantum) quantum = @intCast(remaining);
+            }
+            switch (waitReadable(handle, quantum)) {
+                .timeout => continue, // re-check deadline + kill
+                .failed => {
+                    self.read_reason = .other;
+                    return error.ReadFailed;
+                },
+                .ready => {},
+            }
+            const rc = std.posix.system.recv(handle, @ptrCast(dest.ptr), dest.len, 0);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) return error.EndOfStream; // clean EOF
+                    return n;
+                },
+                // Spurious readable wake / competing reader / interrupted — NOT
+                // EOF and NOT an error: re-poll (deadline + kill re-checked at
+                // the loop top).
+                .AGAIN, .INTR => continue,
+                else => |recv_errno| {
+                    self.read_reason = mapRecvErrno(recv_errno);
+                    return error.ReadFailed;
+                },
+            }
+        }
+    }
+
+    /// `Reader.VTable.stream`: fill `w` (up to `limit`) with one bounded recv.
+    /// The record layer never calls this (it drives `input` via `peek`/`take`,
+    /// which route through `readVec`), but a fully-formed adapter honours the
+    /// whole vtable so `discard`/copy loops behave.
+    fn readerStream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *SocketStream = @alignCast(@fieldParentPtr("reader_interface", io_r));
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        const n = try self.recvInto(dest);
+        io_w.advance(n);
+        return n;
+    }
+
+    /// `Reader.VTable.readVec`: the buffer-fill path the record layer actually
+    /// uses. `peek`/`take` → `fill` → `rebase` (which guarantees room) → here
+    /// with `data[0]` EMPTY, per the vtable contract ("`data[0]` may have zero
+    /// length, in which case the implementation must write to `Reader.buffer`").
+    /// We recv straight into `buffer[end..]`, advance `end`, and return `0`.
+    /// When (only via a non-`fill` caller) the buffer has no room, we fall back
+    /// to the first caller vector so the adapter stays contract-correct.
+    fn readerReadVec(io_r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        const self: *SocketStream = @alignCast(@fieldParentPtr("reader_interface", io_r));
+        const r = &self.reader_interface;
+        const buffer_tail = r.buffer[r.end..];
+        if (buffer_tail.len != 0) {
+            const n = try self.recvInto(buffer_tail);
+            r.end += n;
+            return 0;
+        }
+        // No room in the reader buffer (never taken on the `fill` path, which
+        // rebases first): honour the caller vector instead of spinning.
+        if (data.len == 0 or data[0].len == 0) return 0;
+        return self.recvInto(data[0]);
+    }
+
+    /// `Writer.VTable.drain`: send `buffered()` first, then every slice of
+    /// `data` (the last repeated `splat` times), each fully through the
+    /// poll-quantum send loop. Returns `consume(total)` — the count consumed
+    /// from `data`, resetting the buffer. A stalled/killed send surfaces
+    /// `WriteFailed` with the reason stashed in `write_reason`.
+    fn writerDrain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *SocketStream = @alignCast(@fieldParentPtr("writer_interface", io_w));
+        var total: usize = 0;
+        const buffered = io_w.buffered();
+        if (buffered.len != 0) {
+            try self.sendAll(buffered);
+            total += buffered.len;
+        }
+        if (data.len != 0) {
+            for (data[0 .. data.len - 1]) |chunk| {
+                if (chunk.len != 0) {
+                    try self.sendAll(chunk);
+                    total += chunk.len;
+                }
+            }
+            const last = data[data.len - 1];
+            if (last.len != 0) {
+                var repeat: usize = 0;
+                while (repeat < splat) : (repeat += 1) {
+                    try self.sendAll(last);
+                    total += last.len;
+                }
+            }
+        }
+        return io_w.consume(total);
+    }
+
+    /// `Writer.VTable.flush`: push every buffered byte to the socket and reset
+    /// the buffer. THE ADAPTER HALF OF THE DOUBLE-FLUSH: `Client.flush`
+    /// ENCRYPTS plaintext into THIS writer's buffer (via `writableSliceGreedy`
+    /// + `advance`) but does NOT drain it, so the TLS send leaf (Job 3) must
+    /// call `client.writer.flush()` (encrypt) THEN `client.output.flush()`
+    /// (this — actually push the ciphertext) or the peer hangs on ciphertext
+    /// stuck in the buffer.
+    fn writerFlush(io_w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *SocketStream = @alignCast(@fieldParentPtr("writer_interface", io_w));
+        const buffered = io_w.buffered();
+        if (buffered.len != 0) {
+            try self.sendAll(buffered);
+            io_w.end = 0;
+        }
+    }
+
+    /// Send ALL of `bytes` through the poll-quantum + deadline + kill send loop
+    /// (the `send`/`sendImplPosix` discipline), or fail with `WriteFailed` and
+    /// the classified `Reason` stashed in `write_reason`. The fd is always
+    /// `O_NONBLOCK`, so each `send(2)` places only what currently fits and the
+    /// per-quantum deadline/kill checks always run (HIGH-2). Poll-less targets
+    /// use the fork's blocking `netWrite`.
+    fn sendAll(self: *SocketStream, bytes: []const u8) std.Io.Writer.Error!void {
+        if (bytes.len == 0) return;
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            const the_io = io();
+            const handle = fdFromBits(self.handle);
+            var sent: usize = 0;
+            while (sent < bytes.len) {
+                const written = writeOnce(the_io, handle, bytes[sent..]) catch |err| {
+                    self.write_reason = mapWriteError(err);
+                    return error.WriteFailed;
+                };
+                if (written == 0) {
+                    self.write_reason = .connection_reset;
+                    return error.WriteFailed;
+                }
+                sent += written;
+            }
+            return;
+        }
+        const handle = fdFromBits(self.handle);
+        const flags: u32 = std.posix.MSG.NOSIGNAL; // fd already O_NONBLOCK
+        const has_deadline = self.deadline_ms > 0;
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            if (self.kill_flag) |flag| {
+                if (flag.load(.acquire)) {
+                    self.write_reason = .other;
+                    return error.WriteFailed;
+                }
+            }
+            var quantum: i32 = poll_quantum_ms;
+            if (has_deadline) {
+                const remaining = self.deadline_ms - monotonicMillis();
+                if (remaining <= 0) {
+                    self.write_reason = .timed_out;
+                    return error.WriteFailed;
+                }
+                if (remaining < quantum) quantum = @intCast(remaining);
+            }
+            switch (waitWritable(handle, quantum)) {
+                .timeout => continue, // re-check deadline + kill
+                .failed => {
+                    self.write_reason = .other;
+                    return error.WriteFailed;
+                },
+                .ready => {},
+            }
+            const chunk = bytes[sent..];
+            const rc = std.posix.system.send(handle, @ptrCast(chunk.ptr), chunk.len, flags);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    const written: usize = @intCast(rc);
+                    if (written == 0) {
+                        self.write_reason = .connection_reset;
+                        return error.WriteFailed;
+                    }
+                    sent += written;
+                },
+                // Buffer filled between poll and send, or interrupted — re-poll.
+                .AGAIN, .INTR => {},
+                else => |send_errno| {
+                    self.write_reason = mapSendErrno(send_errno);
+                    return error.WriteFailed;
+                },
+            }
+        }
+    }
+};
+
+/// Classify a `std.crypto.tls.Client.InitError` into a stable, gate-crossing
+/// `Reason` (Phase S4). SECURITY: every CERTIFICATE-verification failure — a
+/// host mismatch, an expired / not-yet-valid certificate, an untrusted issuer,
+/// a bad certificate signature, or the umbrella `TlsCertificateNotVerified` —
+/// maps to `tls_cert_invalid`, so a verification failure is ALWAYS a distinct,
+/// typed outcome the caller can surface as "the peer is not trusted" and is
+/// NEVER silently folded into a generic transport error. Everything else — a
+/// fatal alert, an unexpected/mal-formed handshake message, a record-layer
+/// decrypt failure, insufficient entropy, or the transport read/write failing
+/// mid-handshake — is `tls_handshake_failed` (the design's "cert-* →
+/// tls_cert_invalid, else → tls_handshake_failed", exhaustive by construction).
+pub fn mapTlsInitError(err: tls.Client.InitError) Reason {
+    return switch (err) {
+        error.CertificateFieldHasInvalidLength,
+        error.CertificateHostMismatch,
+        error.CertificatePublicKeyInvalid,
+        error.CertificateExpired,
+        error.CertificateFieldHasWrongDataType,
+        error.CertificateIssuerMismatch,
+        error.CertificateNotYetValid,
+        error.CertificateSignatureAlgorithmMismatch,
+        error.CertificateSignatureAlgorithmUnsupported,
+        error.CertificateSignatureInvalid,
+        error.CertificateSignatureInvalidLength,
+        error.CertificateSignatureNamedCurveUnsupported,
+        error.CertificateSignatureUnsupportedBitCount,
+        error.TlsCertificateNotVerified,
+        error.UnsupportedCertificateVersion,
+        error.CertificateTimeInvalid,
+        error.CertificateHasUnrecognizedObjectId,
+        error.CertificateHasInvalidBitString,
+        => .tls_cert_invalid,
+        else => .tls_handshake_failed,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// The lazy, process-global OS trust-store singleton (Phase S4, LOCKED
+// decision 1). Mirrors the `io()` singleton: a `Certificate.Bundle` populated
+// ONCE from the host OS trust store (`Certificate.Bundle.rescan` — macOS
+// Security framework / Linux `/etc/ssl` / Windows / BSD) on first use, then
+// SHARED read-only across every concurrent handshake under an `Io.RwLock`
+// (which `Client.init`'s `Options.ca.bundle.lock` takes while it walks the
+// chain). Population runs blocking file/keychain I/O, so it happens on the
+// handshake job (Job 3), never on-core.
+// ---------------------------------------------------------------------------
+
+/// Guards the ONE-TIME population of `trust_bundle` (the same spinlock posture
+/// as `io_mutex` — populated once, then only read).
+var trust_init_mutex: std.atomic.Mutex = .unlocked;
+
+/// The OS trust store, populated once by `trustStore`. `.empty` until then.
+var trust_bundle: Certificate.Bundle = .empty;
+
+/// Whether `trust_bundle` has been populated (success OR failure — a failed
+/// rescan is NOT retried, so a broken trust store fails fast and identically
+/// every time rather than re-scanning the filesystem on every connect).
+var trust_ready: bool = false;
+
+/// The outcome of the one-time rescan: `.ok` on success, else the failure
+/// (`out_of_memory` / `other`) every subsequent caller also observes.
+var trust_reason: Reason = .ok;
+
+/// The reader/writer lock `Client.init` takes over `trust_bundle` while it
+/// verifies a chain. Concurrent handshakes hold it as READERS; it exists so a
+/// future trust-store refresh could take it as a writer without racing an
+/// in-flight verification. Shared (one lock for the one shared bundle).
+var trust_rwlock: std.Io.RwLock = .init;
+
+/// The populated trust store plus everything `Client.init`'s
+/// `Options.ca.bundle` needs (`gpa`, `io`, `lock`, `bundle`) — handed back so
+/// the handshake (Job 3) wires it straight into the client options.
+pub const TrustBundle = struct {
+    bundle: *Certificate.Bundle,
+    lock: *std.Io.RwLock,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+};
+
+/// The result of `trustStore`: the shared CA bundle, or the rescan `Reason`.
+pub const TrustOutcome = union(enum) {
+    ready: TrustBundle,
+    failed: Reason,
+};
+
+/// The lazily-initialized OS trust-store singleton. On the FIRST call it scans
+/// the host OS standard trust-store locations (`Certificate.Bundle.rescan`,
+/// blocking file/keychain I/O — safe on the handshake job, never on-core) and
+/// caches the result; every later call returns the cached bundle with NO
+/// rescan. Mutex-guarded population (one-time), then shared read-only across
+/// concurrent handshakes under `trust_rwlock`. A rescan failure is cached and
+/// returned identically thereafter (fail-fast, never a per-connect re-scan).
+pub fn trustStore() TrustOutcome {
+    const the_io = io();
+    while (!trust_init_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer trust_init_mutex.unlock();
+    if (!trust_ready) {
+        const now = std.Io.Clock.now(.real, the_io);
+        if (Certificate.Bundle.rescan(&trust_bundle, std.heap.page_allocator, the_io, now)) |_| {
+            trust_reason = .ok;
+        } else |rescan_error| {
+            trust_reason = mapRescanError(rescan_error);
+        }
+        trust_ready = true;
+    }
+    if (trust_reason != .ok) return .{ .failed = trust_reason };
+    return .{ .ready = .{
+        .bundle = &trust_bundle,
+        .lock = &trust_rwlock,
+        .gpa = std.heap.page_allocator,
+        .io = the_io,
+    } };
+}
+
+/// Map a `Certificate.Bundle.rescan` failure to a stable `Reason`. Allocation
+/// failure is `out_of_memory`; every filesystem/parse/OS failure degrades to
+/// `other` (the trust store could not be read — a handshake then cannot verify
+/// and fails closed).
+fn mapRescanError(err: Certificate.Bundle.RescanError) Reason {
+    return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        else => .other,
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Tests — a real loopback connect/close on the host (macOS/Linux CI).
 // ---------------------------------------------------------------------------
 
@@ -2774,6 +3275,12 @@ test "socket_io: Reason integer values are the pinned ABI contract mirrored by l
     try testing.expectEqual(@as(i32, 11), @intFromEnum(Reason.out_of_memory));
     try testing.expectEqual(@as(i32, 12), @intFromEnum(Reason.unknown_host));
     try testing.expectEqual(@as(i32, 13), @intFromEnum(Reason.invalid_argument));
+    // Phase S4 (TLS): APPEND-ONLY additions — pinned so a renumber breaks the
+    // build here and forces `lib/socket/error.zap`'s `reason_from_code` to move
+    // in lockstep (the atoms `:tls_cert_invalid` / `:tls_handshake_failed` land
+    // with the Zap surface in Job 4).
+    try testing.expectEqual(@as(i32, 14), @intFromEnum(Reason.tls_cert_invalid));
+    try testing.expectEqual(@as(i32, 15), @intFromEnum(Reason.tls_handshake_failed));
     try testing.expectEqual(@as(i32, 99), @intFromEnum(Reason.other));
 }
 
@@ -4224,4 +4731,235 @@ fn uniqueUnixPath(buffer: []u8, tag: []const u8) ![:0]const u8 {
     const written = try std.fmt.bufPrint(buffer, "/tmp/zap-{s}-{d}-{d}.sock", .{ tag, monotonicMillis(), n });
     buffer[written.len] = 0; // NUL-terminate for the raw `unlink`
     return buffer[0..written.len :0];
+}
+
+// ---------------------------------------------------------------------------
+// TLS foundation tests (Phase S4 Job 1) — HERMETIC (no network). The transport
+// is an in-process `socketpair(2)`: one end drives the `SocketStream` adapter,
+// the peer end is driven with raw `send`/`recv` so a full round-trip, a kill
+// mid-read, a deadline expiry, and the flush half of the double-flush are all
+// proven WITHOUT a live server or the record layer.
+// ---------------------------------------------------------------------------
+
+/// A connected, bidirectional, NON-BLOCKING `socketpair(2)` (AF_UNIX / STREAM):
+/// `fds[0]` for the adapter under test, `fds[1]` the peer. Both ends are set
+/// `O_NONBLOCK` to match the always-non-blocking discipline the adapter assumes.
+fn testSocketpairNonblocking() !struct { a: Fd, b: Fd } {
+    var fds: [2]std.posix.fd_t = undefined;
+    const rc = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    if (std.posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    if (!setNonBlocking(fds[0]) or !setNonBlocking(fds[1])) {
+        _ = std.posix.system.close(fds[0]);
+        _ = std.posix.system.close(fds[1]);
+        return error.SkipZigTest;
+    }
+    return .{ .a = fdToBits(fds[0]), .b = fdToBits(fds[1]) };
+}
+
+test "socket_io/tls: SocketStream reader fills from the raw fd and writer drains to it (round-trip)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+    const pair = try testSocketpairNonblocking();
+    defer closeFd(pair.a);
+    defer closeFd(pair.b);
+
+    var read_buffer: [tls_min_buffer_len]u8 = undefined;
+    var write_buffer: [tls_min_buffer_len]u8 = undefined;
+    var stream = SocketStream.init(pair.a, 5000, null, &read_buffer, &write_buffer);
+
+    // Peer writes bytes → the adapter's reader must surface them via `peek`/`take`.
+    const payload = "the quick brown fox\x00\xff\x01jumps";
+    const peer_handle = fdFromBits(pair.b);
+    const sent = std.posix.system.send(peer_handle, payload.ptr, payload.len, 0);
+    try testing.expectEqual(@as(usize, payload.len), @as(usize, @intCast(sent)));
+
+    const got = try stream.inputReader().take(payload.len);
+    try testing.expectEqualStrings(payload, got);
+
+    // The adapter's writer must deliver buffered bytes to the peer on flush.
+    const reply = "adapter-writer-round-trip";
+    var w = stream.outputWriter();
+    try w.writeAll(reply);
+    try w.flush();
+
+    var recv_buffer: [64]u8 = undefined;
+    // The peer is non-blocking; poll until the bytes arrive (bounded).
+    var received: usize = 0;
+    var spins: usize = 0;
+    while (received < reply.len and spins < 1000) : (spins += 1) {
+        const rc = std.posix.system.recv(peer_handle, recv_buffer[received..].ptr, recv_buffer.len - received, 0);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => received += @intCast(rc),
+            .AGAIN, .INTR => {
+                var ts: std.c.timespec = .{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
+                _ = std.c.nanosleep(&ts, null);
+            },
+            else => return error.TestUnexpectedRecvError,
+        }
+    }
+    try testing.expectEqualStrings(reply, recv_buffer[0..received]);
+}
+
+test "socket_io/tls: SocketStream reader deadline expiry returns ReadFailed with a typed timed_out reason (slowloris-handshake bound)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+    const pair = try testSocketpairNonblocking();
+    defer closeFd(pair.a);
+    defer closeFd(pair.b);
+
+    var read_buffer: [tls_min_buffer_len]u8 = undefined;
+    var write_buffer: [tls_min_buffer_len]u8 = undefined;
+    // A short (100 ms) absolute deadline; the peer never writes, so the reader
+    // must hit the deadline and fail — proving a slowloris handshake is bounded.
+    var stream = SocketStream.init(pair.a, 100, null, &read_buffer, &write_buffer);
+
+    const before = monotonicMillis();
+    try testing.expectError(error.ReadFailed, stream.inputReader().takeByte());
+    const elapsed = monotonicMillis() - before;
+
+    // The failure is a DEADLINE, classified out-of-band as `timed_out`.
+    try testing.expectEqual(Reason.timed_out, stream.read_reason);
+    // And it fired near the deadline, never blocking indefinitely.
+    try testing.expect(elapsed >= 90);
+    try testing.expect(elapsed < 5000);
+}
+
+test "socket_io/tls: a kill mid-read makes the SocketStream reader fail promptly with the kill reason stashed" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+    const pair = try testSocketpairNonblocking();
+    defer closeFd(pair.a);
+    defer closeFd(pair.b);
+
+    var read_buffer: [tls_min_buffer_len]u8 = undefined;
+    var write_buffer: [tls_min_buffer_len]u8 = undefined;
+    // No deadline (0): only a kill can end the wait — proving kill-responsiveness.
+    var kill_flag = std.atomic.Value(bool).init(false);
+    var stream = SocketStream.init(pair.a, 0, &kill_flag, &read_buffer, &write_buffer);
+
+    // A background thread flips the kill shortly after the read parks (the peer
+    // never writes, so the reader is blocked polling).
+    const Killer = struct {
+        flag: *std.atomic.Value(bool),
+        fn run(self: @This()) void {
+            var ts: std.c.timespec = .{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            self.flag.store(true, .release);
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Killer.run, .{Killer{ .flag = &kill_flag }});
+    defer thread.join();
+
+    try testing.expectError(error.ReadFailed, stream.inputReader().takeByte());
+    // A kill classifies out-of-band as `other` (the connect/recv kill posture).
+    try testing.expectEqual(Reason.other, stream.read_reason);
+}
+
+test "socket_io/tls: SocketStream writer flush is the adapter half of the double-flush — buffered ciphertext reaches the peer" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+    const pair = try testSocketpairNonblocking();
+    defer closeFd(pair.a);
+    defer closeFd(pair.b);
+
+    var read_buffer: [tls_min_buffer_len]u8 = undefined;
+    var write_buffer: [tls_min_buffer_len]u8 = undefined;
+    var stream = SocketStream.init(pair.a, 5000, null, &read_buffer, &write_buffer);
+    var w = stream.outputWriter();
+
+    // Simulate `Client.flush` staging ciphertext into the output buffer WITHOUT
+    // draining it (the gotcha): write into the buffer via the greedy-slice +
+    // advance path the client uses, and confirm the peer sees NOTHING yet.
+    const record = "encrypted-record-bytes";
+    const slice = try w.writableSliceGreedy(record.len);
+    @memcpy(slice[0..record.len], record);
+    w.advance(record.len);
+
+    var probe: [64]u8 = undefined;
+    const peer_handle = fdFromBits(pair.b);
+    const early = std.posix.system.recv(peer_handle, &probe, probe.len, 0);
+    try testing.expectEqual(std.posix.E.AGAIN, std.posix.errno(early)); // nothing drained yet
+
+    // The adapter's flush is the second half of the double-flush: it PUSHES the
+    // staged ciphertext to the socket.
+    try w.flush();
+    try testing.expectEqual(@as(usize, 0), w.end); // buffer reset
+
+    var received: usize = 0;
+    var spins: usize = 0;
+    while (received < record.len and spins < 1000) : (spins += 1) {
+        const rc = std.posix.system.recv(peer_handle, probe[received..].ptr, probe.len - received, 0);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => received += @intCast(rc),
+            .AGAIN, .INTR => {
+                var ts: std.c.timespec = .{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
+                _ = std.c.nanosleep(&ts, null);
+            },
+            else => return error.TestUnexpectedRecvError,
+        }
+    }
+    try testing.expectEqualStrings(record, probe[0..received]);
+}
+
+test "socket_io/tls: mapTlsInitError maps every certificate failure to tls_cert_invalid and every other handshake failure to tls_handshake_failed" {
+    // CERTIFICATE-verification failures — the security-critical class — MUST be
+    // distinct and typed so a bad-cert connect is never a generic error.
+    const cert_errors = [_]tls.Client.InitError{
+        error.CertificateFieldHasInvalidLength,
+        error.CertificateHostMismatch,
+        error.CertificatePublicKeyInvalid,
+        error.CertificateExpired,
+        error.CertificateFieldHasWrongDataType,
+        error.CertificateIssuerMismatch,
+        error.CertificateNotYetValid,
+        error.CertificateSignatureAlgorithmMismatch,
+        error.CertificateSignatureAlgorithmUnsupported,
+        error.CertificateSignatureInvalid,
+        error.CertificateSignatureInvalidLength,
+        error.CertificateSignatureNamedCurveUnsupported,
+        error.CertificateSignatureUnsupportedBitCount,
+        error.TlsCertificateNotVerified,
+        error.UnsupportedCertificateVersion,
+        error.CertificateTimeInvalid,
+        error.CertificateHasUnrecognizedObjectId,
+        error.CertificateHasInvalidBitString,
+    };
+    for (cert_errors) |err| {
+        try testing.expectEqual(Reason.tls_cert_invalid, mapTlsInitError(err));
+    }
+
+    // Every NON-certificate handshake failure → tls_handshake_failed.
+    const handshake_errors = [_]tls.Client.InitError{
+        error.InsufficientEntropy,
+        error.TlsAlert,
+        error.TlsUnexpectedMessage,
+        error.TlsIllegalParameter,
+        error.TlsDecryptFailure,
+        error.TlsRecordOverflow,
+        error.TlsBadRecordMac,
+        error.TlsConnectionTruncated,
+        error.TlsDecodeError,
+        error.TlsBadSignatureScheme,
+        error.SignatureVerificationFailed,
+        error.WriteFailed,
+        error.ReadFailed,
+    };
+    for (handshake_errors) |err| {
+        try testing.expectEqual(Reason.tls_handshake_failed, mapTlsInitError(err));
+    }
+}
+
+test "socket_io/tls: the lazy OS trust store rescans a NON-EMPTY certificate bundle on this host" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest; // wasi has no OS trust store
+    switch (trustStore()) {
+        .ready => |trust| {
+            // The host OS trust store must yield real CA certificates (macOS
+            // Security framework / Linux `/etc/ssl` / …) — a non-empty bundle
+            // is the "157 macOS certs" path, the precondition for verification.
+            try testing.expect(trust.bundle.bytes.items.len > 0);
+            try testing.expect(trust.bundle.map.count() > 0);
+        },
+        .failed => |reason| {
+            // A host with no trust store at all (unusual in CI) is not a Job-1
+            // failure, but any OTHER failure reason is a real problem.
+            try testing.expect(reason == .other);
+            return error.SkipZigTest;
+        },
+    }
 }
