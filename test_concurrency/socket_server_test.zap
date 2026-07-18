@@ -68,50 +68,82 @@ pub struct TestConcurrency.SocketServerTest {
 
   # The acceptor: bind a listener on an ephemeral port, report the port to the
   # test coordinator by name, TRAP EXITS via `SocketServer.init`, and run the
-  # accept loop. It OWNS the listener for its whole life.
+  # accept loop. It OWNS the listener for its whole life. The echo/crash tests
+  # use the default policy (50 ms poll, NO connection cap, 5 s drain grace).
   pub fn acceptor_entry() -> Nil {
+    TestConcurrency.SocketServerTest.acceptor_boot(SocketServer.options(50, 0, 5000))
+  }
+
+  # The DRAIN acceptor (Job 4): the same loop, but a SHORT 1200 ms drain grace so
+  # the graceful-drain test can measure a stalling handler being force-killed at
+  # the deadline without waiting five seconds. No connection cap.
+  pub fn drain_acceptor_entry() -> Nil {
+    TestConcurrency.SocketServerTest.acceptor_boot(SocketServer.options(50, 0, 1200))
+  }
+
+  # The CAPACITY acceptor (Job 5): a per-acceptor `max_connections` cap of 2, so
+  # the load-shedding test can prove the acceptor STOPS ACCEPTING at the cap and
+  # resumes when a slot frees. Default 5 s drain grace.
+  pub fn capacity_acceptor_entry() -> Nil {
+    TestConcurrency.SocketServerTest.acceptor_boot(SocketServer.options(50, 2, 5000))
+  }
+
+  # Shared acceptor boot: bind an ephemeral loopback listener, report the port to
+  # the coordinator, TRAP EXITS via `SocketServer.init(options)`, and run the
+  # shared accept loop under the given policy. The ONLY thing that differs
+  # between the echo, drain, and capacity acceptors is their `SocketServerOptions`.
+  fn acceptor_boot(options :: SocketServerOptions) -> Nil {
     case Socket.listen(SocketAddress.loopback(0), 128) {
       Result.Error(_e) -> nil
       Result.Ok(listener) ->
         {
           port = SocketListener.local_port(listener)
           _reported = Process.send(:socket_echo_coordinator, port)
-          state = SocketServer.init(SocketServer.options(50, 0, 5000))
+          state = SocketServer.init(options)
           TestConcurrency.SocketServerTest.acceptor_loop(state, listener)
         }
     }
   }
 
-  # One turn: reap dead handlers / observe shutdown, then either drain (close the
-  # listener and exit) or accept the next connection.
+  # One turn: reap dead handlers / observe shutdown, then either DRAIN (Job 4) or
+  # accept the next connection (subject to the Job 5 capacity gate).
   fn acceptor_loop(state :: SocketServerState, listener :: SocketListener) -> Nil {
     reaped = SocketServer.reap_signals(state)
     case SocketServer.draining?(reaped) {
       true ->
         {
-          # Minimal graceful teardown (the full drain — in-flight grace +
-          # straggler kill — is Job 4): stop accepting and exit. Any live handler
-          # is `spawn_link`ed to us, so it dies with us and its fd is reclaimed.
+          # Graceful drain (Job 4): close the listener IMMEDIATELY so new connects
+          # get ECONNREFUSED, then give the in-flight handlers up to
+          # `shutdown_timeout_ms` to finish (`SocketServer.drain`) and force-kill
+          # any stragglers so every connection fd is reclaimed before we exit.
           _closed = SocketListener.close(listener)
-          Process.exit_with(:shutdown)
+          _drained = SocketServer.drain(reaped)
+          Process.exit_with(:normal)
         }
       false -> TestConcurrency.SocketServerTest.acceptor_accept(reaped, listener)
     }
   }
 
   fn acceptor_accept(state :: SocketServerState, listener :: SocketListener) -> Nil {
-    case Socket.accept(listener, state.options.accept_poll_ms) {
-      # A connection arrived: hand it to a fresh, `spawn_link`ed handler by MOVE
-      # (controlling_process). `conn` is CONSUMED by `send_move`.
-      Result.Ok(conn) ->
-        {
-          handler = Process.spawn_link(&TestConcurrency.SocketServerTest.handler_entry/0)
-          _moved = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
-          TestConcurrency.SocketServerTest.acceptor_loop(SocketServer.admitted(state, handler), listener)
+    # Capacity gate (Job 5): at the `max_connections` cap, STOP ACCEPTING — park
+    # (kill/drain-responsive) until a handler EXIT frees a slot, then re-loop. The
+    # kernel backlog absorbs the wait; nothing is accepted-then-reset.
+    case SocketServer.at_capacity?(state) {
+      true -> TestConcurrency.SocketServerTest.acceptor_loop(SocketServer.wait_for_slot(state), listener)
+      false ->
+        case Socket.accept(listener, state.options.accept_poll_ms) {
+          # A connection arrived: hand it to a fresh, `spawn_link`ed handler by
+          # MOVE (controlling_process). `conn` is CONSUMED by `send_move`.
+          Result.Ok(conn) ->
+            {
+              handler = Process.spawn_link(&TestConcurrency.SocketServerTest.handler_entry/0)
+              _moved = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
+              TestConcurrency.SocketServerTest.acceptor_loop(SocketServer.admitted(state, handler), listener)
+            }
+          # `:etimedout` on a quiet poll (the common case) — just loop, re-reaping
+          # and re-checking for shutdown. Any real accept error is transient here.
+          Result.Error(_e) -> TestConcurrency.SocketServerTest.acceptor_loop(state, listener)
         }
-      # `:etimedout` on a quiet poll (the common case) — just loop, re-reaping and
-      # re-checking for shutdown. Any real accept error is likewise transient here.
-      Result.Error(_e) -> TestConcurrency.SocketServerTest.acceptor_loop(state, listener)
     }
   }
 
@@ -247,6 +279,213 @@ pub struct TestConcurrency.SocketServerTest {
     }
   }
 
+  # ---- drain clients (Job 4) -----------------------------------------------
+
+  # The FINISHER: an in-flight connection that must be allowed to COMPLETE during
+  # a drain. It connects, echoes once (proving its handler is live), reports
+  # ready, then PARKS for a `go` message the test sends AFTER it triggers the
+  # drain — and only THEN does a SECOND echo + graceful half-close. That second
+  # echo succeeding proves the draining acceptor keeps serving live connections
+  # (it does NOT cut them off); the clean close lets its handler exit `:normal`
+  # and be REAPED by the drain grace (never force-killed).
+  pub fn finisher_client_entry() -> Nil {
+    port = receive i64 {
+      p -> p
+    }
+    _result = TestConcurrency.SocketServerTest.finisher_client_run(port)
+    nil
+  }
+
+  fn finisher_client_run(port :: i64) -> Atom {
+    payload = "fin-" <> Integer.to_string(Process.self())
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) ->
+        {
+          _r = Process.send(:socket_echo_coordinator, (0 :: i64))
+          :connect_failed
+        }
+      Result.Ok(client) -> TestConcurrency.SocketServerTest.finisher_exchange(client, payload)
+    }
+  }
+
+  fn finisher_exchange(client :: Socket, payload :: String) -> Atom {
+    _sent1 = Socket.send(client, payload)
+    ready = TestConcurrency.SocketServerTest.echo_verdict(client, payload)
+    _ready_reported = Process.send(:socket_echo_coordinator, ready)
+    # Wait for the test's `go` — sent AFTER the drain is triggered.
+    _go = receive i64 {
+      g -> g
+    }
+    # The during-drain second exchange: still served because the acceptor lets
+    # live handlers finish.
+    _sent2 = Socket.send(client, payload)
+    final = TestConcurrency.SocketServerTest.echo_verdict(client, payload)
+    # Graceful half-close so the handler sees EOF and exits cleanly (reaped, not
+    # force-killed).
+    _shut = Socket.shutdown(client, :write)
+    _drain = Socket.recv(client, 0, 5000)
+    _closed = Socket.close(client)
+    _final_reported = Process.send(:socket_echo_coordinator, final)
+    :done
+  }
+
+  # The STRAGGLER: a connection whose handler NEVER finishes within the drain
+  # grace. It connects, echoes once (proving its handler is live), reports ready,
+  # then HOLDS — never sends again, never half-closes — so its handler parks in
+  # `recv` past the drain deadline and must be FORCE-KILLED. When the drain kills
+  # the handler, the reset/FIN wakes this parked `recv`; the client then closes,
+  # so its fd is reclaimed too (leak-exact). Reports NO final verdict — its
+  # teardown is observed through `Socket.live_count`.
+  pub fn straggler_client_entry() -> Nil {
+    port = receive i64 {
+      p -> p
+    }
+    _result = TestConcurrency.SocketServerTest.straggler_client_run(port)
+    nil
+  }
+
+  fn straggler_client_run(port :: i64) -> Atom {
+    payload = "str-" <> Integer.to_string(Process.self())
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) ->
+        {
+          _r = Process.send(:socket_echo_coordinator, (0 :: i64))
+          :connect_failed
+        }
+      Result.Ok(client) -> TestConcurrency.SocketServerTest.straggler_hold(client, payload)
+    }
+  }
+
+  fn straggler_hold(client :: Socket, payload :: String) -> Atom {
+    _sent = Socket.send(client, payload)
+    ready = TestConcurrency.SocketServerTest.echo_verdict(client, payload)
+    _ready_reported = Process.send(:socket_echo_coordinator, ready)
+    # HOLD: park reading until the drain force-kills the handler (which resets or
+    # FINs the connection), then close.
+    _drain = Socket.recv(client, 0, 10000)
+    _closed = Socket.close(client)
+    :done
+  }
+
+  # ---- capacity clients (Job 5) --------------------------------------------
+
+  # A HELD client: connect, echo once (proving it was served), report ready, then
+  # HOLD the connection open until the test sends a release message — occupying a
+  # `max_connections` slot for as long as the test needs. On release it does a
+  # graceful half-close (freeing its slot) and reports a final verdict.
+  pub fn held_client_entry() -> Nil {
+    port = receive i64 {
+      p -> p
+    }
+    _result = TestConcurrency.SocketServerTest.held_client_run(port)
+    nil
+  }
+
+  fn held_client_run(port :: i64) -> Atom {
+    payload = "held-" <> Integer.to_string(Process.self())
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) ->
+        {
+          _r = Process.send(:socket_echo_coordinator, (0 :: i64))
+          :connect_failed
+        }
+      Result.Ok(client) -> TestConcurrency.SocketServerTest.held_serve(client, payload)
+    }
+  }
+
+  fn held_serve(client :: Socket, payload :: String) -> Atom {
+    _sent = Socket.send(client, payload)
+    ready = TestConcurrency.SocketServerTest.echo_verdict(client, payload)
+    _ready_reported = Process.send(:socket_echo_coordinator, ready)
+    # HOLD open (occupying a slot) until the test releases us.
+    _release = receive i64 {
+      r -> r
+    }
+    _shut = Socket.shutdown(client, :write)
+    _drain = Socket.recv(client, 0, 5000)
+    _closed = Socket.close(client)
+    _final_reported = Process.send(:socket_echo_coordinator, (1 :: i64))
+    :done
+  }
+
+  # The EXTRA client: the `(cap + 1)`th connection, offered while the server is at
+  # capacity. The kernel backlog completes its TCP handshake, but the acceptor
+  # STOPS ACCEPTING at the cap, so no handler serves it — its first `recv` MUST
+  # time out (queued, not served). It reports that (phase A), then RETRIES until a
+  # slot frees and its buffered payload is finally echoed (phase B), reporting
+  # `served`.
+  pub fn extra_client_entry() -> Nil {
+    port = receive i64 {
+      p -> p
+    }
+    _result = TestConcurrency.SocketServerTest.extra_client_run(port)
+    nil
+  }
+
+  fn extra_client_run(port :: i64) -> Atom {
+    payload = "extra-" <> Integer.to_string(Process.self())
+    case Socket.connect(SocketAddress.loopback(port), 5000) {
+      Result.Error(_e) ->
+        {
+          _r1 = Process.send(:socket_echo_coordinator, (0 :: i64))
+          _r2 = Process.send(:socket_echo_coordinator, (0 :: i64))
+          :connect_failed
+        }
+      Result.Ok(client) -> TestConcurrency.SocketServerTest.extra_probe(client, payload)
+    }
+  }
+
+  fn extra_probe(client :: Socket, payload :: String) -> Atom {
+    _sent = Socket.send(client, payload)
+    # Phase A: at capacity nobody serves us — the first recv MUST time out.
+    unserved = case Socket.recv(client, 0, 700) {
+      SocketRecv.TimedOut(_p) -> (1 :: i64)
+      SocketRecv.Chunk(_b) -> (0 :: i64)
+      SocketRecv.Closed -> (0 :: i64)
+      SocketRecv.Failed(_e) -> (0 :: i64)
+    }
+    _unserved_reported = Process.send(:socket_echo_coordinator, unserved)
+    # Phase B: once a slot frees, the acceptor accepts us and the handler echoes
+    # our buffered payload — retry until served (or a generous deadline).
+    served = TestConcurrency.SocketServerTest.extra_retry(client, payload, Process.monotonic_millis() + 5000)
+    _served_reported = Process.send(:socket_echo_coordinator, served)
+    _shut = Socket.shutdown(client, :write)
+    _drain = Socket.recv(client, 0, 5000)
+    _closed = Socket.close(client)
+    :done
+  }
+
+  fn extra_retry(client :: Socket, payload :: String, deadline_ms :: i64) -> i64 {
+    case Process.monotonic_millis() >= deadline_ms {
+      true -> (0 :: i64)
+      false ->
+        case Socket.recv(client, 0, 300) {
+          SocketRecv.Chunk(bytes) ->
+            case bytes == payload {
+              true -> (1 :: i64)
+              false -> (0 :: i64)
+            }
+          SocketRecv.TimedOut(_p) -> TestConcurrency.SocketServerTest.extra_retry(client, payload, deadline_ms)
+          SocketRecv.Closed -> (0 :: i64)
+          SocketRecv.Failed(_e) -> (0 :: i64)
+        }
+    }
+  }
+
+  # Shared: read one echo and return `1` iff it matches `payload`, else `0`.
+  fn echo_verdict(client :: Socket, payload :: String) -> i64 {
+    case Socket.recv(client, String.length(payload), 5000) {
+      SocketRecv.Chunk(bytes) ->
+        case bytes == payload {
+          true -> (1 :: i64)
+          false -> (0 :: i64)
+        }
+      SocketRecv.TimedOut(_p) -> (0 :: i64)
+      SocketRecv.Closed -> (0 :: i64)
+      SocketRecv.Failed(_e) -> (0 :: i64)
+    }
+  }
+
   # ---- coordinator helpers -------------------------------------------------
 
   # Spawn `count` normal clients and hand each the port. They connect
@@ -260,6 +499,33 @@ pub struct TestConcurrency.SocketServerTest {
           _sent = Process.send((Pid.of(client) :: Pid(i64)), port)
           TestConcurrency.SocketServerTest.spawn_normals(remaining - 1, port)
         }
+    }
+  }
+
+  # Spawn `count` HELD clients, hand each the port, and return their pids so the
+  # test can RELEASE them one at a time to free `max_connections` slots.
+  fn spawn_held(remaining :: i64, port :: i64, collected :: List(u64)) -> List(u64) {
+    case remaining <= 0 {
+      true -> collected
+      false ->
+        {
+          held = Process.spawn(&TestConcurrency.SocketServerTest.held_client_entry/0)
+          _sent = Process.send((Pid.of(held) :: Pid(i64)), port)
+          TestConcurrency.SocketServerTest.spawn_held(remaining - 1, port, List.push(collected, held))
+        }
+    }
+  }
+
+  # Release the held clients `pids[index, total)` (each frees its slot with a
+  # graceful half-close).
+  fn release_rest(pids :: List(u64), index :: i64, total :: i64) -> Nil {
+    case index < total {
+      true ->
+        {
+          _r = Process.send((Pid.of(List.at(pids, index)) :: Pid(i64)), (1 :: i64))
+          TestConcurrency.SocketServerTest.release_rest(pids, index + 1, total)
+        }
+      false -> nil
     }
   }
 
@@ -362,6 +628,118 @@ pub struct TestConcurrency.SocketServerTest {
 
       _mon = Process.monitor(server_sup)
       _shutdown = Process.exit_signal(server_sup, :shutdown)
+      _down = Process.await_signal()
+      assert(TestConcurrency.SocketServerTest.await_live_count(base, Process.monotonic_millis() + 5000))
+      assert(Socket.live_count() == base)
+      _unreg = Process.unregister(:socket_echo_coordinator)
+    }
+  }
+
+  describe("Graceful drain (Phase S3, Job 4)") {
+    test("a drain closes the listener (new connects refused), lets an in-flight connection finish, and force-kills a stalling handler after the grace; leak-exact") {
+      _named = Process.register(:socket_echo_coordinator)
+      base = Socket.live_count()
+      grace = 1200
+      acceptor = Process.spawn(&TestConcurrency.SocketServerTest.drain_acceptor_entry/0)
+      _mon = Process.monitor(acceptor)
+      port = receive i64 {
+        p -> p
+      }
+      assert(TestConcurrency.SocketServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
+
+      # One FINISHER (must complete DURING the drain) + one STRAGGLER (parks; must
+      # be force-killed at the grace deadline). Both connect, echo once, report
+      # ready, then hold.
+      finisher = Process.spawn(&TestConcurrency.SocketServerTest.finisher_client_entry/0)
+      _fp = Process.send((Pid.of(finisher) :: Pid(i64)), port)
+      straggler = Process.spawn(&TestConcurrency.SocketServerTest.straggler_client_entry/0)
+      _sp = Process.send((Pid.of(straggler) :: Pid(i64)), port)
+      ready = TestConcurrency.SocketServerTest.collect_verdicts(2, 0)
+      assert(ready == 2)
+      # Steady state: listener + 2 handlers + 2 clients.
+      assert(TestConcurrency.SocketServerTest.await_live_count(base + 5, Process.monotonic_millis() + 5000))
+
+      # Trigger the drain (a `:shutdown` from this NON-child process) and time it.
+      started = Process.monotonic_millis()
+      _shutdown = Process.exit_signal(acceptor, :shutdown)
+      # Release the finisher: its during-drain second echo must STILL succeed,
+      # proving the draining acceptor keeps serving live connections.
+      _go = Process.send((Pid.of(finisher) :: Pid(i64)), (1 :: i64))
+      finisher_done = TestConcurrency.SocketServerTest.collect_verdicts(1, 0)
+      assert(finisher_done == 1)
+
+      # The straggler's handler never finishes → force-killed at the grace. Wait
+      # for the acceptor to finish draining and exit, then confirm every fd
+      # (listener + both handlers + both clients) is reclaimed EXACTLY ONCE.
+      _down = Process.await_signal()
+      assert(TestConcurrency.SocketServerTest.await_live_count(base, Process.monotonic_millis() + 5000))
+      elapsed = Process.monotonic_millis() - started
+      # The straggler is killed no earlier than the grace after the drain began.
+      assert(elapsed >= grace)
+      assert(elapsed < grace + 3000)
+      assert(Socket.live_count() == base)
+
+      # The listener was closed on drain: a fresh connect to the port is REFUSED.
+      refused = case Socket.connect(SocketAddress.loopback(port), 500) {
+        Result.Error(_e) -> (1 :: i64)
+        Result.Ok(late) ->
+          {
+            _c = Socket.close(late)
+            (0 :: i64)
+          }
+      }
+      assert(refused == 1)
+      _unreg = Process.unregister(:socket_echo_coordinator)
+    }
+  }
+
+  describe("max_connections load-shedding (Phase S3, Job 5)") {
+    test("at capacity the acceptor STOPS ACCEPTING (a new connection is queued-not-served), a freed slot IS served, and served concurrency never exceeds the cap; leak-exact") {
+      _named = Process.register(:socket_echo_coordinator)
+      base = Socket.live_count()
+      cap = 2
+      acceptor = Process.spawn(&TestConcurrency.SocketServerTest.capacity_acceptor_entry/0)
+      _mon = Process.monitor(acceptor)
+      port = receive i64 {
+        p -> p
+      }
+      assert(TestConcurrency.SocketServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
+
+      # Fill the cap: `cap` HELD connections, each echoes once then holds open.
+      held = TestConcurrency.SocketServerTest.spawn_held(cap, port, (List.new_empty(cap) :: List(u64)))
+      ready = TestConcurrency.SocketServerTest.collect_verdicts(cap, 0)
+      assert(ready == cap)
+      # Steady state AT capacity: listener + cap handlers + cap held clients.
+      assert(TestConcurrency.SocketServerTest.await_live_count(base + 1 + 2 * cap, Process.monotonic_millis() + 5000))
+
+      # An EXTRA connection while at capacity: the kernel backlog completes its
+      # handshake, but the acceptor STOPS ACCEPTING at the cap, so nobody serves
+      # it — its first recv must TIME OUT (queued, not served).
+      extra = Process.spawn(&TestConcurrency.SocketServerTest.extra_client_entry/0)
+      _ep = Process.send((Pid.of(extra) :: Pid(i64)), port)
+      unserved = TestConcurrency.SocketServerTest.collect_verdicts(1, 0)
+      assert(unserved == 1)
+      # Served concurrency is EXACTLY the cap: listener + cap handlers + cap held
+      # clients + 1 extra CLIENT socket (its server side was never accepted, so it
+      # holds no handle and does not count). More than cap handlers here would
+      # break this equality.
+      assert(Socket.live_count() == base + 2 + 2 * cap)
+
+      # Free ONE slot: release a held connection. The freed slot lets the acceptor
+      # accept the queued extra and echo its buffered payload.
+      _released = Process.send((Pid.of(List.at(held, 0)) :: Pid(i64)), (1 :: i64))
+      # Two verdicts (order-free): the released held's clean teardown + the extra
+      # finally served.
+      slot_freed = TestConcurrency.SocketServerTest.collect_verdicts(2, 0)
+      assert(slot_freed == 2)
+
+      # Teardown: release the remaining held connections, collect their finals,
+      # then shut the acceptor down and confirm leak-exactness.
+      _rest = TestConcurrency.SocketServerTest.release_rest(held, 1, List.length(held))
+      rest_finals = TestConcurrency.SocketServerTest.collect_verdicts(cap - 1, 0)
+      assert(rest_finals == cap - 1)
+
+      _shutdown = Process.exit_signal(acceptor, :shutdown)
       _down = Process.await_signal()
       assert(TestConcurrency.SocketServerTest.await_live_count(base, Process.monotonic_millis() + 5000))
       assert(Socket.live_count() == base)

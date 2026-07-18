@@ -8,11 +8,14 @@
     infinite `accept` would never see a trapped signal (a trapped signal sets no
     pending-kill), so the poll deadline is what makes shutdown responsive. Small
     values (25–100 ms) trade a little idle wakeup for prompt shutdown.
-  - `max_connections` — the admission cap (Job 5 seam; `0` = unbounded). Present
-    now so the options shape is stable; the shed-at-capacity policy lands later.
-  - `shutdown_timeout_ms` — the drain grace period (Job 4 seam) an acceptor will
-    give in-flight handlers before force-killing stragglers. Present now; the
-    coordinated drain lands later.
+  - `max_connections` — the per-acceptor admission cap (`0` = unbounded). At the
+    cap the acceptor STOPS ACCEPTING (`SocketServer.at_capacity?` /
+    `wait_for_slot`), resuming only when a handler EXIT frees a slot — the Job 5
+    Ranch-style load-shedding, so a burst is absorbed by the kernel backlog
+    rather than accepted-then-reset.
+  - `shutdown_timeout_ms` — the drain grace period (`SocketServer.drain`) an
+    acceptor gives its in-flight handlers to finish before force-killing the
+    stragglers — the Job 4 coordinated graceful drain.
 
   Build with `SocketServer.options/3` or `SocketServer.default_options/0`.
   """
@@ -70,16 +73,25 @@ pub struct SocketServerState {
 
       state = SocketServer.reap_signals(state)          # reap dead handlers / see shutdown
       case SocketServer.draining?(state) {
-        true  -> stop                                    # leave the loop (Job 4 adds the drain)
+        true  ->                                          # drain (Job 4): close the listener so
+          {                                               # new connects are refused, then let the
+            _closed  = SocketListener.close(listener)     # in-flight handlers finish (grace) and
+            _drained = SocketServer.drain(state)          # force-kill any stragglers, then exit.
+            Process.exit_with(:normal)
+          }
         false ->
-          case Socket.accept(listener, state.options.accept_poll_ms) {
-            Result.Ok(conn) ->
-              {
-                handler = Process.spawn_link(&MyServer.handler_entry/0)
-                _moved  = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
-                loop(SocketServer.admitted(state, handler))
+          case SocketServer.at_capacity?(state) {         # capacity (Job 5): at the cap, STOP
+            true  -> loop(SocketServer.wait_for_slot(state))  # ACCEPTING — park until a slot frees.
+            false ->
+              case Socket.accept(listener, state.options.accept_poll_ms) {
+                Result.Ok(conn) ->
+                  {
+                    handler = Process.spawn_link(&MyServer.handler_entry/0)
+                    _moved  = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
+                    loop(SocketServer.admitted(state, handler))
+                  }
+                Result.Error(_e) -> loop(state)           # :etimedout on a quiet poll — just re-loop
               }
-            Result.Error(_e) -> loop(state)              # :etimedout on a quiet poll — just re-loop
           }
       }
 
@@ -101,9 +113,21 @@ pub struct SocketServerState {
   `:permanent` child of an ordinary `Supervisor`, so an acceptor crash is
   restarted by the tree (a fresh listener + acceptor), not silently lost.
 
-  Coordinated graceful drain (`shutdown_timeout_ms`) and admission capping
-  (`max_connections`) are later jobs; their fields already exist on
-  `SocketServerOptions` so the shape is stable.
+  ## Graceful drain and admission capping
+
+  Two policies extend the loop:
+
+  - **Drain (Job 4)** — when the acceptor observes a shutdown order it CLOSES
+    the listener (new connects get `ECONNREFUSED`), then `SocketServer.drain`
+    gives the in-flight handlers up to `shutdown_timeout_ms`
+    (`wait_for_handlers`) to finish and force-kills any stragglers
+    (`force_close_stragglers`) so every connection fd is reclaimed before it
+    exits.
+  - **Capacity (Job 5)** — with a non-zero `max_connections`, the acceptor
+    checks `SocketServer.at_capacity?` before accepting; at the cap it parks in
+    `wait_for_slot` (STOP ACCEPTING) until a handler EXIT frees a slot, so served
+    concurrency never exceeds the cap and bursts are absorbed by the kernel
+    backlog rather than accepted-then-reset.
   """
 
 @available_on(:network)
@@ -215,6 +239,193 @@ pub struct SocketServer {
 
   pub fn live_count(state :: SocketServerState) -> i64 {
     List.length(state.live_pids)
+  }
+
+  @doc = """
+    Whether the acceptor is at its `max_connections` admission cap — the Job 5
+    load-shedding gate. A `max_connections` of `0` (or any non-positive
+    sentinel) means UNBOUNDED, so this is always `false` and the acceptor never
+    sheds. Otherwise it is `true` once the live handler count
+    (`live_count`) has reached the cap.
+
+    An acceptor that finds itself `at_capacity?` must NOT `accept` — accepting
+    would admit a `(cap + 1)`th connection. Instead it parks in
+    `SocketServer.wait_for_slot` until a handler EXIT frees a slot. This is the
+    Ranch "stop accepting at the cap" model: the kernel `listen` backlog absorbs
+    inbound bursts and the OS refuses only what overflows the backlog, so a
+    connection is never accepted-then-immediately-reset (no accept/RST churn).
+    """
+
+  @available_on(:network)
+
+  pub fn at_capacity?(state :: SocketServerState) -> Bool {
+    case state.options.max_connections <= 0 {
+      true -> false
+      false -> SocketServer.live_count(state) >= state.options.max_connections
+    }
+  }
+
+  @doc = """
+    Park (once, up to the `accept_poll_ms` poll quantum) waiting for a slot to
+    free when the acceptor is `at_capacity?` — the Job 5 shed-by-not-accepting
+    step. Call it INSTEAD of `Socket.accept` while at capacity; the loop then
+    re-checks `draining?`/`at_capacity?` and only `accept`s once a slot is free.
+
+    It blocks on the same zero-user-message timed signal wait the rest of the
+    policy uses (`await_signal_timeout`), so it stays BOTH kill-responsive and
+    drain-responsive while parked at the cap:
+
+    - a handler EXIT (`from` in `live_pids`) — a connection ended, freeing a
+      slot: drop it from the live set (the next loop turn is now under the cap
+      and `accept`s the backlogged connection);
+    - anything else (the supervisor or parent terminating the acceptor) — a
+      shutdown order even while parked at capacity: set `draining` so the loop
+      leaves the accept path and drains;
+    - no signal within the poll — return unchanged; the loop re-checks and
+      parks again (bounded, so a kill/shutdown is still observed promptly).
+    """
+
+  @available_on(:network)
+
+  pub fn wait_for_slot(state :: SocketServerState) -> SocketServerState {
+    case :zig.ProcessRuntime.await_signal_timeout(state.options.accept_poll_ms) {
+      false -> state
+      true ->
+        {
+          from = Process.last_signal_from()
+          case SocketServer.contains_pid(state.live_pids, from, 0, List.length(state.live_pids)) {
+            true -> SocketServer.retire(state, from)
+            false -> SocketServer.mark_draining(state)
+          }
+        }
+    }
+  }
+
+  @doc = """
+    Perform the coordinated graceful DRAIN (Job 4), run BY the acceptor once it
+    has observed a shutdown order and CLOSED its listener (so no new connections
+    are accepted). The sequence:
+
+    1. `wait_for_handlers` — give the live handlers up to `shutdown_timeout_ms`
+       (an ABSOLUTE monotonic deadline) to finish on their own, consuming each
+       handler EXIT and dropping it from the live set as it arrives;
+    2. `force_close_stragglers` — for every handler STILL live at the deadline,
+       send an untrappable `Process.kill`, so each victim's teardown sweep closes
+       its connection fd, then reap its exit.
+
+    Returns the final state with an empty live set. The acceptor then exits;
+    because handlers were `spawn_link`ed to it, this drain (kill + reap) is the
+    graceful path, and an acceptor that itself blows its supervisor's shutdown
+    budget is the backstop — its `:killed` propagates down the links and every
+    handler's drop-list still closes its fd.
+    """
+
+  @available_on(:network)
+
+  pub fn drain(state :: SocketServerState) -> SocketServerState {
+    deadline = Process.monotonic_millis() + state.options.shutdown_timeout_ms
+    waited = SocketServer.wait_for_handlers(state, deadline)
+    SocketServer.force_close_stragglers(waited)
+  }
+
+  @doc = """
+    Wait until `deadline_ms` (an ABSOLUTE `Process.monotonic_millis` instant)
+    for the live handlers to finish, consuming each handler EXIT and dropping it
+    from the live set. Returns as soon as the live set empties (every connection
+    finished within the grace) or the deadline passes (whatever handlers remain
+    are the stragglers `force_close_stragglers` will kill). The Job 4 grace step.
+
+    Built on the same timed signal wait `Supervisor.wait_exit` uses: a handler
+    EXIT (`from` in `live_pids`) retires that pid; any other signal that arrives
+    mid-drain (a second shutdown order) is ignored — the acceptor is already
+    draining. The remaining time is recomputed each turn against the absolute
+    deadline, so a burst of finishing handlers can never extend the grace.
+    """
+
+  @available_on(:network)
+
+  pub fn wait_for_handlers(state :: SocketServerState, deadline_ms :: i64) -> SocketServerState {
+    case SocketServer.live_count(state) <= 0 {
+      true -> state
+      false ->
+        {
+          remaining = deadline_ms - Process.monotonic_millis()
+          case remaining <= 0 {
+            true -> state
+            false ->
+              case :zig.ProcessRuntime.await_signal_timeout(remaining) {
+                false -> state
+                true ->
+                  {
+                    from = Process.last_signal_from()
+                    next = case SocketServer.contains_pid(state.live_pids, from, 0, List.length(state.live_pids)) {
+                      true -> SocketServer.retire(state, from)
+                      false -> state
+                    }
+                    SocketServer.wait_for_handlers(next, deadline_ms)
+                  }
+              }
+          }
+        }
+    }
+  }
+
+  @doc = """
+    Force-close every handler still live after the drain grace — the Job 4
+    straggler step. Sends an untrappable `Process.kill` to ALL remaining
+    handlers FIRST, then reaps exactly one exit per handler. Killing every
+    victim before reaping any is what makes the reap sound even when a straggler
+    happens to die on its own in the same instant: each killed (and linked)
+    handler delivers exactly one EXIT, so reaping until every victim pid is
+    accounted for consumes them all — a stray signal from a non-handler is
+    simply skipped and re-awaited, never mistaken for a victim. Each victim's
+    teardown sweep closes its connection fd (crash-safe fd lifetime), so no
+    connection leaks. Returns the state with an empty live set.
+    """
+
+  @available_on(:network)
+
+  pub fn force_close_stragglers(state :: SocketServerState) -> SocketServerState {
+    victims = state.live_pids
+    _killed = SocketServer.kill_all(victims, 0, List.length(victims))
+    _reaped = SocketServer.reap_all(victims)
+    %SocketServerState{live_pids: (List.new_empty(8) :: List(u64)), draining: state.draining, options: state.options}
+  }
+
+  @doc = """
+    Send an untrappable `Process.kill` to every pid in `pids[index, total)`.
+    Internal to `force_close_stragglers`.
+    """
+
+  fn kill_all(pids :: List(u64), index :: i64, total :: i64) -> Bool {
+    case index < total {
+      true ->
+        {
+          _k = Process.kill(List.at(pids, index))
+          SocketServer.kill_all(pids, index + 1, total)
+        }
+      false -> true
+    }
+  }
+
+  @doc = """
+    Reap exactly one exit signal for each pid still in `remaining` (blocking on
+    `await_signal` — every killed, linked handler is guaranteed to deliver its
+    exit), removing each reaped pid. A signal from a pid NOT in `remaining` (a
+    stray) leaves the set unchanged and is re-awaited. Terminates once the set
+    is empty. Internal to `force_close_stragglers`.
+    """
+
+  fn reap_all(remaining :: List(u64)) -> Bool {
+    case List.empty?(remaining) {
+      true -> true
+      false ->
+        {
+          _r = Process.await_signal()
+          from = Process.last_signal_from()
+          SocketServer.reap_all(SocketServer.list_without(remaining, from, 0, List.length(remaining), (List.new_empty(List.length(remaining)) :: List(u64))))
+        }
+    }
   }
 
   @doc = """
