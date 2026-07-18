@@ -3281,6 +3281,10 @@ const SocketTlsHandshakeRequest = struct {
     host: []const u8,
     timeout_ms: i64,
     kill_flag: ?*std.atomic.Value(bool),
+    // ⚠ Verification-disabled (testing-only) when true — set ONLY by the
+    // separate `zap_socket_tls_handshake_insecure` export; the verified
+    // connect/upgrade exports leave it `false`.
+    insecure: bool,
     session: ?*anyopaque,
     reason: concurrency.socket_io.Reason,
 };
@@ -3293,7 +3297,7 @@ fn socketTlsHandshakeBlockingTrampoline(operation_argument: ?*anyopaque) callcon
         request.reason = .out_of_memory;
         return null;
     };
-    const reason = concurrency.socket_io.tlsHandshake(session, request.host, request.timeout_ms, request.kill_flag);
+    const reason = concurrency.socket_io.tlsHandshake(session, request.host, request.timeout_ms, request.kill_flag, request.insecure);
     if (reason != .ok) {
         // Handshake failed (bad cert, timeout, kill, protocol error): scrub +
         // free the session here (no key residue). The fd is untouched — it is
@@ -3316,6 +3320,7 @@ fn runTlsHandshake(
     handle: concurrency.SocketHandle,
     host: []const u8,
     timeout_ms: i64,
+    insecure: bool,
     request: *SocketTlsHandshakeRequest,
 ) bool {
     const fd = runtime_state.socket_domain.fd(handle) orelse return false;
@@ -3325,6 +3330,7 @@ fn runTlsHandshake(
         .timeout_ms = timeout_ms,
         // Captured on-core so the poll-quantum handshake stays kill-responsive.
         .kill_flag = context.pendingKillFlag(),
+        .insecure = insecure,
         .session = null,
         .reason = .ok,
     };
@@ -3348,9 +3354,45 @@ export fn zap_socket_tls_handshake(
 ) callconv(.c) i32 {
     const context = contextFromHandle(process);
     if (!context.socketLedger().contains(handle_bits)) return -1;
+    return tlsHandshakeBind(process, handle_bits, host_ptr, host_len, timeout_ms, false);
+}
+
+/// ⚠ The INSECURE (verification-disabled, testing-only) twin of
+/// `zap_socket_tls_handshake`: identical control flow but runs the handshake
+/// with BOTH hostname and CA verification OFF (`insecure = true`), producing an
+/// UNAUTHENTICATED tunnel a MITM can impersonate. A SEPARATE export precisely so
+/// the default verified path shares no code with it and cannot be weakened; it
+/// is reached only through the loudly-named `Tls.connect_host_insecure` surface.
+export fn zap_socket_tls_handshake_insecure(
+    process: *anyopaque,
+    handle_bits: u64,
+    host_ptr: [*]const u8,
+    host_len: usize,
+    timeout_ms: i64,
+) callconv(.c) i32 {
+    const context = contextFromHandle(process);
+    if (!context.socketLedger().contains(handle_bits)) return -1;
+    return tlsHandshakeBind(process, handle_bits, host_ptr, host_len, timeout_ms, true);
+}
+
+/// The shared body of the fresh-connect handshake exports: run the offloaded
+/// handshake (verified when `insecure == false`, verification-disabled when
+/// `true`) and, on success, bind the session to the SAME handle (`attachTls`,
+/// no generation bump). Returns `0` on success, a positive `Reason` on failure,
+/// or `-1` on a foreign/stale handle. The ledger membership was validated by
+/// the caller.
+fn tlsHandshakeBind(
+    process: *anyopaque,
+    handle_bits: u64,
+    host_ptr: [*]const u8,
+    host_len: usize,
+    timeout_ms: i64,
+    insecure: bool,
+) i32 {
+    const context = contextFromHandle(process);
     const handle = concurrency.SocketHandle.fromBits(handle_bits);
     var request: SocketTlsHandshakeRequest = undefined;
-    if (!runTlsHandshake(context, handle, host_ptr[0..host_len], timeout_ms, &request)) return -1;
+    if (!runTlsHandshake(context, handle, host_ptr[0..host_len], timeout_ms, insecure, &request)) return -1;
     if (request.reason != .ok) {
         context.socketLedger().last_error = @intFromEnum(request.reason);
         return @intFromEnum(request.reason);
@@ -3387,7 +3429,7 @@ export fn zap_socket_tls_upgrade(
     if (!context.socketLedger().contains(handle_bits)) return socketConnectFailed(context, .invalid_argument);
     const handle = concurrency.SocketHandle.fromBits(handle_bits);
     var request: SocketTlsHandshakeRequest = undefined;
-    if (!runTlsHandshake(context, handle, host_ptr[0..host_len], timeout_ms, &request))
+    if (!runTlsHandshake(context, handle, host_ptr[0..host_len], timeout_ms, false, &request))
         return socketConnectFailed(context, .invalid_argument);
     if (request.reason != .ok) return socketConnectFailed(context, request.reason);
     const session = request.session.?;

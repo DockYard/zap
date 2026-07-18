@@ -4113,6 +4113,10 @@ const ZapConcurrencyKernel = struct {
     // binds the session to the SAME handle (fresh-connect); `tls_upgrade`
     // consumes the plaintext handle and returns the TLS successor (STARTTLS).
     extern fn zap_socket_tls_handshake(process: *anyopaque, handle_bits: u64, host_ptr: [*]const u8, host_len: usize, timeout_ms: i64) callconv(.c) i32;
+    // ⚠ The verification-disabled (testing-only) fresh-connect handshake — a
+    // SEPARATE export from the verified `zap_socket_tls_handshake` so the
+    // default path can never be weakened; reached only via `Tls.*_insecure`.
+    extern fn zap_socket_tls_handshake_insecure(process: *anyopaque, handle_bits: u64, host_ptr: [*]const u8, host_len: usize, timeout_ms: i64) callconv(.c) i32;
     extern fn zap_socket_tls_upgrade(process: *anyopaque, handle_bits: u64, host_ptr: [*]const u8, host_len: usize, timeout_ms: i64) callconv(.c) u64;
     extern fn zap_socket_accept(process: *anyopaque, listener_bits: u64) callconv(.c) u64;
     extern fn zap_socket_accept_timeout(process: *anyopaque, listener_bits: u64, timeout_ms: i64) callconv(.c) u64;
@@ -7372,25 +7376,62 @@ pub const SocketRuntime = struct {
             );
             return result;
         } else {
-            const handle = socket_table.SocketHandle.fromBits(handle_bits);
-            const fd = gateOffFd(handle_bits);
-            const session = socket_io.tlsSessionCreate(fd, timeout_ms, null) orelse {
-                gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
-                return @intFromEnum(socket_io.Reason.out_of_memory);
-            };
-            const reason = socket_io.tlsHandshake(session, host, timeout_ms, null);
-            if (reason != .ok) {
-                socket_io.tlsFreeSession(session);
-                gate_off_last_error = @intFromEnum(reason);
-                return @intFromEnum(reason);
-            }
-            if (!gateOffDomain().attachTls(handle, 0, session)) {
-                socket_io.tlsFreeSession(session);
-                gate_off_last_error = @intFromEnum(socket_io.Reason.other);
-                return @intFromEnum(socket_io.Reason.other);
-            }
-            return 0;
+            return tlsHandshakeGateOff(handle_bits, host, timeout_ms, false);
         }
+    }
+
+    /// ⚠ `Tls.connect_host_insecure`'s handshake leg — the VERIFICATION-DISABLED
+    /// (testing-only) twin of `tls_handshake`: identical binding semantics but
+    /// runs the handshake with BOTH hostname and CA verification OFF, yielding an
+    /// UNAUTHENTICATED tunnel a MITM can impersonate. Gate-ON dispatches to the
+    /// SEPARATE `zap_socket_tls_handshake_insecure` export (so the verified path
+    /// is never on this code path); gate-OFF passes `insecure = true` to the same
+    /// gate-OFF helper. Reached only through the loudly-named `Tls.*_insecure`
+    /// Zap surface. Panics on a foreign/stale handle.
+    pub fn tls_handshake_insecure(handle_bits: u64, host: []const u8, timeout_ms: i64) i64 {
+        if (comptime runtime_concurrency_active) {
+            const result = ZapConcurrencyKernel.zap_socket_tls_handshake_insecure(
+                requireCurrentProcessHandle(),
+                handle_bits,
+                host.ptr,
+                host.len,
+                timeout_ms,
+            );
+            if (result < 0) @panic(
+                "zap: TLS handshake on a socket this process does not own (a closed or stale Socket handle)",
+            );
+            return result;
+        } else {
+            return tlsHandshakeGateOff(handle_bits, host, timeout_ms, true);
+        }
+    }
+
+    /// The shared gate-OFF handshake body for `tls_handshake` (`insecure ==
+    /// false`, the mandatory-verified default) and `tls_handshake_insecure`
+    /// (`insecure == true`). Creates the session over the owned fd, runs the
+    /// inline handshake, and on success binds the session to the SAME handle
+    /// (`attachTls`, no gen bump). Returns `0` on success or a positive `Reason`
+    /// code on failure (also stored in the last-error slot). Frees the session
+    /// on every failure path (no leak, no key residue).
+    fn tlsHandshakeGateOff(handle_bits: u64, host: []const u8, timeout_ms: i64, insecure: bool) i64 {
+        const handle = socket_table.SocketHandle.fromBits(handle_bits);
+        const fd = gateOffFd(handle_bits);
+        const session = socket_io.tlsSessionCreate(fd, timeout_ms, null) orelse {
+            gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
+            return @intFromEnum(socket_io.Reason.out_of_memory);
+        };
+        const reason = socket_io.tlsHandshake(session, host, timeout_ms, null, insecure);
+        if (reason != .ok) {
+            socket_io.tlsFreeSession(session);
+            gate_off_last_error = @intFromEnum(reason);
+            return @intFromEnum(reason);
+        }
+        if (!gateOffDomain().attachTls(handle, 0, session)) {
+            socket_io.tlsFreeSession(session);
+            gate_off_last_error = @intFromEnum(socket_io.Reason.other);
+            return @intFromEnum(socket_io.Reason.other);
+        }
+        return 0;
     }
 
     /// `Tls.upgrade`'s handshake leg (STARTTLS): run the MANDATORY-verification
@@ -7416,7 +7457,7 @@ pub const SocketRuntime = struct {
                 gate_off_last_error = @intFromEnum(socket_io.Reason.out_of_memory);
                 return 0;
             };
-            const reason = socket_io.tlsHandshake(session, host, timeout_ms, null);
+            const reason = socket_io.tlsHandshake(session, host, timeout_ms, null, false);
             if (reason != .ok) {
                 socket_io.tlsFreeSession(session);
                 gate_off_last_error = @intFromEnum(reason);

@@ -3450,25 +3450,61 @@ pub fn tlsSessionCreate(fd: Fd, timeout_ms: i64, kill_flag: ?*std.atomic.Value(b
 /// transport reason, everything else TLS → `tls_handshake_failed`; the session
 /// is NOT freed here (the caller frees it — it still holds the fd). The 240
 /// entropy bytes come from the OS CSPRNG and are scrubbed on the way out.
+///
+/// `insecure` (⚠ testing-only): when `true`, BOTH hostname and CA verification
+/// are disabled (`.host = .no_verification`, `.ca = .no_verification`) — an
+/// UNAUTHENTICATED tunnel that a MITM can trivially impersonate. It is a
+/// SEPARATE branch that shares nothing with the verified path above, reached
+/// only through the loudly-named `Tls.*_insecure` surface + its own abi export,
+/// so the default `false` is byte-for-byte the mandatory-verified handshake.
 pub fn tlsHandshake(
     session_opaque: *anyopaque,
     host: []const u8,
     timeout_ms: i64,
     kill_flag: ?*std.atomic.Value(bool),
+    insecure: bool,
 ) Reason {
     const session: *TlsSession = @ptrCast(@alignCast(session_opaque));
     session.stream.rearm(timeout_ms, kill_flag);
-
-    const trust = switch (trustStore()) {
-        .ready => |bundle| bundle,
-        .failed => |reason| return reason,
-    };
 
     var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
     // Scrub the entropy no matter how we exit — it seeds the ClientHello random
     // and the ephemeral key share.
     defer std.crypto.secureZero(u8, &entropy);
     if (!secureRandomBytes(&entropy)) return .tls_handshake_failed;
+
+    if (insecure) {
+        // ⚠ DANGER — verification is FULLY DISABLED (both hostname AND CA
+        // chain-of-trust). This establishes an UNAUTHENTICATED tunnel: a
+        // man-in-the-middle presenting ANY certificate is accepted. Reached
+        // ONLY via the explicitly-named, loudly-documented `Tls.*_insecure`
+        // Zap surface + its own SEPARATE abi export — never on the default
+        // verified path (this branch touches NO trust store and shares NOTHING
+        // with the verified `Options` below, so it cannot regress it). The
+        // owning process's kill flag + the single absolute deadline still bound
+        // the handshake, so even an insecure handshake stays DoS-safe.
+        const insecure_now = std.Io.Clock.now(.real, io());
+        const insecure_client = tls.Client.init(session.stream.inputReader(), session.stream.outputWriter(), .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .write_buffer = session.plaintext_out,
+            .read_buffer = session.plaintext_in,
+            .entropy = &entropy,
+            .realtime_now = insecure_now,
+        }) catch |err| return switch (err) {
+            error.ReadFailed => if (session.stream.read_reason != .ok) session.stream.read_reason else .tls_handshake_failed,
+            error.WriteFailed => if (session.stream.write_reason != .ok) session.stream.write_reason else .tls_handshake_failed,
+            else => mapTlsInitError(err),
+        };
+        session.client = insecure_client;
+        session.handshake_complete = true;
+        return .ok;
+    }
+
+    const trust = switch (trustStore()) {
+        .ready => |bundle| bundle,
+        .failed => |reason| return reason,
+    };
 
     const now = std.Io.Clock.now(.real, trust.io);
     const client = tls.Client.init(session.stream.inputReader(), session.stream.outputWriter(), .{
@@ -5427,7 +5463,7 @@ test "socket_io/tls: tlsHandshake against a SILENT peer is DoS-bounded — times
     defer session.deinit();
 
     const before = monotonicMillis();
-    const reason = tlsHandshake(@ptrCast(session), "example.com", 200, null);
+    const reason = tlsHandshake(@ptrCast(session), "example.com", 200, null, false);
     const elapsed = monotonicMillis() - before;
 
     // Bounded: the silent peer stalls the ServerHello read, so the single
@@ -5466,7 +5502,7 @@ test "socket_io/tls: tlsHandshake yields PROMPTLY to a kill mid-handshake and fr
     defer thread.join();
 
     const before = monotonicMillis();
-    const reason = tlsHandshake(@ptrCast(session), "example.com", 0, &kill_flag);
+    const reason = tlsHandshake(@ptrCast(session), "example.com", 0, &kill_flag, false);
     const elapsed = monotonicMillis() - before;
 
     // A kill classifies as `other` (the connect/recv kill posture) and returns
@@ -5492,7 +5528,7 @@ test "socket_io/tls: tlsFreeSession scrubs + frees a failed-handshake session on
     // trampoline frees via `tlsFreeSession`. The testing allocator proves the
     // whole box + four buffers are reclaimed exactly once, no residue leaked.
     const session = try TlsSession.create(testing.allocator, pair.a, 150, null);
-    const reason = tlsHandshake(@ptrCast(session), "example.com", 150, null);
+    const reason = tlsHandshake(@ptrCast(session), "example.com", 150, null, false);
     try testing.expect(reason != .ok);
     tlsFreeSession(@ptrCast(session)); // scrub + free (no close_notify — not complete)
     // No `defer deinit` — `tlsFreeSession` already freed it; a double free would
@@ -5718,9 +5754,56 @@ test "socket_io/tls: an over-the-wire wrong-hostname certificate is REJECTED —
         const session = try TlsSession.create(testing.allocator, pair.a, 5000, null);
         defer session.deinit(); // testing allocator asserts no leak / no key residue
 
-        const reason = tlsHandshake(@ptrCast(session), s4_mismatch_host, 5000, null);
+        const reason = tlsHandshake(@ptrCast(session), s4_mismatch_host, 5000, null, false);
         try testing.expectEqual(Reason.tls_cert_invalid, reason);
         // A rejected handshake never completes — no session keys, no close_notify.
+        try testing.expect(!session.handshake_complete);
+    }
+}
+
+test "socket_io/tls: the INSECURE handshake genuinely SKIPS verification — the same wrong-hostname flight the verified path rejects as tls_cert_invalid is NOT a cert rejection when insecure (the loud opt-in is real)" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) return error.SkipZigTest;
+    // The insecure branch consults NO trust store, but the verified control leg
+    // below does — require the bundle so the two legs differ ONLY by the
+    // verification toggle, isolating exactly what `insecure` changes.
+    switch (trustStore()) {
+        .ready => {},
+        .failed => return error.SkipZigTest,
+    }
+
+    // ---- Control leg: VERIFIED (insecure = false) ----
+    // The canned wrong-hostname flight fails CLOSED at certificate verification →
+    // `tls_cert_invalid` (the committed mandatory-verification proof), fast.
+    {
+        const pair = try testSocketpairNonblocking();
+        defer closeFd(pair.a);
+        defer closeFd(pair.b);
+        try tlsTestWriteFlightToPeer(pair.b, &s4_bad_cert_server_flight);
+        const session = try TlsSession.create(testing.allocator, pair.a, 5000, null);
+        defer session.deinit();
+        const reason = tlsHandshake(@ptrCast(session), s4_mismatch_host, 5000, null, false);
+        try testing.expectEqual(Reason.tls_cert_invalid, reason);
+        try testing.expect(!session.handshake_complete);
+    }
+
+    // ---- Opt-in leg: INSECURE (insecure = true) ----
+    // ⚠ The SAME wrong-hostname flight — with verification disabled it does NOT
+    // fail as a certificate rejection: it SKIPS `verifyHostName` and proceeds
+    // PAST the Certificate message (the truncated flight then carries no
+    // ServerKeyExchange, so the handshake fails LATER for a non-cert reason,
+    // bounded by the short deadline). The security-meaningful invariant is that
+    // `insecure` genuinely bypassed cert verification (`reason != tls_cert_invalid`)
+    // — proving the loud opt-in is a REAL toggle, not a no-op that silently keeps
+    // verifying — while a truncated flight still never yields a usable session.
+    {
+        const pair = try testSocketpairNonblocking();
+        defer closeFd(pair.a);
+        defer closeFd(pair.b);
+        try tlsTestWriteFlightToPeer(pair.b, &s4_bad_cert_server_flight);
+        const session = try TlsSession.create(testing.allocator, pair.a, 300, null);
+        defer session.deinit();
+        const reason = tlsHandshake(@ptrCast(session), s4_mismatch_host, 300, null, true);
+        try testing.expect(reason != .tls_cert_invalid);
         try testing.expect(!session.handshake_complete);
     }
 }
