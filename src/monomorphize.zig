@@ -201,6 +201,32 @@ pub const MonomorphResult = struct {
     boxed_impl_specs: []const hir.BoxedImplSpec = &.{},
 };
 
+/// Build the name-string → protocol-name-`StringId` index that backs
+/// `MonomorphContext.protocol_name_ids`. One entry per protocol; keys borrow
+/// the interner's stable strings, so the map is valid for as long as the
+/// interner outlives the context (always true within a monomorphize run).
+fn buildProtocolNameIndex(
+    allocator: Allocator,
+    program: *const hir.Program,
+    interner: *ast.StringInterner,
+) !std.StringHashMapUnmanaged(ast.StringId) {
+    var index: std.StringHashMapUnmanaged(ast.StringId) = .empty;
+    // A protocol-free program allocates nothing — keeps the index build off the
+    // allocator entirely (matters for the failing-allocator OOM unit tests,
+    // whose programs carry no protocols).
+    if (program.protocols.len == 0) return index;
+    errdefer index.deinit(allocator);
+    try index.ensureTotalCapacity(allocator, @intCast(program.protocols.len));
+    for (program.protocols) |proto| {
+        // A protocol name string maps to its own `StringId`. Duplicate names
+        // (should not occur post-HIR-build) collapse to the last, matching the
+        // prior linear scan's first-match-wins only in the no-duplicate case;
+        // the index is authoritative for the well-formed program.
+        index.putAssumeCapacity(interner.get(proto.name), proto.name);
+    }
+    return index;
+}
+
 /// Run the monomorphization pass on a HIR program.
 ///
 /// For each function group with type-variable parameters, scans all call
@@ -220,6 +246,9 @@ pub fn monomorphize(
         .next_group_id = next_group_id,
         .interner = interner,
         .program = program,
+        // Fallible init first so a failure here cannot leak the infallible
+        // maps below (their `.init` cannot fail).
+        .protocol_name_ids = try buildProtocolNameIndex(allocator, program, interner),
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
@@ -228,6 +257,7 @@ pub fn monomorphize(
         .local_types = std.AutoHashMap(u32, TypeId).init(allocator),
         .errors = .empty,
     };
+    defer ctx.protocol_name_ids.deinit(allocator);
     defer ctx.generic_groups.deinit();
     defer ctx.specializations.deinit();
     defer ctx.specialization_counts.deinit();
@@ -463,6 +493,14 @@ const MonomorphContext = struct {
     interner: *ast.StringInterner,
     /// Reference to the whole HIR program for resolving named cross-struct calls
     program: *const hir.Program,
+    /// Name-string → protocol-name `StringId` index over `program.protocols`,
+    /// so `isProtocolCall` is an O(1) lookup rather than an O(num_protocols)
+    /// string scan run for EVERY named call in the scan. The linear scan
+    /// dominated the monomorphize profile on whole-program builds (most named
+    /// calls are not protocol calls, so each paid a full protocol-list walk of
+    /// `mem.eql`s before returning null). Built once by `buildProtocolNameIndex`
+    /// at context construction; keys borrow the interner's stable strings.
+    protocol_name_ids: std.StringHashMapUnmanaged(ast.StringId),
     /// Current struct index being scanned (for placing specializations)
     current_scan_struct_idx: ?usize = null,
     /// Current function params during scan — used to resolve param_get types
@@ -840,13 +878,7 @@ const MonomorphContext = struct {
     /// Returns the protocol name StringId if it matches a registered protocol.
     fn isProtocolCall(self: *const MonomorphContext, nc: hir.NamedCall) ?ast.StringId {
         const target_struct = nc.struct_name orelse return null;
-        for (self.program.protocols) |proto| {
-            const proto_str = self.interner.get(proto.name);
-            if (std.mem.eql(u8, proto_str, target_struct)) {
-                return proto.name;
-            }
-        }
-        return null;
+        return self.protocol_name_ids.get(target_struct);
     }
 
     /// Resolve a protocol dispatch: given a protocol name, function name,
@@ -4196,6 +4228,9 @@ pub fn specializeSpawnManagers(
         .next_group_id = next_group_id,
         .interner = interner,
         .program = program,
+        // Fallible init first so a failure here cannot leak the infallible
+        // maps below (their `.init` cannot fail).
+        .protocol_name_ids = try buildProtocolNameIndex(allocator, program, interner),
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
@@ -4204,6 +4239,7 @@ pub fn specializeSpawnManagers(
         .local_types = std.AutoHashMap(u32, TypeId).init(allocator),
         .errors = .empty,
     };
+    defer ctx.protocol_name_ids.deinit(allocator);
     defer ctx.generic_groups.deinit();
     defer ctx.specializations.deinit();
     defer ctx.specialization_counts.deinit();
@@ -5129,6 +5165,9 @@ fn initTestMonomorphContext(
         .next_group_id = next_group_id,
         .interner = interner,
         .program = program,
+        // Test programs carry no protocols, so this is allocation-free and
+        // cannot fail; `catch .empty` keeps the helper non-fallible.
+        .protocol_name_ids = buildProtocolNameIndex(allocator, program, interner) catch .empty,
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
@@ -5140,6 +5179,7 @@ fn initTestMonomorphContext(
 }
 
 fn deinitTestMonomorphContext(ctx: *MonomorphContext) void {
+    ctx.protocol_name_ids.deinit(ctx.allocator);
     ctx.generic_groups.deinit();
     ctx.specializations.deinit();
     ctx.specialization_counts.deinit();
@@ -5646,6 +5686,7 @@ test "protocol constraint replacement compares substituted source params" {
         .next_group_id = &next_group_id,
         .interner = &interner,
         .program = &empty_program,
+        .protocol_name_ids = try buildProtocolNameIndex(alloc, &empty_program, &interner),
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(alloc),
         .specializations = std.AutoHashMap(u64, u32).init(alloc),
         .specialization_counts = std.AutoHashMap(u32, u32).init(alloc),
@@ -5657,6 +5698,7 @@ test "protocol constraint replacement compares substituted source params" {
         .current_protocol_param_types = &concrete_protocol_params,
         .current_protocol_source_param_types = &source_params,
     };
+    defer ctx.protocol_name_ids.deinit(alloc);
     defer ctx.generic_groups.deinit();
     defer ctx.specializations.deinit();
     defer ctx.specialization_counts.deinit();
@@ -5698,6 +5740,7 @@ test "monomorphizer rejects structurally oversized specialization type arguments
         .next_group_id = &next_group_id,
         .interner = &interner,
         .program = &empty_program,
+        .protocol_name_ids = try buildProtocolNameIndex(alloc, &empty_program, &interner),
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(alloc),
         .specializations = std.AutoHashMap(u64, u32).init(alloc),
         .specialization_counts = std.AutoHashMap(u32, u32).init(alloc),
@@ -5706,6 +5749,7 @@ test "monomorphizer rejects structurally oversized specialization type arguments
         .local_types = std.AutoHashMap(u32, TypeId).init(alloc),
         .errors = .empty,
     };
+    defer ctx.protocol_name_ids.deinit(alloc);
     defer ctx.generic_groups.deinit();
     defer ctx.specializations.deinit();
     defer ctx.specialization_counts.deinit();
