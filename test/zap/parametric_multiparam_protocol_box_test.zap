@@ -25,19 +25,19 @@
   vtable `__drop__` / release paths (leak-free under `Memory.Tracking`).
   """
 
-pub protocol Stage(input, output) {
+pub protocol MultiParamStage(input, output) {
   @doc = """
     Consume one input item, emitting zero or more outputs and the next
     stage state.
     """
 
-  fn step(x :: unique Stage(input, output), item :: input) -> {Atom, [output], Stage(input, output)}
+  fn step(x :: unique MultiParamStage(input, output), item :: input) -> {Atom, [output], MultiParamStage(input, output)}
 
   @doc = """
     Signal end-of-input, emitting any buffered outputs.
     """
 
-  fn flush(x :: unique Stage(input, output)) -> {Atom, [output]}
+  fn flush(x :: unique MultiParamStage(input, output)) -> {Atom, [output]}
 }
 
 @doc = """
@@ -49,7 +49,7 @@ pub struct Mapper(input, output) {
   transform :: fn(input) -> output
 }
 
-pub impl Stage(input, output) for Mapper(input, output) {
+pub impl MultiParamStage(input, output) for Mapper(input, output) {
   @doc = """
     step: apply the closure to `item`, emit the single output, keep going.
     """
@@ -105,12 +105,12 @@ pub struct Zap.ParametricMultiparamProtocolBoxTest {
     consumed receiver, then flush — collecting every emitted output.
     """
 
-  fn drive_to_string(stage :: unique Stage(i64, String), first :: i64, second :: i64) -> {Atom, [String]} {
-    case Stage.step(stage, first) {
+  fn drive_to_string(stage :: unique MultiParamStage(i64, String), first :: i64, second :: i64) -> {Atom, [String]} {
+    case MultiParamStage.step(stage, first) {
       {_cont_a, outputs_a, next_a} ->
-        case Stage.step(next_a, second) {
+        case MultiParamStage.step(next_a, second) {
           {_cont_b, outputs_b, next_b} ->
-            case Stage.flush(next_b) {
+            case MultiParamStage.flush(next_b) {
               {done_atom, outputs_flush} -> {done_atom, (outputs_a <> outputs_b) <> outputs_flush}
             }
         }
@@ -123,12 +123,12 @@ pub struct Zap.ParametricMultiparamProtocolBoxTest {
     head.
     """
 
-  fn drive_to_int(stage :: unique Stage(i64, i64), first :: i64, second :: i64) -> {Atom, [i64]} {
-    case Stage.step(stage, first) {
+  fn drive_to_int(stage :: unique MultiParamStage(i64, i64), first :: i64, second :: i64) -> {Atom, [i64]} {
+    case MultiParamStage.step(stage, first) {
       {_cont_a, outputs_a, next_a} ->
-        case Stage.step(next_a, second) {
+        case MultiParamStage.step(next_a, second) {
           {_cont_b, outputs_b, next_b} ->
-            case Stage.flush(next_b) {
+            case MultiParamStage.flush(next_b) {
               {done_atom, outputs_flush} -> {done_atom, (outputs_a <> outputs_b) <> outputs_flush}
             }
         }

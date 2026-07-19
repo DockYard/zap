@@ -37,7 +37,7 @@ pub impl Stage(i64, Result(i64, String)) for DivideStage {
   }
 }
 
-pub struct ResultOutputStageTest {
+pub struct Zap.ResultOutputStageTest {
   use Zest.Case
 
   describe("a Result-output stage carries errors as values") {

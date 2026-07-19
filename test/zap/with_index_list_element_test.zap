@@ -20,7 +20,7 @@
   binaries.
   """
 
-pub struct WithIndexListElementTest {
+pub struct Zap.WithIndexListElementTest {
   use Zest.Case
 
   describe("with_index over a list-of-lists source") {
