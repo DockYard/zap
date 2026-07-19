@@ -448,6 +448,31 @@ pub fn validateKernelTargetSupport(
     }
 }
 
+/// Non-erroring capability probe: `true` iff the concurrency kernel can exist
+/// on `target_triple` (the same architecture + OS checks
+/// `validateKernelTargetSupport` enforces, but returning a bool instead of a
+/// diagnostic-and-error). This is the decision point for the DEFAULT (opt-out)
+/// gate: when `runtime_concurrency` is left unspecified, the build resolves it
+/// to this — concurrency is on wherever the kernel can run, and silently off on
+/// targets it cannot (single-threaded wasm, unported OSes). An UNKNOWN or
+/// unparseable target defers to `true` (the compile path emits its own
+/// diagnostic) — auto-off never disables concurrency for a target it cannot
+/// classify. An EXPLICIT `runtime_concurrency: true` still flows through
+/// `validateKernelTargetSupport` and errors loudly on an unsupported target.
+pub fn kernelTargetSupported(target_triple: ?[]const u8) bool {
+    var target_architecture: std.Target.Cpu.Arch = builtin.cpu.arch;
+    var target_operating_system: std.Target.Os.Tag = builtin.os.tag;
+    if (target_triple) |triple| {
+        const parsed = memory_driver.parseTargetTriple(triple) orelse return true;
+        target_architecture = architectureFromForkTag(parsed.arch_tag) orelse return true;
+        target_operating_system = operatingSystemFromForkTag(parsed.os_tag) orelse return true;
+    }
+    const architecture_is_fiber_capable = for (FIBER_SUPPORTED_ARCHITECTURES) |supported_architecture| {
+        if (target_architecture == supported_architecture) break true;
+    } else false;
+    return architecture_is_fiber_capable and kernelSupportsOperatingSystem(target_operating_system);
+}
+
 /// Whether the concurrency kernel's OS-primitive layer is implemented for
 /// `operating_system` — the OS axis of the capability matrix (plan 7.2,
 /// P7-J3), mirroring the kernel's own comptime OS gates: futex parking

@@ -1265,9 +1265,18 @@ fn applyBuildOverrides(config: *zap.builder.BuildConfig, overrides: BuildOverrid
         };
     }
     if (overrides.frame_pointers) |fp| config.frame_pointers = fp;
-    // P2-J1: `-Druntime-concurrency=` overrides the manifest's comptime
-    // concurrency gate per-field, exactly like every other `-D` flag.
-    if (overrides.runtime_concurrency) |gate| config.runtime_concurrency = gate;
+    // `-Druntime-concurrency=` overrides the manifest's comptime concurrency
+    // gate per-field, exactly like every other `-D` flag. An explicit override
+    // is honored verbatim (marked explicit so the opt-out default does not
+    // second-guess it).
+    if (overrides.runtime_concurrency) |gate| {
+        config.runtime_concurrency = gate;
+        config.runtime_concurrency_explicit = true;
+    }
+    // Concurrency is opt-out: with the gate left unspecified, resolve it from
+    // the (now-final) target's capability — ON where the kernel can run, OFF on
+    // targets it cannot host. Runs after the target override lands above.
+    resolveConcurrencyGate(config);
     // P6-J6: `-Druntime-tracing=` overrides the manifest's comptime
     // trace gate per-field. Its "requires concurrency" validation runs
     // after ALL overrides land (`validateRuntimeTracingGate`), so the
@@ -9146,6 +9155,20 @@ const ScriptContentKeyControls = struct {
     concurrency_kernel_key: []const u8 = "",
 };
 
+/// Resolve the opt-out concurrency default. Concurrency is ON unless you opt
+/// out: when neither the manifest nor `-Druntime-concurrency=` set the gate
+/// (`runtime_concurrency_explicit == false`), it resolves to whether the target
+/// can host the kernel — ON for fiber-capable arch + supported OS
+/// (aarch64/x86_64 on macOS/Linux), silently OFF elsewhere (single-threaded
+/// wasm, unported OSes). An EXPLICIT setting is left untouched, so an explicit
+/// `true` on an unsupported target still reaches `validateKernelTargetSupport`
+/// and errors loudly. Must run after the target override has landed.
+fn resolveConcurrencyGate(config: *zap.builder.BuildConfig) void {
+    if (!config.runtime_concurrency_explicit) {
+        config.runtime_concurrency = zap.concurrency_driver.kernelTargetSupported(config.target);
+    }
+}
+
 /// P6-J6: `runtime_tracing` instruments the concurrency kernel, so it is
 /// meaningless — and a likely misconfiguration — without the concurrency
 /// runtime. Fail the build with an actionable diagnostic rather than
@@ -16531,6 +16554,29 @@ test "applyBuildOverrides: -Druntime-concurrency overrides the manifest gate (P2
 
     applyBuildOverrides(&config, .{ .runtime_concurrency = false });
     try testing.expect(!config.runtime_concurrency);
+}
+
+test "resolveConcurrencyGate: opt-out default resolves from target capability" {
+    // Unspecified gate + host (fiber-capable arch, supported OS) -> ON by
+    // default. This is the opt-out posture: concurrency is available unless you
+    // turn it off.
+    var host_config: zap.builder.BuildConfig = .{ .name = "app", .version = "0.0.0", .kind = .bin };
+    applyBuildOverrides(&host_config, .{});
+    try testing.expect(!host_config.runtime_concurrency_explicit);
+    try testing.expect(host_config.runtime_concurrency);
+
+    // Unspecified gate + single-threaded wasm -> silently OFF (the kernel needs
+    // stackful fibers wasm cannot provide). No error: the program just builds
+    // without concurrency.
+    var wasm_config: zap.builder.BuildConfig = .{ .name = "app", .version = "0.0.0", .kind = .bin };
+    applyBuildOverrides(&wasm_config, .{ .target = "wasm32-wasi" });
+    try testing.expect(!wasm_config.runtime_concurrency);
+
+    // Explicit false stays off even on a capable host (opt-out honored).
+    var off_config: zap.builder.BuildConfig = .{ .name = "app", .version = "0.0.0", .kind = .bin };
+    applyBuildOverrides(&off_config, .{ .runtime_concurrency = false });
+    try testing.expect(off_config.runtime_concurrency_explicit);
+    try testing.expect(!off_config.runtime_concurrency);
 }
 
 test "parseBuildOverrides: only scans the leading region (leading_end)" {

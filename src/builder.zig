@@ -54,13 +54,22 @@ pub const BuildConfig = struct {
     /// dependency sources are loaded. There is no callable backend
     /// resolver — `Memory.Manager` is a zero-method conformance marker.
     memory_manager: ?MemoryManager = null,
-    /// P2-J1 comptime concurrency gate (`Zap.Manifest.runtime_concurrency`,
-    /// overridable by `-Druntime-concurrency=on|off`). `false` — the
-    /// default — is the zero-cost posture: no kernel object is compiled
-    /// or linked and no `zap_proc_*` symbol exists in the artifact.
-    /// `true` links the per-target kernel object resolved by
-    /// `src/concurrency_driver.zig` and enables the runtime bootstrap.
+    /// Comptime concurrency gate (`Zap.Manifest.runtime_concurrency`,
+    /// overridable by `-Druntime-concurrency=on|off`). This is the RESOLVED
+    /// effective gate. Concurrency is **opt-out**: when neither the manifest
+    /// nor `-D` specifies it (`runtime_concurrency_explicit == false`), the
+    /// build resolves this to `concurrency_driver.kernelTargetSupported(target)`
+    /// — ON wherever the kernel can run, silently OFF on targets it cannot host
+    /// (single-threaded wasm, unported OSes). `false` links no kernel object and
+    /// emits no `zap_proc_*` symbol; `true` links the per-target kernel object
+    /// (`src/concurrency_driver.zig`) and enables the runtime bootstrap. An
+    /// explicit `true` on an unsupported target errors at kernel resolution.
     runtime_concurrency: bool = false,
+    /// Whether `runtime_concurrency` was set explicitly (by the manifest field
+    /// or `-Druntime-concurrency=`) versus left to the opt-out default. When
+    /// `false`, `resolveConcurrencyGate` computes `runtime_concurrency` from the
+    /// target's capability; when `true`, the specified value is honored verbatim.
+    runtime_concurrency_explicit: bool = false,
     /// P6-J6 comptime message-flow trace gate
     /// (`Zap.Manifest.runtime_tracing`, overridable by
     /// `-Druntime-tracing=on|off`). `false` — the default — compiles the
@@ -1723,10 +1732,15 @@ fn constValueToBuildConfig(alloc: std.mem.Allocator, val: zap.ctfe.ConstValue) !
                         else => {},
                     }
                 } else if (std.mem.eql(u8, field.name, "runtime_concurrency")) {
-                    config.runtime_concurrency = switch (field.value) {
-                        .bool_val => |gate_enabled| gate_enabled,
-                        else => false,
-                    };
+                    switch (field.value) {
+                        .bool_val => |gate_enabled| {
+                            config.runtime_concurrency = gate_enabled;
+                            config.runtime_concurrency_explicit = true;
+                        },
+                        // `nil`/absent — leave for the opt-out default
+                        // (`resolveConcurrencyGate`, which needs the target).
+                        else => {},
+                    }
                 } else if (std.mem.eql(u8, field.name, "runtime_tracing")) {
                     config.runtime_tracing = switch (field.value) {
                         .bool_val => |trace_enabled| trace_enabled,
@@ -3491,6 +3505,23 @@ test "constValueToBuildConfig parses the runtime_concurrency gate (P2-J1)" {
     } };
     const gate_on_config = try constValueToBuildConfig(alloc, gate_on);
     try testing.expect(gate_on_config.runtime_concurrency);
+    // Explicit `true` in the manifest marks the gate resolved — `resolveConcurrencyGate`
+    // must leave it untouched (an explicit request, not the opt-out default).
+    try testing.expect(gate_on_config.runtime_concurrency_explicit);
+
+    const gate_off = zap.ctfe.ConstValue{ .struct_val = .{
+        .type_name = "Zap.Manifest",
+        .fields = &.{
+            .{ .name = "name", .value = .{ .string = "gate_probe" } },
+            .{ .name = "version", .value = .{ .string = "0.0.0" } },
+            .{ .name = "kind", .value = .{ .atom = "bin" } },
+            .{ .name = "runtime_concurrency", .value = .{ .bool_val = false } },
+        },
+    } };
+    const gate_off_config = try constValueToBuildConfig(alloc, gate_off);
+    // Explicit `false` opts OUT — resolved, so the target-based default never applies.
+    try testing.expect(!gate_off_config.runtime_concurrency);
+    try testing.expect(gate_off_config.runtime_concurrency_explicit);
 
     const gate_absent = zap.ctfe.ConstValue{ .struct_val = .{
         .type_name = "Zap.Manifest",
@@ -3501,8 +3532,11 @@ test "constValueToBuildConfig parses the runtime_concurrency gate (P2-J1)" {
         },
     } };
     const gate_absent_config = try constValueToBuildConfig(alloc, gate_absent);
-    // Absent field ⇒ the zero-cost default.
+    // Absent field ⇒ left UNRESOLVED (explicit == false) so `resolveConcurrencyGate`
+    // computes the opt-out default from the target. The pre-resolution value is still
+    // `false`; resolution is what flips it ON for capable targets.
     try testing.expect(!gate_absent_config.runtime_concurrency);
+    try testing.expect(!gate_absent_config.runtime_concurrency_explicit);
 }
 
 test "memoryManagerSelectionFromManifest parses memory Type value" {
