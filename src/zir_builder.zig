@@ -1112,6 +1112,20 @@ pub const ZirDriver = struct {
     param_refs: std.ArrayListUnmanaged(u32),
     allocator: Allocator,
     program: ?ir.Program,
+    /// Cached per-struct type-decl classification index. `emitStructTypeDecls`
+    /// runs once per emitted struct and used to scan ALL `program.type_defs`
+    /// with a `classifyTypeDef` string transform+compare each — O(structs ×
+    /// type_defs), which blows up on whole-program builds (monomorphization
+    /// multiplies both). This index precomputes, in one O(type_defs) pass
+    /// (`buildTypeDeclIndex`), the `.primary` type_def per struct name and the
+    /// ordered `.nested` type_defs per owner prefix, so each emission is O(1) +
+    /// O(its own nested). The arena owns every key string and list; the index is
+    /// rebuilt whenever `program` is reassigned (namespace/recursive emission
+    /// swaps it — tracked by `type_decl_index_built_for`).
+    type_decl_index_arena: ?std.heap.ArenaAllocator = null,
+    type_decl_index_built_for: ?[]const ir.TypeDef = null,
+    type_decl_primary: std.StringHashMapUnmanaged(usize) = .empty,
+    type_decl_nested: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
     lib_mode: bool = false,
     /// Phase 2.b — set true once a root `main` entry point has been
     /// emitted (executable output). Gates the injection of the root
@@ -1453,6 +1467,9 @@ pub const ZirDriver = struct {
     }
 
     fn deinitOwnedState(self: *ZirDriver) void {
+        // Frees every type-decl-index key string, list, and map bucket at once
+        // (all arena-backed); the maps themselves need no separate deinit.
+        if (self.type_decl_index_arena) |*index_arena| index_arena.deinit();
         self.local_refs.deinit(self.allocator);
         self.param_refs.deinit(self.allocator);
         self.closure_function_map.deinit(self.allocator);
@@ -2461,54 +2478,104 @@ pub const ZirDriver = struct {
         return false;
     }
 
+    /// Build (or rebuild) the per-struct type-decl classification index for the
+    /// current `program`, in one O(type_defs) pass that replicates
+    /// `classifyTypeDef` EXACTLY. A type_def whose dotted name normalizes
+    /// (`.` → `_`) to `<owner>` is that owner's `.primary` (first occurrence
+    /// wins, mirroring the original `if (primary_def != null) continue`). A
+    /// dotted name is `.nested` under `<owner>` for every prefix `underscore[0..p]`
+    /// where `underscore[p] == '_'` with at least one char after it — the exact
+    /// set the original nested predicate accepts (`has_dot` and
+    /// `startsWith(owner)` and `underscore[owner.len] == '_'` and
+    /// `len > owner.len + 1`). Names longer than classifyTypeDef's 256-byte
+    /// scratch are skipped (they classified `.foreign`, owning/nesting nothing).
+    /// Nested lists keep type_def order so emission order matches the original
+    /// in-loop walk. The arena owns every key string and list.
+    fn buildTypeDeclIndex(self: *ZirDriver) !void {
+        const prog = self.program orelse return;
+
+        if (self.type_decl_index_arena) |*existing| {
+            _ = existing.reset(.free_all);
+        } else {
+            self.type_decl_index_arena = std.heap.ArenaAllocator.init(self.allocator);
+        }
+        // Old map storage lived in the arena just freed/reset — start fresh.
+        self.type_decl_primary = .empty;
+        self.type_decl_nested = .empty;
+        const arena = self.type_decl_index_arena.?.allocator();
+
+        for (prog.type_defs, 0..) |type_def, index| {
+            if (type_def.name.len > 256) continue;
+
+            const underscore = try arena.dupe(u8, type_def.name);
+            var has_dot = false;
+            for (underscore) |*ch| {
+                if (ch.* == '.') {
+                    ch.* = '_';
+                    has_dot = true;
+                }
+            }
+
+            const primary_gop = try self.type_decl_primary.getOrPut(arena, underscore);
+            if (!primary_gop.found_existing) primary_gop.value_ptr.* = index;
+
+            if (!has_dot) continue;
+            for (underscore, 0..) |ch, p| {
+                if (ch != '_') continue;
+                if (p == 0 or p + 1 >= underscore.len) continue;
+                const owner = underscore[0..p];
+                const nested_gop = try self.type_decl_nested.getOrPut(arena, owner);
+                if (!nested_gop.found_existing) nested_gop.value_ptr.* = .empty;
+                try nested_gop.value_ptr.append(arena, index);
+            }
+        }
+
+        self.type_decl_index_built_for = prog.type_defs;
+    }
+
     fn emitStructTypeDecls(self: *ZirDriver) !void {
         const prog = self.program orelse return;
         const current_struct = self.current_emit_struct orelse return;
+
+        // Rebuild the classification index when `program` changed — a nested or
+        // recursive emission swaps `self.program`; the `type_defs` slice is its
+        // identity. Built once for a stable program, then reused across every
+        // struct emission (the O(type_defs)-per-struct → O(type_defs)-once win).
+        const cached = self.type_decl_index_built_for;
+        if (cached == null or
+            cached.?.ptr != prog.type_defs.ptr or
+            cached.?.len != prog.type_defs.len)
+        {
+            try self.buildTypeDeclIndex();
+        }
+
         // Track emitted struct names to avoid duplicates
         var emitted = std.StringHashMap(void).init(self.allocator);
         defer emitted.deinit();
 
-        // The primary struct of this emission — the Zap struct whose
-        // source produced this Zig file. Its fields go on the file's
-        // root struct_decl via `zir_builder_set_root_fields`, so
-        // `@import("X")` from another emission yields THIS canonical
-        // type with single nominal identity. Other Zap structs that
-        // happen to be in `prog.type_defs` (peer top-level structs,
-        // structs defined in other emissions) are NOT duplicated here
-        // — consumers reach them via `@import("...")` which resolves
-        // to their own canonical emission's root type.
-        var primary_def: ?ir.TypeDef = null;
-
-        for (prog.type_defs) |type_def| {
-            var buf: [256]u8 = undefined;
-            const cls = classifyTypeDef(type_def.name, current_struct, &buf);
-            switch (cls) {
-                .primary => {
-                    if (primary_def != null) continue; // two claims; first wins
-                    primary_def = type_def;
-                },
-                .nested => {
-                    // Struct/enum/union nested inside the primary —
-                    // keep emitting as a `pub const X = struct {...}`
-                    // decl inside this file's struct_decl.
-                    try self.emitNestedTypeDecl(type_def, &emitted);
-                },
-                .foreign => continue, // reached via @import elsewhere
+        // Nested struct/enum/union decls of the primary — emitted as
+        // `pub const X = struct {...}` inside this file's struct_decl, in
+        // type_def order (preserved by `buildTypeDeclIndex`).
+        if (self.type_decl_nested.get(current_struct)) |nested_indices| {
+            for (nested_indices.items) |index| {
+                try self.emitNestedTypeDecl(prog.type_defs[index], &emitted);
             }
         }
 
         try self.emitClosureEnvTypeDecls();
 
-        // Emit the primary struct's fields at the file's root
-        // struct_decl (instruction 0 / `main_struct_inst`). When the
-        // primary has no `struct_def` entry — e.g. a top-level Zap
-        // struct that holds only functions — we emit nothing here and
-        // the file's root remains a fields-less struct, which is
-        // exactly what we want.
-        if (primary_def) |td| switch (td.kind) {
-            .struct_def => |def| try self.emitRootFields(def),
-            else => {},
-        };
+        // Emit the primary struct's fields at the file's root struct_decl
+        // (instruction 0 / `main_struct_inst`). The primary is the Zap struct
+        // whose source produced this Zig file; peer/foreign structs are reached
+        // by consumers via `@import("...")`. When the primary has no
+        // `struct_def` entry — e.g. a top-level struct holding only functions —
+        // nothing is emitted and the root stays a fields-less struct.
+        if (self.type_decl_primary.get(current_struct)) |index| {
+            switch (prog.type_defs[index].kind) {
+                .struct_def => |def| try self.emitRootFields(def),
+                else => {},
+            }
+        }
     }
 
     fn currentStructMatches(self: *const ZirDriver, struct_name: []const u8) bool {
