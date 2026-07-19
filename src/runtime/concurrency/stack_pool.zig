@@ -32,7 +32,7 @@
 //! alternative — reserving `PROT_NONE` and `mprotect`ing the usable range
 //! on acquisition — would put a syscall on the pool-hit path and destroy
 //! the E9 9 ns pooled-spawn floor this pool exists to preserve. E9's
-//! measurement harness (`spike/concurrency-e9/fiber_switch.zig`) used this
+//! measurement harness (`docs/concurrency-bench-results.md`) used this
 //! exact fault-commit shape, so the recorded floor numbers price it.
 //!
 //! ## Free-list bounding: live-stack high-watermark
@@ -76,7 +76,7 @@
 //!
 //! ## The fiber-stack-lifetime invariant (release-side enforcement)
 //!
-//! From the G2 triage (`spike/concurrency-e1/triage/README.md`) of the
+//! From the G2 triage (`docs/concurrency-bench-results.md`) of the
 //! Dispatch backend's fiber-lifetime race: **a finished fiber's stack may
 //! not be freed or recycled until the finishing fiber has provably left
 //! it.** `release` enforces the local half of that invariant structurally:
@@ -121,7 +121,7 @@ pub const poison_byte: u8 = 0xAA;
 const poison_sample_length: usize = 64;
 
 /// Default usable stack size (excluding the guard page): 256 KiB, matching
-/// the E9 measurement geometry (`spike/concurrency-e9/fiber_switch.zig`
+/// the E9 measurement geometry (`docs/concurrency-bench-results.md`
 /// `fiber_stack_size`) so the recorded floor numbers stay comparable.
 pub const default_usable_size: usize = 256 * 1024;
 

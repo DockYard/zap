@@ -1,5 +1,8 @@
 # Concurrency Campaign — Benchmark Results
 
+> **Provenance note:** the `spike/…` benchmark files cited below were throwaway exploratory harnesses, removed from the tree after these results were recorded. They remain recoverable from git history; the distilled results in this document are the permanent record.
+
+
 Results ledger for the concurrency implementation campaign
 (`docs/concurrency-implementation-plan.md`). Job **S0.1** (Phase 0) recorded the
 CLBG performance baseline below on pre-concurrency `main` so that every later

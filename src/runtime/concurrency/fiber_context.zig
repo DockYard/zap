@@ -7,7 +7,7 @@
 //! builds directly on `std.Io.fiber.Context`/`contextSwitch` (the substrate
 //! chosen by the Appendix A scheduler decision) with the same stack layout
 //! and naked entry trampoline the fork's `Io/Dispatch.zig` and the E9
-//! measurement spike (`spike/concurrency-e9/fiber_switch.zig`) use:
+//! measurement spike (`docs/concurrency-bench-results.md`) use:
 //! an entry frame at the top of the stack, a naked trampoline that forwards
 //! the stack pointer as the first parameter, and `fp = 0` to terminate
 //! frame-pointer walks.
@@ -15,7 +15,7 @@
 //! ## The fiber-stack-lifetime invariant (structural enforcement)
 //!
 //! From the G2 triage of the Dispatch backend's fiber-lifetime race
-//! (`spike/concurrency-e1/triage/README.md`, plan Appendix A.4 item 4):
+//! (`docs/concurrency-bench-results.md`, plan Appendix A.4 item 4):
 //! **a finished fiber's stack may not be freed or recycled until the
 //! finishing fiber has provably left it.** The Dispatch bug freed a fiber
 //! allocation from `await` while the finishing task was still executing

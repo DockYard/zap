@@ -6,12 +6,7 @@
 //! and any future Zig-side manager runtime should import these types
 //! from here rather than redeclaring them locally.
 //!
-//! The spike's no-op manager (`spike/manager_v1/src/manager.zig`)
-//! intentionally redeclares its own copies because it is throwaway code
-//! built against the C ABI rather than against this Zig module. Future
-//! first-party managers should depend on this module directly.
-//!
-//! `runtime.zig` ALSO redeclares the same shapes — but for a different
+//! `runtime.zig` redeclares the same shapes — but for a different
 //! reason: `runtime.zig` is `@embedFile`'d into the Zap compiler and
 //! injected into every Zap user binary as a standalone source unit with
 //! no sibling files (it can only import `std` and `builtin`). The
