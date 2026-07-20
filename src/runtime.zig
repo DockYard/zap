@@ -19805,6 +19805,18 @@ pub const Zest = struct {
     var timeout_ms: i64 = 0; // per-test timeout in milliseconds (0 = no timeout)
     var test_start_ns: u64 = 0; // timestamp when current test started
     var timeout_count: i64 = 0; // number of tests that timed out
+    // Phase B supervisor isolation (docs/phase-b-test-isolation-design.md):
+    // `resume_after` skips every global ordinal <= it so a re-spawned child
+    // continues just past the test that crashed/hung the previous shard
+    // (-1 = start at ordinal 0). `supervised` gates the per-ordinal
+    // `##ZEST-BEGIN`/`##ZEST-END` checkpoint markers the supervisor reads to
+    // attribute an abnormal exit to the exact in-flight test. Both are off by
+    // default, so an ordinary `zap test` run behaves and prints exactly as
+    // before. `current_shuffle_position` carries the in-flight ordinal to the
+    // trailing `##ZEST-END` (`end_shuffle_pass` takes no argument).
+    var resume_after: i64 = -1;
+    var supervised: bool = false;
+    var current_shuffle_position: i64 = -1;
 
     fn nowNs() u64 {
         // Wall-clock nanoseconds since the Unix epoch through the seam
@@ -19836,6 +19848,35 @@ pub const Zest = struct {
 
     pub fn get_timeout() i64 {
         return timeout_ms;
+    }
+
+    /// Phase B: skip every global ordinal <= `n` so a re-spawned child
+    /// resumes just past the test that crashed/hung the previous shard.
+    /// The seeded shuffle is identical across shards, so ordinals map to
+    /// the same cases in every re-spawn.
+    pub fn set_resume_after(n: i64) void {
+        resume_after = n;
+    }
+
+    /// The global ordinal the discovered-cases loop starts at:
+    /// `resume_after + 1`, clamped to 0.
+    pub fn start_position() i64 {
+        if (resume_after < 0) return 0;
+        return resume_after + 1;
+    }
+
+    /// Enable the `##ZEST-BEGIN <n>` / `##ZEST-END <n>` checkpoint markers
+    /// (stderr) the supervisor reads to attribute an abnormal child exit to
+    /// the exact in-flight test. Off by default — an ordinary run emits none.
+    pub fn enable_supervised() void {
+        supervised = true;
+    }
+
+    fn emitCheckpoint(comptime tag: []const u8, position: i64) void {
+        if (!supervised) return;
+        var buf: [48]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, tag ++ " {d}\n", .{position}) catch return;
+        stderrWriteFlushed(line);
     }
 
     pub fn enable_timings() void {
@@ -19901,13 +19942,17 @@ pub const Zest = struct {
         shuffle_suite_offset = 0;
         shuffle_suite_selected_index = -1;
         shuffle_suite_claimed = false;
+        current_shuffle_position = position;
+        emitCheckpoint("##ZEST-BEGIN", position);
     }
 
     pub fn end_shuffle_pass() void {
+        emitCheckpoint("##ZEST-END", current_shuffle_position);
         shuffle_global_target_index = -1;
         shuffle_suite_offset = 0;
         shuffle_suite_selected_index = -1;
         shuffle_suite_claimed = false;
+        current_shuffle_position = -1;
     }
 
     pub fn enter_selected_suite(case_count: i64) bool {

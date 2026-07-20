@@ -47,7 +47,7 @@ pub struct Zest.Runner {
 
       pub fn main(_args :: [String]) -> u8 {
         Zest.Runner.configure()
-        zest_run_discovered_cases(0, zest_total_case_count())
+        zest_run_discovered_cases(:zig.Zest.start_position(), zest_total_case_count())
         Zest.Runner.run()
       }
 
@@ -207,7 +207,21 @@ pub struct Zest.Runner {
                 :ok
               }
             } else {
-              parse_cli_args(index + 1, count)
+              if System.arg_at(index) == "--resume-after" {
+                if index + 1 < count {
+                  set_resume_after_from_arg(System.arg_at(index + 1))
+                  parse_cli_args(index + 2, count)
+                } else {
+                  :ok
+                }
+              } else {
+                if System.arg_at(index) == "--supervised" {
+                  :zig.Zest.enable_supervised()
+                  parse_cli_args(index + 1, count)
+                } else {
+                  parse_cli_args(index + 1, count)
+                }
+              }
             }
           }
         }
@@ -238,6 +252,19 @@ pub struct Zest.Runner {
 
   fn set_timeout_from_optional(timeout :: i64) -> Atom {
     :zig.Zest.set_timeout(timeout)
+    :ok
+  }
+
+  fn set_resume_after_from_arg(value :: String) -> Atom {
+    set_resume_after_from_optional(Integer.parse(value))
+  }
+
+  fn set_resume_after_from_optional(nil) -> Atom {
+    :ok
+  }
+
+  fn set_resume_after_from_optional(ordinal :: i64) -> Atom {
+    :zig.Zest.set_resume_after(ordinal)
     :ok
   }
 
