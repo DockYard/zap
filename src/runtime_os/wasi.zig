@@ -360,6 +360,13 @@ pub const Backend = struct {
     /// not depend on this install. Matches the campaign's comptime-degrade
     /// contract, never a compile error.
     pub fn installCrashHandlers() void {}
+
+    /// Phase B per-test hard timeout — a no-op on WASI (no SIGALRM). The
+    /// in-process `check_timeout` still catches slow-but-returning tests. See
+    /// the POSIX backend for the real implementation.
+    pub fn alarmSeconds(seconds: u32) void {
+        _ = seconds;
+    }
     // ZAP_RUNTIME_OS_BODY_END wasi
 };
 

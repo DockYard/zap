@@ -366,6 +366,20 @@ const RuntimeOs = struct {
         std.posix.sigaction(.ILL, &act, null);
         std.posix.sigaction(.TRAP, &act, null);
     }
+
+    /// Phase B per-test hard timeout: arm (or, with 0, cancel) a `SIGALRM`
+    /// `seconds` from now. SIGALRM's default action terminates the process, so
+    /// a hung test that never returns still dies — and because the test's
+    /// `##ZEST-BEGIN` marker was already flushed, the supervisor running the
+    /// binary under `--supervised` sees an unterminated ordinal and isolates it
+    /// via the SAME crash-resume path as a `@panic`/fault. POSIX-only
+    /// (Darwin/Linux, the `signal_handlers_supported` gate); a no-op elsewhere,
+    /// where the in-process `check_timeout` still catches slow-but-returning
+    /// tests.
+    pub fn alarmSeconds(seconds: u32) void {
+        if (comptime !signal_handlers_supported) return;
+        _ = std.c.alarm(@intCast(seconds));
+    }
 };
 // ZAP_RUNTIME_OS_SEAM_END
 
@@ -19980,6 +19994,14 @@ pub const Zest = struct {
         current_test_name = duplicateFailureString(name) orelse name;
         test_count += 1;
         test_start_ns = if (timeout_ms > 0 or record_timings) nowNs() else 0;
+        // Under the supervisor, arm a hard per-test timeout so a hung
+        // (non-returning) test triggers SIGALRM and dies, letting the
+        // supervisor isolate it. `alarm` is whole-second granularity, so round
+        // any sub-second `--timeout` up to 1s.
+        if (supervised and timeout_ms > 0) {
+            const secs: u32 = @intCast(@divTrunc(timeout_ms + 999, 1000));
+            RuntimeOs.alarmSeconds(secs);
+        }
     }
 
     pub fn check_timeout() bool {
@@ -19998,6 +20020,9 @@ pub const Zest = struct {
     }
 
     pub fn end_test() void {
+        // The test returned in time — cancel the hard timeout armed in
+        // `begin_named_test` before the inter-test bookkeeping runs.
+        if (supervised and timeout_ms > 0) RuntimeOs.alarmSeconds(0);
         if (record_timings and test_start_ns != 0) {
             recordTiming(nowNs() - test_start_ns);
         }

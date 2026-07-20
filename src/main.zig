@@ -2351,6 +2351,24 @@ fn superviseTestRun(
     const stderr_path = ".zap-zest-shard.stderr";
     defer std.Io.Dir.cwd().deleteFile(global_io, stderr_path) catch {};
 
+    // Pin ONE seed for the whole run so every shard shuffles identically —
+    // otherwise a re-spawned child would default to a fresh clock-based seed,
+    // giving a different ordinal→case mapping, and `--resume-after <n>` would
+    // skip the wrong tests (and re-run the crashing one). Honor the user's
+    // `--seed` if they passed one; otherwise derive a fresh per-run seed here
+    // and pass it to every shard (Zest prints it, so the run stays
+    // reproducible).
+    const has_user_seed = for (base_args) |a| {
+        if (std.mem.eql(u8, a, "--seed")) break true;
+    } else false;
+    var seed_buf: [24]u8 = undefined;
+    const pinned_seed: ?[]const u8 = if (has_user_seed) null else blk: {
+        var timestamp: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+        _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &timestamp);
+        const seed_bits: u64 = @bitCast(@as(i64, timestamp.sec) *% 1_000_000_000 +% @as(i64, timestamp.nsec));
+        break :blk try std.fmt.bufPrint(&seed_buf, "{d}", .{seed_bits & 0x7FFF_FFFF_FFFF_FFFF});
+    };
+
     var resume_after: i64 = -1;
     var hard_failures: usize = 0;
     var worst_exit: u8 = 0;
@@ -2360,6 +2378,10 @@ fn superviseTestRun(
         defer args.deinit(allocator);
         for (base_args) |a| try args.append(allocator, a);
         try args.append(allocator, "--supervised");
+        if (pinned_seed) |seed_value| {
+            try args.append(allocator, "--seed");
+            try args.append(allocator, seed_value);
+        }
         var resume_buf: [24]u8 = undefined;
         if (resume_after >= 0) {
             try args.append(allocator, "--resume-after");

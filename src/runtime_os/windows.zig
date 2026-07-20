@@ -820,6 +820,14 @@ pub const Backend = struct {
         if (veh_handle != null) return;
         veh_handle = std.os.windows.ntdll.RtlAddVectoredExceptionHandler(1, vehHandler);
     }
+
+    /// Phase B per-test hard timeout — a no-op on Windows (no SIGALRM). A hung
+    /// test is not force-killed here; the in-process `check_timeout` still
+    /// catches slow-but-returning tests. See the POSIX backend for the real
+    /// implementation.
+    pub fn alarmSeconds(seconds: u32) void {
+        _ = seconds;
+    }
     // ZAP_RUNTIME_OS_BODY_END windows
 };
 

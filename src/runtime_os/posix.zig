@@ -452,6 +452,20 @@ pub const Backend = struct {
         std.posix.sigaction(.ILL, &act, null);
         std.posix.sigaction(.TRAP, &act, null);
     }
+
+    /// Phase B per-test hard timeout: arm (or, with 0, cancel) a `SIGALRM`
+    /// `seconds` from now. SIGALRM's default action terminates the process, so
+    /// a hung test that never returns still dies — and because the test's
+    /// `##ZEST-BEGIN` marker was already flushed, the supervisor running the
+    /// binary under `--supervised` sees an unterminated ordinal and isolates it
+    /// via the SAME crash-resume path as a `@panic`/fault. POSIX-only
+    /// (Darwin/Linux, the `signal_handlers_supported` gate); a no-op elsewhere,
+    /// where the in-process `check_timeout` still catches slow-but-returning
+    /// tests.
+    pub fn alarmSeconds(seconds: u32) void {
+        if (comptime !signal_handlers_supported) return;
+        _ = std.c.alarm(@intCast(seconds));
+    }
     // ZAP_RUNTIME_OS_BODY_END posix
 };
 
