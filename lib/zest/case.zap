@@ -115,7 +115,11 @@ pub struct Zest.Case {
 
     quote {
       :zig.Zest.begin_named_test(unquote(test_display_name))
-      unquote(make_call(".", [env, generated_function_name]))()
+      try {
+        unquote(make_call(".", [env, generated_function_name]))()
+      } rescue {
+        caught :: Error -> Zest.Case.zest_record_raised(caught)
+      }
       :zig.Zest.end_test()
       :zig.Zest.print_result()
     }
@@ -368,6 +372,22 @@ pub struct Zest.Case {
   pub fn print_result() -> Atom {
     :zig.Zest.print_result()
     :ok
+  }
+
+  @doc = """
+    Records the currently-running Zest case as FAILED because its body raised
+    an uncaught error, rendering the error as `** (kind) message` for the
+    failure detail. The generated per-case landing pad (`build_run_call`) wraps
+    each test body in `try { … } rescue { caught :: Error -> ... }` and calls
+    this from the rescue arm, so a raising test fails that ONE case and the
+    runner proceeds to the next — instead of the raise propagating out of
+    `zest_run_selected_case` and aborting the entire suite. Returns a `String`
+    so the rescue arm unifies with the test body's `String` return.
+    """
+
+  pub fn zest_record_raised(caught :: Error) -> String {
+    :zig.Zest.fail_assertion_with_message("test raised ** (" <> Atom.to_string(Error.kind(caught)) <> ") " <> Error.message(caught))
+    "raised"
   }
 
   @doc = """

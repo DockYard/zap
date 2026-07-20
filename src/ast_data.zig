@@ -3167,6 +3167,51 @@ fn ctValueToExprBudgeted(
         }
     }
 
+    // Try/rescue: {:try_rescue, meta, [do: body, rescue: [clauses...], after: cleanup_or_nil]}
+    // where each rescue clause is {:->, [], [[pattern], body]}. Mirror of the
+    // encode in the `.try_rescue` arm of the expr→ct-value path; without this
+    // decode arm a quoted `try`/`rescue` fell through to InvalidCtValueShape.
+    if (std.mem.eql(u8, form_name, "try_rescue")) {
+        var body_stmts: []const ast.Stmt = &.{};
+        var have_body = false;
+        errdefer if (have_body) deinitDecodedStmtSlice(alloc, body_stmts);
+        var clauses = DecodedCaseClauseList.init(alloc);
+        defer clauses.deinit();
+        var after_block: ?[]const ast.Stmt = null;
+        errdefer if (after_block) |after_stmts| deinitDecodedStmtSlice(alloc, after_stmts);
+
+        for (arg_elems) |pair| {
+            if (pair != .tuple or pair.tuple.elems.len != 2 or pair.tuple.elems[0] != .atom) continue;
+            const key = pair.tuple.elems[0].atom;
+            const val = pair.tuple.elems[1];
+            if (std.mem.eql(u8, key, "do")) {
+                body_stmts = try ctValueToStmtsBudgeted(alloc, interner, val, budget);
+                have_body = true;
+            } else if (std.mem.eql(u8, key, "rescue")) {
+                if (val == .list) {
+                    for (val.list.elems) |clause_val| {
+                        try clauses.append(try ctValueToCaseClauseBudgeted(alloc, interner, clause_val, budget));
+                    }
+                }
+            } else if (std.mem.eql(u8, key, "after")) {
+                if (val != .nil) {
+                    after_block = try ctValueToStmtsBudgeted(alloc, interner, val, budget);
+                }
+            }
+        }
+
+        const expr = try alloc.create(ast.Expr);
+        errdefer alloc.destroy(expr);
+        const clause_slice = try clauses.takeOwnedSlice();
+        expr.* = .{ .try_rescue = .{
+            .meta = node_meta,
+            .body = body_stmts,
+            .rescue_clauses = clause_slice,
+            .after_block = after_block,
+        } };
+        return expr;
+    }
+
     // String interpolation: {:<<>>, meta, [parts...]}
     if (std.mem.eql(u8, form_name, "<<>>")) {
         var parts = DecodedStringPartList.init(alloc);
