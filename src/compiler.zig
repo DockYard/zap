@@ -11902,6 +11902,40 @@ pub fn runBinaryWithEnv(
     };
 }
 
+/// Phase B supervisor (docs/phase-b-test-isolation-design.md): spawn ONE shard
+/// of the Zest test binary. The child's stdout is INHERITED so live progress
+/// (the dots + summary) reaches the user unchanged, while its stderr is
+/// redirected to `stderr_file` — a temp file the supervisor reads AFTER the
+/// child exits for the `##ZEST-BEGIN`/`##ZEST-END` checkpoint markers and any
+/// crash report. A file (not a pipe) avoids a pipe-buffer deadlock when the
+/// child emits many markers, and lets the supervisor attribute an abnormal
+/// exit (`@panic`/fault) to the exact in-flight test. Returns the raw `Term`
+/// so the caller distinguishes a clean exit from a signal/abort.
+pub fn spawnTestShard(
+    allocator: std.mem.Allocator,
+    pio: std.Io,
+    bin_path: []const u8,
+    program_args: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    stderr_file: std.Io.File,
+) !std.process.Child.Term {
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, bin_path);
+    for (program_args) |arg| {
+        try argv.append(allocator, arg);
+    }
+
+    var child = try std.process.spawn(pio, .{
+        .argv = argv.items,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .{ .file = stderr_file },
+        .environ_map = environ_map,
+    });
+    return try child.wait(pio);
+}
+
 /// Validate that a source file contains exactly one struct declaration and that the
 /// struct name matches the file path. Returns an error message if validation
 /// fails, or null if the file is valid.

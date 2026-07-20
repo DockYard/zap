@@ -2226,12 +2226,25 @@ fn runPipelineArtifactAndExit(
     switch (mode) {
         .tests => std.debug.print("Running tests\n", .{}),
     }
-    const exit_code = compiler.runBinaryWithEnv(allocator, global_io, artifact.path, run_args, global_env_map) catch |err| {
-        switch (mode) {
-            .tests => std.debug.print("Error running tests: {}\n", .{err}),
+    // Phase B: `ZAP_ZEST_ISOLATE` opts into per-test hard-failure isolation —
+    // the supervisor re-spawns past any test that `@panic`s/faults/hangs so one
+    // hard failure no longer aborts the whole run. Off by default, so an
+    // ordinary `zap test` runs the binary exactly as before.
+    const isolate = std.c.getenv("ZAP_ZEST_ISOLATE") != null;
+    const exit_code = if (isolate)
+        superviseTestRun(allocator, artifact.path, run_args, global_env_map) catch |err| {
+            switch (mode) {
+                .tests => std.debug.print("Error running tests: {}\n", .{err}),
+            }
+            std.process.exit(1);
         }
-        std.process.exit(1);
-    };
+    else
+        compiler.runBinaryWithEnv(allocator, global_io, artifact.path, run_args, global_env_map) catch |err| {
+            switch (mode) {
+                .tests => std.debug.print("Error running tests: {}\n", .{err}),
+            }
+            std.process.exit(1);
+        };
     std.process.exit(exit_code);
 }
 
@@ -2288,6 +2301,113 @@ fn executePipelineAfterInitialCompile(
         }
     }
     pipelineError("completed without a run step", .{});
+}
+
+/// Phase B (docs/phase-b-test-isolation-design.md): the last `##ZEST-BEGIN <n>`
+/// in a shard's captured stderr that has no matching `##ZEST-END <n>` — i.e. the
+/// global ordinal the child was running when it died. `null` when every BEGIN
+/// was terminated (the shard ran its tests to completion). Crash-report lines
+/// and other stderr are ignored (only the markers move `pending`).
+fn zestCrashedOrdinal(stderr_bytes: []const u8) ?i64 {
+    var pending: ?i64 = null;
+    var lines = std.mem.splitScalar(u8, stderr_bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "##ZEST-BEGIN ")) {
+            const rest = std.mem.trim(u8, line["##ZEST-BEGIN ".len..], " \r\t");
+            pending = std.fmt.parseInt(i64, rest, 10) catch continue;
+        } else if (std.mem.startsWith(u8, line, "##ZEST-END ")) {
+            pending = null;
+        }
+    }
+    return pending;
+}
+
+/// Forward a shard's captured stderr to the real stderr, dropping the internal
+/// `##ZEST-BEGIN`/`##ZEST-END` marker lines so the user sees crash reports and
+/// any genuine diagnostics but not the supervisor's bookkeeping.
+fn reemitShardStderr(stderr_bytes: []const u8) void {
+    var lines = std.mem.splitScalar(u8, stderr_bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "##ZEST-BEGIN ") or std.mem.startsWith(u8, line, "##ZEST-END ")) continue;
+        if (line.len == 0) continue;
+        std.debug.print("{s}\n", .{line});
+    }
+}
+
+/// Phase B supervisor: run the Zest test binary with per-test hard-failure
+/// isolation. The child runs with `--supervised` (checkpoint markers) and its
+/// stderr captured to a temp file; stdout stays live. On a clean exit the
+/// single shard IS the whole run. On an abnormal exit (a signal/abort, or an
+/// exit with an unterminated `##ZEST-BEGIN`) the crashing ordinal is recorded
+/// as a hard failure and the binary is re-spawned with `--resume-after <n>` to
+/// continue past it — so one `@panic`/fault loses at most that one test.
+/// Returns the process exit code (0 iff every shard passed and nothing crashed).
+fn superviseTestRun(
+    allocator: std.mem.Allocator,
+    bin_path: []const u8,
+    base_args: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !u8 {
+    const stderr_path = ".zap-zest-shard.stderr";
+    defer std.Io.Dir.cwd().deleteFile(global_io, stderr_path) catch {};
+
+    var resume_after: i64 = -1;
+    var hard_failures: usize = 0;
+    var worst_exit: u8 = 0;
+
+    while (true) {
+        var args: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer args.deinit(allocator);
+        for (base_args) |a| try args.append(allocator, a);
+        try args.append(allocator, "--supervised");
+        var resume_buf: [24]u8 = undefined;
+        if (resume_after >= 0) {
+            try args.append(allocator, "--resume-after");
+            try args.append(allocator, try std.fmt.bufPrint(&resume_buf, "{d}", .{resume_after}));
+        }
+
+        const stderr_file = try std.Io.Dir.cwd().createFile(global_io, stderr_path, .{ .read = true });
+        const term = compiler.spawnTestShard(allocator, global_io, bin_path, args.items, environ_map, stderr_file) catch |err| {
+            stderr_file.close(global_io);
+            std.debug.print("Error running test shard: {}\n", .{err});
+            return 1;
+        };
+        stderr_file.close(global_io);
+
+        const stderr_bytes = std.Io.Dir.cwd().readFileAlloc(global_io, stderr_path, allocator, .limited(64 * 1024 * 1024)) catch &.{};
+        defer if (stderr_bytes.len > 0) allocator.free(stderr_bytes);
+        const crashed = zestCrashedOrdinal(stderr_bytes);
+        reemitShardStderr(stderr_bytes);
+
+        if (crashed == null) {
+            // The shard ran its remaining tests to completion.
+            if (term == .exited and term.exited > worst_exit) worst_exit = term.exited;
+            if (term != .exited) {
+                // Abnormal exit AFTER the last test (teardown/summary) — count
+                // it, but there is nothing left to resume.
+                hard_failures += 1;
+            }
+            break;
+        }
+
+        const crashed_ordinal = crashed.?;
+        hard_failures += 1;
+        std.debug.print(
+            "\n\x1b[1;31m⚡ test #{d} crashed ({any}) — isolated as a hard failure, resuming\x1b[0m\n",
+            .{ crashed_ordinal, term },
+        );
+        resume_after = crashed_ordinal;
+        worst_exit = 1;
+    }
+
+    if (hard_failures > 0) {
+        std.debug.print(
+            "\n\x1b[1;31m{d} test(s) crashed (hard failure — isolated by the supervisor)\x1b[0m\n",
+            .{hard_failures},
+        );
+        return 1;
+    }
+    return worst_exit;
 }
 
 fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -2350,12 +2470,19 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    // Run the built test binary
+    // Run the built test binary. `ZAP_ZEST_ISOLATE` opts into the Phase B
+    // per-test hard-failure supervisor (same gate as the pipeline path).
     std.debug.print("Running tests\n", .{});
-    const exit_code = compiler.runBinary(allocator, global_io, artifact.path, test_run_args.items) catch |err| {
-        std.debug.print("Error running tests: {}\n", .{err});
-        std.process.exit(1);
-    };
+    const exit_code = if (std.c.getenv("ZAP_ZEST_ISOLATE") != null)
+        superviseTestRun(allocator, artifact.path, test_run_args.items, global_env_map) catch |err| {
+            std.debug.print("Error running tests: {}\n", .{err});
+            std.process.exit(1);
+        }
+    else
+        compiler.runBinary(allocator, global_io, artifact.path, test_run_args.items) catch |err| {
+            std.debug.print("Error running tests: {}\n", .{err});
+            std.process.exit(1);
+        };
     std.process.exit(exit_code);
 }
 
