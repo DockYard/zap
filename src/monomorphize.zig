@@ -250,6 +250,7 @@ pub fn monomorphize(
         // maps below (their `.init` cannot fail).
         .protocol_name_ids = try buildProtocolNameIndex(allocator, program, interner),
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
+        .generic_owner_structs = std.AutoHashMap(u32, ?ast.StructName).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
         .new_groups = .empty,
@@ -259,6 +260,7 @@ pub fn monomorphize(
     };
     defer ctx.protocol_name_ids.deinit(allocator);
     defer ctx.generic_groups.deinit();
+    defer ctx.generic_owner_structs.deinit();
     defer ctx.specializations.deinit();
     defer ctx.specialization_counts.deinit();
     defer ctx.new_groups.deinit(allocator);
@@ -270,12 +272,14 @@ pub fn monomorphize(
         for (mod.functions) |*group| {
             if (try ctx.isGenericGroup(group)) {
                 try ctx.generic_groups.put(group.id, group);
+                try ctx.recordGenericOwnerStruct(group, mod.name);
             }
         }
     }
     for (program.top_functions) |*group| {
         if (try ctx.isGenericGroup(group)) {
             try ctx.generic_groups.put(group.id, group);
+            try ctx.recordGenericOwnerStruct(group, null);
         }
     }
 
@@ -420,12 +424,14 @@ pub fn monomorphize(
                 // Cross-struct: place in calling struct
                 if (target_idx == mod_idx) {
                     try new_fns.append(allocator, entry.group);
+                    try ctx.copySpecializationRaisesRow(entry, mod.name);
                 }
             } else {
                 // Intra-struct: place in defining struct
                 for (mod.functions) |orig_group| {
                     if (entry.source_group_id == orig_group.id) {
                         try new_fns.append(allocator, entry.group);
+                        try ctx.copySpecializationRaisesRow(entry, mod.name);
                     }
                 }
             }
@@ -447,6 +453,7 @@ pub fn monomorphize(
         for (program.top_functions) |orig_group| {
             if (entry.source_group_id == orig_group.id) {
                 try new_top_fns.append(allocator, entry.group);
+                try ctx.copySpecializationRaisesRow(entry, null);
             }
         }
     }
@@ -539,6 +546,32 @@ const MonomorphContext = struct {
     current_protocol_source_param_types: ?[]const hir.TypedParam = null,
     /// Map from group_id → FunctionGroup for generic functions
     generic_groups: std.AutoHashMap(u32, *const hir.FunctionGroup),
+    /// Map from generic group_id → the generic's OWNING struct name (null for
+    /// a top-level generic). Recorded in Phase A so Phase C can copy a RAISING
+    /// generic's `inferred_raises` row onto each of its monomorphized
+    /// specializations.
+    ///
+    /// A specialization raises iff its generic does, but raise inference runs
+    /// on the UN-lowered generic — the direct `raise(...)` expr is detected
+    /// there and its row stored under the generic's key. A specialization is a
+    /// clone produced AFTER that lowering pass, so its `raise` is already a
+    /// `Kernel.recoverable_raise(...)` call that carries no row of its own;
+    /// re-scanning the clone finds no detectable raise. Without copying the
+    /// generic's row onto the specialization's key, `functionRaises` reports
+    /// the specialization as non-raising, codegen drops its `error{ZapRaise}!T`
+    /// return ABI, and a caller that catches the raise fails to compile
+    /// (`expected T, found error{ZapRaise}`). Single-arity stdlib generics like
+    /// `List.head!` were the trigger: the same-named instance `List_head!__i64`
+    /// lost the row.
+    ///
+    /// The owning struct is needed (not just a precomputed key) because a
+    /// specialization is queried under TWO prefixes that differ for a
+    /// cross-struct instantiation: the IR backend widens the instance's own
+    /// return under its PLACEMENT module (`current_struct_prefix`), while a
+    /// call site decides the unwrap via the callee group's SCOPE-walked prefix
+    /// (which, for a clone, is the generic's owning struct). Phase C copies the
+    /// row under both so producer and both consumers agree.
+    generic_owner_structs: std.AutoHashMap(u32, ?ast.StructName),
     /// Map from hash(group_id, type_args) → specialized group_id
     specializations: std.AutoHashMap(u64, u32),
     /// Newly created specialized groups
@@ -657,6 +690,79 @@ const MonomorphContext = struct {
         while (try walker.next()) |item| {
             try walker.pushStructuralChildren(self.store, item);
         }
+    }
+
+    /// Build the stable `inferred_raises` row key for a function identified by
+    /// its owning struct name (null for a top-level function), interned method
+    /// name, and arity. Delegates the format + separator canonicalization to
+    /// `TypeStore.raisesRowKeyString` so this producer shares one definition of
+    /// the key with the type checker and the IR backend.
+    fn raisesKeyFor(
+        self: *MonomorphContext,
+        struct_name: ?ast.StructName,
+        method_name_id: ast.StringId,
+        arity: u32,
+    ) !ast.StringId {
+        var prefix_buf: ?[]const u8 = null;
+        defer if (prefix_buf) |buf| self.allocator.free(buf);
+        const prefix: ?[]const u8 = if (struct_name) |sn| blk: {
+            const joined = try sn.joinedWith(self.allocator, self.interner, ".");
+            prefix_buf = joined;
+            break :blk joined;
+        } else null;
+        return try self.store.raisesRowKeyString(prefix, self.interner.get(method_name_id), arity);
+    }
+
+    /// Phase A helper: remember a generic function group's OWNING struct so
+    /// Phase C can copy its row onto each specialization. See the
+    /// `generic_owner_structs` field doc for why a specialization cannot
+    /// re-derive its own row.
+    fn recordGenericOwnerStruct(
+        self: *MonomorphContext,
+        group: *const hir.FunctionGroup,
+        struct_name: ?ast.StructName,
+    ) !void {
+        try self.generic_owner_structs.put(group.id, struct_name);
+    }
+
+    /// Copy `row` (dup'd into store-owned memory) into `inferred_raises` under
+    /// `key`, unless a row is already present there. Marks the fixpoint dirty
+    /// so a transitively-raising caller is re-closed by `closeRaisesFixpoint`.
+    fn seedRaisesRowIfAbsent(self: *MonomorphContext, key: ast.StringId, row: []const TypeId) !void {
+        if (self.store.inferred_raises.contains(key)) return;
+        const copied = try self.store.allocator.dupe(TypeId, row);
+        try self.store.inferred_raises.put(key, copied);
+        self.store.raises_fixpoint_dirty = true;
+    }
+
+    /// Phase C helper: if the generic that `entry` specializes has a non-empty
+    /// inferred `raises` row, copy that row onto the specialization's key under
+    /// BOTH prefixes it is later queried by, so producer and every consumer
+    /// agree that the specialization raises:
+    ///   - `placement_struct` — the module the clone is emitted into, the
+    ///     prefix the IR backend uses (`current_struct_prefix`) to widen the
+    ///     instance's OWN error-union return;
+    ///   - the generic's OWNING struct — the prefix a CALL SITE derives by
+    ///     scope-walking the callee group (a clone keeps the generic's scope),
+    ///     which drives the call-site `try`/`catch` unwrap (`calleeRaises`).
+    /// For an intra-struct instantiation the two prefixes coincide and the
+    /// second copy is a no-op via the `contains` guard.
+    fn copySpecializationRaisesRow(
+        self: *MonomorphContext,
+        entry: NewGroupEntry,
+        placement_struct: ?ast.StructName,
+    ) !void {
+        const generic_group = self.generic_groups.get(entry.source_group_id) orelse return;
+        const owner_struct = self.generic_owner_structs.get(entry.source_group_id) orelse return;
+        const generic_key = try self.raisesKeyFor(owner_struct, generic_group.name, generic_group.arity);
+        const generic_row = self.store.inferred_raises.get(generic_key) orelse return;
+        if (generic_row.len == 0) return;
+
+        const placement_key = try self.raisesKeyFor(placement_struct, entry.group.name, entry.group.arity);
+        try self.seedRaisesRowIfAbsent(placement_key, generic_row);
+
+        const scope_key = try self.raisesKeyFor(owner_struct, entry.group.name, entry.group.arity);
+        try self.seedRaisesRowIfAbsent(scope_key, generic_row);
     }
 
     fn isGenericGroup(self: *MonomorphContext, group: *const hir.FunctionGroup) error{OutOfMemory}!bool {
@@ -4232,6 +4338,7 @@ pub fn specializeSpawnManagers(
         // maps below (their `.init` cannot fail).
         .protocol_name_ids = try buildProtocolNameIndex(allocator, program, interner),
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
+        .generic_owner_structs = std.AutoHashMap(u32, ?ast.StructName).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
         .new_groups = .empty,
@@ -4241,6 +4348,7 @@ pub fn specializeSpawnManagers(
     };
     defer ctx.protocol_name_ids.deinit(allocator);
     defer ctx.generic_groups.deinit();
+    defer ctx.generic_owner_structs.deinit();
     defer ctx.specializations.deinit();
     defer ctx.specialization_counts.deinit();
     defer ctx.new_groups.deinit(allocator);
@@ -5169,6 +5277,7 @@ fn initTestMonomorphContext(
         // cannot fail; `catch .empty` keeps the helper non-fallible.
         .protocol_name_ids = buildProtocolNameIndex(allocator, program, interner) catch .empty,
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(allocator),
+        .generic_owner_structs = std.AutoHashMap(u32, ?ast.StructName).init(allocator),
         .specializations = std.AutoHashMap(u64, u32).init(allocator),
         .specialization_counts = std.AutoHashMap(u32, u32).init(allocator),
         .new_groups = .empty,
@@ -5181,6 +5290,7 @@ fn initTestMonomorphContext(
 fn deinitTestMonomorphContext(ctx: *MonomorphContext) void {
     ctx.protocol_name_ids.deinit(ctx.allocator);
     ctx.generic_groups.deinit();
+    ctx.generic_owner_structs.deinit();
     ctx.specializations.deinit();
     ctx.specialization_counts.deinit();
     ctx.new_groups.deinit(ctx.allocator);
@@ -5688,6 +5798,7 @@ test "protocol constraint replacement compares substituted source params" {
         .program = &empty_program,
         .protocol_name_ids = try buildProtocolNameIndex(alloc, &empty_program, &interner),
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(alloc),
+        .generic_owner_structs = std.AutoHashMap(u32, ?ast.StructName).init(alloc),
         .specializations = std.AutoHashMap(u64, u32).init(alloc),
         .specialization_counts = std.AutoHashMap(u32, u32).init(alloc),
         .new_groups = .empty,
@@ -5700,6 +5811,7 @@ test "protocol constraint replacement compares substituted source params" {
     };
     defer ctx.protocol_name_ids.deinit(alloc);
     defer ctx.generic_groups.deinit();
+    defer ctx.generic_owner_structs.deinit();
     defer ctx.specializations.deinit();
     defer ctx.specialization_counts.deinit();
     defer ctx.new_groups.deinit(alloc);
@@ -5742,6 +5854,7 @@ test "monomorphizer rejects structurally oversized specialization type arguments
         .program = &empty_program,
         .protocol_name_ids = try buildProtocolNameIndex(alloc, &empty_program, &interner),
         .generic_groups = std.AutoHashMap(u32, *const hir.FunctionGroup).init(alloc),
+        .generic_owner_structs = std.AutoHashMap(u32, ?ast.StructName).init(alloc),
         .specializations = std.AutoHashMap(u64, u32).init(alloc),
         .specialization_counts = std.AutoHashMap(u32, u32).init(alloc),
         .new_groups = .empty,
@@ -5751,6 +5864,7 @@ test "monomorphizer rejects structurally oversized specialization type arguments
     };
     defer ctx.protocol_name_ids.deinit(alloc);
     defer ctx.generic_groups.deinit();
+    defer ctx.generic_owner_structs.deinit();
     defer ctx.specializations.deinit();
     defer ctx.specialization_counts.deinit();
     defer ctx.new_groups.deinit(alloc);

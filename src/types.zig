@@ -339,6 +339,20 @@ pub const TypeStore = struct {
     /// the O(edges × depth) propagation work when the graph actually changed
     /// (e.g. after a later CTFE re-check adds rows to the same store).
     raises_fixpoint_dirty: bool = true,
+    /// Set once the IR backend's whole-program HIR call-edge pre-pass
+    /// (`IrBuilder.collectRaisesCallEdges`) has run. The per-struct IR
+    /// pipeline (`compileStructByStruct`) invokes `IrBuilder.buildProgram`
+    /// once per struct against this SHARED store, each time passing the
+    /// whole-program HIR view as `known_name_program`. Collecting the
+    /// call-edge graph from EVERY function's HIR body (where all
+    /// desugared/protocol/operator call forms are finally explicit —
+    /// unlike the incomplete per-struct type-check-time edge recording)
+    /// need happen only ONCE against the store; this flag makes the
+    /// subsequent per-struct `buildProgram` calls skip the redundant
+    /// re-walk while `closeRaisesFixpoint` still runs cheaply (a no-op
+    /// once the dirty flag is clear). Defaults false; never reset within
+    /// a store's lifetime (a store maps 1:1 to one compilation's HIR).
+    raises_hir_edges_collected: bool = false,
     /// Struct TypeIds whose `field :: Type = expr` defaults have
     /// already been validated by `TypeChecker.validateStructFieldDefaults`.
     /// Lives on the TypeStore (not the TypeChecker) because the
@@ -643,9 +657,30 @@ pub const TypeStore = struct {
         method_name: []const u8,
         arity: u32,
     ) !ast.StringId {
-        const key_text = if (struct_prefix) |prefix|
-            try std.fmt.allocPrint(self.allocator, "{s}.{s}/{d}", .{ prefix, method_name, arity })
-        else
+        // Canonicalize the struct-prefix separator so producer and consumer
+        // land on ONE key. The prefix reaches this function spelled two ways
+        // depending on the caller: the type checker walks scope-graph struct
+        // names and DOT-joins nested parts (`Zap.ListTest`), while the IR
+        // backend derives its query prefix via `structNameToPrefix`, which
+        // UNDERSCORE-joins them (`Zap_ListTest`) so the result is a legal Zig
+        // identifier. Both spellings MUST map to the same `inferred_raises`
+        // key — otherwise the type checker's stored/fixpoint-flipped row is
+        // invisible to the codegen ABI query for any nested (dotted) struct,
+        // which silently drops the `error{ZapRaise}!T` return and turns a
+        // caught cross-function `raise` into an `expected T, found
+        // error{ZapRaise}` compile error (single-part stdlib structs like
+        // `List` have no separator, so they were unaffected and the mismatch
+        // stayed latent until nested test structs exercised it). Normalize to
+        // the underscore form — the codegen identity, which cannot change
+        // because it must be a Zig identifier — so both callers converge.
+        // Method names never contain `.`, so the prefix/method boundary `.`
+        // stays an unambiguous separator.
+        const key_text = if (struct_prefix) |prefix| blk: {
+            const normalized_prefix = try self.allocator.alloc(u8, prefix.len);
+            defer self.allocator.free(normalized_prefix);
+            for (prefix, 0..) |ch, i| normalized_prefix[i] = if (ch == '.') '_' else ch;
+            break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}/{d}", .{ normalized_prefix, method_name, arity });
+        } else
             try std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ method_name, arity });
         defer self.allocator.free(key_text);
         const interner_mut: *ast.StringInterner = @constCast(self.interner);
