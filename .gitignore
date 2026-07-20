@@ -41,3 +41,4 @@ bench/map-workloads/*/instrumentation.json
 bench/map-workloads/*/map-instrumentation.json
 bench/map-workloads/*/map-instrumentation.jsonl
 zap-deps
+.zap-zest-shard.stderr

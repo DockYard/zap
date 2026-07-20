@@ -2226,11 +2226,11 @@ fn runPipelineArtifactAndExit(
     switch (mode) {
         .tests => std.debug.print("Running tests\n", .{}),
     }
-    // Phase B: `ZAP_ZEST_ISOLATE` opts into per-test hard-failure isolation —
-    // the supervisor re-spawns past any test that `@panic`s/faults/hangs so one
-    // hard failure no longer aborts the whole run. Off by default, so an
-    // ordinary `zap test` runs the binary exactly as before.
-    const isolate = std.c.getenv("ZAP_ZEST_ISOLATE") != null;
+    // Phase B: per-test hard-failure isolation is ON by default — the
+    // supervisor re-spawns past any test that `@panic`s/faults/hangs so one
+    // hard failure no longer aborts the whole run. Set `ZAP_ZEST_NO_ISOLATE`
+    // to opt out and run the binary directly (a single un-supervised process).
+    const isolate = std.c.getenv("ZAP_ZEST_NO_ISOLATE") == null;
     const exit_code = if (isolate)
         superviseTestRun(allocator, artifact.path, run_args, global_env_map) catch |err| {
             switch (mode) {
@@ -2482,6 +2482,37 @@ fn superviseTestRun(
     return worst_exit;
 }
 
+test "Phase B: zestCrashedOrdinal returns the unterminated BEGIN ordinal" {
+    // A begin with no matching end => that test crashed mid-run.
+    try std.testing.expectEqual(@as(?i64, 1), zestCrashedOrdinal(
+        "##ZEST-BEGIN 0\n##ZEST-END 0\n##ZEST-BEGIN 1\n",
+    ));
+    // A trailing crash report after the begin must not disturb the result.
+    try std.testing.expectEqual(@as(?i64, 2), zestCrashedOrdinal(
+        "##ZEST-BEGIN 2\n** (runtime_error) boom\n  Foo.bar/0 at x.zap:1\n",
+    ));
+}
+
+test "Phase B: zestCrashedOrdinal returns null when every BEGIN is terminated" {
+    try std.testing.expectEqual(@as(?i64, null), zestCrashedOrdinal(
+        "##ZEST-BEGIN 0\n##ZEST-END 0\n##ZEST-BEGIN 1\n##ZEST-END 1\n",
+    ));
+    try std.testing.expectEqual(@as(?i64, null), zestCrashedOrdinal("no markers at all\n"));
+}
+
+test "Phase B: ShardTally.accumulate folds END counts and SUMMARY fields" {
+    var tally: ShardTally = .{};
+    // A shard that ran two tests to completion and reported a summary.
+    tally.accumulate("##ZEST-BEGIN 0\n##ZEST-END 0\n##ZEST-BEGIN 1\n##ZEST-END 1\n##ZEST-SUMMARY 2 1 5 1 0\n");
+    // A second (dying) shard: one completed test, no summary.
+    tally.accumulate("##ZEST-BEGIN 2\n##ZEST-END 2\n##ZEST-BEGIN 3\n");
+    try std.testing.expectEqual(@as(u64, 3), tally.completed); // three ##ZEST-END total
+    try std.testing.expectEqual(@as(u64, 1), tally.failures); // only the surviving shard's summary
+    try std.testing.expectEqual(@as(u64, 5), tally.assertions);
+    try std.testing.expectEqual(@as(u64, 1), tally.assertion_failures);
+    try std.testing.expectEqual(@as(u64, 0), tally.timeouts);
+}
+
 fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
     switch (try classifyRunPositional(allocator, args)) {
         .script => |s| return cmdTestScript(allocator, args, s.path, s.arg_index),
@@ -2542,10 +2573,11 @@ fn cmdTest(allocator: std.mem.Allocator, args: []const []const u8) !void {
         std.process.exit(1);
     }
 
-    // Run the built test binary. `ZAP_ZEST_ISOLATE` opts into the Phase B
-    // per-test hard-failure supervisor (same gate as the pipeline path).
+    // Run the built test binary under the Phase B per-test hard-failure
+    // supervisor by default (`ZAP_ZEST_NO_ISOLATE` opts out; same gate as the
+    // pipeline path).
     std.debug.print("Running tests\n", .{});
-    const exit_code = if (std.c.getenv("ZAP_ZEST_ISOLATE") != null)
+    const exit_code = if (std.c.getenv("ZAP_ZEST_NO_ISOLATE") == null)
         superviseTestRun(allocator, artifact.path, test_run_args.items, global_env_map) catch |err| {
             std.debug.print("Error running tests: {}\n", .{err});
             std.process.exit(1);
