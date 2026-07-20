@@ -6376,6 +6376,30 @@ pub const IrBuilder = struct {
         return self.findNamedHirGroupIn(self.known_name_program, target_struct, named.name, arity);
     }
 
+    /// True when `name`'s fully-qualified spelling, joined with `separator`,
+    /// equals `target`, compared WITHOUT allocating (this is called from the
+    /// non-fallible `findNamedHirGroupIn`). Checked for BOTH the dotted form
+    /// (`Zap.ListTest`) and the underscore form (`Zap_ListTest`, the codegen
+    /// identity that a macro splicing a struct VALUE into a call target emits),
+    /// so a nested (dotted) callee resolves regardless of which spelling the
+    /// call site carries. A single-part name is handled by the caller's
+    /// last-part check.
+    fn structNameEqualsJoined(self: *const IrBuilder, name: ast.StructName, target: []const u8, separator: u8) bool {
+        if (name.parts.len <= 1) return false;
+        var pos: usize = 0;
+        for (name.parts, 0..) |part_id, index| {
+            if (index > 0) {
+                if (pos >= target.len or target[pos] != separator) return false;
+                pos += 1;
+            }
+            const part = self.interner.get(part_id);
+            if (pos + part.len > target.len) return false;
+            if (!std.mem.eql(u8, target[pos .. pos + part.len], part)) return false;
+            pos += part.len;
+        }
+        return pos == target.len;
+    }
+
     fn findNamedHirGroupIn(
         self: *const IrBuilder,
         maybe_program: ?*const hir_mod.Program,
@@ -6387,7 +6411,20 @@ pub const IrBuilder = struct {
         for (program.structs) |*struct_info| {
             if (struct_info.name.parts.len == 0) continue;
             const last_part = self.interner.get(struct_info.name.parts[struct_info.name.parts.len - 1]);
-            if (!std.mem.eql(u8, last_part, target_struct)) continue;
+            // Match the caller-supplied struct token against BOTH the struct's
+            // last name part (`ListTest` — the common single-part call form
+            // like `List.head!`) AND its fully-qualified dotted name
+            // (`Zap.ListTest`). A macro that splices a whole struct VALUE into
+            // a call target — e.g. the Zest aggregate runner's
+            // `unquote(s).zest_run_selected_case(...)` — yields the FULL dotted
+            // name; matching only the last part silently fails to resolve the
+            // callee for any nested (dotted) struct, which (via `calleeRaises`)
+            // drops the call-site error-union unwrap and leaves a raw
+            // `error{ZapRaise}!T` where the case/if peer type expects the
+            // unwrapped payload (`anyerror![]const u8` vs `anyerror!?[]const u8`).
+            if (!std.mem.eql(u8, last_part, target_struct) and
+                !self.structNameEqualsJoined(struct_info.name, target_struct, '.') and
+                !self.structNameEqualsJoined(struct_info.name, target_struct, '_')) continue;
             for (struct_info.functions) |*function_group| {
                 if (function_group.arity == arity and
                     std.mem.eql(u8, self.interner.get(function_group.name), function_name))
