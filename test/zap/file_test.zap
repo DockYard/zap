@@ -11,19 +11,26 @@ pub struct Zap.FileTest {
     }
 
     test("write returns true") {
-      assert(File.write("_test_tmp.txt", "hello zap"))
+      assert(File.write("_test_write.txt", "hello zap"))
+      File.rm("_test_write.txt")
     }
 
     test("exists? after write") {
-      assert(File.exists?("_test_tmp.txt"))
+      File.write("_test_exists.txt", "hello zap")
+      assert(File.exists?("_test_exists.txt"))
+      File.rm("_test_exists.txt")
     }
 
     test("read after write") {
-      assert(File.read("_test_tmp.txt") == "hello zap")
+      File.write("_test_read.txt", "hello zap")
+      assert(File.read("_test_read.txt") == "hello zap")
+      File.rm("_test_read.txt")
     }
 
     test("read! returns content for existing file") {
-      assert(File.read!("_test_tmp.txt") == "hello zap")
+      File.write("_test_read_bang.txt", "hello zap")
+      assert(File.read!("_test_read_bang.txt") == "hello zap")
+      File.rm("_test_read_bang.txt")
     }
 
     test("rm deletes file") {
@@ -102,11 +109,15 @@ pub struct Zap.FileTest {
     }
 
     test("regular? on file") {
-      assert(File.regular?("_test_tmp.txt"))
+      File.write("_test_regular.txt", "hello zap")
+      assert(File.regular?("_test_regular.txt"))
+      File.rm("_test_regular.txt")
     }
 
     test("dir? on file is false") {
-      reject(File.dir?("_test_tmp.txt"))
+      File.write("_test_dir_check.txt", "hello zap")
+      reject(File.dir?("_test_dir_check.txt"))
+      File.rm("_test_dir_check.txt")
     }
   }
 }
