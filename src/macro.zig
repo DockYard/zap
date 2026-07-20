@@ -1526,7 +1526,7 @@ pub const MacroEngine = struct {
                 if (!inner.changed) return .{ .expr = expr, .changed = false };
                 return .{
                     .expr = try self.create(ast.Expr, .{
-                        .raise_expr = .{ .meta = re.meta, .value = inner.expr },
+                        .raise_expr = .{ .meta = re.meta, .value = inner.expr, .wrap_string = re.wrap_string },
                     }),
                     .changed = true,
                 };

@@ -708,7 +708,7 @@ fn substituteInExprDepth(
             const new_value = try substituteInExprDepth(owner, alloc, re.value, func_attrs, mod_attrs, interner, errors, depth + 1);
             if (new_value == re.value) return expr;
             const new_expr = try owner.createExpr();
-            new_expr.* = .{ .raise_expr = .{ .meta = re.meta, .value = new_value } };
+            new_expr.* = .{ .raise_expr = .{ .meta = re.meta, .value = new_value, .wrap_string = re.wrap_string } };
             return new_expr;
         },
         .with_expr => |we| {

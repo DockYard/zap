@@ -318,6 +318,27 @@ pub const TypeStore = struct {
     /// error-union return (`error{ZapRaise}!T`) carrying the boxed `Error`
     /// existential through the thread-local side-channel.
     inferred_raises: std.AutoHashMap(ast.StringId, []const TypeId),
+    /// Whole-program `raises` call graph: caller row-key → the set of
+    /// callee row-keys it invokes (both keyed by the same stable
+    /// `"<Struct>.<method>/<arity>"` string as `inferred_raises`). Recorded
+    /// by `TypeChecker.reconcileRaisesRow` from the per-clause callee
+    /// accumulator, once per function clause, unioned across clauses and
+    /// re-check passes. This is the DATA that makes `raises` inference
+    /// order-independent: the per-struct type checker's call-site fold
+    /// (`recordCalleeRaisesRow`) only propagates a callee's row when that
+    /// callee was already checked, so a caller checked before its callee
+    /// misses the effect. `closeRaisesFixpoint` reads these edges after ALL
+    /// structs/stdlib are checked and marks every function that can
+    /// TRANSITIVELY reach a `raise` as raising, so the codegen boundary
+    /// (`functionRaises`) reflects the whole-program closure regardless of
+    /// per-struct check order.
+    raises_call_edges: std.AutoHashMap(ast.StringId, std.ArrayListUnmanaged(ast.StringId)),
+    /// Set when a new `raises` row or call edge is recorded and cleared by
+    /// `closeRaisesFixpoint`. Lets the fixpoint be invoked cheaply at every
+    /// IR-lowering entry point (`IrBuilder.buildProgram`) while only doing
+    /// the O(edges × depth) propagation work when the graph actually changed
+    /// (e.g. after a later CTFE re-check adds rows to the same store).
+    raises_fixpoint_dirty: bool = true,
     /// Struct TypeIds whose `field :: Type = expr` defaults have
     /// already been validated by `TypeChecker.validateStructFieldDefaults`.
     /// Lives on the TypeStore (not the TypeChecker) because the
@@ -380,6 +401,7 @@ pub const TypeStore = struct {
             .next_var = 0,
             .inferred_signatures = std.AutoHashMap(ast.StringId, InferredSignature).init(allocator),
             .inferred_raises = std.AutoHashMap(ast.StringId, []const TypeId).init(allocator),
+            .raises_call_edges = std.AutoHashMap(ast.StringId, std.ArrayListUnmanaged(ast.StringId)).init(allocator),
             .validated_default_struct_ids = std.AutoHashMap(TypeId, void).init(allocator),
             .revalidated_default_applied_ids = std.AutoHashMap(TypeId, void).init(allocator),
             .owned_closure_backfill_fields = std.AutoHashMap(TypeId, []const Type.StructField).init(allocator),
@@ -396,6 +418,9 @@ pub const TypeStore = struct {
         var raises_it = self.inferred_raises.valueIterator();
         while (raises_it.next()) |row| self.allocator.free(row.*);
         self.inferred_raises.deinit();
+        var raises_edges_it = self.raises_call_edges.valueIterator();
+        while (raises_edges_it.next()) |edges| edges.deinit(self.allocator);
+        self.raises_call_edges.deinit();
         self.validated_default_struct_ids.deinit();
         self.revalidated_default_applied_ids.deinit();
         var backfill_fields_it = self.owned_closure_backfill_fields.valueIterator();
@@ -648,6 +673,84 @@ pub const TypeStore = struct {
         const key = try self.raisesRowKeyString(struct_prefix, method_name, arity);
         const row = self.inferred_raises.get(key) orelse return false;
         return row.len > 0;
+    }
+
+    /// Record a `raises` call-graph edge `caller_key -> callee_key` for the
+    /// whole-program fixpoint. Deduplicated per caller; marks the fixpoint
+    /// dirty so the next `closeRaisesFixpoint` re-propagates. Both keys are
+    /// the stable `raisesRowKeyString` form so they line up with
+    /// `inferred_raises` and `functionRaises`.
+    pub fn recordRaisesCallEdge(self: *TypeStore, caller_key: ast.StringId, callee_key: ast.StringId) !void {
+        if (caller_key == callee_key) return; // self-recursion contributes nothing
+        const gop = try self.raises_call_edges.getOrPut(caller_key);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (gop.value_ptr.items) |existing| {
+            if (existing == callee_key) return;
+        }
+        try gop.value_ptr.append(self.allocator, callee_key);
+        self.raises_fixpoint_dirty = true;
+    }
+
+    /// Whole-program `raises` closure. After every struct and stdlib module
+    /// has been type-checked (so each function's DIRECT-raise row and the
+    /// call-graph edges are recorded), propagate raising-ness transitively
+    /// across `raises_call_edges` until a fixpoint: a function is raising iff
+    /// it directly raises OR it calls some function that (transitively)
+    /// raises. This makes `functionRaises` — the codegen boundary that
+    /// decides the `error{ZapRaise}!T` ABI and the call-site unwrap mode —
+    /// independent of the per-struct check order, so a `raise` threads up to
+    /// the nearest `try`/`rescue` regardless of whether every intervening
+    /// frame was checked before its callees.
+    ///
+    /// Only functions with a CURRENTLY-EMPTY row are ever flipped: a function
+    /// that already has a row (a direct `raise`, a declared `raises` row, or a
+    /// prior flip) is left byte-for-byte untouched, so declared narrowing and
+    /// direct-raise rows are preserved exactly. A flipped function is given a
+    /// row equal to the union of its raising callees' rows (a meaningful error
+    /// set for diagnostics; only its non-emptiness is load-bearing for
+    /// codegen). The closure is monotone — rows only ever gain the raising
+    /// property — so the loop terminates in at most (number of keys)
+    /// iterations. Idempotent: re-running on an already-closed graph makes no
+    /// change, and the dirty flag skips the work entirely.
+    pub fn closeRaisesFixpoint(self: *TypeStore) !void {
+        if (!self.raises_fixpoint_dirty) return;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var it = self.raises_call_edges.iterator();
+            while (it.next()) |entry| {
+                const caller_key = entry.key_ptr.*;
+                // Already raising (direct / declared / previously flipped)?
+                // Leave it untouched — its row is authoritative.
+                if (self.inferred_raises.get(caller_key)) |existing| {
+                    if (existing.len > 0) continue;
+                }
+                var union_row: std.ArrayListUnmanaged(TypeId) = .empty;
+                defer union_row.deinit(self.allocator);
+                for (entry.value_ptr.items) |callee_key| {
+                    const callee_row = self.inferred_raises.get(callee_key) orelse continue;
+                    if (callee_row.len == 0) continue;
+                    for (callee_row) |raised_type| {
+                        var already_present = false;
+                        for (union_row.items) |present_type| {
+                            if (self.typeEquals(present_type, raised_type)) {
+                                already_present = true;
+                                break;
+                            }
+                        }
+                        if (!already_present) try union_row.append(self.allocator, raised_type);
+                    }
+                }
+                if (union_row.items.len == 0) continue; // no raising callee yet
+                const owned = try union_row.toOwnedSlice(self.allocator);
+                if (self.inferred_raises.fetchRemove(caller_key)) |prior| {
+                    self.allocator.free(prior.value);
+                }
+                try self.inferred_raises.put(caller_key, owned);
+                changed = true;
+            }
+        }
+        self.raises_fixpoint_dirty = false;
     }
 
     pub fn freshVar(self: *TypeStore) !TypeId {
@@ -2291,6 +2394,19 @@ pub const TypeChecker = struct {
     /// coverage and (b) attach the inferred row to the function's
     /// signature. Entries are dedup'd by structural type equality.
     current_raises: std.ArrayListUnmanaged(TypeId) = .empty,
+
+    /// Accumulator for the `raises` CALL-GRAPH edges of the function clause
+    /// currently being checked: the stable row-key of every callee resolved
+    /// at a call site in this clause's body. Populated alongside
+    /// `current_raises` by `recordCalleeRaisesRow` (and the closure-argument
+    /// effect paths), then recorded as `caller_key -> callee_key` edges by
+    /// `reconcileRaisesRow` once the clause is done. Unlike `current_raises`
+    /// (which only captures a callee's effect when that callee was ALREADY
+    /// checked), the edge is recorded unconditionally, so the whole-program
+    /// `closeRaisesFixpoint` can propagate raising-ness order-independently.
+    /// Reset/isolated per clause exactly like `current_raises` (nested
+    /// closures accumulate their own callees, restored on exit).
+    current_callees: std.ArrayListUnmanaged(ast.StringId) = .empty,
 
     /// Phase 5 (effect precision — boxed-return CAPTURING undischarged flag).
     /// Per-`Callable`-constraint-TypeId `raises` error row: the concrete error
@@ -8395,6 +8511,21 @@ pub const TypeChecker = struct {
         } else {
             try self.storeRaisesRow(func, clause, self.current_raises.items);
         }
+
+        // Record the whole-program `raises` call-graph edges for this clause:
+        // `caller_key -> callee_key` for every callee resolved in the body.
+        // The caller key is the SAME stable row-key `storeRaisesRow` filed
+        // this function's row under, so the fixpoint's flipped rows are found
+        // by `functionRaises` at the codegen boundary. Recorded even for a
+        // function whose own row is empty here — that is precisely the
+        // function the fixpoint later flips when a callee turns out to raise.
+        if (self.current_callees.items.len > 0) {
+            if (try self.raisesRowKeyForDecl(func, clause)) |caller_key| {
+                for (self.current_callees.items) |callee_key| {
+                    try self.store.recordRaisesCallEdge(caller_key, callee_key);
+                }
+            }
+        }
     }
 
     /// Build the stable, collision-free key into `store.inferred_raises` for
@@ -8526,6 +8657,10 @@ pub const TypeChecker = struct {
             self.store.allocator.free(prior.value);
         }
         try self.store.inferred_raises.put(key, owned);
+        // A direct/declared row change is a fixpoint input; re-close if a
+        // later re-check pass (CTFE, escape replay) mutates the store after
+        // `closeRaisesFixpoint` already ran.
+        self.store.raises_fixpoint_dirty = true;
     }
 
     /// Phase 3.b — record a CALLEE's stored `raises` row into the enclosing
@@ -8540,10 +8675,29 @@ pub const TypeChecker = struct {
     /// pure function, or one not yet checked) contributes nothing.
     fn recordCalleeRaisesRow(self: *TypeChecker, family_id: scope_mod.FunctionFamilyId, span: ast.SourceSpan) !void {
         const key = (try self.raisesRowKey(family_id)) orelse return;
+        // Record the call-graph edge UNCONDITIONALLY — even when the callee's
+        // row is currently empty (its body may not be checked yet, or it may
+        // only become raising once the whole-program fixpoint propagates
+        // through ITS callees). This edge is what makes `raises` inference
+        // order-independent; the immediate row-fold below is the order-
+        // dependent fast path that also carries the concrete error types into
+        // this clause's row for declared-`raises` subset checking.
+        try self.recordCurrentCallee(key);
         const row = self.store.inferred_raises.get(key) orelse return;
         for (row) |error_type| {
             try self.recordRaisedErrorType(error_type, span);
         }
+    }
+
+    /// Append a resolved callee row-key to the current clause's call-graph
+    /// edge accumulator (`current_callees`), de-duplicated. Recorded as a
+    /// `caller_key -> callee_key` edge by `reconcileRaisesRow` and consumed by
+    /// the whole-program `TypeStore.closeRaisesFixpoint`.
+    fn recordCurrentCallee(self: *TypeChecker, callee_key: ast.StringId) !void {
+        for (self.current_callees.items) |existing| {
+            if (existing == callee_key) return;
+        }
+        try self.current_callees.append(self.allocator, callee_key);
     }
 
     /// #201 — instantiate a callee's polymorphic closure-parameter effect
@@ -8634,6 +8788,19 @@ pub const TypeChecker = struct {
         defer {
             self.current_raises.deinit(self.allocator);
             self.current_raises = enclosing_raises;
+        }
+
+        // The `raises` call-graph edge accumulator is isolated per clause the
+        // same way as `current_raises` above: a nested closure/anonymous
+        // function accumulates ITS OWN callees (recorded under the closure's
+        // own row-key by its `reconcileRaisesRow`), and the enclosing
+        // function's accumulator is restored byte-for-byte on exit so only
+        // this clause's direct call sites become this function's edges.
+        const enclosing_callees = self.current_callees;
+        self.current_callees = .empty;
+        defer {
+            self.current_callees.deinit(self.allocator);
+            self.current_callees = enclosing_callees;
         }
 
         // Inside an impl block, pre-bind the impl's declared type

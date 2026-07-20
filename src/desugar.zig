@@ -1803,14 +1803,45 @@ pub const Desugarer = struct {
                 // error type into the enclosing function's inferred `raises`
                 // row; HIR lowers it transparently.
                 const desugared_value = try self.desugarExpr(re.value);
-                // Eagerly normalise a bare string LITERAL / interpolation to
-                // `%RuntimeError{message: ...}` so the common `raise "msg"`
-                // case carries a concrete `RuntimeError` value (this makes
-                // the type-checker record `RuntimeError` — not `String` — in
-                // the inferred `raises` row). Non-literal String-typed values
-                // (`raise x <> y`) are left as-is and handled by the
-                // `do_raise(String)` clause at runtime.
-                const error_value: *const ast.Expr = switch (desugared_value.*) {
+                // IDEMPOTENCY: this arm rewrites `raise <value>` to
+                // `raise_expr{ value = Kernel.do_raise(<error>) }`. The rewrite
+                // MUST be a fixpoint: if the desugar runs more than once over
+                // the same tree (the manifest-CTFE frontend re-desugars a
+                // program the collection pass already lowered, unlike the
+                // staged per-struct path), the value is ALREADY a
+                // `Kernel.do_raise(<error>)` call. Re-wrapping it would nest
+                // `Kernel.do_raise(Kernel.do_raise(<error>))` — whose inner
+                // call returns `Never`, so the outer `do_raise(error :: Error)`
+                // clause then rejects the `Never` argument. Detect the lowered
+                // shape and pass it through untouched so both frontends agree.
+                if (isDoRaiseCall(desugared_value, self.interner)) {
+                    return try self.create(ast.Expr, .{
+                        .raise_expr = .{
+                            .meta = re.meta,
+                            .value = desugared_value,
+                        },
+                    });
+                }
+                // Eagerly normalise the raised value to a concrete
+                // `%RuntimeError{message: ...}` when it is a `String` message,
+                // so `raise` always carries an `Error` value (the type-checker
+                // then records `RuntimeError` — not `String` — in the inferred
+                // `raises` row, and the recoverable/propagating lowering boxes
+                // a real `Error`).
+                //
+                //   * `wrap_string` (the parenthesised `raise("<string>")`
+                //     spelling): the value is ALWAYS a `String` message —
+                //     literal, interpolation, concat, or variable — so wrap it
+                //     regardless of syntactic shape. This is what makes the
+                //     stdlib's `raise("..." <> path)` sites catchable instead
+                //     of an uncatchable direct abort.
+                //   * bare `raise <value>`: only a string LITERAL /
+                //     interpolation is wrapped; any other value may already be
+                //     a concrete `Error` (`raise %IOError{}` / `raise err`) and
+                //     is passed through untouched.
+                const error_value: *const ast.Expr = if (re.wrap_string)
+                    try self.wrapStringInRuntimeError(desugared_value, re.meta)
+                else switch (desugared_value.*) {
                     .string_literal, .string_interpolation => try self.wrapStringInRuntimeError(desugared_value, re.meta),
                     else => desugared_value,
                 };
@@ -2675,7 +2706,7 @@ pub const Desugarer = struct {
                 },
             }),
             .raise_expr => |re| return try self.create(ast.Expr, .{
-                .raise_expr = .{ .meta = re.meta, .value = try self.rewriteCaptureExpr(re.value, self_name, capture_set) },
+                .raise_expr = .{ .meta = re.meta, .value = try self.rewriteCaptureExpr(re.value, self_name, capture_set), .wrap_string = re.wrap_string },
             }),
             // Literals, references that cannot name a captured value
             // (struct_ref, function_ref, attr_ref), intrinsics, quote
@@ -3430,6 +3461,21 @@ pub const Desugarer = struct {
                 .fields = fields,
             },
         });
+    }
+
+    /// True when `expr` is an already-lowered `Kernel.do_raise(<error>)` call
+    /// — a single-argument call whose callee is `field_access(_, do_raise)`.
+    /// Used by the `raise_expr` desugar to stay idempotent: a raise whose
+    /// value is already `do_raise(...)` has been lowered by a prior desugar
+    /// pass and must not be wrapped again (which would nest
+    /// `do_raise(do_raise(...))`). Matching on the `do_raise` field name (not
+    /// the `Kernel` receiver) keeps it robust to how the receiver is spelled.
+    fn isDoRaiseCall(expr: *const ast.Expr, interner: *const ast.StringInterner) bool {
+        if (expr.* != .call) return false;
+        const call = expr.call;
+        if (call.args.len != 1) return false;
+        if (call.callee.* != .field_access) return false;
+        return std.mem.eql(u8, interner.get(call.callee.field_access.field), "do_raise");
     }
 
     /// Build the `Kernel.do_raise(<error_value>)` call that backs the

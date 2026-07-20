@@ -7333,6 +7333,20 @@ pub const IrBuilder = struct {
         self.current_hir_program = hir_program;
         defer self.current_hir_program = saved_hir_program;
 
+        // Whole-program `raises` closure. By the time ANY IR is built, every
+        // struct and stdlib module has been type-checked, so each function's
+        // direct-raise row and the call-graph edges are all recorded. Closing
+        // the fixpoint HERE — before the ABI decision (`functionRaises`), the
+        // call-site unwrap (`calleeRaises`), and the per-`Callable` raises
+        // join below all consult it — makes a `raise` catchable by an
+        // enclosing `try`/`rescue` regardless of the per-struct check order:
+        // a function that only TRANSITIVELY reaches a `raise` is now marked
+        // raising, so it lowers to `error{ZapRaise}!T` and propagates rather
+        // than aborting through its non-raising boundary via `do_raise`. This
+        // is the single chokepoint every IR-lowering entry point funnels
+        // through; the dirty flag makes the repeated per-struct calls cheap.
+        if (self.type_store) |store| try @constCast(store).closeRaisesFixpoint();
+
         // Intern any parametric type a protocol method signature names
         // (e.g. `Error.code(e) -> Option(Atom)`) into the shared
         // TypeStore BEFORE the specialization table is built. These

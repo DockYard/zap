@@ -4769,12 +4769,15 @@ pub const Parser = struct {
     /// True when `tag` can begin the value expression of the Error-aware
     /// `raise` keyword form (`raise "msg"`, `raise %E{...}`, `raise expr`).
     ///
-    /// `.left_paren` is intentionally EXCLUDED: `raise(...)` keeps its
-    /// legacy reading as a plain call to the `Kernel.raise/1` String
-    /// function (used across the stdlib, e.g. `lib/file.zap`'s
-    /// `raise("..." <> path)`). The keyword form is the paren-less
-    /// `raise <value>` spelling, which the spec reserves for the
-    /// Error-aware abort (`raise "string"` → `%RuntimeError{...}`).
+    /// `.left_paren` is INCLUDED: the parenthesised `raise("<string>")`
+    /// spelling (used across the stdlib, e.g. `lib/file.zap`'s
+    /// `raise("..." <> path)`) is the Error-aware `raise` too — a `String`
+    /// message the desugar wraps in `%RuntimeError{...}` — so it is catchable
+    /// by `try`/`rescue`, exactly like the paren-less `raise "string"` form.
+    /// `parseRaiseExpr` flags the paren spelling (`wrap_string`) so the
+    /// desugar wraps its (possibly non-literal, e.g. concat) String value.
+    /// An EXPLICIT `Kernel.raise(...)` qualified call is a `field_access`
+    /// callee, not the bare `raise` contextual keyword, so it is unaffected.
     fn tokenStartsRaiseValue(tag: Token.Tag) bool {
         return switch (tag) {
             .int_literal,
@@ -4789,6 +4792,7 @@ pub const Parser = struct {
             .identifier,
             .type_identifier,
             .left_bracket,
+            .left_paren,
             .percent_brace,
             .percent,
             .left_angle_angle,
@@ -4835,6 +4839,14 @@ pub const Parser = struct {
         const start = self.currentSpan();
         _ = self.advance(); // consume the `raise` identifier
 
+        // The parenthesised spelling `raise(<value>)` is the historical
+        // `Kernel.raise/1` String form: its value is always a `String`
+        // message (a literal, interpolation, concat, or variable), so flag it
+        // for the desugar to wrap in `%RuntimeError{message: <value>}`. The
+        // bare `raise <value>` keyword form is left unflagged — its value may
+        // already be a concrete `Error` (`raise %IOError{}` / `raise err`).
+        const wrap_string = self.check(.left_paren);
+
         // Disable trailing-block parsing while reading the raised value so
         // that `raise %Error{...}` inside a `case` arm (`pattern -> raise
         // %E{...}`) does not greedily absorb the arm's / case's closing
@@ -4850,6 +4862,7 @@ pub const Parser = struct {
             .raise_expr = .{
                 .meta = .{ .span = ast.SourceSpan.merge(start, self.previousSpan()) },
                 .value = value,
+                .wrap_string = wrap_string,
             },
         });
     }

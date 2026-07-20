@@ -1235,6 +1235,17 @@ pub const PanicExpr = struct {
 pub const RaiseExpr = struct {
     meta: NodeMeta,
     value: *const Expr,
+    /// True for the parenthesised `raise(<string>)` spelling (historically a
+    /// plain call to `Kernel.raise/1`, whose parameter is `String`). Its value
+    /// is ALWAYS a `String` message, so the desugar wraps it in
+    /// `%RuntimeError{message: <value>}` regardless of the value's syntactic
+    /// shape — a concat (`raise("prefix " <> path)`) or variable, not just a
+    /// literal. This makes the parenthesised form an ordinary Error-aware
+    /// `raise` (catchable by `try`/`rescue`) instead of an uncatchable direct
+    /// abort. The bare `raise <value>` keyword form leaves this false: its
+    /// value may already be an `Error` (`raise %IOError{}`), so only bare
+    /// string literals/interpolations are wrapped.
+    wrap_string: bool = false,
 };
 
 /// The `try { … } rescue { pat -> … } after { … }` recoverable-error
