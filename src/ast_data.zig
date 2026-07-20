@@ -555,7 +555,17 @@ pub fn exprToCtValue(
         },
         .raise_expr => |v| {
             const value = try exprToCtValue(alloc, interner, store, v.value);
-            const args = try makeListWithTemporaryChildren(alloc, store, &.{value});
+            // Preserve `wrap_string` across the ct-value round trip (a macro
+            // may quote a parenthesised `raise("...")`, whose value is ALWAYS a
+            // String the desugar wraps in `%RuntimeError` so it stays catchable;
+            // losing the flag on decode would silently turn it into an
+            // uncatchable direct abort). Encoded as a trailing boolean arg ONLY
+            // when true, so the common bare `raise <value>` stays the
+            // single-element `[value]` shape existing consumers expect.
+            const args = if (v.wrap_string)
+                try makeListWithTemporaryChildren(alloc, store, &.{ value, .{ .bool_val = true } })
+            else
+                try makeListWithTemporaryChildren(alloc, store, &.{value});
             var owner = TemporaryCtValueOwner.init(alloc, store);
             defer owner.deinit();
             try owner.adopt(args);
@@ -3395,11 +3405,15 @@ fn ctValueToExprBudgeted(
     }
 
     if (std.mem.eql(u8, form_name, "raise")) {
-        if (arg_elems.len == 1) {
+        // `[value]` (bare `raise`) or `[value, true]` (parenthesised
+        // `raise("...")`, whose trailing boolean is the preserved `wrap_string`
+        // flag — see the encoder).
+        if (arg_elems.len == 1 or arg_elems.len == 2) {
             const raised_value = try ctValueToExprBudgeted(alloc, interner, arg_elems[0], budget);
             errdefer deinitDecodedExpr(alloc, raised_value);
+            const wrap_string = arg_elems.len == 2 and arg_elems[1] == .bool_val and arg_elems[1].bool_val;
             const expr = try alloc.create(ast.Expr);
-            expr.* = .{ .raise_expr = .{ .meta = node_meta, .value = raised_value } };
+            expr.* = .{ .raise_expr = .{ .meta = node_meta, .value = raised_value, .wrap_string = wrap_string } };
             return expr;
         }
     }
