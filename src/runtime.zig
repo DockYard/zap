@@ -20067,6 +20067,16 @@ pub const Zest = struct {
     pub fn summary() i64 {
         printFailureReports();
         printTimingReports();
+        if (supervised) {
+            // Emit a machine-readable per-shard summary for the supervisor to
+            // aggregate across shards, and SUPPRESS the human summary (the
+            // supervisor prints one unified summary for the whole run). Failure
+            // reports above are still shown so per-shard failures are visible.
+            var buf: [128]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "##ZEST-SUMMARY {d} {d} {d} {d} {d}\n", .{ test_count, test_failures, assertion_count, assertion_failures, timeout_count }) catch return test_failures;
+            stderrWriteFlushed(line);
+            return test_failures;
+        }
         stdoutPrint("\n\nSeed: ", .{});
         writeI64(get_seed());
         if (timeout_ms > 0) {

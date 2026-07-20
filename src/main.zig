@@ -2334,6 +2334,42 @@ fn reemitShardStderr(stderr_bytes: []const u8) void {
     }
 }
 
+/// Running totals the supervisor aggregates across shards for the unified
+/// final summary (each shard's own human summary is suppressed under
+/// `--supervised`).
+const ShardTally = struct {
+    completed: u64 = 0, // total `##ZEST-END` markers = tests that finished
+    failures: u64 = 0, // summed from surviving shards' `##ZEST-SUMMARY`
+    assertions: u64 = 0,
+    assertion_failures: u64 = 0,
+    timeouts: u64 = 0,
+
+    /// Fold one shard's captured stderr into the totals: count its terminated
+    /// ordinals (completed tests) and, if it survived to print a
+    /// `##ZEST-SUMMARY <tests> <failures> <assertions> <afailures> <timeouts>`,
+    /// add its failure/assertion counts.
+    fn accumulate(self: *ShardTally, stderr_bytes: []const u8) void {
+        var lines = std.mem.splitScalar(u8, stderr_bytes, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "##ZEST-END ")) {
+                self.completed += 1;
+            } else if (std.mem.startsWith(u8, line, "##ZEST-SUMMARY ")) {
+                var fields = std.mem.tokenizeScalar(u8, line["##ZEST-SUMMARY ".len..], ' ');
+                const t = fields.next();
+                _ = t; // the shard's test count is derived from ##ZEST-END instead
+                const f = fields.next() orelse continue;
+                const a = fields.next() orelse continue;
+                const af = fields.next() orelse continue;
+                const to = fields.next() orelse continue;
+                self.failures += std.fmt.parseInt(u64, f, 10) catch 0;
+                self.assertions += std.fmt.parseInt(u64, a, 10) catch 0;
+                self.assertion_failures += std.fmt.parseInt(u64, af, 10) catch 0;
+                self.timeouts += std.fmt.parseInt(u64, to, 10) catch 0;
+            }
+        }
+    }
+};
+
 /// Phase B supervisor: run the Zest test binary with per-test hard-failure
 /// isolation. The child runs with `--supervised` (checkpoint markers) and its
 /// stderr captured to a temp file; stdout stays live. On a clean exit the
@@ -2372,6 +2408,7 @@ fn superviseTestRun(
     var resume_after: i64 = -1;
     var hard_failures: usize = 0;
     var worst_exit: u8 = 0;
+    var tally: ShardTally = .{};
 
     while (true) {
         var args: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -2400,6 +2437,7 @@ fn superviseTestRun(
         defer if (stderr_bytes.len > 0) allocator.free(stderr_bytes);
         const crashed = zestCrashedOrdinal(stderr_bytes);
         reemitShardStderr(stderr_bytes);
+        tally.accumulate(stderr_bytes);
 
         if (crashed == null) {
             // The shard ran its remaining tests to completion.
@@ -2422,13 +2460,25 @@ fn superviseTestRun(
         worst_exit = 1;
     }
 
-    if (hard_failures > 0) {
-        std.debug.print(
-            "\n\x1b[1;31m{d} test(s) crashed (hard failure — isolated by the supervisor)\x1b[0m\n",
-            .{hard_failures},
-        );
-        return 1;
+    // One unified summary for the whole run: completed tests (##ZEST-END
+    // across every shard) PLUS the crashed tests, and the failures/assertions
+    // the surviving shards reported. A crash counts both as a run test and as a
+    // failure.
+    const total_tests = tally.completed + hard_failures;
+    const total_failures = tally.failures + hard_failures;
+    if (pinned_seed) |seed_value| {
+        std.debug.print("\nSeed: {s}\n", .{seed_value});
     }
+    std.debug.print("{d} tests, {d} failures", .{ total_tests, total_failures });
+    if (hard_failures > 0) {
+        std.debug.print(" (\x1b[1;31m{d} crashed — isolated\x1b[0m)", .{hard_failures});
+    }
+    if (tally.timeouts > 0) {
+        std.debug.print(" ({d} timed out)", .{tally.timeouts});
+    }
+    std.debug.print("\n{d} assertions, {d} failures\n", .{ tally.assertions, tally.assertion_failures });
+
+    if (total_failures > 0) return 1;
     return worst_exit;
 }
 
