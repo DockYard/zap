@@ -11803,6 +11803,16 @@ pub const ArcRuntime = struct {
     ) void {
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
+        // Erase the typed cell pointer to the ABI's `object: *anyopaque` slot
+        // shape. For a value-typed `T` the implicit `*T` -> `*anyopaque`
+        // coercion would suffice, but when `T` is itself a pointer — an
+        // indirect-storage cell whose payload is `?*const List(...)` /
+        // `?*const Map(...)` (a boxed nullable collection reference) — `slot_ptr`
+        // is a DOUBLE pointer, which Zig refuses to implicitly cast to
+        // `*anyopaque`. Erase it explicitly, symmetric with the receiving side's
+        // `@ptrCast(@alignCast(object))` in `DeepWalkFnFor` and identical to the
+        // sibling `refCountAny`'s `@ptrCast(@constCast(slot_ptr))`.
+        const object: *anyopaque = @ptrCast(slot_ptr);
         // Multi-manager (per-spawn managers): dispatch the side-table release
         // through the RUNNING process's OWN refcount capability so an ORC
         // process reaches ORC's `release_sized` (`noteDecrement` → cycle-root
@@ -11813,20 +11823,20 @@ pub const ArcRuntime = struct {
         // REFCOUNT_V1 manager honours (plan item 3.1/3.3, P3-R1a).
         if (comptime multi_manager_active) {
             if (currentRefcountCapability()) |cap| {
-                cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
+                cap.release_sized(ctx, object, size, @intCast(alignment_bytes), deep_walk);
             }
             return;
         }
         if (comptime !active_manager_source_available) {
             const cap = active_manager_state.refcount_capability orelse unreachable;
-            cap.release_sized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
+            cap.release_sized(ctx, object, size, @intCast(alignment_bytes), deep_walk);
         } else if (comptime refcount_v1_active) {
             const maybe_class_index = comptime refcountSlabClassIndexFor(T);
             if (comptime maybe_class_index != null) {
-                active_manager.releaseSizedClass(ctx, slot_ptr, maybe_class_index.?, deep_walk);
+                active_manager.releaseSizedClass(ctx, object, maybe_class_index.?, deep_walk);
                 return;
             }
-            active_manager.releaseSized(ctx, slot_ptr, size, @intCast(alignment_bytes), deep_walk);
+            active_manager.releaseSized(ctx, object, size, @intCast(alignment_bytes), deep_walk);
         } else {
             @panic("zap runtime: " ++ dispatch_name ++ " dispatched but active manager does not declare REFCOUNT_V1");
         }
@@ -12499,25 +12509,30 @@ pub const ArcRuntime = struct {
     ) void {
         const size = @sizeOf(T);
         const alignment_bytes = @alignOf(T);
+        // Erase the typed cell pointer to the ABI's `object: *anyopaque` slot
+        // shape (see `releaseArcSideTableSized`): an indirect-storage cell whose
+        // payload is itself a pointer (`?*const List(...)` / `?*const Map(...)`)
+        // makes `slot_ptr` a DOUBLE pointer, which Zig will not implicitly cast.
+        const object: *anyopaque = @ptrCast(slot_ptr);
         // Multi-manager: side-table retain through the running process's own
         // refcount capability (see `releaseArcSideTableSized` for the rationale
         // and the class-fast-path bypass note).
         if (comptime multi_manager_active) {
             if (currentRefcountCapability()) |cap| {
-                cap.retain_sized(ctx, slot_ptr, size, @intCast(alignment_bytes));
+                cap.retain_sized(ctx, object, size, @intCast(alignment_bytes));
             }
             return;
         }
         if (comptime !active_manager_source_available) {
             const cap = active_manager_state.refcount_capability orelse unreachable;
-            cap.retain_sized(ctx, slot_ptr, size, @intCast(alignment_bytes));
+            cap.retain_sized(ctx, object, size, @intCast(alignment_bytes));
         } else if (comptime refcount_v1_active) {
             const maybe_class_index = comptime refcountSlabClassIndexFor(T);
             if (comptime maybe_class_index != null) {
-                active_manager.retainSizedClass(ctx, slot_ptr, maybe_class_index.?);
+                active_manager.retainSizedClass(ctx, object, maybe_class_index.?);
                 return;
             }
-            active_manager.retainSized(ctx, slot_ptr, size, @intCast(alignment_bytes));
+            active_manager.retainSized(ctx, object, size, @intCast(alignment_bytes));
         } else {
             @panic("zap runtime: " ++ dispatch_name ++ " dispatched but active manager does not declare REFCOUNT_V1");
         }
