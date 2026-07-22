@@ -2,13 +2,13 @@
   A `Stage` that threads an accumulator through the stream, emitting the
   running accumulator after each item.
 
-  `ScanStage(input, accumulator)` is the stage behind `Stream.scan/3`. The
+  `Stage.Scan(input, accumulator)` is the stage behind `Stream.scan/3`. The
   reducer receives `(accumulator, item)` — the same argument order as
   `Enum.reduce/3` — and returns the next accumulator, which is both emitted
   and carried into the next step.
   """
 
-pub struct ScanStage(input, accumulator) {
+pub struct Stage.Scan(input, accumulator) {
   state :: accumulator
   reducer :: Callable({accumulator, input}, accumulator)
 }
@@ -18,14 +18,14 @@ pub struct ScanStage(input, accumulator) {
   the new accumulator.
   """
 
-pub impl Stage(input, accumulator) for ScanStage(input, accumulator) {
+pub impl Stage(input, accumulator) for Stage.Scan(input, accumulator) {
   @doc = """
     Computes the next accumulator from `(state, item)`, emits it, and carries
     it forward as the new state.
     """
 
-  pub fn step(stage :: unique ScanStage(input, accumulator), item :: input) -> {Atom, [accumulator], ScanStage(input, accumulator)} {
-    ScanStage.advance(stage.state, stage.reducer, item)
+  pub fn step(stage :: unique Stage.Scan(input, accumulator), item :: input) -> {Atom, [accumulator], Stage.Scan(input, accumulator)} {
+    Stage.Scan.advance(stage.state, stage.reducer, item)
   }
 
   @doc = """
@@ -33,12 +33,12 @@ pub impl Stage(input, accumulator) for ScanStage(input, accumulator) {
     time.
     """
 
-  pub fn flush(_stage :: unique ScanStage(input, accumulator)) -> [accumulator] {
+  pub fn flush(_stage :: unique Stage.Scan(input, accumulator)) -> [accumulator] {
     ([] :: [accumulator])
   }
 
-  fn advance(state :: accumulator, reducer :: Callable({accumulator, input}, accumulator), item :: input) -> {Atom, [accumulator], ScanStage(input, accumulator)} {
+  fn advance(state :: accumulator, reducer :: Callable({accumulator, input}, accumulator), item :: input) -> {Atom, [accumulator], Stage.Scan(input, accumulator)} {
     next_state = Callable.call(reducer, {state, item})
-    {:cont, [next_state], %ScanStage(input, accumulator){state: next_state, reducer: reducer}}
+    {:cont, [next_state], %Stage.Scan(input, accumulator){state: next_state, reducer: reducer}}
   }
 }

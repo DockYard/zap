@@ -8,7 +8,7 @@ pub struct SocketStreamTest {
   #   * a full-duplex echo roundtrip with a BINARY-SAFE payload (embedded NUL +
   #     an invalid-UTF-8 byte) survives intact through send/recv both ways;
   #   * `recv_exact` reads exactly N bytes;
-  #   * `shutdown(:write)` half-closes: the peer reads `SocketRecv.Closed` (EOF)
+  #   * `shutdown(:write)` half-closes: the peer reads `Socket.Recv.Closed` (EOF)
   #     while the writer's handle stays valid (graceful handshake);
   #   * an idle `recv` timeout yields `TimedOut(partial)` and leaves the socket
   #     OPEN and usable (Erlang semantics — timeout never closes); a
@@ -31,37 +31,37 @@ pub struct SocketStreamTest {
   # ---- connection setup helpers (return an atom result; assert in the test) --
 
   fn echo_binary_safe() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> SocketStreamTest.echo_after_listen(listener)
     }
   }
 
-  fn echo_after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn echo_after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> SocketStreamTest.echo_after_connect(listener, client)
     }
   }
 
-  fn echo_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn echo_after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> SocketStreamTest.echo_exchange(listener, client, server)
     }
   }
 
-  fn echo_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn echo_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     payload = "hi\x00\xffz"
     _sent = Socket.send(client, payload)
     forward = SocketStreamTest.classify_exact(Socket.recv(server, String.length(payload), 5000), payload)
@@ -69,64 +69,64 @@ pub struct SocketStreamTest {
     backward = SocketStreamTest.classify_next(Socket.recv(client, 0, 5000), "pong")
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     case forward == :ok {
       true -> backward
       false -> forward
     }
   }
 
-  fn classify_exact(received :: SocketRecv, expected :: String) -> Atom {
+  fn classify_exact(received :: Socket.Recv, expected :: String) -> Atom {
     case received {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         case bytes == expected {
           true -> :ok
           false -> :mismatch
         }
-      SocketRecv.TimedOut(_partial) -> :unexpected_timeout
-      SocketRecv.Closed -> :unexpected_eof
-      SocketRecv.Failed(_e) -> :recv_failed
+      Socket.Recv.TimedOut(_partial) -> :unexpected_timeout
+      Socket.Recv.Closed -> :unexpected_eof
+      Socket.Recv.Failed(_e) -> :recv_failed
     }
   }
 
-  fn classify_next(received :: SocketRecv, expected :: String) -> Atom {
+  fn classify_next(received :: Socket.Recv, expected :: String) -> Atom {
     SocketStreamTest.classify_exact(received, expected)
   }
 
   # ---- shutdown(:write) graceful half-close -> peer reads EOF ---------------
 
   fn half_close_eof() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> SocketStreamTest.half_close_after_listen(listener)
     }
   }
 
-  fn half_close_after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn half_close_after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> SocketStreamTest.half_close_after_connect(listener, client)
     }
   }
 
-  fn half_close_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn half_close_after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> SocketStreamTest.half_close_exchange(listener, client, server)
     }
   }
 
-  fn half_close_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn half_close_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     _sent = Socket.send(client, "final")
     # Client half-closes its WRITE side; the handle must stay valid.
     _shut = Socket.shutdown(client, :write)
@@ -137,7 +137,7 @@ pub struct SocketStreamTest {
     eof = SocketStreamTest.classify_eof(Socket.recv(server, 0, 5000))
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     passed = still_open and (got_data == :ok) and (eof == :closed)
     case passed {
       true -> :ok
@@ -145,49 +145,49 @@ pub struct SocketStreamTest {
     }
   }
 
-  fn classify_eof(received :: SocketRecv) -> Atom {
+  fn classify_eof(received :: Socket.Recv) -> Atom {
     case received {
-      SocketRecv.Chunk(_bytes) -> :unexpected_data
-      SocketRecv.TimedOut(_partial) -> :unexpected_timeout
-      SocketRecv.Closed -> :closed
-      SocketRecv.Failed(_e) -> :failed
+      Socket.Recv.Chunk(_bytes) -> :unexpected_data
+      Socket.Recv.TimedOut(_partial) -> :unexpected_timeout
+      Socket.Recv.Closed -> :closed
+      Socket.Recv.Failed(_e) -> :failed
     }
   }
 
   # ---- idle recv timeout does NOT close the socket -------------------------
 
   fn timeout_keeps_open() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> SocketStreamTest.timeout_after_listen(listener)
     }
   }
 
-  fn timeout_after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn timeout_after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> SocketStreamTest.timeout_after_connect(listener, client)
     }
   }
 
-  fn timeout_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn timeout_after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> SocketStreamTest.timeout_exchange(listener, client, server)
     }
   }
 
-  fn timeout_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn timeout_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     # Nothing sent: the recv must TIME OUT (never hang), reason :etimedout.
     timed = SocketStreamTest.classify_timeout(Socket.recv(server, 0, 150))
     # The socket must still be usable after the timeout.
@@ -195,7 +195,7 @@ pub struct SocketStreamTest {
     usable = SocketStreamTest.classify_next(Socket.recv(server, 0, 5000), "after")
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     passed = (timed == :timeout) and (usable == :ok)
     case passed {
       true -> :ok
@@ -203,51 +203,51 @@ pub struct SocketStreamTest {
     }
   }
 
-  fn classify_timeout(received :: SocketRecv) -> Atom {
+  fn classify_timeout(received :: Socket.Recv) -> Atom {
     case received {
-      SocketRecv.Chunk(_bytes) -> :unexpected_data
+      Socket.Recv.Chunk(_bytes) -> :unexpected_data
       # A next-available idle timeout is now the dedicated TimedOut variant
       # (empty partial — nothing was read before the deadline), NOT Failed.
-      SocketRecv.TimedOut(_partial) -> :timeout
-      SocketRecv.Closed -> :unexpected_eof
-      SocketRecv.Failed(_e) -> :wrong_reason
+      Socket.Recv.TimedOut(_partial) -> :timeout
+      Socket.Recv.Closed -> :unexpected_eof
+      Socket.Recv.Failed(_e) -> :wrong_reason
     }
   }
 
   # ---- streaming: Enum.reduce / for over Socket.chunks to EOF ---------------
 
   fn stream_total_via_reduce() -> i64 {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> -1
       Result.Ok(listener) -> SocketStreamTest.stream_reduce_after_listen(listener)
     }
   }
 
-  fn stream_reduce_after_listen(listener :: SocketListener) -> i64 {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn stream_reduce_after_listen(listener :: Socket.Listener) -> i64 {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           -1
         }
       Result.Ok(client) -> SocketStreamTest.stream_reduce_after_connect(listener, client)
     }
   }
 
-  fn stream_reduce_after_connect(listener :: SocketListener, client :: Socket) -> i64 {
+  fn stream_reduce_after_connect(listener :: Socket.Listener, client :: Socket) -> i64 {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           -1
         }
       Result.Ok(server) -> SocketStreamTest.stream_reduce_exchange(listener, client, server)
     }
   }
 
-  fn stream_reduce_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> i64 {
+  fn stream_reduce_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> i64 {
     _sent = Socket.send(server, "abcdefghij")
     _shut = Socket.shutdown(server, :write)
     # A `for` comprehension folds the live stream to EOF, extracting each
@@ -258,42 +258,42 @@ pub struct SocketStreamTest {
     }
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     Enum.sum(sizes)
   }
 
   fn stream_count_via_for() -> i64 {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> -1
       Result.Ok(listener) -> SocketStreamTest.stream_for_after_listen(listener)
     }
   }
 
-  fn stream_for_after_listen(listener :: SocketListener) -> i64 {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn stream_for_after_listen(listener :: Socket.Listener) -> i64 {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           -1
         }
       Result.Ok(client) -> SocketStreamTest.stream_for_after_connect(listener, client)
     }
   }
 
-  fn stream_for_after_connect(listener :: SocketListener, client :: Socket) -> i64 {
+  fn stream_for_after_connect(listener :: Socket.Listener, client :: Socket) -> i64 {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           -1
         }
       Result.Ok(server) -> SocketStreamTest.stream_for_exchange(listener, client, server)
     }
   }
 
-  fn stream_for_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> i64 {
+  fn stream_for_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> i64 {
     _sent = Socket.send(server, "xyz")
     _shut = Socket.shutdown(server, :write)
     sizes = for chunk <- Socket.chunks(client, 5000) {
@@ -301,11 +301,11 @@ pub struct SocketStreamTest {
     }
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     Enum.sum(sizes)
   }
 
-  fn chunk_size(chunk :: Result(String, SocketError)) -> i64 {
+  fn chunk_size(chunk :: Result(String, Socket.Error)) -> i64 {
     case chunk {
       Result.Ok(bytes) -> String.length(bytes)
       Result.Error(_e) -> 0
@@ -315,37 +315,37 @@ pub struct SocketStreamTest {
   # ---- borrow semantics: take early-exits, dispose keeps the fd open --------
 
   fn take_then_resume() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> SocketStreamTest.take_after_listen(listener)
     }
   }
 
-  fn take_after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn take_after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> SocketStreamTest.take_after_connect(listener, client)
     }
   }
 
-  fn take_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn take_after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> SocketStreamTest.take_exchange(listener, client, server)
     }
   }
 
-  fn take_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn take_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     _first = Socket.send(server, "AAAA")
     # take ONE chunk, then dispose the iterator (borrow: fd NOT closed).
     taken = Enum.take(Socket.chunks(client, 5000), 1)
@@ -355,7 +355,7 @@ pub struct SocketStreamTest {
     resumed = SocketStreamTest.classify_next(Socket.recv(client, 0, 5000), "BBBB")
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     passed = still_open and (resumed == :ok) and (List.length(taken) == 1)
     case passed {
       true -> :ok
@@ -366,37 +366,37 @@ pub struct SocketStreamTest {
   # ---- Socket.fold halts mid-stream on a protocol condition -----------------
 
   fn fold_halts_on_terminator() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> SocketStreamTest.fold_after_listen(listener)
     }
   }
 
-  fn fold_after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn fold_after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> SocketStreamTest.fold_after_connect(listener, client)
     }
   }
 
-  fn fold_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn fold_after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> SocketStreamTest.fold_exchange(listener, client, server)
     }
   }
 
-  fn fold_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn fold_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     # Server sends a NUL-terminated record; fold halts as soon as it sees NUL,
     # WITHOUT waiting for EOF — the protocol-condition early-halt.
     _sent = Socket.send(server, "ready\x00ignored-trailer")
@@ -409,7 +409,7 @@ pub struct SocketStreamTest {
     })
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     case outcome {
       Result.Ok(text) ->
         case String.contains?(text, "ready") {
@@ -423,68 +423,68 @@ pub struct SocketStreamTest {
   # ---- recv_exact timeout surfaces the partial bytes (MED-1, no desync) -----
 
   fn partial_on_timeout() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> SocketStreamTest.partial_after_listen(listener)
     }
   }
 
-  fn partial_after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn partial_after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> SocketStreamTest.partial_after_connect(listener, client)
     }
   }
 
-  fn partial_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn partial_after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> SocketStreamTest.partial_exchange(listener, client, server)
     }
   }
 
-  fn partial_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn partial_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     # Client sends only 3 of the 10 bytes the server's recv_exact will demand.
     _sent = Socket.send(client, "abc")
     # recv_exact(10) consumes the 3 available bytes, then times out waiting for
     # the missing 7. The 3 consumed bytes MUST be surfaced (TimedOut), not
     # silently dropped — dropping them would desync the next framed read.
     partial_ok = case Socket.recv_exact(server, 10, 200) {
-      SocketRecv.TimedOut(partial) ->
+      Socket.Recv.TimedOut(partial) ->
         case partial == "abc" {
           true -> :ok
           false -> :wrong_partial
         }
-      SocketRecv.Chunk(_b) -> :unexpected_full
-      SocketRecv.Closed -> :unexpected_eof
-      SocketRecv.Failed(_e) -> :unexpected_failure
+      Socket.Recv.Chunk(_b) -> :unexpected_full
+      Socket.Recv.Closed -> :unexpected_eof
+      Socket.Recv.Failed(_e) -> :unexpected_failure
     }
     # The remaining bytes arrive; a follow-up recv_exact sees the ALIGNED
     # remainder ("defghij"), proving the partial was surfaced, not re-consumed.
     _more = Socket.send(client, "defghij")
     aligned = case Socket.recv_exact(server, 7, 5000) {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         case bytes == "defghij" {
           true -> :ok
           false -> :misaligned
         }
-      SocketRecv.TimedOut(_p) -> :unexpected_timeout
-      SocketRecv.Closed -> :unexpected_eof
-      SocketRecv.Failed(_e) -> :recv_failed
+      Socket.Recv.TimedOut(_p) -> :unexpected_timeout
+      Socket.Recv.Closed -> :unexpected_eof
+      Socket.Recv.Failed(_e) -> :recv_failed
     }
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     passed = (partial_ok == :ok) and (aligned == :ok)
     case passed {
       true -> :ok
@@ -493,7 +493,7 @@ pub struct SocketStreamTest {
   }
 
   # ---- chunks: a MID-STREAM idle timeout is a final Error(:etimedout) --------
-  # P3f: the SocketChunks pull routes through the SAME `SocketRecv.decode` core
+  # P3f: the Socket.Chunks pull routes through the SAME `Socket.Recv.decode` core
   # as `recv`/`fold`. A chunks pull is always next-available (byte_count 0), so
   # an idle timeout reads NOTHING (empty partial — no data loss); the stream
   # surfaces it as one final `Error(:etimedout)` element then `:done`, matching
@@ -501,37 +501,37 @@ pub struct SocketStreamTest {
   # `TimedOut(partial)` (pinned by `timeout_keeps_open` / `partial_on_timeout`).
 
   fn chunks_timeout_terminal() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> SocketStreamTest.chunks_timeout_after_listen(listener)
     }
   }
 
-  fn chunks_timeout_after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn chunks_timeout_after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> SocketStreamTest.chunks_timeout_after_connect(listener, client)
     }
   }
 
-  fn chunks_timeout_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn chunks_timeout_after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> SocketStreamTest.chunks_timeout_exchange(listener, client, server)
     }
   }
 
-  fn chunks_timeout_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn chunks_timeout_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     # Client sends ONE chunk then stays idle (no more sends, no close). The
     # server's chunks stream reads "hi", then the next pull idles past the 150ms
     # deadline and yields a final Error(:etimedout), ending the stream.
@@ -541,11 +541,11 @@ pub struct SocketStreamTest {
     }
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     SocketStreamTest.classify_chunks_timeout(markers)
   }
 
-  fn mark_chunk(chunk :: Result(String, SocketError)) -> Atom {
+  fn mark_chunk(chunk :: Result(String, Socket.Error)) -> Atom {
     case chunk {
       Result.Ok(_bytes) -> :data
       Result.Error(error) ->

@@ -1,12 +1,12 @@
 @doc = """
   A `Stage` that discards the first `count` items and passes the rest through.
 
-  `DropStage(element)` is the stage behind `Stream.drop/2`. It carries the
+  `Stage.Drop(element)` is the stage behind `Stream.drop/2`. It carries the
   remaining drop count as explicit scalar state and reconstructs a fresh stage
   on every step (a scalar-only boxed struct must never return `self`).
   """
 
-pub struct DropStage(element) {
+pub struct Stage.Drop(element) {
   count :: i64
 }
 
@@ -15,29 +15,29 @@ pub struct DropStage(element) {
   then pass everything through.
   """
 
-pub impl Stage(element, element) for DropStage(element) {
+pub impl Stage(element, element) for Stage.Drop(element) {
   @doc = """
     Emits nothing while the count remains, decrementing it; once exhausted,
     emits every item.
     """
 
-  pub fn step(stage :: unique DropStage(element), item :: element) -> {Atom, [element], DropStage(element)} {
-    DropStage.decide(stage.count, item)
+  pub fn step(stage :: unique Stage.Drop(element), item :: element) -> {Atom, [element], Stage.Drop(element)} {
+    Stage.Drop.decide(stage.count, item)
   }
 
   @doc = """
     Emits nothing on flush — a drop buffers no state.
     """
 
-  pub fn flush(_stage :: unique DropStage(element)) -> [element] {
+  pub fn flush(_stage :: unique Stage.Drop(element)) -> [element] {
     ([] :: [element])
   }
 
-  fn decide(count :: i64, item :: element) -> {Atom, [element], DropStage(element)} {
+  fn decide(count :: i64, item :: element) -> {Atom, [element], Stage.Drop(element)} {
     if count <= 0 {
-      {:cont, [item], %DropStage(element){count: 0}}
+      {:cont, [item], %Stage.Drop(element){count: 0}}
     } else {
-      {:cont, ([] :: [element]), %DropStage(element){count: count - 1}}
+      {:cont, ([] :: [element]), %Stage.Drop(element){count: count - 1}}
     }
   }
 }

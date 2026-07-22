@@ -3,7 +3,7 @@
 # The shape (the S3 socket-server architecture, straight from the stdlib):
 #
 #   * the ROOT process binds the listener and runs the accept loop under the
-#     `SocketServer` policy helpers (trap-exits, capacity gate, dead-handler
+#     `Socket.Server` policy helpers (trap-exits, capacity gate, dead-handler
 #     reaping, graceful drain);
 #   * every accepted connection is MOVED (`Process.send_move`) to a freshly
 #     `Process.spawn_link`ed HANDLER process, which adopts it via
@@ -36,7 +36,7 @@ pub struct HttpRequest {
 
 @doc = """
   The per-connection-process HTTP server: root-process accept loop under the
-  `SocketServer` policy helpers, one spawned handler process per connection,
+  `Socket.Server` policy helpers, one spawned handler process per connection,
   socket ownership transferred by move.
   """
 
@@ -49,7 +49,7 @@ pub struct HttpServer {
 
   pub fn main(_args :: [String]) -> u8 {
     port = HttpServer.requested_port()
-    case Socket.listen(SocketAddress.loopback(port), 128) {
+    case Socket.listen(Socket.Address.loopback(port), 128) {
       Result.Error(bind_error) ->
         {
           IO.puts("bind failed on port " <> Integer.to_string(port) <> ": " <> Atom.to_string(bind_error.reason))
@@ -57,15 +57,15 @@ pub struct HttpServer {
         }
       Result.Ok(listener) ->
         {
-          IO.puts("Listening on http://127.0.0.1:" <> Integer.to_string(SocketListener.local_port(listener)))
+          IO.puts("Listening on http://127.0.0.1:" <> Integer.to_string(Socket.Listener.local_port(listener)))
           IO.puts("Every connection is served by its own Zap process — try GET /crash.")
           # A server never exits, so the buffered banner must be flushed to
           # become visible now rather than at process teardown.
           _flushed = IO.flush()
-          # `SocketServer.init` traps exits so handler crashes arrive as
+          # `Socket.Server.init` traps exits so handler crashes arrive as
           # reapable EXIT signals; the options are (accept_poll_ms,
           # max_connections, shutdown_timeout_ms).
-          state = SocketServer.init(SocketServer.options(100, 256, 5000))
+          state = Socket.Server.init(Socket.Server.options(100, 256, 5000))
           HttpServer.accept_loop(state, listener)
           0
         }
@@ -84,20 +84,20 @@ pub struct HttpServer {
     frame per accepted connection — a latent DoS on a long-lived server.
     """
 
-  pub fn accept_loop(state :: SocketServerState, listener :: SocketListener) -> Nil {
-    reaped = SocketServer.reap_signals(state)
-    case SocketServer.draining?(reaped) {
+  pub fn accept_loop(state :: Socket.ServerState, listener :: Socket.Listener) -> Nil {
+    reaped = Socket.Server.reap_signals(state)
+    case Socket.Server.draining?(reaped) {
       true ->
         {
           # Graceful drain: refuse new connections immediately, give
           # in-flight handlers the shutdown grace, then force-reclaim.
-          _closed = SocketListener.close(listener)
-          _drained = SocketServer.drain(reaped)
+          _closed = Socket.Listener.close(listener)
+          _drained = Socket.Server.drain(reaped)
           nil
         }
       false ->
-        case SocketServer.at_capacity?(reaped) {
-          true -> HttpServer.accept_loop(SocketServer.wait_for_slot(reaped), listener)
+        case Socket.Server.at_capacity?(reaped) {
+          true -> HttpServer.accept_loop(Socket.Server.wait_for_slot(reaped), listener)
           false ->
             case Socket.accept(listener, reaped.options.accept_poll_ms) {
               Result.Ok(conn) ->
@@ -107,7 +107,7 @@ pub struct HttpServer {
                   # with `receive Socket` and owns its whole lifetime.
                   handler = Process.spawn_link(&HttpServer.handler_entry/0)
                   _moved = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
-                  HttpServer.accept_loop(SocketServer.admitted(reaped, handler), listener)
+                  HttpServer.accept_loop(Socket.Server.admitted(reaped, handler), listener)
                 }
               # `:etimedout` is the quiet-poll heartbeat — loop and re-reap.
               Result.Error(_accept_error) -> HttpServer.accept_loop(reaped, listener)
@@ -156,10 +156,10 @@ pub struct HttpServer {
       true -> accumulated
       false ->
         case Socket.recv(conn, 0, 10000) {
-          SocketRecv.Chunk(bytes) -> HttpServer.read_request_head(conn, accumulated <> bytes)
-          SocketRecv.Closed -> ""
-          SocketRecv.TimedOut(_partial) -> ""
-          SocketRecv.Failed(_recv_error) -> ""
+          Socket.Recv.Chunk(bytes) -> HttpServer.read_request_head(conn, accumulated <> bytes)
+          Socket.Recv.Closed -> ""
+          Socket.Recv.TimedOut(_partial) -> ""
+          Socket.Recv.Failed(_recv_error) -> ""
         }
     }
   }

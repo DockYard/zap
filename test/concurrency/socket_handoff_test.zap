@@ -34,37 +34,37 @@ pub struct Concurrency.SocketHandoffTest {
   }
 
   fn handoff_echo() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> Concurrency.SocketHandoffTest.after_listen(listener)
     }
   }
 
-  fn after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> Concurrency.SocketHandoffTest.after_connect(listener, client)
     }
   }
 
-  fn after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> Concurrency.SocketHandoffTest.hand_off(listener, client, server)
     }
   }
 
-  fn hand_off(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn hand_off(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     child = Process.spawn(&Concurrency.SocketHandoffTest.echo_child_entry/0)
     _monitor_ref = Process.monitor(child)
     # Hand the ACCEPTED server socket to the child. `server` is CONSUMED here —
@@ -75,10 +75,10 @@ pub struct Concurrency.SocketHandoffTest {
     # reads these bytes off it, and writes them straight back.
     _sent = Socket.send(client, "handoff-echo")
     echoed = case Socket.recv(client, 12, 5000) {
-      SocketRecv.Chunk(bytes) -> bytes
-      SocketRecv.TimedOut(_partial) -> "!timeout"
-      SocketRecv.Closed -> "!eof"
-      SocketRecv.Failed(_e) -> "!failed"
+      Socket.Recv.Chunk(bytes) -> bytes
+      Socket.Recv.TimedOut(_partial) -> "!timeout"
+      Socket.Recv.Closed -> "!eof"
+      Socket.Recv.Failed(_e) -> "!failed"
     }
 
     # Wait for the child to be FULLY dead (its socket-sweep has run) before the
@@ -86,7 +86,7 @@ pub struct Concurrency.SocketHandoffTest {
     _down = Process.await_signal()
 
     _cc = Socket.close(client)
-    _lc = SocketListener.close(listener)
+    _lc = Socket.Listener.close(listener)
     case echoed == "handoff-echo" {
       true -> :ok
       false -> :mismatch
@@ -100,14 +100,14 @@ pub struct Concurrency.SocketHandoffTest {
       s -> s
     }
     _echoed = case Socket.recv(conn, 12, 5000) {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         {
           _s = Socket.send(conn, bytes)
           :echoed
         }
-      SocketRecv.TimedOut(_partial) -> :no_echo
-      SocketRecv.Closed -> :no_echo
-      SocketRecv.Failed(_e) -> :no_echo
+      Socket.Recv.TimedOut(_partial) -> :no_echo
+      Socket.Recv.Closed -> :no_echo
+      Socket.Recv.Failed(_e) -> :no_echo
     }
     _closed = Socket.close(conn)
     nil

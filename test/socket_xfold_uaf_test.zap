@@ -30,43 +30,43 @@ pub struct SocketXfoldUafTest {
   # ---- Phase 1: fold A retains + RETURNS its FIRST chunk (escapes) ----
 
   fn escaped_from_a() -> {Atom, String} {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> {:err_listen, ""}
       Result.Ok(listener) -> SocketXfoldUafTest.a_after_listen(listener)
     }
   }
 
-  fn a_after_listen(listener :: SocketListener) -> {Atom, String} {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn a_after_listen(listener :: Socket.Listener) -> {Atom, String} {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           {:err_connect, ""}
         }
       Result.Ok(client) -> SocketXfoldUafTest.a_after_connect(listener, client)
     }
   }
 
-  fn a_after_connect(listener :: SocketListener, client :: Socket) -> {Atom, String} {
+  fn a_after_connect(listener :: Socket.Listener, client :: Socket) -> {Atom, String} {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           {:err_accept, ""}
         }
       Result.Ok(server) -> SocketXfoldUafTest.a_exchange(listener, client, server)
     }
   }
 
-  fn a_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> {Atom, String} {
+  fn a_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> {Atom, String} {
     _sent = Socket.send(server, SocketXfoldUafTest.payload_a())
     _shut = Socket.shutdown(server, :write)
     outcome = Socket.fold(client, {:pending, ""}, 5000, &SocketXfoldUafTest.keep_first/2)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     case outcome {
       Result.Ok(pair) -> pair
       Result.Error(_e) -> {:err_fold, ""}
@@ -83,43 +83,43 @@ pub struct SocketXfoldUafTest {
   # ---- Phase 2: fold B scalar over a FRESH socket forces the shared arena reset ----
 
   fn scalar_fold_b() -> i64 {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> -1
       Result.Ok(listener) -> SocketXfoldUafTest.b_after_listen(listener)
     }
   }
 
-  fn b_after_listen(listener :: SocketListener) -> i64 {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn b_after_listen(listener :: Socket.Listener) -> i64 {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           -1
         }
       Result.Ok(client) -> SocketXfoldUafTest.b_after_connect(listener, client)
     }
   }
 
-  fn b_after_connect(listener :: SocketListener, client :: Socket) -> i64 {
+  fn b_after_connect(listener :: Socket.Listener, client :: Socket) -> i64 {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           -1
         }
       Result.Ok(server) -> SocketXfoldUafTest.b_exchange(listener, client, server)
     }
   }
 
-  fn b_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> i64 {
+  fn b_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> i64 {
     _sent = Socket.send(server, SocketXfoldUafTest.payload_b())
     _shut = Socket.shutdown(server, :write)
     outcome = Socket.fold(client, 0, 5000, &SocketXfoldUafTest.count_bytes/2)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     case outcome {
       Result.Ok(total) -> total
       Result.Error(_e) -> -1
@@ -150,43 +150,43 @@ pub struct SocketXfoldUafTest {
   # ==== Bare-recv escape variant: a single Socket.recv chunk held across a fold ====
 
   fn escaped_bare_recv() -> {Atom, String} {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> {:err_listen, ""}
       Result.Ok(listener) -> SocketXfoldUafTest.br_after_listen(listener)
     }
   }
 
-  fn br_after_listen(listener :: SocketListener) -> {Atom, String} {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn br_after_listen(listener :: Socket.Listener) -> {Atom, String} {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           {:err_connect, ""}
         }
       Result.Ok(client) -> SocketXfoldUafTest.br_after_connect(listener, client)
     }
   }
 
-  fn br_after_connect(listener :: SocketListener, client :: Socket) -> {Atom, String} {
+  fn br_after_connect(listener :: Socket.Listener, client :: Socket) -> {Atom, String} {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           {:err_accept, ""}
         }
       Result.Ok(server) -> SocketXfoldUafTest.br_exchange(listener, client, server)
     }
   }
 
-  fn br_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> {Atom, String} {
+  fn br_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> {Atom, String} {
     _sent = Socket.send(server, SocketXfoldUafTest.payload_a())
     _shut = Socket.shutdown(server, :write)
     got = SocketXfoldUafTest.first_chunk_of(client)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     got
   }
 
@@ -194,10 +194,10 @@ pub struct SocketXfoldUafTest {
   # to probe it at all.
   fn first_chunk_of(client :: Socket) -> {Atom, String} {
     case Socket.recv(client, 0, 5000) {
-      SocketRecv.Chunk(bytes) -> {:got, bytes}
-      SocketRecv.Closed -> {:err_closed, ""}
-      SocketRecv.TimedOut(_p) -> {:err_timeout, ""}
-      SocketRecv.Failed(_e) -> {:err_failed, ""}
+      Socket.Recv.Chunk(bytes) -> {:got, bytes}
+      Socket.Recv.Closed -> {:err_closed, ""}
+      Socket.Recv.TimedOut(_p) -> {:err_timeout, ""}
+      Socket.Recv.Failed(_e) -> {:err_failed, ""}
     }
   }
 
@@ -238,43 +238,43 @@ pub struct SocketXfoldUafTest {
   }
 
   fn nested_from_a() -> {Atom, String} {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> {:err_listen, ""}
       Result.Ok(listener) -> SocketXfoldUafTest.nested_after_listen(listener)
     }
   }
 
-  fn nested_after_listen(listener :: SocketListener) -> {Atom, String} {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn nested_after_listen(listener :: Socket.Listener) -> {Atom, String} {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           {:err_connect, ""}
         }
       Result.Ok(client) -> SocketXfoldUafTest.nested_after_connect(listener, client)
     }
   }
 
-  fn nested_after_connect(listener :: SocketListener, client :: Socket) -> {Atom, String} {
+  fn nested_after_connect(listener :: Socket.Listener, client :: Socket) -> {Atom, String} {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           {:err_accept, ""}
         }
       Result.Ok(server) -> SocketXfoldUafTest.nested_exchange(listener, client, server)
     }
   }
 
-  fn nested_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> {Atom, String} {
+  fn nested_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> {Atom, String} {
     _sent = Socket.send(server, SocketXfoldUafTest.payload_a())
     _shut = Socket.shutdown(server, :write)
     outcome = Socket.fold(client, {:pending, ""}, 5000, &SocketXfoldUafTest.nested_cb/2)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     case outcome {
       Result.Ok(pair) -> pair
       Result.Error(_e) -> {:err_fold, ""}

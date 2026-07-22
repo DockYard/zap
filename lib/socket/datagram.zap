@@ -1,9 +1,9 @@
 @doc = """
-  `SocketDatagram` — a value-threaded handle to a DATAGRAM socket: UDP
+  `Socket.Datagram` — a value-threaded handle to a DATAGRAM socket: UDP
   (`:ip4`) or Unix-domain datagram (`:unix`) (Phase S2,
   `docs/socket-implementation-plan.md`).
 
-  Like `Socket`/`SocketListener` it is a **one-word, single-owner, move-only**
+  Like `Socket`/`Socket.Listener` it is a **one-word, single-owner, move-only**
   handle (Decision B): the reserved `zap_socket_handle` field is a
   generation-validated token into the runtime's socket domain, NOT a raw fd. A
   datagram socket travels between processes only by `Process.send_move`, and
@@ -14,10 +14,10 @@
 
   * **No connection, no EOF.** `bind` opens an unconnected socket; `send_to`
     addresses each datagram explicitly and `recv_from` reports each datagram's
-    SENDER. A datagram socket has no end-of-stream, so `SocketDatagramRecv` has
+    SENDER. A datagram socket has no end-of-stream, so `Socket.DatagramRecv` has
     no `Closed` variant.
   * **Truncation is first-class.** A datagram larger than the receive buffer is
-    surfaced through the distinct `SocketDatagramRecv.Truncated` variant — never
+    surfaced through the distinct `Socket.DatagramRecv.Truncated` variant — never
     silently dropped. An exhaustive `case` FORCES a `Truncated` arm, so
     silent datagram loss is unrepresentable.
   * **Connected mode.** `connect` fixes a default peer; the kernel then FILTERS
@@ -37,17 +37,17 @@
 
   ## Examples
 
-      case SocketDatagram.bind(SocketAddress.loopback(0)) {
+      case Socket.Datagram.bind(Socket.Address.loopback(0)) {
         Result.Ok(receiver) -> {
-          port = SocketDatagram.local_port(receiver)
-          case SocketDatagram.bind(SocketAddress.loopback(0)) {
+          port = Socket.Datagram.local_port(receiver)
+          case Socket.Datagram.bind(Socket.Address.loopback(0)) {
             Result.Ok(sender) -> {
-              _ = SocketDatagram.send_to(sender, SocketAddress.loopback(port), "ping")
-              case SocketDatagram.recv_from(receiver, 65536, 5000) {
-                SocketDatagramRecv.Datagram(d)  -> d.data
-                SocketDatagramRecv.Truncated(d) -> d.data
-                SocketDatagramRecv.TimedOut     -> "timeout"
-                SocketDatagramRecv.Failed(_e)   -> "error"
+              _ = Socket.Datagram.send_to(sender, Socket.Address.loopback(port), "ping")
+              case Socket.Datagram.recv_from(receiver, 65536, 5000) {
+                Socket.DatagramRecv.Datagram(d)  -> d.data
+                Socket.DatagramRecv.Truncated(d) -> d.data
+                Socket.DatagramRecv.TimedOut     -> "timeout"
+                Socket.DatagramRecv.Failed(_e)   -> "error"
               }
             }
             Result.Error(_e) -> "bind_failed"
@@ -59,32 +59,32 @@
 
 @available_on(:network)
 
-pub struct SocketDatagram {
+pub struct Socket.Datagram {
   zap_socket_handle :: u64
 
   @doc = """
     Binds a datagram socket to `address` (an `:ip4` or `:ip6` UDP socket, or a
     `:unix` Unix-domain datagram socket at the address's path). Port 0 (`:ip4`/
     `:ip6`) → an ephemeral port, discoverable via `local_port`. Returns
-    `Result.Ok(socket)` or `Result.Error(%SocketError{...})`. For a Unix
+    `Result.Ok(socket)` or `Result.Error(%Socket.Error{...})`. For a Unix
     filesystem path, unlink any stale socket file before binding (Decision 4 —
     caller-managed cleanup). A genuinely-unsupported family returns `:einval`.
 
     ## Examples
 
-        SocketDatagram.bind(SocketAddress.loopback(0))
-        SocketDatagram.bind(SocketAddress.ip6_loopback(0))
-        SocketDatagram.bind(SocketAddress.unix("/tmp/app.sock"))
+        Socket.Datagram.bind(Socket.Address.loopback(0))
+        Socket.Datagram.bind(Socket.Address.ip6_loopback(0))
+        Socket.Datagram.bind(Socket.Address.unix("/tmp/app.sock"))
     """
 
   @available_on(:network)
 
-  pub fn bind(address :: SocketAddress) -> Result(SocketDatagram, SocketError) {
+  pub fn bind(address :: Socket.Address) -> Result(Socket.Datagram, Socket.Error) {
     case address.family {
-      :ip4 -> SocketDatagram.result_from_handle(:zig.SocketRuntime.bind_udp(address.a, address.b, address.c, address.d, address.port))
-      :ip6 -> SocketDatagram.result_from_handle(:zig.SocketRuntime.bind_udp6(address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port))
-      :unix -> SocketDatagram.result_from_handle(:zig.SocketRuntime.bind_udp_unix(address.path))
-      _ -> Result(SocketDatagram, SocketError).Error(%SocketError{reason: :einval})
+      :ip4 -> Socket.Datagram.result_from_handle(:zig.SocketRuntime.bind_udp(address.a, address.b, address.c, address.d, address.port))
+      :ip6 -> Socket.Datagram.result_from_handle(:zig.SocketRuntime.bind_udp6(address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port))
+      :unix -> Socket.Datagram.result_from_handle(:zig.SocketRuntime.bind_udp_unix(address.path))
+      _ -> Result(Socket.Datagram, Socket.Error).Error(%Socket.Error{reason: :einval})
     }
   }
 
@@ -92,29 +92,29 @@ pub struct SocketDatagram {
     Connects a UDP datagram socket to `address` (an `:ip4` or `:ip6` endpoint) —
     sets a DEFAULT peer so the kernel filters inbound datagrams to it and
     `send`/`recv` (no explicit address) address it. Returns `Result.Ok(socket)`
-    or `Result.Error(%SocketError{...})`. Unlike a stream connect this completes
+    or `Result.Error(%Socket.Error{...})`. Unlike a stream connect this completes
     immediately (a datagram has no handshake). A genuinely-unsupported family
     returns `:einval`.
 
     ## Examples
 
-        SocketDatagram.connect(SocketAddress.ip4(127, 0, 0, 1, 9000))
-        SocketDatagram.connect(SocketAddress.ip6_loopback(9000))
+        Socket.Datagram.connect(Socket.Address.ip4(127, 0, 0, 1, 9000))
+        Socket.Datagram.connect(Socket.Address.ip6_loopback(9000))
     """
 
   @available_on(:network)
 
-  pub fn connect(address :: SocketAddress) -> Result(SocketDatagram, SocketError) {
+  pub fn connect(address :: Socket.Address) -> Result(Socket.Datagram, Socket.Error) {
     case address.family {
-      :ip4 -> SocketDatagram.result_from_handle(:zig.SocketRuntime.connect_udp(address.a, address.b, address.c, address.d, address.port))
-      :ip6 -> SocketDatagram.result_from_handle(:zig.SocketRuntime.connect_udp6(address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port))
-      _ -> Result(SocketDatagram, SocketError).Error(%SocketError{reason: :einval})
+      :ip4 -> Socket.Datagram.result_from_handle(:zig.SocketRuntime.connect_udp(address.a, address.b, address.c, address.d, address.port))
+      :ip6 -> Socket.Datagram.result_from_handle(:zig.SocketRuntime.connect_udp6(address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port))
+      _ -> Result(Socket.Datagram, Socket.Error).Error(%Socket.Error{reason: :einval})
     }
   }
 
   @doc = """
-    Turns a runtime handle-bits result into a `Result(SocketDatagram,
-    SocketError)`: `0` → the typed last-error, else `Ok`. The error reason is
+    Turns a runtime handle-bits result into a `Result(Socket.Datagram,
+    Socket.Error)`: `0` → the typed last-error, else `Ok`. The error reason is
     read immediately after the failed op (a non-yielding per-process slot).
     Shared by `bind`/`connect` (an unsupported family never reaches here — those
     arms return `:einval` directly).
@@ -122,10 +122,10 @@ pub struct SocketDatagram {
 
   @available_on(:network)
 
-  fn result_from_handle(raw :: u64) -> Result(SocketDatagram, SocketError) {
+  fn result_from_handle(raw :: u64) -> Result(Socket.Datagram, Socket.Error) {
     case raw {
-      0 -> Result(SocketDatagram, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(SocketDatagram, SocketError).Ok(%SocketDatagram{zap_socket_handle: handle_bits})
+      0 -> Result(Socket.Datagram, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket.Datagram, Socket.Error).Ok(%Socket.Datagram{zap_socket_handle: handle_bits})
     }
   }
 
@@ -135,13 +135,13 @@ pub struct SocketDatagram {
 
     ## Examples
 
-        SocketDatagram.send_to(socket, SocketAddress.loopback(9000), "ping")
+        Socket.Datagram.send_to(socket, Socket.Address.loopback(9000), "ping")
     """
 
   @available_on(:network)
 
-  pub fn send_to(datagram :: SocketDatagram, address :: SocketAddress, bytes :: String) -> Result(i64, SocketError) {
-    SocketDatagram.send_to(datagram, address, bytes, 0)
+  pub fn send_to(datagram :: Socket.Datagram, address :: Socket.Address, bytes :: String) -> Result(i64, Socket.Error) {
+    Socket.Datagram.send_to(datagram, address, bytes, 0)
   }
 
   @doc = """
@@ -155,18 +155,18 @@ pub struct SocketDatagram {
 
     ## Examples
 
-        SocketDatagram.send_to(socket, SocketAddress.loopback(9000), payload, 5000)
+        Socket.Datagram.send_to(socket, Socket.Address.loopback(9000), payload, 5000)
     """
 
   @available_on(:network)
 
-  pub fn send_to(datagram :: SocketDatagram, address :: SocketAddress, bytes :: String, timeout_ms :: i64) -> Result(i64, SocketError) {
+  pub fn send_to(datagram :: Socket.Datagram, address :: Socket.Address, bytes :: String, timeout_ms :: i64) -> Result(i64, Socket.Error) {
     total = String.length(bytes)
     case address.family {
-      :ip4 -> SocketDatagram.classify_send(:zig.SocketRuntime.send_to_ip4(datagram.zap_socket_handle, address.a, address.b, address.c, address.d, address.port, bytes, timeout_ms), total)
-      :ip6 -> SocketDatagram.classify_send(:zig.SocketRuntime.send_to_ip6(datagram.zap_socket_handle, address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port, bytes, timeout_ms), total)
-      :unix -> SocketDatagram.classify_send(:zig.SocketRuntime.send_to_unix(datagram.zap_socket_handle, address.path, bytes, timeout_ms), total)
-      _ -> Result(i64, SocketError).Error(%SocketError{reason: :einval})
+      :ip4 -> Socket.Datagram.classify_send(:zig.SocketRuntime.send_to_ip4(datagram.zap_socket_handle, address.a, address.b, address.c, address.d, address.port, bytes, timeout_ms), total)
+      :ip6 -> Socket.Datagram.classify_send(:zig.SocketRuntime.send_to_ip6(datagram.zap_socket_handle, address.h0, address.h1, address.h2, address.h3, address.h4, address.h5, address.h6, address.h7, address.scope_id, address.port, bytes, timeout_ms), total)
+      :unix -> Socket.Datagram.classify_send(:zig.SocketRuntime.send_to_unix(datagram.zap_socket_handle, address.path, bytes, timeout_ms), total)
+      _ -> Result(i64, Socket.Error).Error(%Socket.Error{reason: :einval})
     }
   }
 
@@ -178,15 +178,15 @@ pub struct SocketDatagram {
 
     ## Examples
 
-        SocketDatagram.send(connected, "ping", 5000)
+        Socket.Datagram.send(connected, "ping", 5000)
     """
 
   @available_on(:network)
 
-  pub fn send(datagram :: SocketDatagram, bytes :: String, timeout_ms :: i64) -> Result(i64, SocketError) {
+  pub fn send(datagram :: Socket.Datagram, bytes :: String, timeout_ms :: i64) -> Result(i64, Socket.Error) {
     total = String.length(bytes)
     sent = :zig.SocketRuntime.send(datagram.zap_socket_handle, bytes, timeout_ms)
-    SocketDatagram.classify_send(sent, total)
+    Socket.Datagram.classify_send(sent, total)
   }
 
   @doc = """
@@ -198,39 +198,39 @@ pub struct SocketDatagram {
 
   @available_on(:network)
 
-  fn classify_send(sent :: i64, total :: i64) -> Result(i64, SocketError) {
+  fn classify_send(sent :: i64, total :: i64) -> Result(i64, Socket.Error) {
     case sent == total {
-      true -> Result(i64, SocketError).Ok(sent)
-      false -> Result(i64, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(:zig.SocketRuntime.last_error()), bytes_sent: sent})
+      true -> Result(i64, Socket.Error).Ok(sent)
+      false -> Result(i64, Socket.Error).Error(%Socket.Error{reason: Socket.Error.reason_from_code(:zig.SocketRuntime.last_error()), bytes_sent: sent})
     }
   }
 
   @doc = """
     Receives ONE datagram (blocking until one arrives or `timeout_ms` elapses),
-    returning the truncation-safe `SocketDatagramRecv` union. `max_bytes` caps
+    returning the truncation-safe `Socket.DatagramRecv` union. `max_bytes` caps
     the receive buffer (clamped by the runtime to the 64 KiB datagram maximum;
     `0` or less uses that maximum). On success a `Datagram(data)` (or
     `Truncated(data)` when the datagram exceeded `max_bytes`) carries the bytes,
-    the SENDER's `SocketAddress`, and the datagram's true size; an idle timeout
+    the SENDER's `Socket.Address`, and the datagram's true size; an idle timeout
     yields `TimedOut` (the socket stays OPEN — Decision E); a failure yields
     `Failed(error)`. Parks the fiber off its core gate-ON, blocks the single OS
     thread gate-OFF. Panics on a stale handle.
 
     ## Examples
 
-        case SocketDatagram.recv_from(socket, 65536, 5000) {
-          SocketDatagramRecv.Datagram(d)  -> handle(d.data, d.peer)
-          SocketDatagramRecv.Truncated(d) -> handle_partial(d.data, d.datagram_size)
-          SocketDatagramRecv.TimedOut     -> :idle
-          SocketDatagramRecv.Failed(_e)   -> :error
+        case Socket.Datagram.recv_from(socket, 65536, 5000) {
+          Socket.DatagramRecv.Datagram(d)  -> handle(d.data, d.peer)
+          Socket.DatagramRecv.Truncated(d) -> handle_partial(d.data, d.datagram_size)
+          Socket.DatagramRecv.TimedOut     -> :idle
+          Socket.DatagramRecv.Failed(_e)   -> :error
         }
     """
 
   @available_on(:network)
 
-  pub fn recv_from(datagram :: SocketDatagram, max_bytes :: i64, timeout_ms :: i64) -> SocketDatagramRecv {
+  pub fn recv_from(datagram :: Socket.Datagram, max_bytes :: i64, timeout_ms :: i64) -> Socket.DatagramRecv {
     bytes = :zig.SocketRuntime.recv_from(datagram.zap_socket_handle, max_bytes, timeout_ms)
-    SocketDatagram.decode_recv(bytes)
+    Socket.Datagram.decode_recv(bytes)
   }
 
   @doc = """
@@ -240,37 +240,37 @@ pub struct SocketDatagram {
 
     ## Examples
 
-        SocketDatagram.recv(connected, 65536, 5000)
+        Socket.Datagram.recv(connected, 65536, 5000)
     """
 
   @available_on(:network)
 
-  pub fn recv(datagram :: SocketDatagram, max_bytes :: i64, timeout_ms :: i64) -> SocketDatagramRecv {
-    SocketDatagram.recv_from(datagram, max_bytes, timeout_ms)
+  pub fn recv(datagram :: Socket.Datagram, max_bytes :: i64, timeout_ms :: i64) -> Socket.DatagramRecv {
+    Socket.Datagram.recv_from(datagram, max_bytes, timeout_ms)
   }
 
   @doc = """
     Reads the recv metadata slots (status, truncation flag, datagram length, and
     the sender endpoint) IMMEDIATELY after a `recv_from` and decodes them, with
-    `bytes`, into the `SocketDatagramRecv` union via
-    `SocketDatagramRecvDecoder.decode` — the single decode point. The reads are
+    `bytes`, into the `Socket.DatagramRecv` union via
+    `Socket.DatagramRecvDecoder.decode` — the single decode point. The reads are
     paired with the receive (a non-yielding per-process slot), so no other op
     can interpose.
     """
 
   @available_on(:network)
 
-  fn decode_recv(bytes :: String) -> SocketDatagramRecv {
+  fn decode_recv(bytes :: String) -> Socket.DatagramRecv {
     status = :zig.SocketRuntime.recv_status()
     truncated = :zig.SocketRuntime.recv_truncated()
     datagram_size = :zig.SocketRuntime.recv_datagram_len()
-    peer = SocketDatagram.recv_peer_address()
-    SocketDatagramRecvDecoder.decode(status, truncated, bytes, peer, datagram_size)
+    peer = Socket.Datagram.recv_peer_address()
+    Socket.DatagramRecvDecoder.decode(status, truncated, bytes, peer, datagram_size)
   }
 
   @doc = """
-    Reconstructs the SENDER's `SocketAddress` from the recv-peer accessor slots
-    (the datagram-peer twin of `SocketAddress.of_handle`'s decode): the packed v4
+    Reconstructs the SENDER's `Socket.Address` from the recv-peer accessor slots
+    (the datagram-peer twin of `Socket.Address.of_handle`'s decode): the packed v4
     fast path, else the four v6 words (a real `:ip6` sender surfaces its address),
     else the Unix `sun_path` (`recv_peer_path` → a String → `unix_from_path`), so
     a BOUND Unix datagram sender surfaces a `:unix` reply address the server can
@@ -280,15 +280,15 @@ pub struct SocketDatagram {
 
   @available_on(:network)
 
-  fn recv_peer_address() -> SocketAddress {
+  fn recv_peer_address() -> Socket.Address {
     packed = :zig.SocketRuntime.recv_peer()
     case packed < 0 {
-      false -> SocketAddress.from_packed(packed)
+      false -> Socket.Address.from_packed(packed)
       true ->
         {
           word0 = :zig.SocketRuntime.recv_peer_v6_word(0)
           case word0 < 0 {
-            true -> SocketDatagram.recv_peer_unix()
+            true -> Socket.Datagram.recv_peer_unix()
             false ->
               {
                 word1 = :zig.SocketRuntime.recv_peer_v6_word(1)
@@ -296,7 +296,7 @@ pub struct SocketDatagram {
                 word3 = :zig.SocketRuntime.recv_peer_v6_word(3)
                 scope_id = :zig.SocketRuntime.recv_peer_scope()
                 port = :zig.SocketRuntime.recv_peer_port()
-                SocketAddress.ip6_from_words(word0, word1, word2, word3, scope_id, port)
+                Socket.Address.ip6_from_words(word0, word1, word2, word3, scope_id, port)
               }
           }
         }
@@ -304,36 +304,36 @@ pub struct SocketDatagram {
   }
 
   @doc = """
-    Resolves a non-v4/non-v6 `recv_from` sender to a `:unix` `SocketAddress`
+    Resolves a non-v4/non-v6 `recv_from` sender to a `:unix` `Socket.Address`
     carrying the sender's `sun_path` (`recv_peer_path` → a String →
     `unix_from_path`), or `:unavailable` when the sender is UNBOUND (empty path —
     it has no reply address). The datagram-recv twin of
-    `SocketAddress.of_unix_handle`.
+    `Socket.Address.of_unix_handle`.
     """
 
   @available_on(:network)
 
-  fn recv_peer_unix() -> SocketAddress {
+  fn recv_peer_unix() -> Socket.Address {
     path = :zig.SocketRuntime.recv_peer_path()
     case String.length(path) == 0 {
-      true -> %SocketAddress{family: :unavailable}
-      false -> SocketAddress.unix_from_path(path)
+      true -> %Socket.Address{family: :unavailable}
+      false -> Socket.Address.unix_from_path(path)
     }
   }
 
   @doc = """
-    Returns the LOCAL (bound) `SocketAddress` of the datagram socket via
+    Returns the LOCAL (bound) `Socket.Address` of the datagram socket via
     `getsockname`. Panics on a stale handle.
 
     ## Examples
 
-        SocketDatagram.local_address(socket)
+        Socket.Datagram.local_address(socket)
     """
 
   @available_on(:network)
 
-  pub fn local_address(datagram :: SocketDatagram) -> SocketAddress {
-    SocketAddress.of_handle(datagram.zap_socket_handle, 0)
+  pub fn local_address(datagram :: Socket.Datagram) -> Socket.Address {
+    Socket.Address.of_handle(datagram.zap_socket_handle, 0)
   }
 
   @doc = """
@@ -346,30 +346,30 @@ pub struct SocketDatagram {
 
     ## Examples
 
-        SocketDatagram.local_port(socket)
+        Socket.Datagram.local_port(socket)
     """
 
   @available_on(:network)
 
-  pub fn local_port(datagram :: SocketDatagram) -> i64 {
-    local = SocketDatagram.local_address(datagram)
+  pub fn local_port(datagram :: Socket.Datagram) -> i64 {
+    local = Socket.Datagram.local_address(datagram)
     local.port
   }
 
   @doc = """
-    Returns the REMOTE (connected peer) `SocketAddress` of a CONNECTED datagram
+    Returns the REMOTE (connected peer) `Socket.Address` of a CONNECTED datagram
     socket via `getpeername`, or `:unavailable` for an unconnected socket. Panics
     on a stale handle.
 
     ## Examples
 
-        SocketDatagram.peer_address(connected)
+        Socket.Datagram.peer_address(connected)
     """
 
   @available_on(:network)
 
-  pub fn peer_address(datagram :: SocketDatagram) -> SocketAddress {
-    SocketAddress.of_handle(datagram.zap_socket_handle, 1)
+  pub fn peer_address(datagram :: Socket.Datagram) -> Socket.Address {
+    Socket.Address.of_handle(datagram.zap_socket_handle, 1)
   }
 
   @doc = """
@@ -380,12 +380,12 @@ pub struct SocketDatagram {
 
     ## Examples
 
-        SocketDatagram.close(socket)
+        Socket.Datagram.close(socket)
     """
 
   @available_on(:network)
 
-  pub fn close(datagram :: SocketDatagram) -> Bool {
+  pub fn close(datagram :: Socket.Datagram) -> Bool {
     :zig.SocketRuntime.close(datagram.zap_socket_handle)
   }
 
@@ -395,37 +395,37 @@ pub struct SocketDatagram {
 
     ## Examples
 
-        SocketDatagram.open?(socket)
+        Socket.Datagram.open?(socket)
     """
 
   @available_on(:network)
 
-  pub fn open?(datagram :: SocketDatagram) -> Bool {
+  pub fn open?(datagram :: Socket.Datagram) -> Bool {
     :zig.SocketRuntime.is_live(datagram.zap_socket_handle)
   }
 }
 
 @doc = """
-  `SocketDatagramData` — the payload of a received datagram (Phase S2): the
+  `Socket.DatagramData` — the payload of a received datagram (Phase S2): the
   `data` bytes (binary-safe, embedded NULs survive), the SENDER's `peer`
-  `SocketAddress`, and the datagram's true `datagram_size` (exact on Linux; the
-  captured floor on macOS). Carried by both the `SocketDatagramRecv.Datagram`
-  and `SocketDatagramRecv.Truncated` variants — on `Truncated`, `data` is the
+  `Socket.Address`, and the datagram's true `datagram_size` (exact on Linux; the
+  captured floor on macOS). Carried by both the `Socket.DatagramRecv.Datagram`
+  and `Socket.DatagramRecv.Truncated` variants — on `Truncated`, `data` is the
   captured PREFIX and `datagram_size` reports how much was actually sent, so the
   loss is quantified, never silent.
   """
 
 @available_on(:network)
 
-pub struct SocketDatagramData {
+pub struct Socket.DatagramData {
   data :: String
-  peer :: SocketAddress
+  peer :: Socket.Address
   datagram_size :: i64
 }
 
 @doc = """
-  `SocketDatagramRecv` — the truncation-safe result of a `SocketDatagram`
-  receive (Phase S2), the datagram analogue of the stream `SocketRecv`.
+  `Socket.DatagramRecv` — the truncation-safe result of a `Socket.Datagram`
+  receive (Phase S2), the datagram analogue of the stream `Socket.Recv`.
 
   A datagram socket has no end-of-stream, so there is NO `Closed` variant; a
   datagram larger than the receive buffer is NOT silently dropped but surfaced
@@ -439,76 +439,76 @@ pub struct SocketDatagramData {
     size, so the caller knows exactly how much was lost.
   * `TimedOut` — the idle `timeout_ms` deadline fired with no datagram; the
     socket stays OPEN and usable (Decision E — a timeout never closes it).
-  * `Failed(error)` — the receive failed (a typed `SocketError`).
+  * `Failed(error)` — the receive failed (a typed `Socket.Error`).
 
   ## Examples
 
-      case SocketDatagram.recv_from(socket, 1024, 5000) {
-        SocketDatagramRecv.Datagram(d)  -> use(d.data)
-        SocketDatagramRecv.Truncated(d) -> log_oversize(d.datagram_size)
-        SocketDatagramRecv.TimedOut     -> :idle
-        SocketDatagramRecv.Failed(_e)   -> :error
+      case Socket.Datagram.recv_from(socket, 1024, 5000) {
+        Socket.DatagramRecv.Datagram(d)  -> use(d.data)
+        Socket.DatagramRecv.Truncated(d) -> log_oversize(d.datagram_size)
+        Socket.DatagramRecv.TimedOut     -> :idle
+        Socket.DatagramRecv.Failed(_e)   -> :error
       }
   """
 
 @available_on(:network)
 
-pub union SocketDatagramRecv {
-  Datagram :: SocketDatagramData
-  Truncated :: SocketDatagramData
+pub union Socket.DatagramRecv {
+  Datagram :: Socket.DatagramData
+  Truncated :: Socket.DatagramData
   TimedOut
-  Failed :: SocketError
+  Failed :: Socket.Error
 }
 
 @doc = """
-  `SocketDatagramRecvDecoder` — the ONE shared decode core that turns a runtime
+  `Socket.DatagramRecvDecoder` — the ONE shared decode core that turns a runtime
   `recv_from` status (+ truncation flag, bytes, peer, datagram size) into the
-  `SocketDatagramRecv` union.
+  `Socket.DatagramRecv` union.
 
   A stateless namespace (no fields), the single point every datagram receive form
   (`recv_from`, connected `recv`) routes its status → variant mapping through, so
   the mapping lives in ONE place and cannot drift between forms. This is the
-  datagram twin of `SocketRecvDecoder`, on its own struct so the receive forms
+  datagram twin of `Socket.RecvDecoder`, on its own struct so the receive forms
   call it without a mutual struct cycle.
 
   ## Examples
 
-      SocketDatagramRecvDecoder.decode(0, 0, "hi", peer, 2)   # => Datagram
-      SocketDatagramRecvDecoder.decode(0, 1, "hi", peer, 100) # => Truncated
+      Socket.DatagramRecvDecoder.decode(0, 0, "hi", peer, 2)   # => Datagram
+      Socket.DatagramRecvDecoder.decode(0, 1, "hi", peer, 100) # => Truncated
   """
 
 @available_on(:network)
 
-pub struct SocketDatagramRecvDecoder {
+pub struct Socket.DatagramRecvDecoder {
   @doc = """
-    Decodes a `recv_from` result into the `SocketDatagramRecv` union: `status 0`
+    Decodes a `recv_from` result into the `Socket.DatagramRecv` union: `status 0`
     = a datagram (`truncated 1` → `Truncated`, else `Datagram`, both carrying a
-    `SocketDatagramData` of `bytes`/`peer`/`datagram_size`); `status 2` = an idle
+    `Socket.DatagramData` of `bytes`/`peer`/`datagram_size`); `status 2` = an idle
     `TimedOut` (the socket stays open); any other positive `status` = a `Failed`
     reason. There is NO `Closed` (datagrams have no EOF). A plain Bool cascade
     (no integer-literal `case` arm).
 
     ## Examples
 
-        SocketDatagramRecvDecoder.decode(2, 0, "", peer, 0)   # => TimedOut
+        Socket.DatagramRecvDecoder.decode(2, 0, "", peer, 0)   # => TimedOut
     """
 
   @available_on(:network)
 
-  pub fn decode(status :: i64, truncated :: i64, bytes :: String, peer :: SocketAddress, datagram_size :: i64) -> SocketDatagramRecv {
+  pub fn decode(status :: i64, truncated :: i64, bytes :: String, peer :: Socket.Address, datagram_size :: i64) -> Socket.DatagramRecv {
     case status == 0 {
       true ->
         {
-          data = %SocketDatagramData{data: bytes, peer: peer, datagram_size: datagram_size}
+          data = %Socket.DatagramData{data: bytes, peer: peer, datagram_size: datagram_size}
           case truncated == 1 {
-            true -> SocketDatagramRecv.Truncated(data)
-            false -> SocketDatagramRecv.Datagram(data)
+            true -> Socket.DatagramRecv.Truncated(data)
+            false -> Socket.DatagramRecv.Datagram(data)
           }
         }
       false ->
         case status == 2 {
-          true -> SocketDatagramRecv.TimedOut
-          false -> SocketDatagramRecv.Failed(SocketError.from_code(status))
+          true -> Socket.DatagramRecv.TimedOut
+          false -> Socket.DatagramRecv.Failed(Socket.Error.from_code(status))
         }
     }
   }

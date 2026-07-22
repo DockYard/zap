@@ -27,11 +27,11 @@
   The value-threaded Tier-1 op set: `connect`/`connect_to` (resolved address)
   and `connect_host` (connect by NAME with RFC 8305 Happy Eyeballs over DNS),
   `send`/`send_all`/`send_some`, the EOF-safe `recv`/`recv_exact` returning
-  `SocketRecv` (and `recv_blob` returning the `Blob`-carrying `SocketRecvBlob`),
+  `Socket.Recv` (and `recv_blob` returning the `Blob`-carrying `Socket.RecvBlob`),
   `shutdown` (half-close), `close`, `local_address`/`peer_address`/
   `local_port`/`peer_port`, and the streaming Form-1 surface `chunks`/`fold`
   (an `Enumerable` of received chunks). `listen` yields a DISTINCT
-  `SocketListener` (which `accept`s data `Socket`s); the type system alone
+  `Socket.Listener` (which `accept`s data `Socket`s); the type system alone
   forbids `recv` on a listener or `accept` on a data socket. Timeouts are
   poll-quantum-bounded (§6.1), never `SO_RCVTIMEO`, and a timeout never closes
   the socket.
@@ -58,12 +58,12 @@
 
   ## Examples
 
-      case Socket.listen(SocketAddress.loopback(0), 128) {
+      case Socket.listen(Socket.Address.loopback(0), 128) {
         Result.Ok(listener) -> {
-          port = SocketListener.local_port(listener)
-          case Socket.connect(SocketAddress.loopback(port), 5000) {
-            Result.Ok(client) -> { _ = Socket.close(client); _ = SocketListener.close(listener) }
-            Result.Error(_error) -> _ = SocketListener.close(listener)
+          port = Socket.Listener.local_port(listener)
+          case Socket.connect(Socket.Address.loopback(port), 5000) {
+            Result.Ok(client) -> { _ = Socket.close(client); _ = Socket.Listener.close(listener) }
+            Result.Error(_error) -> _ = Socket.Listener.close(listener)
           }
         }
         Result.Error(_error) -> nil
@@ -80,7 +80,7 @@ pub struct Socket {
     milliseconds (`0` = no deadline). An `:ip4` address connects an IPv4 TCP
     socket; a `:unix` address (Phase S2) connects a Unix-domain STREAM socket to
     the address's path. Returns `Result.Ok(socket)` on success or
-    `Result.Error(%SocketError{...})` with a matchable reason. The connection
+    `Result.Error(%Socket.Error{...})` with a matchable reason. The connection
     races nothing — `address` is a single explicit, already-resolved endpoint;
     connect by NAME with RFC 8305 Happy Eyeballs over DNS is
     `Socket.connect_host/3`.
@@ -92,28 +92,28 @@ pub struct Socket {
 
     ## Examples
 
-        Socket.connect(SocketAddress.loopback(8080), 5000)
+        Socket.connect(Socket.Address.loopback(8080), 5000)
     """
 
   @available_on(:network)
 
-  pub fn connect(address :: SocketAddress, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn connect(address :: Socket.Address, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     raw = case address.family {
       :unix -> :zig.SocketRuntime.connect_unix(address.path, timeout_ms)
       _ -> :zig.SocketRuntime.connect(address.a, address.b, address.c, address.d, address.port, timeout_ms)
     }
     case raw {
-      0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
+      0 -> Result(Socket, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket, Socket.Error).Ok(%Socket{zap_socket_handle: handle_bits})
     }
   }
 
   @doc = """
     Binds and listens a stream socket on `address` with the given `backlog`
     (an `:ip4` address binds an IPv4 TCP listener — port 0 → an ephemeral port,
-    discoverable via `SocketListener.local_port`; a `:unix` address, Phase S2,
+    discoverable via `Socket.Listener.local_port`; a `:unix` address, Phase S2,
     binds a Unix-domain STREAM listener at the address's path), returning a
-    DISTINCT `SocketListener` handle (Phase S1). `accept` it into per-connection
+    DISTINCT `Socket.Listener` handle (Phase S1). `accept` it into per-connection
     `Socket`s (Unix-domain accepts flow through the SAME `accept`); you cannot
     `send`/`recv` a listener (no such operation exists on the type). The backlog
     is capped by the OS `somaxconn`. For a Unix filesystem path, unlink any stale
@@ -121,22 +121,22 @@ pub struct Socket {
 
     ## Examples
 
-        case Socket.listen(SocketAddress.loopback(0), 128) {
-          Result.Ok(listener) -> SocketListener.local_port(listener)
+        case Socket.listen(Socket.Address.loopback(0), 128) {
+          Result.Ok(listener) -> Socket.Listener.local_port(listener)
           Result.Error(_error) -> 0
         }
     """
 
   @available_on(:network)
 
-  pub fn listen(address :: SocketAddress, backlog :: i64) -> Result(SocketListener, SocketError) {
+  pub fn listen(address :: Socket.Address, backlog :: i64) -> Result(Socket.Listener, Socket.Error) {
     raw = case address.family {
       :unix -> :zig.SocketRuntime.listen_unix(address.path, backlog)
       _ -> :zig.SocketRuntime.listen(address.a, address.b, address.c, address.d, address.port, backlog)
     }
     case raw {
-      0 -> Result(SocketListener, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(SocketListener, SocketError).Ok(%SocketListener{zap_socket_handle: handle_bits})
+      0 -> Result(Socket.Listener, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket.Listener, Socket.Error).Ok(%Socket.Listener{zap_socket_handle: handle_bits})
     }
   }
 
@@ -150,20 +150,20 @@ pub struct Socket {
 
     Use this (not `set_options` after `listen`) when you need `reuse_port` /
     `reuse_address`: applying them post-bind is too late to matter. The other
-    `SocketOptions` fields (nodelay, keepalive, buffers, linger) are per-
+    `Socket.Options` fields (nodelay, keepalive, buffers, linger) are per-
     connection concerns — set them on the accepted `Socket` with `set_options`.
 
     ## Examples
 
-        Socket.listen(SocketAddress.loopback(0), 128, %SocketOptions{reuse_port: true})
+        Socket.listen(Socket.Address.loopback(0), 128, %Socket.Options{reuse_port: true})
     """
 
   @available_on(:network)
 
-  pub fn listen(address :: SocketAddress, backlog :: i64, options :: SocketOptions) -> Result(SocketListener, SocketError) {
+  pub fn listen(address :: Socket.Address, backlog :: i64, options :: Socket.Options) -> Result(Socket.Listener, Socket.Error) {
     case :zig.SocketRuntime.listen_with_options(address.a, address.b, address.c, address.d, address.port, backlog, options.reuse_address, options.reuse_port) {
-      0 -> Result(SocketListener, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(SocketListener, SocketError).Ok(%SocketListener{zap_socket_handle: handle_bits})
+      0 -> Result(Socket.Listener, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket.Listener, Socket.Error).Ok(%Socket.Listener{zap_socket_handle: handle_bits})
     }
   }
 
@@ -171,17 +171,17 @@ pub struct Socket {
     Accepts the next inbound connection on `listener`, parking the fiber until
     one arrives (offloaded off the process's core gate-ON, inline gate-OFF).
     Returns `Result.Ok(socket)` — a data `Socket` that INHERITS the listener's
-    options — or `Result.Error(%SocketError{...})`. You cannot `accept` a data
-    `Socket` (the parameter is a `SocketListener`) nor `send`/`recv` a listener —
+    options — or `Result.Error(%Socket.Error{...})`. You cannot `accept` a data
+    `Socket` (the parameter is a `Socket.Listener`) nor `send`/`recv` a listener —
     the distinct types make both a compile error. Panics on a closed or stale
     listener handle.
 
-    A `SocketListener` is single-owner like every socket handle (Decision B): it
+    A `Socket.Listener` is single-owner like every socket handle (Decision B): it
     is `accept`ed by the ONE process that owns it, not shared. The
     acceptor/handler server pattern is therefore ONE process looping `accept` and
     handing each accepted `Socket` to a fresh handler by `Process.send_move`
     (`controlling_process` — owner-executed handoff); `lib/socket/server.zap`
-    (`SocketServer`) is the policy scaffold, and `SocketListener.close` (or the
+    (`Socket.Server`) is the policy scaffold, and `Socket.Listener.close` (or the
     owner's death) is what stops it.
 
     ## Examples
@@ -194,17 +194,17 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn accept(listener :: SocketListener) -> Result(Socket, SocketError) {
+  pub fn accept(listener :: Socket.Listener) -> Result(Socket, Socket.Error) {
     case :zig.SocketRuntime.accept(listener.zap_socket_handle) {
-      0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
+      0 -> Result(Socket, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket, Socket.Error).Ok(%Socket{zap_socket_handle: handle_bits})
     }
   }
 
   @doc = """
     Accepts the next inbound connection on `listener`, BOUNDED by `timeout_ms`
     (Phase S3, Job 2): if no connection arrives within `timeout_ms` milliseconds
-    the call returns `Result.Error(%SocketError{reason: :etimedout})` instead of
+    the call returns `Result.Error(%Socket.Error{reason: :etimedout})` instead of
     parking forever. `timeout_ms <= 0` is the infinite `accept/1` behavior.
 
     The deadline is poll-quantum-bounded against an ABSOLUTE monotonic instant
@@ -223,17 +223,17 @@ pub struct Socket {
 
         case Socket.accept(listener, 50) {
           Result.Ok(connection)                       -> dispatch(connection)
-          Result.Error(%SocketError{reason: :etimedout}) -> keep_serving()
+          Result.Error(%Socket.Error{reason: :etimedout}) -> keep_serving()
           Result.Error(_error)                        -> :accept_failed
         }
     """
 
   @available_on(:network)
 
-  pub fn accept(listener :: SocketListener, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn accept(listener :: Socket.Listener, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     case :zig.SocketRuntime.accept_timeout(listener.zap_socket_handle, timeout_ms) {
-      0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
+      0 -> Result(Socket, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket, Socket.Error).Ok(%Socket{zap_socket_handle: handle_bits})
     }
   }
 
@@ -241,12 +241,12 @@ pub struct Socket {
     Returns the LOCAL port of a connected data `Socket` via `getsockname` — the
     ephemeral source port the OS assigned to an outbound `connect` (a thin read
     of `local_address(socket).port`, the symmetric companion to `peer_port`).
-    For a LISTENER's bound port use `SocketListener.local_port`. Panics on a
+    For a LISTENER's bound port use `Socket.Listener.local_port`. Panics on a
     closed or stale handle.
 
     ## Examples
 
-        case Socket.connect(SocketAddress.loopback(port), 5000) {
+        case Socket.connect(Socket.Address.loopback(port), 5000) {
           Result.Ok(client) -> Socket.local_port(client)   # => e.g. 54233
           Result.Error(_error) -> 0
         }
@@ -268,7 +268,7 @@ pub struct Socket {
 
     ## Examples
 
-        case Socket.connect(SocketAddress.loopback(8080), 5000) {
+        case Socket.connect(Socket.Address.loopback(8080), 5000) {
           Result.Ok(client) -> Socket.close(client)
           Result.Error(_error) -> false
         }
@@ -287,7 +287,7 @@ pub struct Socket {
 
     ## Examples
 
-        case Socket.connect(SocketAddress.loopback(8080), 5000) {
+        case Socket.connect(Socket.Address.loopback(8080), 5000) {
           Result.Ok(client) -> {
             was_open = Socket.open?(client)   # => true
             _ = Socket.close(client)
@@ -311,7 +311,7 @@ pub struct Socket {
     ## Examples
 
         base = Socket.live_count()
-        case Socket.listen(SocketAddress.loopback(0), 1) {
+        case Socket.listen(Socket.Address.loopback(0), 1) {
           Result.Ok(listener) -> {
             grew = Socket.live_count() > base
             _ = Socket.close(listener)
@@ -329,21 +329,21 @@ pub struct Socket {
 
   @doc = """
     The explicit resolved-address connect (`connect_to/2`): connects to an
-    already-resolved `SocketAddress`, identical to `connect/2` in S1 (DNS
+    already-resolved `Socket.Address`, identical to `connect/2` in S1 (DNS
     resolution inside `connect` and happy-eyeballs racing over multiple
     resolved addresses arrive with the hostname `connect` in a later phase;
-    S1's `SocketAddress` is an explicit IPv4 endpoint, so there is nothing to
+    S1's `Socket.Address` is an explicit IPv4 endpoint, so there is nothing to
     race). Kept as the named escape hatch the `resolve` + `connect_to` pattern
     documents.
 
     ## Examples
 
-        Socket.connect_to(SocketAddress.ip4(127, 0, 0, 1, 8080), 5000)
+        Socket.connect_to(Socket.Address.ip4(127, 0, 0, 1, 8080), 5000)
     """
 
   @available_on(:network)
 
-  pub fn connect_to(address :: SocketAddress, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn connect_to(address :: Socket.Address, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     Socket.connect(address, timeout_ms)
   }
 
@@ -360,7 +360,7 @@ pub struct Socket {
     `timeout_ms` (`0` = no deadline) is ONE absolute deadline across BOTH the
     resolve and the race (Decision E — a per-call relative timeout, never
     `SO_*TIMEO`). Returns `Result.Ok(socket)` on the winning connection, or
-    `Result.Error(%SocketError{...})`: `:nxdomain` when the name resolves to no
+    `Result.Error(%Socket.Error{...})`: `:nxdomain` when the name resolves to no
     address, `:einval` when the name is not a valid host name (RFC 1123),
     `:etimedout` when the whole resolve+race exceeds the deadline, or a POSIX
     reason (e.g. `:econnrefused`) from the last failed attempt.
@@ -368,7 +368,7 @@ pub struct Socket {
     Works in both concurrent (gate-ON) and plain-script (gate-OFF) programs;
     the resolve step blocks the calling thread (the platform resolver is
     uninterruptible), bounded by the address cap and the deadline. Use
-    `connect`/`connect_to` when you already hold a resolved `SocketAddress`.
+    `connect`/`connect_to` when you already hold a resolved `Socket.Address`.
 
     ## Examples
 
@@ -380,16 +380,16 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn connect_host(host :: String, port :: i64, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn connect_host(host :: String, port :: i64, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     case :zig.SocketRuntime.connect_host(host, port, timeout_ms) {
-      0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
+      0 -> Result(Socket, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket, Socket.Error).Ok(%Socket{zap_socket_handle: handle_bits})
     }
   }
 
   @doc = """
     Receives the NEXT available bytes (blocking until at least one byte arrives
-    or the stream ends), returning the EOF-safe `SocketRecv` union: a
+    or the stream ends), returning the EOF-safe `Socket.Recv` union: a
     `Chunk(bytes)` (always ≥ 1 byte, binary-safe), `Closed` on clean EOF, or
     `Failed(error)`. Parks the fiber off its core gate-ON, blocks the single OS
     thread gate-OFF. Panics on a closed or stale handle.
@@ -397,15 +397,15 @@ pub struct Socket {
     ## Examples
 
         case Socket.recv(socket) {
-          SocketRecv.Chunk(bytes) -> handle(bytes)
-          SocketRecv.Closed       -> :eof
-          SocketRecv.Failed(_e)   -> :error
+          Socket.Recv.Chunk(bytes) -> handle(bytes)
+          Socket.Recv.Closed       -> :eof
+          Socket.Recv.Failed(_e)   -> :error
         }
     """
 
   @available_on(:network)
 
-  pub fn recv(socket :: Socket) -> SocketRecv {
+  pub fn recv(socket :: Socket) -> Socket.Recv {
     Socket.recv(socket, 0, 0)
   }
 
@@ -423,7 +423,7 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn recv(socket :: Socket, byte_count :: i64) -> SocketRecv {
+  pub fn recv(socket :: Socket, byte_count :: i64) -> Socket.Recv {
     Socket.recv(socket, byte_count, 0)
   }
 
@@ -446,14 +446,14 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn recv(socket :: Socket, byte_count :: i64, timeout_ms :: i64) -> SocketRecv {
+  pub fn recv(socket :: Socket, byte_count :: i64, timeout_ms :: i64) -> Socket.Recv {
     Socket.recv_from_handle(socket.zap_socket_handle, byte_count, timeout_ms)
   }
 
   @doc = """
     Receives from a raw socket handle and decodes the runtime's status into the
-    EOF-safe `SocketRecv` union via `SocketRecvDecoder.decode` — the ONE shared
-    decode core `recv`/`recv_exact`, `Socket.fold`, and the `SocketChunks`
+    EOF-safe `Socket.Recv` union via `Socket.RecvDecoder.decode` — the ONE shared
+    decode core `recv`/`recv_exact`, `Socket.fold`, and the `Socket.Chunks`
     stream pull all route through (each then maps the union onto its own tail),
     so the status → variant mapping cannot drift between forms. `byte_count == 0` is
     next-available; `> 0` is `recv_exact`; `timeout_ms` bounds each pull. The
@@ -465,10 +465,10 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn recv_from_handle(handle_bits :: u64, byte_count :: i64, timeout_ms :: i64) -> SocketRecv {
+  pub fn recv_from_handle(handle_bits :: u64, byte_count :: i64, timeout_ms :: i64) -> Socket.Recv {
     bytes = :zig.SocketRuntime.recv(handle_bits, byte_count, timeout_ms)
     status = :zig.SocketRuntime.recv_status()
-    SocketRecvDecoder.decode(status, bytes)
+    Socket.RecvDecoder.decode(status, bytes)
   }
 
   @doc = """
@@ -483,7 +483,7 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn recv_exact(socket :: Socket, byte_count :: i64, timeout_ms :: i64) -> SocketRecv {
+  pub fn recv_exact(socket :: Socket, byte_count :: i64, timeout_ms :: i64) -> Socket.Recv {
     Socket.recv(socket, byte_count, timeout_ms)
   }
 
@@ -492,27 +492,27 @@ pub struct Socket {
     receives up to/exactly `byte_count` bytes (or next-available when `0`) with
     a `timeout_ms` deadline and wraps the payload in a `Blob` — the shared tier
     a large body can be `Process.send_move`d through a handler pipeline with no
-    re-copy. Returns the EOF-safe `SocketRecvBlob`. Requires the concurrency
+    re-copy. Returns the EOF-safe `Socket.RecvBlob`. Requires the concurrency
     runtime (a `Blob` only exists gate-ON).
 
     ## Examples
 
         case Socket.recv_blob(socket, 65536, 5000) {
-          SocketRecvBlob.Chunk(body) -> forward(body)
-          SocketRecvBlob.Closed      -> :eof
-          SocketRecvBlob.Failed(_e)  -> :error
+          Socket.RecvBlob.Chunk(body) -> forward(body)
+          Socket.RecvBlob.Closed      -> :eof
+          Socket.RecvBlob.Failed(_e)  -> :error
         }
     """
 
   @available_on(:network)
 
-  pub fn recv_blob(socket :: Socket, byte_count :: i64, timeout_ms :: i64) -> SocketRecvBlob {
+  pub fn recv_blob(socket :: Socket, byte_count :: i64, timeout_ms :: i64) -> Socket.RecvBlob {
     received = Socket.recv(socket, byte_count, timeout_ms)
     case received {
-      SocketRecv.Chunk(bytes) -> SocketRecvBlob.Chunk(Blob.create(bytes))
-      SocketRecv.TimedOut(partial) -> SocketRecvBlob.TimedOut(Blob.create(partial))
-      SocketRecv.Closed -> SocketRecvBlob.Closed
-      SocketRecv.Failed(error) -> SocketRecvBlob.Failed(error)
+      Socket.Recv.Chunk(bytes) -> Socket.RecvBlob.Chunk(Blob.create(bytes))
+      Socket.Recv.TimedOut(partial) -> Socket.RecvBlob.TimedOut(Blob.create(partial))
+      Socket.Recv.Closed -> Socket.RecvBlob.Closed
+      Socket.Recv.Failed(error) -> Socket.RecvBlob.Failed(error)
     }
   }
 
@@ -527,7 +527,7 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn send(socket :: Socket, bytes :: String) -> Result(i64, SocketError) {
+  pub fn send(socket :: Socket, bytes :: String) -> Result(i64, Socket.Error) {
     Socket.send(socket, bytes, 0)
   }
 
@@ -539,7 +539,7 @@ pub struct Socket {
     forever — it times out and the socket stays OPEN (a timeout never closes
     it), and under the concurrency runtime the send stays kill-responsive so it
     can never pin a blocking-pool thread. Returns `Result.Ok(byte_count)` on
-    full delivery, or `Result.Error(%SocketError{..., bytes_sent: n})`
+    full delivery, or `Result.Error(%Socket.Error{..., bytes_sent: n})`
     reporting how much of the payload committed before the failure or timeout
     (the Erlang `RestData` lesson — no silent partial-send loss). Binary-safe.
     Panics on a stale handle.
@@ -551,12 +551,12 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn send(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, SocketError) {
+  pub fn send(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, Socket.Error) {
     total = String.length(bytes)
     sent = :zig.SocketRuntime.send(socket.zap_socket_handle, bytes, timeout_ms)
     case sent == total {
-      true -> Result(i64, SocketError).Ok(sent)
-      false -> Result(i64, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(:zig.SocketRuntime.last_error()), bytes_sent: sent})
+      true -> Result(i64, Socket.Error).Ok(sent)
+      false -> Result(i64, Socket.Error).Error(%Socket.Error{reason: Socket.Error.reason_from_code(:zig.SocketRuntime.last_error()), bytes_sent: sent})
     }
   }
 
@@ -571,7 +571,7 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn send_all(socket :: Socket, bytes :: String) -> Result(i64, SocketError) {
+  pub fn send_all(socket :: Socket, bytes :: String) -> Result(i64, Socket.Error) {
     Socket.send(socket, bytes, 0)
   }
 
@@ -586,7 +586,7 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn send_all(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, SocketError) {
+  pub fn send_all(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, Socket.Error) {
     Socket.send(socket, bytes, timeout_ms)
   }
 
@@ -601,7 +601,7 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn send_some(socket :: Socket, bytes :: String) -> Result(i64, SocketError) {
+  pub fn send_some(socket :: Socket, bytes :: String) -> Result(i64, Socket.Error) {
     Socket.send_some(socket, bytes, 0)
   }
 
@@ -621,14 +621,14 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn send_some(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, SocketError) {
+  pub fn send_some(socket :: Socket, bytes :: String, timeout_ms :: i64) -> Result(i64, Socket.Error) {
     written = :zig.SocketRuntime.send_some(socket.zap_socket_handle, bytes, timeout_ms)
     case written > 0 {
-      true -> Result(i64, SocketError).Ok(written)
+      true -> Result(i64, Socket.Error).Ok(written)
       false ->
         case String.length(bytes) == 0 {
-          true -> Result(i64, SocketError).Ok(0)
-          false -> Result(i64, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(:zig.SocketRuntime.last_error()), bytes_sent: 0})
+          true -> Result(i64, Socket.Error).Ok(0)
+          false -> Result(i64, Socket.Error).Error(%Socket.Error{reason: Socket.Error.reason_from_code(:zig.SocketRuntime.last_error()), bytes_sent: 0})
         }
     }
   }
@@ -648,7 +648,7 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn shutdown(socket :: Socket, direction :: Atom) -> Result(Bool, SocketError) {
+  pub fn shutdown(socket :: Socket, direction :: Atom) -> Result(Bool, Socket.Error) {
     how = case direction {
       :read -> 0
       :write -> 1
@@ -656,13 +656,13 @@ pub struct Socket {
       _ -> 2
     }
     case :zig.SocketRuntime.shutdown(socket.zap_socket_handle, how) {
-      0 -> Result(Bool, SocketError).Ok(true)
-      reason -> Result(Bool, SocketError).Error(SocketError.from_code(reason))
+      0 -> Result(Bool, Socket.Error).Ok(true)
+      reason -> Result(Bool, Socket.Error).Error(Socket.Error.from_code(reason))
     }
   }
 
   @doc = """
-    Returns the LOCAL (bound) `SocketAddress` of a connected socket via
+    Returns the LOCAL (bound) `Socket.Address` of a connected socket via
     `getsockname` — the local endpoint the OS assigned (e.g. the ephemeral
     source port of an outbound connection). An IPv4 connection yields an `:ip4`
     address; a connection that won over IPv6 (a `connect_host` Happy-Eyeballs
@@ -677,12 +677,12 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn local_address(socket :: Socket) -> SocketAddress {
+  pub fn local_address(socket :: Socket) -> Socket.Address {
     Socket.address_of(socket.zap_socket_handle, 0)
   }
 
   @doc = """
-    Returns the REMOTE (peer) `SocketAddress` of a connected socket via
+    Returns the REMOTE (peer) `Socket.Address` of a connected socket via
     `getpeername` — an `:ip4` address for an IPv4 connection, a real `:ip6`
     address for one that won over IPv6 (a `connect_host` Happy-Eyeballs race),
     a Unix-domain (`:unix`) peer's socket `path` (e.g. the listener's bound path
@@ -696,15 +696,15 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn peer_address(socket :: Socket) -> SocketAddress {
+  pub fn peer_address(socket :: Socket) -> Socket.Address {
     Socket.address_of(socket.zap_socket_handle, 1)
   }
 
   @doc = """
     Resolves the endpoint (`which` `0` = local/`getsockname`, `1` = peer/
-    `getpeername`) of a socket handle into a `SocketAddress` — a thin delegate to
-    the shared `SocketAddress.of_handle` decoder (the single decode point stream
-    `Socket` and `SocketDatagram` both route through). The v4 fast path is
+    `getpeername`) of a socket handle into a `Socket.Address` — a thin delegate to
+    the shared `Socket.Address.of_handle` decoder (the single decode point stream
+    `Socket` and `Socket.Datagram` both route through). The v4 fast path is
     BYTE-IDENTICAL to the packed decode; a v6 endpoint reconstructs from the four
     32-bit address words; a `:unix` endpoint surfaces its `sun_path`
     (`endpoint_unix_path` → a String → `unix_from_path`), so a Unix-domain stream
@@ -713,8 +713,8 @@ pub struct Socket {
 
   @available_on(:network)
 
-  fn address_of(handle_bits :: u64, which :: i64) -> SocketAddress {
-    SocketAddress.of_handle(handle_bits, which)
+  fn address_of(handle_bits :: u64, which :: i64) -> Socket.Address {
+    Socket.Address.of_handle(handle_bits, which)
   }
 
   @doc = """
@@ -725,7 +725,7 @@ pub struct Socket {
 
     ## Examples
 
-        case Socket.connect(SocketAddress.loopback(port), 5000) {
+        case Socket.connect(Socket.Address.loopback(port), 5000) {
           Result.Ok(client) -> Socket.peer_port(client)   # => the listener's port
           Result.Error(_error) -> 0
         }
@@ -739,8 +739,8 @@ pub struct Socket {
   }
 
   @doc = """
-    Streams the socket as a `SocketChunks` — a concrete
-    `Enumerable(Result(String, SocketError))` (the same convention `Stream.map`/
+    Streams the socket as a `Socket.Chunks` — a concrete
+    `Enumerable(Result(String, Socket.Error))` (the same convention `Stream.map`/
     `unfold` follow, returning the concrete adapter that auto-boxes as
     `Enumerable` at every consumer). The functional pull surface (Form 1,
     §4.1): a `for` comprehension and short-circuiting `Enum` consumers
@@ -752,7 +752,7 @@ pub struct Socket {
 
     BORROW SEMANTICS: the stream borrows the socket; `dispose` (via an early
     `Enum.take`/`find`) releases only the iterator state and NEVER closes the
-    fd — a fresh `chunks` resumes. See `SocketChunks` for the full boundedness
+    fd — a fresh `chunks` resumes. See `Socket.Chunks` for the full boundedness
     table (which consumers are safe on a never-closing stream).
 
     ## Examples
@@ -769,8 +769,8 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn chunks(socket :: Socket, timeout_ms :: i64) -> SocketChunks {
-    %SocketChunks{handle: socket.zap_socket_handle, timeout_ms: timeout_ms, active: true}
+  pub fn chunks(socket :: Socket, timeout_ms :: i64) -> Socket.Chunks {
+    %Socket.Chunks{handle: socket.zap_socket_handle, timeout_ms: timeout_ms, active: true}
   }
 
   @doc = """
@@ -801,7 +801,7 @@ pub struct Socket {
 
   @available_on(:network)
 
-  pub fn fold(socket :: Socket, initial :: acc, timeout_ms :: i64, callback :: fn(acc, String) -> {Atom, acc}) -> Result(acc, SocketError) {
+  pub fn fold(socket :: Socket, initial :: acc, timeout_ms :: i64, callback :: fn(acc, String) -> {Atom, acc}) -> Result(acc, Socket.Error) {
     Socket.fold_loop(socket.zap_socket_handle, timeout_ms, initial, callback)
   }
 
@@ -819,31 +819,31 @@ pub struct Socket {
 
   @available_on(:network)
 
-  fn fold_loop(handle_bits :: u64, timeout_ms :: i64, acc :: acc, callback :: fn(acc, String) -> {Atom, acc}) -> Result(acc, SocketError) {
+  fn fold_loop(handle_bits :: u64, timeout_ms :: i64, acc :: acc, callback :: fn(acc, String) -> {Atom, acc}) -> Result(acc, Socket.Error) {
     received = Socket.recv_from_handle(handle_bits, 0, timeout_ms)
     case received {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         case callback(acc, bytes) {
           {:cont, continued} -> Socket.fold_loop(handle_bits, timeout_ms, continued, callback)
-          {:halt, halted} -> Result(acc, SocketError).Ok(halted)
-          {_other, fallthrough} -> Result(acc, SocketError).Ok(fallthrough)
+          {:halt, halted} -> Result(acc, Socket.Error).Ok(halted)
+          {_other, fallthrough} -> Result(acc, Socket.Error).Ok(fallthrough)
         }
       # A next-available fold pull carries no partial (byte_count 0 reads
       # nothing on timeout), so an idle timeout ends the fold as an Error —
       # its documented mid-stream boundedness.
-      SocketRecv.TimedOut(_partial) -> Result(acc, SocketError).Error(%SocketError{reason: :etimedout})
-      SocketRecv.Closed -> Result(acc, SocketError).Ok(acc)
-      SocketRecv.Failed(error) -> Result(acc, SocketError).Error(error)
+      Socket.Recv.TimedOut(_partial) -> Result(acc, Socket.Error).Error(%Socket.Error{reason: :etimedout})
+      Socket.Recv.Closed -> Result(acc, Socket.Error).Ok(acc)
+      Socket.Recv.Failed(error) -> Result(acc, Socket.Error).Error(error)
     }
   }
 
   @doc = """
     Applies `options` to `socket` via `setsockopt`, returning
     `Result.Ok(socket)` (the same value-threaded handle, for rebinding) once
-    every option applied, or `Result.Error(%SocketError{...})` on failure. This
-    is the OPT-IN that makes `SocketOptions`' defaults take effect: a bare
+    every option applied, or `Result.Error(%Socket.Error{...})` on failure. This
+    is the OPT-IN that makes `Socket.Options`' defaults take effect: a bare
     `connect` keeps OS-default behavior (Nagle ON), and calling
-    `set_options(socket, SocketOptions.default())` turns on the latency-first
+    `set_options(socket, Socket.Options.default())` turns on the latency-first
     `TCP_NODELAY` (and the rest of the curated set) — a deliberate, applied-on-
     request posture, never an automatic flip of every socket.
 
@@ -851,7 +851,7 @@ pub struct Socket {
     first `setsockopt` failure; fields at their "unset" sentinel are skipped (a
     buffer size of `0` = leave the OS default; `linger_ms` of `-1` = no
     override; `ip6_only` applied only when `true`). A stale or foreign handle
-    yields `Result.Error(%SocketError{reason: :closed})` — the ownership gate,
+    yields `Result.Error(%Socket.Error{reason: :closed})` — the ownership gate,
     surfaced as a recoverable error rather than a panic (unlike `send`/`recv`,
     a config op on a closed socket is not a program bug). `reuse_address` /
     `reuse_port` are pre-bind options; set those with `Socket.listen/3`, not
@@ -859,26 +859,26 @@ pub struct Socket {
 
     ## Examples
 
-        case Socket.connect(SocketAddress.loopback(8080), 5000) {
+        case Socket.connect(Socket.Address.loopback(8080), 5000) {
           Result.Ok(client) ->
-            case Socket.set_options(client, SocketOptions.default()) {
+            case Socket.set_options(client, Socket.Options.default()) {
               Result.Ok(configured) -> Socket.send(configured, "GET / HTTP/1.0\\r\\n\\r\\n")
-              Result.Error(error)   -> Result(i64, SocketError).Error(error)
+              Result.Error(error)   -> Result(i64, Socket.Error).Error(error)
             }
-          Result.Error(error) -> Result(i64, SocketError).Error(error)
+          Result.Error(error) -> Result(i64, Socket.Error).Error(error)
         }
     """
 
   @available_on(:network)
 
-  pub fn set_options(socket :: Socket, options :: SocketOptions) -> Result(Socket, SocketError) {
-    status = SocketOptions.apply_to_handle(options, socket.zap_socket_handle)
+  pub fn set_options(socket :: Socket, options :: Socket.Options) -> Result(Socket, Socket.Error) {
+    status = Socket.Options.apply_to_handle(options, socket.zap_socket_handle)
     case status == 0 {
-      true -> Result(Socket, SocketError).Ok(socket)
+      true -> Result(Socket, Socket.Error).Ok(socket)
       false ->
         case status < 0 {
-          true -> Result(Socket, SocketError).Error(%SocketError{reason: :closed})
-          false -> Result(Socket, SocketError).Error(SocketError.from_code(status))
+          true -> Result(Socket, Socket.Error).Error(%Socket.Error{reason: :closed})
+          false -> Result(Socket, Socket.Error).Error(Socket.Error.from_code(status))
         }
     }
   }
@@ -892,12 +892,12 @@ pub struct Socket {
     OS-applied value (a `0`/`1` bool, a byte count, or `linger` milliseconds),
     or `-1` when the socket is not a live handle this program owns or the
     option could not be read. Lets a program CONFIRM that, say,
-    `set_options(_, %SocketOptions{nodelay: true})` actually took effect
+    `set_options(_, %Socket.Options{nodelay: true})` actually took effect
     (`get_option(socket, 0) == 1`), not merely that the call was accepted.
 
     ## Examples
 
-        _ = Socket.set_options(socket, %SocketOptions{nodelay: true})
+        _ = Socket.set_options(socket, %Socket.Options{nodelay: true})
         Socket.get_option(socket, 0)   # => 1 (TCP_NODELAY is on)
     """
 

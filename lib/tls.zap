@@ -57,7 +57,7 @@ pub struct TlsServerConfig {
   handshake, yielding a TLS `Socket` over which `Socket.recv`/`send`/`chunks`/
   `fold` transparently decrypt/encrypt via the SAME record layer the client uses.
   The accepted TLS `Socket` is an ordinary single-owner `Socket`: it composes
-  with the `SocketServer` acceptor/handler pattern (`Process.send_move` a TLS
+  with the `Socket.Server` acceptor/handler pattern (`Process.send_move` a TLS
   `Socket` to a per-connection handler exactly like a plaintext one — the session
   travels with the handle). `Tls.upgrade_server(socket, config, timeout_ms)` is
   the server-side STARTTLS. A bad cert/key fails `Tls.listen` at bind time with
@@ -83,7 +83,7 @@ pub struct TlsServerConfig {
   the requested `host` (SNI + hostname match) AND the host OS trust store
   (chain-of-trust). A certificate that is expired, not-yet-valid, issued for the
   wrong host, or signed by an untrusted issuer is REJECTED — the call returns
-  `Result.Error(%SocketError{reason: :tls_cert_invalid})` and the connection is
+  `Result.Error(%Socket.Error{reason: :tls_cert_invalid})` and the connection is
   torn down. A non-certificate handshake failure (a fatal alert, a malformed
   message, a record-layer decrypt failure, or the transport failing
   mid-handshake) returns `:tls_handshake_failed`; a transport timeout during the
@@ -135,7 +135,7 @@ pub struct TlsServerConfig {
           _ = Socket.close(socket)
           reply
         }
-        Result.Error(%SocketError{reason: :tls_cert_invalid}) -> :peer_not_trusted
+        Result.Error(%Socket.Error{reason: :tls_cert_invalid}) -> :peer_not_trusted
         Result.Error(_error) -> :unreachable
       }
   """
@@ -150,7 +150,7 @@ pub struct Tls {
     server name and the certificate verification target, waiting at most
     `timeout_ms` milliseconds per leg (`0` = no deadline). Returns
     `Result.Ok(socket)` — a TLS `Socket` over which `Socket.recv`/`send`
-    transparently decrypt/encrypt — or `Result.Error(%SocketError{...})`:
+    transparently decrypt/encrypt — or `Result.Error(%Socket.Error{...})`:
     `:tls_cert_invalid` when the server certificate fails verification,
     `:tls_handshake_failed` for a non-certificate handshake failure, or a
     transport reason (`:econnrefused`, `:etimedout`, …) from the connect leg.
@@ -162,22 +162,22 @@ pub struct Tls {
 
     ## Examples
 
-        Tls.connect(SocketAddress.ip4(93, 184, 216, 34, 443), "example.com", 5000)
+        Tls.connect(Socket.Address.ip4(93, 184, 216, 34, 443), "example.com", 5000)
     """
 
   @available_on(:network)
 
-  pub fn connect(address :: SocketAddress, host :: String, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn connect(address :: Socket.Address, host :: String, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     case Socket.connect(address, timeout_ms) {
       Result.Ok(socket) ->
         case :zig.SocketRuntime.tls_handshake(socket.zap_socket_handle, host, timeout_ms) {
-          0 -> Result(Socket, SocketError).Ok(socket)
+          0 -> Result(Socket, Socket.Error).Ok(socket)
           reason -> {
             _closed = Socket.close(socket)
-            Result(Socket, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(reason)})
+            Result(Socket, Socket.Error).Error(%Socket.Error{reason: Socket.Error.reason_from_code(reason)})
           }
         }
-      Result.Error(error) -> Result(Socket, SocketError).Error(error)
+      Result.Error(error) -> Result(Socket, Socket.Error).Error(error)
     }
   }
 
@@ -187,7 +187,7 @@ pub struct Tls {
     MANDATORY-verification TLS handshake using `host` as BOTH the SNI server name
     and the certificate verification target, waiting at most `timeout_ms`
     milliseconds per leg (`0` = no deadline). Returns `Result.Ok(socket)` (a TLS
-    `Socket`) or `Result.Error(%SocketError{...})`: `:tls_cert_invalid` on a
+    `Socket`) or `Result.Error(%Socket.Error{...})`: `:tls_cert_invalid` on a
     certificate-verification failure, `:tls_handshake_failed` on a non-cert
     handshake failure, `:nxdomain`/`:einval` from the resolve, or a POSIX reason
     (`:econnrefused`, `:etimedout`, …) from the race.
@@ -205,17 +205,17 @@ pub struct Tls {
 
   @available_on(:network)
 
-  pub fn connect_host(host :: String, port :: i64, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn connect_host(host :: String, port :: i64, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     case Socket.connect_host(host, port, timeout_ms) {
       Result.Ok(socket) ->
         case :zig.SocketRuntime.tls_handshake(socket.zap_socket_handle, host, timeout_ms) {
-          0 -> Result(Socket, SocketError).Ok(socket)
+          0 -> Result(Socket, Socket.Error).Ok(socket)
           reason -> {
             _closed = Socket.close(socket)
-            Result(Socket, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(reason)})
+            Result(Socket, Socket.Error).Error(%Socket.Error{reason: Socket.Error.reason_from_code(reason)})
           }
         }
-      Result.Error(error) -> Result(Socket, SocketError).Error(error)
+      Result.Error(error) -> Result(Socket, Socket.Error).Error(error)
     }
   }
 
@@ -246,17 +246,17 @@ pub struct Tls {
 
   @available_on(:network)
 
-  pub fn connect_host_insecure(host :: String, port :: i64, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn connect_host_insecure(host :: String, port :: i64, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     case Socket.connect_host(host, port, timeout_ms) {
       Result.Ok(socket) ->
         case :zig.SocketRuntime.tls_handshake_insecure(socket.zap_socket_handle, host, timeout_ms) {
-          0 -> Result(Socket, SocketError).Ok(socket)
+          0 -> Result(Socket, Socket.Error).Ok(socket)
           reason -> {
             _closed = Socket.close(socket)
-            Result(Socket, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(reason)})
+            Result(Socket, Socket.Error).Error(%Socket.Error{reason: Socket.Error.reason_from_code(reason)})
           }
         }
-      Result.Error(error) -> Result(Socket, SocketError).Error(error)
+      Result.Error(error) -> Result(Socket, Socket.Error).Error(error)
     }
   }
 
@@ -271,7 +271,7 @@ pub struct Tls {
     generation in place, so the passed-in plaintext handle is STALE everywhere
     and ONLY the returned TLS `Socket` is valid — using the old handle after a
     successful upgrade is a compile error (move) or a stale-handle panic. Returns
-    `Result.Ok(tls_socket)` on success, or `Result.Error(%SocketError{...})` —
+    `Result.Ok(tls_socket)` on success, or `Result.Error(%Socket.Error{...})` —
     `:tls_cert_invalid` / `:tls_handshake_failed` / a transport reason — on
     failure, in which case the underlying socket is CLOSED (the argument was
     consumed by the move, so it is torn down rather than leaked).
@@ -291,50 +291,50 @@ pub struct Tls {
 
   @available_on(:network)
 
-  pub fn upgrade(socket :: Socket, host :: String, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn upgrade(socket :: Socket, host :: String, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     case :zig.SocketRuntime.tls_upgrade(socket.zap_socket_handle, host, timeout_ms) {
       0 -> {
         _closed = Socket.close(socket)
-        Result(Socket, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(:zig.SocketRuntime.last_error())})
+        Result(Socket, Socket.Error).Error(%Socket.Error{reason: Socket.Error.reason_from_code(:zig.SocketRuntime.last_error())})
       }
-      successor_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: successor_bits})
+      successor_bits -> Result(Socket, Socket.Error).Ok(%Socket{zap_socket_handle: successor_bits})
     }
   }
 
   @doc = """
     Binds a TLS SERVER LISTENER on `address` (an IPv4 endpoint; port `0` → an
-    ephemeral port, discoverable via `SocketListener.local_port`) presenting the
+    ephemeral port, discoverable via `Socket.Listener.local_port`) presenting the
     certificate material in `config`. The certificate chain, private key, and
     ALPN list are parsed and validated ONCE here — a bad, unparseable, or
     key-mismatched certificate fails IMMEDIATELY with
-    `Result.Error(%SocketError{reason: :tls_config_invalid})`, before the socket
+    `Result.Error(%Socket.Error{reason: :tls_config_invalid})`, before the socket
     binds, so a mis-configured server never silently accepts connections it
-    cannot serve. Returns `Result.Ok(listener)` — a `SocketListener` you `accept`
-    with `Tls.accept/2` — or `Result.Error(%SocketError{...})` with a transport
+    cannot serve. Returns `Result.Ok(listener)` — a `Socket.Listener` you `accept`
+    with `Tls.accept/2` — or `Result.Error(%Socket.Error{...})` with a transport
     reason (`:eaddrinuse`, `:eacces`, …) from the bind.
 
-    The returned listener is an ordinary single-owner `SocketListener`: close it
-    with `SocketListener.close` (which also scrubs + frees the stored private
-    key), and drive it with the `SocketServer` acceptor/handler pattern exactly
+    The returned listener is an ordinary single-owner `Socket.Listener`: close it
+    with `Socket.Listener.close` (which also scrubs + frees the stored private
+    key), and drive it with the `Socket.Server` acceptor/handler pattern exactly
     like a plaintext listener — only swap `Socket.accept` for `Tls.accept`.
 
     ## Examples
 
         config = %TlsServerConfig{cert_pem: cert, key_pem: key, alpn: ["http/1.1"]}
-        case Tls.listen(SocketAddress.loopback(0), config, 128) {
-          Result.Ok(listener) -> SocketListener.local_port(listener)
-          Result.Error(%SocketError{reason: :tls_config_invalid}) -> -1
+        case Tls.listen(Socket.Address.loopback(0), config, 128) {
+          Result.Ok(listener) -> Socket.Listener.local_port(listener)
+          Result.Error(%Socket.Error{reason: :tls_config_invalid}) -> -1
           Result.Error(_error) -> 0
         }
     """
 
   @available_on(:network)
 
-  pub fn listen(address :: SocketAddress, config :: TlsServerConfig, backlog :: i64) -> Result(SocketListener, SocketError) {
+  pub fn listen(address :: Socket.Address, config :: TlsServerConfig, backlog :: i64) -> Result(Socket.Listener, Socket.Error) {
     alpn_wire = String.join(config.alpn, "\n")
     case :zig.SocketRuntime.tls_listen(address.a, address.b, address.c, address.d, address.port, backlog, config.cert_pem, config.key_pem, alpn_wire) {
-      0 -> Result(SocketListener, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(SocketListener, SocketError).Ok(%SocketListener{zap_socket_handle: handle_bits})
+      0 -> Result(Socket.Listener, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket.Listener, Socket.Error).Ok(%Socket.Listener{zap_socket_handle: handle_bits})
     }
   }
 
@@ -345,7 +345,7 @@ pub struct Tls {
     Returns `Result.Ok(socket)` — a TLS `Socket` over which `Socket.recv`/`send`/
     `chunks`/`fold` transparently decrypt/encrypt (the SAME record layer the
     client uses; there is no separate `Tls.recv`/`send`) — or
-    `Result.Error(%SocketError{...})`: `:etimedout` when no connection arrives
+    `Result.Error(%Socket.Error{...})`: `:etimedout` when no connection arrives
     within the deadline, `:tls_no_matching_cert` when the client offers no
     signature scheme the configured leaf key can produce,
     `:tls_handshake_failed` for any other handshake failure (a fatal alert, a
@@ -357,24 +357,24 @@ pub struct Tls {
     blocking-pool thread). On a handshake failure the accepted fd is CLOSED
     before returning — a failed TLS accept leaks no socket. The accepted TLS
     `Socket` is single-owner and move-only: `Process.send_move` it to a
-    per-connection handler (the `SocketServer` pattern) and the session travels
+    per-connection handler (the `Socket.Server` pattern) and the session travels
     with the handle.
 
     ## Examples
 
         case Tls.accept(listener, 50) {
           Result.Ok(connection)                          -> dispatch(connection)
-          Result.Error(%SocketError{reason: :etimedout}) -> keep_serving()
+          Result.Error(%Socket.Error{reason: :etimedout}) -> keep_serving()
           Result.Error(_error)                           -> :accept_failed
         }
     """
 
   @available_on(:network)
 
-  pub fn accept(listener :: SocketListener, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn accept(listener :: Socket.Listener, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     case :zig.SocketRuntime.tls_accept(listener.zap_socket_handle, timeout_ms) {
-      0 -> Result(Socket, SocketError).Error(SocketError.from_code(:zig.SocketRuntime.last_error()))
-      handle_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: handle_bits})
+      0 -> Result(Socket, Socket.Error).Error(Socket.Error.from_code(:zig.SocketRuntime.last_error()))
+      handle_bits -> Result(Socket, Socket.Error).Ok(%Socket{zap_socket_handle: handle_bits})
     }
   }
 
@@ -391,7 +391,7 @@ pub struct Tls {
     generation in place, so the passed-in plaintext handle is STALE everywhere
     and ONLY the returned TLS `Socket` is valid — using the old handle after a
     successful upgrade is a compile error (move) or a stale-handle panic. Returns
-    `Result.Ok(tls_socket)` on success, or `Result.Error(%SocketError{...})` —
+    `Result.Ok(tls_socket)` on success, or `Result.Error(%Socket.Error{...})` —
     `:tls_config_invalid` for a bad cert/key, `:tls_no_matching_cert` /
     `:tls_handshake_failed` for a handshake failure, or a transport reason — on
     failure, in which case the underlying socket is CLOSED (the argument was
@@ -408,14 +408,14 @@ pub struct Tls {
 
   @available_on(:network)
 
-  pub fn upgrade_server(socket :: Socket, config :: TlsServerConfig, timeout_ms :: i64) -> Result(Socket, SocketError) {
+  pub fn upgrade_server(socket :: Socket, config :: TlsServerConfig, timeout_ms :: i64) -> Result(Socket, Socket.Error) {
     alpn_wire = String.join(config.alpn, "\n")
     case :zig.SocketRuntime.tls_server_upgrade(socket.zap_socket_handle, config.cert_pem, config.key_pem, alpn_wire, timeout_ms) {
       0 -> {
         _closed = Socket.close(socket)
-        Result(Socket, SocketError).Error(%SocketError{reason: SocketError.reason_from_code(:zig.SocketRuntime.last_error())})
+        Result(Socket, Socket.Error).Error(%Socket.Error{reason: Socket.Error.reason_from_code(:zig.SocketRuntime.last_error())})
       }
-      successor_bits -> Result(Socket, SocketError).Ok(%Socket{zap_socket_handle: successor_bits})
+      successor_bits -> Result(Socket, Socket.Error).Ok(%Socket{zap_socket_handle: successor_bits})
     }
   }
 

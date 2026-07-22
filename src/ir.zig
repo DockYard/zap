@@ -568,6 +568,19 @@ fn primitiveNameToZigType(name: []const u8) ?ZigType {
 /// `.applied` forms whose mangling needs recursive type-store
 /// inspection). The caller falls back to the bare base name in
 /// that case.
+/// A (possibly dotted) nominal type name with every `.` replaced by `_` —
+/// returns the input slice unchanged when it carries no dot (the common
+/// case allocates nothing). The identifier-safety leaf rule shared with
+/// `types.appendDotSanitized`.
+fn dotSanitizedName(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '.') == null) return name;
+    const sanitized = try allocator.dupe(u8, name);
+    for (sanitized) |*ch| {
+        if (ch.* == '.') ch.* = '_';
+    }
+    return sanitized;
+}
+
 fn mangledNameForArgZigType(allocator: std.mem.Allocator, zig_type: ZigType) TypeWalkError!?[]const u8 {
     var budget = TypeWalkBudget{};
     return mangledNameForArgZigTypeBudgeted(allocator, zig_type, &budget);
@@ -606,15 +619,19 @@ fn mangledNameForArgZigTypeBudgeted(
         .f128 => "f128",
         .usize => "usize",
         .isize => "isize",
-        .struct_ref => |name| name,
-        .tagged_union => |name| name,
+        // Nominal names may be DOTTED (`Socket.Error`, `Stream.Transform` —
+        // the lib namespacing convention); mangled names are Zig-identifier
+        // components, so sanitize dots at the leaf — the same rule as
+        // `types.appendDotSanitized`, keeping the two manglers aligned.
+        .struct_ref => |name| try dotSanitizedName(allocator, name),
+        .tagged_union => |name| try dotSanitizedName(allocator, name),
         // `protocol_constraint(P)` mangles to the bare protocol name
         // — matches `types.typeIdMangledNameBorrowed`'s mangling so
         // `Option(Error)` -> `Option_Error` lines up across the IR
         // pipeline (the per-instantiation `Option_Error` `union_def`
         // is produced by `populateAppliedSpecializations` under that
         // same key).
-        .protocol_box => |name| name,
+        .protocol_box => |name| try dotSanitizedName(allocator, name),
         // Runtime-native containers mangle to their bare base names,
         // mirroring `types.typeIdMangledName`'s `.list`/`.map` arms so
         // vtable-instance names composed here (`<Proto>VTable_for_List`)
@@ -17439,19 +17456,38 @@ pub const IrBuilder = struct {
         const target_name: []const u8 = concrete: {
             if (value_zig_type == .struct_ref) {
                 const struct_target_name = value_zig_type.struct_ref;
-                const target_id = self.interner.lookupExisting(struct_target_name) orelse break :concrete null;
-                const proto_struct_name: ast.StructName = .{
-                    .parts = &[_]ast.StringId{protocol_id},
-                    .span = .{ .start = 0, .end = 0 },
+                // The registered impl's `target_type` is a PART-WISE
+                // `ast.StructName` — a namespaced target (`impl P for
+                // Framer.LengthPrefixed`) carries TWO parts. Split the
+                // value's dotted type name into the same shape;
+                // interning it whole as a single part can never match
+                // (`structNamesMatch` compares part counts first).
+                var target_parts_buf: [8]ast.StringId = undefined;
+                var target_parts_len: usize = 0;
+                var dotted_part_iter = std.mem.splitScalar(u8, struct_target_name, '.');
+                const target_parts: ?[]const ast.StringId = parts: {
+                    while (dotted_part_iter.next()) |part_text| {
+                        if (target_parts_len >= target_parts_buf.len) break :parts null;
+                        const part_id = self.interner.lookupExisting(part_text) orelse break :parts null;
+                        target_parts_buf[target_parts_len] = part_id;
+                        target_parts_len += 1;
+                    }
+                    break :parts target_parts_buf[0..target_parts_len];
                 };
-                const target_struct_name: ast.StructName = .{
-                    .parts = &[_]ast.StringId{target_id},
-                    .span = .{ .start = 0, .end = 0 },
-                };
-                // `findImpl` handles concrete `impl P for T` directly (the
-                // registered impl's target_type carries the bare `T`).
-                if (graph.findImpl(proto_struct_name, target_struct_name) != null) {
-                    break :concrete struct_target_name;
+                if (target_parts) |parts| {
+                    const proto_struct_name: ast.StructName = .{
+                        .parts = &[_]ast.StringId{protocol_id},
+                        .span = .{ .start = 0, .end = 0 },
+                    };
+                    const target_struct_name: ast.StructName = .{
+                        .parts = parts,
+                        .span = .{ .start = 0, .end = 0 },
+                    };
+                    // `findImpl` handles concrete `impl P for T` directly (the
+                    // registered impl's target_type carries the bare `T`).
+                    if (graph.findImpl(proto_struct_name, target_struct_name) != null) {
+                        break :concrete struct_target_name;
+                    }
                 }
             }
             break :concrete null;
@@ -19809,6 +19845,20 @@ pub fn findProtocolMethodSlot(
     return null;
 }
 
+/// Compare two type/protocol names modulo dot-sanitization: IR value
+/// sites carry ORIGINAL (dotted) names (`Framer.LengthPrefixed`) while
+/// vtable instance defs record the module-form underscore-joined name
+/// (`Framer_LengthPrefixed`). The two spell the same nominal identity.
+fn namesEqlDotSanitized(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |a_char, b_char| {
+        const a_norm: u8 = if (a_char == '.') '_' else a_char;
+        const b_norm: u8 = if (b_char == '.') '_' else b_char;
+        if (a_norm != b_norm) return false;
+    }
+    return true;
+}
+
 pub fn findProtocolImplVTable(
     program: *const Program,
     protocol_name: []const u8,
@@ -19817,8 +19867,8 @@ pub fn findProtocolImplVTable(
     for (program.type_defs) |type_def| {
         switch (type_def.kind) {
             .protocol_vtable_instance_def => |inst| {
-                if (!std.mem.eql(u8, inst.protocol_name, protocol_name)) continue;
-                if (!std.mem.eql(u8, inst.target_type_name, target_type_name)) continue;
+                if (!namesEqlDotSanitized(inst.protocol_name, protocol_name)) continue;
+                if (!namesEqlDotSanitized(inst.target_type_name, target_type_name)) continue;
                 return type_def.name;
             },
             else => {},
@@ -20877,23 +20927,17 @@ fn nominalNameToImportExpr(
     name: []const u8,
     decl_lives_inside_file: bool,
 ) std.mem.Allocator.Error![]const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot_idx| {
-        const owner_prefix = name[0..dot_idx];
-        const leaf_name = name[dot_idx + 1 ..];
-        var rendered: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer rendered.deinit(allocator);
-        try rendered.appendSlice(allocator, "@import(\"");
-        for (owner_prefix) |prefix_char| {
-            try rendered.append(allocator, if (prefix_char == '.') '_' else prefix_char);
-        }
-        try rendered.appendSlice(allocator, "\").");
-        try rendered.appendSlice(allocator, leaf_name);
-        return rendered.toOwnedSlice(allocator);
-    }
+    // A namespaced (dotted) declaration lives in its own STANDALONE module
+    // under the fully dot-sanitized name — the same layout rules as a flat
+    // name (`decl_lives_inside_file` distinguishes file-IS-struct from the
+    // Step 3.6 `pub const`-inside layout), so sanitize once and fall through
+    // to the uniform rendering. The namespace prefix is NEVER a module
+    // member owner (it may be a protocol — `Stage` — with no module at all).
+    const sanitized = try dotSanitizedName(allocator, name);
     if (decl_lives_inside_file) {
-        return std.fmt.allocPrint(allocator, "@import(\"{s}\").{s}", .{ name, name });
+        return std.fmt.allocPrint(allocator, "@import(\"{s}\").{s}", .{ sanitized, sanitized });
     }
-    return std.fmt.allocPrint(allocator, "@import(\"{s}\")", .{name});
+    return std.fmt.allocPrint(allocator, "@import(\"{s}\")", .{sanitized});
 }
 
 /// Render a Zig type string for a `union_def`/`enum_def` variant
@@ -26004,13 +26048,15 @@ test "zigTypeToImportableStr renders nominal payloads as import expressions" {
     // Direct unit coverage for the specialization-payload renderer.
     // The import shapes mirror `emitStructTypeRef`'s foreign cases —
     // a synthetic specialization file is always a foreign module
-    // relative to the payload's defining emission:
+    // relative to the payload's defining emission. A namespaced
+    // (dotted) declaration lives in its own STANDALONE module under
+    // the fully dot-sanitized name — same layout rules as flat names:
     //
     //   * plain struct `Bar`      → `@import("Bar")`   (file IS the type)
-    //   * dotted struct `IO.Mode` → `@import("IO").Mode`
+    //   * dotted struct `IO.Mode` → `@import("IO_Mode")` (standalone module)
     //   * union/enum `Color`      → `@import("Color").Color`
     //     (Step 3.6 declares the type INSIDE the file)
-    //   * dotted union `A.B.C`    → `@import("A_B").C`
+    //   * dotted union `A.B.C`    → `@import("A_B_C").A_B_C`
     //   * primitives pass through `zigTypeToStr` unchanged
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -26021,7 +26067,7 @@ test "zigTypeToImportableStr renders nominal payloads as import expressions" {
         try zigTypeToImportableStr(alloc, .{ .struct_ref = "Bar" }),
     );
     try std.testing.expectEqualStrings(
-        "@import(\"IO\").Mode",
+        "@import(\"IO_Mode\")",
         try zigTypeToImportableStr(alloc, .{ .struct_ref = "IO.Mode" }),
     );
     try std.testing.expectEqualStrings(
@@ -26033,7 +26079,7 @@ test "zigTypeToImportableStr renders nominal payloads as import expressions" {
         try zigTypeToImportableStr(alloc, .{ .tagged_union = "Option_i64" }),
     );
     try std.testing.expectEqualStrings(
-        "@import(\"A_B\").C",
+        "@import(\"A_B_C\").A_B_C",
         try zigTypeToImportableStr(alloc, .{ .tagged_union = "A.B.C" }),
     );
     try std.testing.expectEqualStrings(

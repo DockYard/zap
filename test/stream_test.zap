@@ -29,7 +29,7 @@ pub impl Enumerable(i64) for CountingSource {
 }
 
 # A stage that emits THREE String outputs per input. An early-halting consumer
-# leaves ARC-backed outputs sitting in the Transform's `pending` buffer at
+# leaves ARC-backed outputs sitting in the Stream.Transform's `pending` buffer at
 # dispose time — exercising that the driver releases un-yielded buffered
 # outputs.
 pub struct TriEmitStage {
@@ -241,8 +241,8 @@ pub struct StreamTest {
 
   describe("unfold") {
     test("finite unfold ends on Stop") {
-      result = Enum.to_list(Stream.unfold(1, fn(state :: i64) -> UnfoldStep(i64, i64) {
-        if state > 4 { UnfoldStep(i64, i64).Stop } else { UnfoldStep.emit(state, state + 1) }
+      result = Enum.to_list(Stream.unfold(1, fn(state :: i64) -> Stream.UnfoldStep(i64, i64) {
+        if state > 4 { Stream.UnfoldStep(i64, i64).Stop } else { Stream.UnfoldStep.emit(state, state + 1) }
       }))
       assert(List.length(result) == 4)
       assert(List.head(result) == 1)
@@ -250,15 +250,15 @@ pub struct StreamTest {
     }
 
     test("an infinite unfold is safe under a bounded consumer") {
-      result = Enum.to_list(Stream.take(Stream.unfold(1, fn(state :: i64) -> UnfoldStep(i64, i64) { UnfoldStep.emit(state, state * 2) }), 5))
+      result = Enum.to_list(Stream.take(Stream.unfold(1, fn(state :: i64) -> Stream.UnfoldStep(i64, i64) { Stream.UnfoldStep.emit(state, state * 2) }), 5))
       assert(List.length(result) == 5)
       assert(List.head(result) == 1)
       assert(List.last(result) == 16)
     }
 
     test("unfold can change element and accumulator types") {
-      result = Enum.to_list(Stream.unfold(1, fn(state :: i64) -> UnfoldStep(String, i64) {
-        if state > 3 { UnfoldStep(String, i64).Stop } else { UnfoldStep.emit(Integer.to_string(state), state + 1) }
+      result = Enum.to_list(Stream.unfold(1, fn(state :: i64) -> Stream.UnfoldStep(String, i64) {
+        if state > 3 { Stream.UnfoldStep(String, i64).Stop } else { Stream.UnfoldStep.emit(Integer.to_string(state), state + 1) }
       }))
       assert(List.length(result) == 3)
       assert(List.head(result) == "1")
@@ -328,11 +328,11 @@ pub struct StreamTest {
 
     test("unfold with a String accumulator reaching Stop is fault-free") {
       assert_no_memory_faults {
-        result = Enum.to_list(Stream.unfold("", fn(accumulator :: String) -> UnfoldStep(i64, String) {
+        result = Enum.to_list(Stream.unfold("", fn(accumulator :: String) -> Stream.UnfoldStep(i64, String) {
           if String.length(accumulator) >= 3 {
-            UnfoldStep(i64, String).Stop
+            Stream.UnfoldStep(i64, String).Stop
           } else {
-            UnfoldStep.emit(String.length(accumulator), accumulator <> "x")
+            Stream.UnfoldStep.emit(String.length(accumulator), accumulator <> "x")
           }
         }))
         assert(List.length(result) == 3)
@@ -390,13 +390,13 @@ pub struct StreamTest {
     }
 
     test("unfold that stops immediately is empty") {
-      result = Enum.to_list(Stream.unfold(1, fn(_state :: i64) -> UnfoldStep(i64, i64) { UnfoldStep(i64, i64).Stop }))
+      result = Enum.to_list(Stream.unfold(1, fn(_state :: i64) -> Stream.UnfoldStep(i64, i64) { Stream.UnfoldStep(i64, i64).Stop }))
       assert(List.length(result) == 0)
     }
 
     test("unfold that emits exactly once then stops") {
-      result = Enum.to_list(Stream.unfold(1, fn(state :: i64) -> UnfoldStep(i64, i64) {
-        if state == 1 { UnfoldStep.emit(state, state + 1) } else { UnfoldStep(i64, i64).Stop }
+      result = Enum.to_list(Stream.unfold(1, fn(state :: i64) -> Stream.UnfoldStep(i64, i64) {
+        if state == 1 { Stream.UnfoldStep.emit(state, state + 1) } else { Stream.UnfoldStep(i64, i64).Stop }
       }))
       assert(List.length(result) == 1)
       assert(List.head(result) == 1)
@@ -488,7 +488,7 @@ pub struct StreamTest {
     }
 
     test("unfold then take invokes the generator exactly take times") {
-      result = Enum.to_list(Stream.take(Stream.unfold(1, fn(state :: i64) -> UnfoldStep(i64, i64) { UnfoldStep.emit(state, state + 1) }), 3))
+      result = Enum.to_list(Stream.take(Stream.unfold(1, fn(state :: i64) -> Stream.UnfoldStep(i64, i64) { Stream.UnfoldStep.emit(state, state + 1) }), 3))
       assert(List.length(result) == 3)
       assert(List.last(result) == 3)
     }

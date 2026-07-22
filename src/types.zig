@@ -2149,6 +2149,16 @@ const TypeMangleBudget = struct {
 /// exhaustion. Every current `Type` tag has an explicit component
 /// spelling; new tags must be added here rather than silently falling
 /// back to a placeholder.
+/// Append `name` with every `.` replaced by `_` — the single rule that
+/// makes a (possibly dotted) nominal type name identifier-safe inside a
+/// mangled/composed name. Kept textually identical to the leaf rule in
+/// `ir.mangledNameForArgZigType` so the two manglers can never drift.
+fn appendDotSanitized(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), name: []const u8) !void {
+    for (name) |ch| {
+        try buf.append(allocator, if (ch == '.') '_' else ch);
+    }
+}
+
 pub fn typeIdMangledName(
     allocator: std.mem.Allocator,
     store: *const TypeStore,
@@ -2269,9 +2279,15 @@ fn appendTypeIdMangledName(
         },
         .unknown => try buf.appendSlice(allocator, "Any"),
         .error_type => try buf.appendSlice(allocator, "Error"),
-        .struct_type => |st| try buf.appendSlice(allocator, @constCast(store).interner.get(st.name)),
-        .tagged_union => |tu| try buf.appendSlice(allocator, @constCast(store).interner.get(tu.name)),
-        .opaque_type => |ot| try buf.appendSlice(allocator, @constCast(store).interner.get(ot.name)),
+        // Nominal names may be DOTTED (the lib namespacing convention:
+        // `Socket.Error`, `Stream.Transform`); a mangled name is a Zig
+        // identifier / generated-module component, so the dots become
+        // underscores HERE, at the leaf, keeping every composed name
+        // (`Result_String_Socket_Error`) identifier-safe and consistent
+        // with `ir.mangledNameForArgZigType`'s identical leaf rule.
+        .struct_type => |st| try appendDotSanitized(allocator, buf, @constCast(store).interner.get(st.name)),
+        .tagged_union => |tu| try appendDotSanitized(allocator, buf, @constCast(store).interner.get(tu.name)),
+        .opaque_type => |ot| try appendDotSanitized(allocator, buf, @constCast(store).interner.get(ot.name)),
         // A protocol existential mangles to the protocol's bare name —
         // so `Option(Error)` joins to `Option_Error`, matching the
         // per-instantiation TypeDef the IR emits for it (Phase 1.2.5.b).
@@ -2289,7 +2305,7 @@ fn appendTypeIdMangledName(
         .protocol_constraint => |pc| blk: {
             const proto_name = @constCast(store).interner.get(pc.protocol_name);
             if (pc.type_params.len == 0) {
-                try buf.appendSlice(allocator, proto_name);
+                try appendDotSanitized(allocator, buf, proto_name);
                 break :blk;
             }
             try buf.appendSlice(allocator, proto_name);
@@ -11573,20 +11589,13 @@ pub const TypeChecker = struct {
                     }
                 }
 
-                // Check if this is a struct name — structs can be used as
-                // types in impl declarations and type annotations. Any
-                // struct name is accepted as a valid type reference. The
-                // monomorphizer resolves the concrete type at specialization.
-                for (self.graph.structs.items) |mod| {
-                    if (mod.name.parts.len > 0) {
-                        const mod_name = self.interner.get(mod.name.parts[mod.name.parts.len - 1]);
-                        if (std.mem.eql(u8, name, mod_name)) {
-                            return TypeStore.UNKNOWN;
-                        }
-                    }
-                }
-
-                // Check if this is a protocol name
+                // Check if this is a protocol name. This EXACT-name check must
+                // run BEFORE the struct LAST-PART fallback below: a namespaced
+                // declaration whose final component equals a protocol's name
+                // (`Framer.Error` vs the `Error` protocol) would otherwise
+                // intercept the annotation via the fuzzy suffix match and
+                // degrade every `:: Error` existential to UNKNOWN — an exact
+                // protocol match always outranks a partial struct match.
                 for (self.graph.protocols.items) |proto| {
                     if (proto.name.parts.len > 0 and (try self.structNameMatchesTypeName(proto.name, name))) {
                         // Protocol constraint — resolve type params and create constraint type
@@ -11603,6 +11612,22 @@ pub const TypeChecker = struct {
                                 .type_params = owned_type_params,
                             },
                         });
+                    }
+                }
+
+                // Check if this is a struct name — structs can be used as
+                // types in impl declarations and type annotations. Any
+                // struct name is accepted as a valid type reference (matched
+                // by its FINAL name component — a deliberately fuzzy
+                // forward-reference fallback, which is why it runs LAST,
+                // after every exact nominal/alias/protocol resolution). The
+                // monomorphizer resolves the concrete type at specialization.
+                for (self.graph.structs.items) |mod| {
+                    if (mod.name.parts.len > 0) {
+                        const mod_name = self.interner.get(mod.name.parts[mod.name.parts.len - 1]);
+                        if (std.mem.eql(u8, name, mod_name)) {
+                            return TypeStore.UNKNOWN;
+                        }
                     }
                 }
 

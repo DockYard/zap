@@ -10,28 +10,28 @@ pub struct TlsTest {
   # `test/tls_live_test.zap` (set `ZAP_TLS_LIVE=1`); the hermetic wrong-hostname
   # rejection is pinned in `socket_io.zig`'s Zig test suite.
 
-  describe("SocketError decodes the S4 TLS reason codes") {
+  describe("Socket.Error decodes the S4 TLS reason codes") {
     test("14 -> :tls_cert_invalid and 15 -> :tls_handshake_failed round-trip through reason_from_code") {
-      assert(SocketError.reason_from_code(14) == :tls_cert_invalid)
-      assert(SocketError.reason_from_code(15) == :tls_handshake_failed)
+      assert(Socket.Error.reason_from_code(14) == :tls_cert_invalid)
+      assert(Socket.Error.reason_from_code(15) == :tls_handshake_failed)
     }
 
     test("the pre-existing arms and the open-set escape hatch are unchanged") {
-      assert(SocketError.reason_from_code(1) == :econnrefused)
-      assert(SocketError.reason_from_code(2) == :etimedout)
-      assert(SocketError.reason_from_code(13) == :einval)
-      assert(SocketError.reason_from_code(99) == :unknown)
-      assert(SocketError.reason_from_code(1000) == :unknown)
+      assert(Socket.Error.reason_from_code(1) == :econnrefused)
+      assert(Socket.Error.reason_from_code(2) == :etimedout)
+      assert(Socket.Error.reason_from_code(13) == :einval)
+      assert(Socket.Error.reason_from_code(99) == :unknown)
+      assert(Socket.Error.reason_from_code(1000) == :unknown)
     }
 
-    test("from_code builds a typed %SocketError carrying the TLS reason") {
-      error = SocketError.from_code(14)
+    test("from_code builds a typed %Socket.Error carrying the TLS reason") {
+      error = Socket.Error.from_code(14)
       assert(error.reason == :tls_cert_invalid)
     }
 
     test("16 -> :tls_no_matching_cert and 17 -> :tls_config_invalid (the S5 server arms) round-trip") {
-      assert(SocketError.reason_from_code(16) == :tls_no_matching_cert)
-      assert(SocketError.reason_from_code(17) == :tls_config_invalid)
+      assert(Socket.Error.reason_from_code(16) == :tls_no_matching_cert)
+      assert(Socket.Error.reason_from_code(17) == :tls_config_invalid)
     }
   }
 
@@ -56,13 +56,13 @@ pub struct TlsTest {
   }
 
   describe("Tls.connect / connect_host compose over Socket and never leak (gate-OFF)") {
-    test("connect_host to a refused port yields a typed SocketError (connect leg fails before TLS), leak-exact") {
+    test("connect_host to a refused port yields a typed Socket.Error (connect leg fails before TLS), leak-exact") {
       base = Socket.live_count()
       assert(TlsTest.connect_host_refused_is_error())
       assert(Socket.live_count() == base)
     }
 
-    test("connect (resolved endpoint) to a refused port yields a typed SocketError, leak-exact") {
+    test("connect (resolved endpoint) to a refused port yields a typed Socket.Error, leak-exact") {
       base = Socket.live_count()
       assert(TlsTest.connect_refused_is_error())
       assert(Socket.live_count() == base)
@@ -94,11 +94,11 @@ pub struct TlsTest {
   # Bind an ephemeral loopback port, read it, then close the listener so nothing
   # listens there — a deterministic "connection refused" target.
   fn dead_port() -> i64 {
-    case Socket.listen(SocketAddress.loopback(0), 1) {
+    case Socket.listen(Socket.Address.loopback(0), 1) {
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
-          _closed = SocketListener.close(listener)
+          port = Socket.Listener.local_port(listener)
+          _closed = Socket.Listener.close(listener)
           port
         }
       Result.Error(_e) -> 0
@@ -106,7 +106,7 @@ pub struct TlsTest {
   }
 
   # Tls.connect_host to a dead port: the TCP connect leg fails (:econnrefused)
-  # before any TLS, so no socket is ever created — a typed SocketError, no crash.
+  # before any TLS, so no socket is ever created — a typed Socket.Error, no crash.
   fn connect_host_refused_is_error() -> Bool {
     case Tls.connect_host("localhost", TlsTest.dead_port(), 1000) {
       Result.Error(_e) -> true
@@ -119,7 +119,7 @@ pub struct TlsTest {
   }
 
   fn connect_refused_is_error() -> Bool {
-    case Tls.connect(SocketAddress.loopback(TlsTest.dead_port()), "example.com", 1000) {
+    case Tls.connect(Socket.Address.loopback(TlsTest.dead_port()), "example.com", 1000) {
       Result.Error(_e) -> true
       Result.Ok(socket) ->
         {
@@ -134,11 +134,11 @@ pub struct TlsTest {
   # that never comes, so it TIMES OUT on the short deadline. Tls.connect_host
   # must return a typed Error AND close the underlying fd (leak-exact).
   fn connect_host_non_tls_handshake_fails() -> Bool {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> false
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           outcome = case Tls.connect_host("localhost", port, 300) {
             Result.Error(_e2) -> true
             Result.Ok(socket) ->
@@ -147,18 +147,18 @@ pub struct TlsTest {
                 false
               }
           }
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           outcome
         }
     }
   }
 
   fn connect_host_insecure_non_tls_handshake_fails() -> Bool {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> false
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           outcome = case Tls.connect_host_insecure("localhost", port, 300) {
             Result.Error(_e2) -> true
             Result.Ok(socket) ->
@@ -167,7 +167,7 @@ pub struct TlsTest {
                 false
               }
           }
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           outcome
         }
     }
@@ -178,20 +178,20 @@ pub struct TlsTest {
   # socket, so no fd leaks. `client` is never used after the upgrade (it was
   # moved) — the move-only consume contract.
   fn upgrade_non_tls_fails() -> Bool {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> false
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           outcome = TlsTest.upgrade_client(port)
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           outcome
         }
     }
   }
 
   fn upgrade_client(port :: i64) -> Bool {
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) -> false
       Result.Ok(client) ->
         case Tls.upgrade(client, "example.com", 300) {
@@ -213,11 +213,11 @@ pub struct TlsTest {
   # client, exercised by the gate-ON `test_concurrency/tls_server_test.zap`).
   fn listen_valid_binds_and_closes() -> Bool {
     config = %TlsServerConfig{cert_pem: TlsTest.cert_pem(), key_pem: TlsTest.key_pem(), alpn: ["http/1.1"]}
-    case Tls.listen(SocketAddress.loopback(0), config, 16) {
+    case Tls.listen(Socket.Address.loopback(0), config, 16) {
       Result.Error(_e) -> false
       Result.Ok(listener) ->
         {
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           true
         }
     }
@@ -226,10 +226,10 @@ pub struct TlsTest {
   # The reason atom Tls.listen fails with for a given (bad) config — or
   # :unexpected_ok if it wrongly bound a listener.
   fn listen_reason(config :: TlsServerConfig) -> Atom {
-    case Tls.listen(SocketAddress.loopback(0), config, 16) {
+    case Tls.listen(Socket.Address.loopback(0), config, 16) {
       Result.Ok(listener) ->
         {
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           :unexpected_ok
         }
       Result.Error(error) -> error.reason

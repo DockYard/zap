@@ -1,5 +1,5 @@
 @doc = """
-  `SocketAddress` — a sendable value naming a socket endpoint.
+  `Socket.Address` — a sendable value naming a socket endpoint.
 
   It carries the address `family` and the endpoint's `port`. For an `:ip4`
   endpoint the four octets `a`/`b`/`c`/`d` are meaningful; for an `:ip6`
@@ -12,29 +12,29 @@
 
   A `:ip6` endpoint arises when a `Socket.connect_host` Happy-Eyeballs race
   (§7.2, RFC 8305) wins over IPv6: `Socket.peer_address`/`local_address` then
-  return a real `:ip6` `SocketAddress` (the runtime carries the v6 bytes
+  return a real `:ip6` `Socket.Address` (the runtime carries the v6 bytes
   honestly and reconstructs them across the ABI as four 32-bit words — a single
   i64 cannot hold a 16-byte address). Explicit dialing (`Socket.connect`/
   `connect_to`/`listen`) is IPv4 in this phase.
 
   DNS resolution lives *inside* `Socket.connect_host(host, port, timeout_ms)`
   (§7.2 — RFC 8305 Happy Eyeballs racing over the resolved addresses); a
-  `SocketAddress` produced by `ip4`/`ip6`/`loopback` is always an explicit,
+  `Socket.Address` produced by `ip4`/`ip6`/`loopback` is always an explicit,
   already-resolved endpoint.
 
   Only available on targets with the `:network` capability.
 
   ## Examples
 
-      SocketAddress.loopback(8080)
-      SocketAddress.ip4(127, 0, 0, 1, 8080)
-      SocketAddress.ip6_loopback(8080)
-      SocketAddress.format(SocketAddress.ip6_loopback(8080))   # => "[::1]:8080"
+      Socket.Address.loopback(8080)
+      Socket.Address.ip4(127, 0, 0, 1, 8080)
+      Socket.Address.ip6_loopback(8080)
+      Socket.Address.format(Socket.Address.ip6_loopback(8080))   # => "[::1]:8080"
   """
 
 @available_on(:network)
 
-pub struct SocketAddress {
+pub struct Socket.Address {
   family :: Atom = :ip4
   a :: i64 = 0
   b :: i64 = 0
@@ -57,13 +57,13 @@ pub struct SocketAddress {
 
     ## Examples
 
-        SocketAddress.ip4(93, 184, 216, 34, 80)
+        Socket.Address.ip4(93, 184, 216, 34, 80)
     """
 
   @available_on(:network)
 
-  pub fn ip4(a :: i64, b :: i64, c :: i64, d :: i64, port :: i64) -> SocketAddress {
-    %SocketAddress{family: :ip4, a: a, b: b, c: c, d: d, port: port}
+  pub fn ip4(a :: i64, b :: i64, c :: i64, d :: i64, port :: i64) -> Socket.Address {
+    %Socket.Address{family: :ip4, a: a, b: b, c: c, d: d, port: port}
   }
 
   @doc = """
@@ -72,13 +72,13 @@ pub struct SocketAddress {
 
     ## Examples
 
-        SocketAddress.loopback(0)   # an ephemeral-port loopback endpoint
+        Socket.Address.loopback(0)   # an ephemeral-port loopback endpoint
     """
 
   @available_on(:network)
 
-  pub fn loopback(port :: i64) -> SocketAddress {
-    %SocketAddress{family: :ip4, a: 127, b: 0, c: 0, d: 1, port: port}
+  pub fn loopback(port :: i64) -> Socket.Address {
+    %Socket.Address{family: :ip4, a: 127, b: 0, c: 0, d: 1, port: port}
   }
 
   @doc = """
@@ -89,13 +89,13 @@ pub struct SocketAddress {
     ## Examples
 
         # 2001:db8::1 on port 443
-        SocketAddress.ip6(8193, 3512, 0, 0, 0, 0, 0, 1, 0, 443)
+        Socket.Address.ip6(8193, 3512, 0, 0, 0, 0, 0, 1, 0, 443)
     """
 
   @available_on(:network)
 
-  pub fn ip6(h0 :: i64, h1 :: i64, h2 :: i64, h3 :: i64, h4 :: i64, h5 :: i64, h6 :: i64, h7 :: i64, scope_id :: i64, port :: i64) -> SocketAddress {
-    %SocketAddress{family: :ip6, h0: h0, h1: h1, h2: h2, h3: h3, h4: h4, h5: h5, h6: h6, h7: h7, scope_id: scope_id, port: port}
+  pub fn ip6(h0 :: i64, h1 :: i64, h2 :: i64, h3 :: i64, h4 :: i64, h5 :: i64, h6 :: i64, h7 :: i64, scope_id :: i64, port :: i64) -> Socket.Address {
+    %Socket.Address{family: :ip6, h0: h0, h1: h1, h2: h2, h3: h3, h4: h4, h5: h5, h6: h6, h7: h7, scope_id: scope_id, port: port}
   }
 
   @doc = """
@@ -103,18 +103,18 @@ pub struct SocketAddress {
 
     ## Examples
 
-        SocketAddress.format(SocketAddress.ip6_loopback(80))   # => "[::1]:80"
+        Socket.Address.format(Socket.Address.ip6_loopback(80))   # => "[::1]:80"
     """
 
   @available_on(:network)
 
-  pub fn ip6_loopback(port :: i64) -> SocketAddress {
-    SocketAddress.ip6(0, 0, 0, 0, 0, 0, 0, 1, 0, port)
+  pub fn ip6_loopback(port :: i64) -> Socket.Address {
+    Socket.Address.ip6(0, 0, 0, 0, 0, 0, 0, 1, 0, port)
   }
 
   @doc = """
     Builds a Unix-domain (`:unix`) address from a socket `path` (Phase S2) — the
-    endpoint a `SocketDatagram.bind`/`send_to` or a `Socket.connect`/`listen`
+    endpoint a `Socket.Datagram.bind`/`send_to` or a `Socket.connect`/`listen`
     over the Unix-domain names. A plain path is a FILESYSTEM socket (the caller
     manages the socket file — unlink it before re-binding); a `@`-prefixed path
     is a Linux ABSTRACT-namespace name (no filesystem entry, auto-cleaned when
@@ -123,54 +123,54 @@ pub struct SocketAddress {
 
     ## Examples
 
-        SocketAddress.unix("/tmp/app.sock")
-        SocketAddress.unix("@app-abstract")   # Linux abstract namespace
+        Socket.Address.unix("/tmp/app.sock")
+        Socket.Address.unix("@app-abstract")   # Linux abstract namespace
     """
 
   @available_on(:network)
 
-  pub fn unix(path :: String) -> SocketAddress {
-    %SocketAddress{family: :unix, path: path}
+  pub fn unix(path :: String) -> Socket.Address {
+    %Socket.Address{family: :unix, path: path}
   }
 
   @doc = """
-    Reconstructs a `:unix` `SocketAddress` from a `path` — the decoder companion
+    Reconstructs a `:unix` `Socket.Address` from a `path` — the decoder companion
     to `unix/1` (identical result), named for symmetry with `from_packed`/
     `ip6_from_words`. Kept distinct so a future path-bearing peer readback has a
     single decode point to route through.
 
     ## Examples
 
-        SocketAddress.unix_from_path("/tmp/app.sock")
+        Socket.Address.unix_from_path("/tmp/app.sock")
     """
 
   @available_on(:network)
 
-  pub fn unix_from_path(path :: String) -> SocketAddress {
-    %SocketAddress{family: :unix, path: path}
+  pub fn unix_from_path(path :: String) -> Socket.Address {
+    %Socket.Address{family: :unix, path: path}
   }
 
   @doc = """
     Unpacks a runtime v4 endpoint code
     (`((((a*256+b)*256+c)*256+d)*65536)+port`, or `-1` when unavailable) into a
-    `SocketAddress` (Phase S1). Integer division only — Zap has no bitwise ops
+    `Socket.Address` (Phase S1). Integer division only — Zap has no bitwise ops
     and needs none here. An unavailable endpoint yields
-    `%SocketAddress{family: :unavailable}`. This is the IPv4 decode; a v6
+    `%Socket.Address{family: :unavailable}`. This is the IPv4 decode; a v6
     endpoint (which cannot fit one i64) is reconstructed by `ip6_from_words`.
     Lives here (with the address it produces) so both `Socket.local_address`/
-    `peer_address` and `SocketListener.local_address` reuse it without a
-    `Socket ↔ SocketListener` cross-call.
+    `peer_address` and `Socket.Listener.local_address` reuse it without a
+    `Socket ↔ Socket.Listener` cross-call.
 
     ## Examples
 
-        SocketAddress.from_packed(-1)   # => %SocketAddress{family: :unavailable}
+        Socket.Address.from_packed(-1)   # => %Socket.Address{family: :unavailable}
     """
 
   @available_on(:network)
 
-  pub fn from_packed(packed :: i64) -> SocketAddress {
+  pub fn from_packed(packed :: i64) -> Socket.Address {
     case packed < 0 {
-      true -> %SocketAddress{family: :unavailable}
+      true -> %Socket.Address{family: :unavailable}
       false ->
         {
           port = Integer.remainder(packed, 65536)
@@ -179,13 +179,13 @@ pub struct SocketAddress {
           c = Integer.remainder(host / 256, 256)
           b = Integer.remainder(host / 65536, 256)
           a = host / 16777216
-          %SocketAddress{family: :ip4, a: a, b: b, c: c, d: d, port: port}
+          %Socket.Address{family: :ip4, a: a, b: b, c: c, d: d, port: port}
         }
     }
   }
 
   @doc = """
-    Reconstructs an `:ip6` `SocketAddress` from the runtime's four 32-bit
+    Reconstructs an `:ip6` `Socket.Address` from the runtime's four 32-bit
     big-endian address words (`w0`..`w3`, each `0..2^32-1`, network order), the
     IPv6 `scope_id`, and the `port` — the values the
     `:zig.SocketRuntime.endpoint_v6_word`/`endpoint_scope`/`endpoint_port`
@@ -197,12 +197,12 @@ pub struct SocketAddress {
     ## Examples
 
         # ::1 (words 0, 0, 0, 1) on port 8080
-        SocketAddress.format(SocketAddress.ip6_from_words(0, 0, 0, 1, 0, 8080))   # => "[::1]:8080"
+        Socket.Address.format(Socket.Address.ip6_from_words(0, 0, 0, 1, 0, 8080))   # => "[::1]:8080"
     """
 
   @available_on(:network)
 
-  pub fn ip6_from_words(w0 :: i64, w1 :: i64, w2 :: i64, w3 :: i64, scope_id :: i64, port :: i64) -> SocketAddress {
+  pub fn ip6_from_words(w0 :: i64, w1 :: i64, w2 :: i64, w3 :: i64, scope_id :: i64, port :: i64) -> Socket.Address {
     h0 = w0 / 65536
     h1 = Integer.remainder(w0, 65536)
     h2 = w1 / 65536
@@ -211,15 +211,15 @@ pub struct SocketAddress {
     h5 = Integer.remainder(w2, 65536)
     h6 = w3 / 65536
     h7 = Integer.remainder(w3, 65536)
-    SocketAddress.ip6(h0, h1, h2, h3, h4, h5, h6, h7, scope_id, port)
+    Socket.Address.ip6(h0, h1, h2, h3, h4, h5, h6, h7, scope_id, port)
   }
 
   @doc = """
     Resolves the endpoint (`which` `0` = local/`getsockname`, `1` = peer/
-    `getpeername`) of a socket `handle_bits` into a `SocketAddress`,
+    `getpeername`) of a socket `handle_bits` into a `Socket.Address`,
     transparently across ALL address families — the SINGLE decode point every
     `local_address`/`peer_address` routes through (both the stream `Socket` and
-    the `SocketDatagram`). The v4 fast path is BYTE-IDENTICAL to the packed
+    the `Socket.Datagram`). The v4 fast path is BYTE-IDENTICAL to the packed
     decode (`endpoint` → `from_packed`, NO extra runtime call); a non-v4 endpoint
     packs as `-1`, and the accessor path then disambiguates: a v6 endpoint
     reconstructs from the four 32-bit words (`endpoint_v6_word`, the first word
@@ -230,15 +230,15 @@ pub struct SocketAddress {
 
     ## Examples
 
-        SocketAddress.of_handle(handle, 0)   # the local endpoint
+        Socket.Address.of_handle(handle, 0)   # the local endpoint
     """
 
   @available_on(:network)
 
-  pub fn of_handle(handle_bits :: u64, which :: i64) -> SocketAddress {
+  pub fn of_handle(handle_bits :: u64, which :: i64) -> Socket.Address {
     packed = :zig.SocketRuntime.endpoint(handle_bits, which)
     case packed < 0 {
-      false -> SocketAddress.from_packed(packed)
+      false -> Socket.Address.from_packed(packed)
       true ->
         {
           word0 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 0)
@@ -250,9 +250,9 @@ pub struct SocketAddress {
                 word3 = :zig.SocketRuntime.endpoint_v6_word(handle_bits, which, 3)
                 scope_id = :zig.SocketRuntime.endpoint_scope(handle_bits, which)
                 port = :zig.SocketRuntime.endpoint_port(handle_bits, which)
-                SocketAddress.ip6_from_words(word0, word1, word2, word3, scope_id, port)
+                Socket.Address.ip6_from_words(word0, word1, word2, word3, scope_id, port)
               }
-            true -> SocketAddress.of_unix_handle(handle_bits, which)
+            true -> Socket.Address.of_unix_handle(handle_bits, which)
           }
         }
     }
@@ -260,7 +260,7 @@ pub struct SocketAddress {
 
   @doc = """
     Resolves a non-v4/non-v6 endpoint (`which` `0` local, `1` peer) of
-    `handle_bits` to a `:unix` `SocketAddress` carrying the socket `sun_path`, or
+    `handle_bits` to a `:unix` `Socket.Address` carrying the socket `sun_path`, or
     `:unavailable` when the endpoint has no path (an unnamed/unbound Unix socket,
     or a genuinely unavailable endpoint). The `sun_path` crosses the ABI as bytes
     → a Zap String (`endpoint_unix_path`) → `unix_from_path` — the stream/datagram
@@ -269,16 +269,16 @@ pub struct SocketAddress {
 
   @available_on(:network)
 
-  fn of_unix_handle(handle_bits :: u64, which :: i64) -> SocketAddress {
+  fn of_unix_handle(handle_bits :: u64, which :: i64) -> Socket.Address {
     path = :zig.SocketRuntime.endpoint_unix_path(handle_bits, which)
     case String.length(path) == 0 {
-      true -> %SocketAddress{family: :unavailable}
-      false -> SocketAddress.unix_from_path(path)
+      true -> %Socket.Address{family: :unavailable}
+      false -> Socket.Address.unix_from_path(path)
     }
   }
 
   @doc = """
-    Renders a `SocketAddress` as its canonical textual form with the port:
+    Renders a `Socket.Address` as its canonical textual form with the port:
     `"a.b.c.d:port"` for `:ip4`, the bracketed RFC 5952 form `"[address]:port"`
     for `:ip6` (lowercase hextets, no leading zeros, the longest run of zero
     hextets compressed to `::`, a non-zero zone appended as `%scope_id`),
@@ -287,13 +287,13 @@ pub struct SocketAddress {
 
     ## Examples
 
-        SocketAddress.format(SocketAddress.ip4(127, 0, 0, 1, 8080))   # => "127.0.0.1:8080"
-        SocketAddress.format(SocketAddress.ip6_loopback(8080))        # => "[::1]:8080"
+        Socket.Address.format(Socket.Address.ip4(127, 0, 0, 1, 8080))   # => "127.0.0.1:8080"
+        Socket.Address.format(Socket.Address.ip6_loopback(8080))        # => "[::1]:8080"
     """
 
   @available_on(:network)
 
-  pub fn format(address :: SocketAddress) -> String {
+  pub fn format(address :: Socket.Address) -> String {
     case address.family {
       :ip4 ->
         Integer.to_string(address.a) <> "." <> Integer.to_string(address.b) <> "." <> Integer.to_string(address.c) <> "." <> Integer.to_string(address.d) <> ":" <> Integer.to_string(address.port)
@@ -303,7 +303,7 @@ pub struct SocketAddress {
             true -> ""
             false -> "%" <> Integer.to_string(address.scope_id)
           }
-          "[" <> SocketAddress.ip6_body(address) <> zone <> "]:" <> Integer.to_string(address.port)
+          "[" <> Socket.Address.ip6_body(address) <> zone <> "]:" <> Integer.to_string(address.port)
         }
       :unix -> "unix:" <> address.path
       _ -> "unavailable"
@@ -311,7 +311,7 @@ pub struct SocketAddress {
   }
 
   @doc = """
-    The bracket-less canonical IPv6 body of an `:ip6` `SocketAddress` — the eight
+    The bracket-less canonical IPv6 body of an `:ip6` `Socket.Address` — the eight
     hextets rendered lowercase without leading zeros, with the LEFTMOST LONGEST
     run of two-or-more consecutive zero hextets compressed to `::` (RFC 5952). A
     lone zero hextet is never compressed; an all-zero address renders `::`.
@@ -319,26 +319,26 @@ pub struct SocketAddress {
 
   @available_on(:network)
 
-  fn ip6_body(address :: SocketAddress) -> String {
-    case SocketAddress.longest_zero_run(address, 0, 0, 0, 0, 0) {
+  fn ip6_body(address :: Socket.Address) -> String {
+    case Socket.Address.longest_zero_run(address, 0, 0, 0, 0, 0) {
       {start, length} ->
         case length < 2 {
-          true -> SocketAddress.join_hextets(address, 0, 8)
+          true -> Socket.Address.join_hextets(address, 0, 8)
           false ->
-            SocketAddress.join_hextets(address, 0, start) <> "::" <> SocketAddress.join_hextets(address, start + length, 8)
+            Socket.Address.join_hextets(address, 0, start) <> "::" <> Socket.Address.join_hextets(address, start + length, 8)
         }
     }
   }
 
   @doc = """
     The hextet (`0..65535`) at position `index` (`0..7`) of an `:ip6`
-    `SocketAddress` — a fixed-position accessor over the eight `h0`..`h7` fields,
+    `Socket.Address` — a fixed-position accessor over the eight `h0`..`h7` fields,
     so the scan/join can walk the address by index without a heap list.
     """
 
   @available_on(:network)
 
-  fn hextet_at(address :: SocketAddress, index :: i64) -> i64 {
+  fn hextet_at(address :: Socket.Address, index :: i64) -> i64 {
     case index {
       0 -> address.h0
       1 -> address.h1
@@ -361,11 +361,11 @@ pub struct SocketAddress {
 
   @available_on(:network)
 
-  fn longest_zero_run(address :: SocketAddress, index :: i64, current_start :: i64, current_length :: i64, best_start :: i64, best_length :: i64) -> {i64, i64} {
+  fn longest_zero_run(address :: Socket.Address, index :: i64, current_start :: i64, current_length :: i64, best_start :: i64, best_length :: i64) -> {i64, i64} {
     case index >= 8 {
       true -> {best_start, best_length}
       false ->
-        case SocketAddress.hextet_at(address, index) == 0 {
+        case Socket.Address.hextet_at(address, index) == 0 {
           true ->
             {
               run_start = case current_length == 0 {
@@ -374,11 +374,11 @@ pub struct SocketAddress {
               }
               run_length = current_length + 1
               case run_length > best_length {
-                true -> SocketAddress.longest_zero_run(address, index + 1, run_start, run_length, run_start, run_length)
-                false -> SocketAddress.longest_zero_run(address, index + 1, run_start, run_length, best_start, best_length)
+                true -> Socket.Address.longest_zero_run(address, index + 1, run_start, run_length, run_start, run_length)
+                false -> Socket.Address.longest_zero_run(address, index + 1, run_start, run_length, best_start, best_length)
               }
             }
-          false -> SocketAddress.longest_zero_run(address, index + 1, 0, 0, best_start, best_length)
+          false -> Socket.Address.longest_zero_run(address, index + 1, 0, 0, best_start, best_length)
         }
     }
   }
@@ -391,15 +391,15 @@ pub struct SocketAddress {
 
   @available_on(:network)
 
-  fn join_hextets(address :: SocketAddress, from :: i64, to :: i64) -> String {
+  fn join_hextets(address :: Socket.Address, from :: i64, to :: i64) -> String {
     case from >= to {
       true -> ""
       false ->
         {
-          head = SocketAddress.hextet_hex(SocketAddress.hextet_at(address, from))
+          head = Socket.Address.hextet_hex(Socket.Address.hextet_at(address, from))
           case from + 1 >= to {
             true -> head
-            false -> head <> ":" <> SocketAddress.join_hextets(address, from + 1, to)
+            false -> head <> ":" <> Socket.Address.join_hextets(address, from + 1, to)
           }
         }
     }
@@ -415,8 +415,8 @@ pub struct SocketAddress {
 
   fn hextet_hex(value :: i64) -> String {
     case value < 16 {
-      true -> SocketAddress.hex_digit(value)
-      false -> SocketAddress.hextet_hex(value / 16) <> SocketAddress.hex_digit(Integer.remainder(value, 16))
+      true -> Socket.Address.hex_digit(value)
+      false -> Socket.Address.hextet_hex(value / 16) <> Socket.Address.hex_digit(Integer.remainder(value, 16))
     }
   }
 

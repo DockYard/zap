@@ -12,8 +12,8 @@
 
   ## Return types are concrete lazy adapters
 
-  Each adapter returns its concrete lazy type — `Transform(input, output)` for
-  the stage adapters, `Unfold(accumulator, element)` for `unfold` — rather
+  Each adapter returns its concrete lazy type — `Stream.Transform(input, output)` for
+  the stage adapters, `Stream.Unfold(accumulator, element)` for `unfold` — rather
   than a type-erased `Enumerable`. Those types implement `Enumerable`, so they
   compose with every `Enum` function and `for` comprehension and box
   automatically wherever an `Enumerable` is expected. This mirrors how
@@ -33,7 +33,7 @@
       |> Enum.to_list()
       # => [9, 16, 25]
 
-      Stream.unfold(1, fn(n :: i64) -> UnfoldStep(i64, i64) { UnfoldStep.emit(n, n * 2) })
+      Stream.unfold(1, fn(n :: i64) -> Stream.UnfoldStep(i64, i64) { Stream.UnfoldStep.emit(n, n * 2) })
       |> Stream.take(4)
       |> Enum.to_list()
       # => [1, 2, 4, 8]
@@ -47,13 +47,13 @@ pub struct Stream {
 
     ## Example
 
-        Stream.transform([1, 2, 3], %MapStage(i64, i64){callback: fn(x :: i64) -> i64 { x + 1 }})
+        Stream.transform([1, 2, 3], %Stage.Map(i64, i64){callback: fn(x :: i64) -> i64 { x + 1 }})
         |> Enum.to_list()
         # => [2, 3, 4]
     """
 
-  pub fn transform(source :: unique Enumerable(input), stage :: unique Stage(input, output)) -> Transform(input, output) {
-    %Transform(input, output){source: source, stage: stage, pending: ([] :: [output])}
+  pub fn transform(source :: unique Enumerable(input), stage :: unique Stage(input, output)) -> Stream.Transform(input, output) {
+    %Stream.Transform(input, output){source: source, stage: stage, pending: ([] :: [output])}
   }
 
   @doc = """
@@ -65,8 +65,8 @@ pub struct Stream {
         # => [10, 20, 30]
     """
 
-  pub fn map(source :: unique Enumerable(input), callback :: Callable({input}, output)) -> Transform(input, output) {
-    Stream.transform(source, %MapStage(input, output){callback: callback})
+  pub fn map(source :: unique Enumerable(input), callback :: Callable({input}, output)) -> Stream.Transform(input, output) {
+    Stream.transform(source, %Stage.Map(input, output){callback: callback})
   }
 
   @doc = """
@@ -78,8 +78,8 @@ pub struct Stream {
         # => [3, 4]
     """
 
-  pub fn filter(source :: unique Enumerable(element), predicate :: Callable({element}, Bool)) -> Transform(element, element) {
-    Stream.transform(source, %FilterStage(element){predicate: predicate})
+  pub fn filter(source :: unique Enumerable(element), predicate :: Callable({element}, Bool)) -> Stream.Transform(element, element) {
+    Stream.transform(source, %Stage.Filter(element){predicate: predicate})
   }
 
   @doc = """
@@ -92,8 +92,8 @@ pub struct Stream {
         # => [1, 2]
     """
 
-  pub fn reject(source :: unique Enumerable(element), predicate :: Callable({element}, Bool)) -> Transform(element, element) {
-    Stream.transform(source, %RejectStage(element){predicate: predicate})
+  pub fn reject(source :: unique Enumerable(element), predicate :: Callable({element}, Bool)) -> Stream.Transform(element, element) {
+    Stream.transform(source, %Stage.Reject(element){predicate: predicate})
   }
 
   @doc = """
@@ -108,11 +108,11 @@ pub struct Stream {
         # => [1, 2, 3]
     """
 
-  pub fn take(source :: unique Enumerable(element), count :: i64) -> Transform(element, element) {
+  pub fn take(source :: unique Enumerable(element), count :: i64) -> Stream.Transform(element, element) {
     if count <= 0 {
       Stream.empty_take(source)
     } else {
-      Stream.transform(source, %TakeStage(element){count: count})
+      Stream.transform(source, %Stage.Take(element){count: count})
     }
   }
 
@@ -126,8 +126,8 @@ pub struct Stream {
         # => [1, 2]
     """
 
-  pub fn take_while(source :: unique Enumerable(element), predicate :: Callable({element}, Bool)) -> Transform(element, element) {
-    Stream.transform(source, %TakeWhileStage(element){predicate: predicate})
+  pub fn take_while(source :: unique Enumerable(element), predicate :: Callable({element}, Bool)) -> Stream.Transform(element, element) {
+    Stream.transform(source, %Stage.TakeWhile(element){predicate: predicate})
   }
 
   @doc = """
@@ -139,8 +139,8 @@ pub struct Stream {
         # => [3, 4, 5]
     """
 
-  pub fn drop(source :: unique Enumerable(element), count :: i64) -> Transform(element, element) {
-    Stream.transform(source, %DropStage(element){count: count})
+  pub fn drop(source :: unique Enumerable(element), count :: i64) -> Stream.Transform(element, element) {
+    Stream.transform(source, %Stage.Drop(element){count: count})
   }
 
   @doc = """
@@ -154,8 +154,8 @@ pub struct Stream {
         # => [3, 1]
     """
 
-  pub fn drop_while(source :: unique Enumerable(element), predicate :: Callable({element}, Bool)) -> Transform(element, element) {
-    Stream.transform(source, %DropWhileStage(element){predicate: predicate, dropping: true})
+  pub fn drop_while(source :: unique Enumerable(element), predicate :: Callable({element}, Bool)) -> Stream.Transform(element, element) {
+    Stream.transform(source, %Stage.DropWhile(element){predicate: predicate, dropping: true})
   }
 
   @doc = """
@@ -169,8 +169,8 @@ pub struct Stream {
         # => [1, 3, 6, 10]
     """
 
-  pub fn scan(source :: unique Enumerable(input), initial :: accumulator, reducer :: Callable({accumulator, input}, accumulator)) -> Transform(input, accumulator) {
-    Stream.transform(source, %ScanStage(input, accumulator){state: initial, reducer: reducer})
+  pub fn scan(source :: unique Enumerable(input), initial :: accumulator, reducer :: Callable({accumulator, input}, accumulator)) -> Stream.Transform(input, accumulator) {
+    Stream.transform(source, %Stage.Scan(input, accumulator){state: initial, reducer: reducer})
   }
 
   @doc = """
@@ -184,9 +184,9 @@ pub struct Stream {
         # => [[1, 2], [3, 4], [5]]
     """
 
-  pub fn chunk_every(source :: unique Enumerable(element), count :: i64) -> Transform(element, [element]) {
+  pub fn chunk_every(source :: unique Enumerable(element), count :: i64) -> Stream.Transform(element, [element]) {
     checked_count = Stream.check_chunk_size(count)
-    %Transform(element, [element]){source: source, stage: %ChunkEveryStage(element){count: checked_count, buffer: ([] :: [element])}, pending: ([] :: [[element]])}
+    %Stream.Transform(element, [element]){source: source, stage: %Stage.ChunkEvery(element){count: checked_count, buffer: ([] :: [element])}, pending: ([] :: [[element]])}
   }
 
   @doc = """
@@ -199,8 +199,8 @@ pub struct Stream {
         # => [{"a", 0}, {"b", 1}, {"c", 2}]
     """
 
-  pub fn with_index(source :: unique Enumerable(element)) -> Transform(element, {element, i64}) {
-    %Transform(element, {element, i64}){source: source, stage: %WithIndexStage(element){index: 0}, pending: ([] :: [{element, i64}])}
+  pub fn with_index(source :: unique Enumerable(element)) -> Stream.Transform(element, {element, i64}) {
+    %Stream.Transform(element, {element, i64}){source: source, stage: %Stage.WithIndex(element){index: 0}, pending: ([] :: [{element, i64}])}
   }
 
   @doc = """
@@ -213,29 +213,29 @@ pub struct Stream {
         # => [1, 2, 3, 1]
     """
 
-  pub fn dedupe(source :: unique Enumerable(element)) -> Transform(element, element) {
-    Stream.transform(source, %DedupeStage(element){last: Option(element).None})
+  pub fn dedupe(source :: unique Enumerable(element)) -> Stream.Transform(element, element) {
+    Stream.transform(source, %Stage.Dedupe(element){last: Option(element).None})
   }
 
   @doc = """
     Builds a lazy stream by repeatedly applying `generator` to an accumulator,
-    starting from `initial`. `generator` returns an `UnfoldStep`:
-    `UnfoldStep.emit(value, next_accumulator)` to yield `value` and continue,
-    or `UnfoldStep(element, accumulator).Stop` to end the stream. Nothing is
+    starting from `initial`. `generator` returns an `Stream.UnfoldStep`:
+    `Stream.UnfoldStep.emit(value, next_accumulator)` to yield `value` and continue,
+    or `Stream.UnfoldStep(element, accumulator).Stop` to end the stream. Nothing is
     generated until demanded, so `unfold` describes infinite sequences safely
     when paired with a bounded consumer.
 
     ## Example
 
-        Stream.unfold(1, fn(n :: i64) -> UnfoldStep(i64, i64) {
-          if n > 100 { UnfoldStep(i64, i64).Stop } else { UnfoldStep.emit(n, n * 2) }
+        Stream.unfold(1, fn(n :: i64) -> Stream.UnfoldStep(i64, i64) {
+          if n > 100 { Stream.UnfoldStep(i64, i64).Stop } else { Stream.UnfoldStep.emit(n, n * 2) }
         })
         |> Enum.to_list()
         # => [1, 2, 4, 8, 16, 32, 64]
     """
 
-  pub fn unfold(initial :: accumulator, generator :: Callable({accumulator}, UnfoldStep(element, accumulator))) -> Unfold(accumulator, element) {
-    %Unfold(accumulator, element){seed: initial, generator: generator}
+  pub fn unfold(initial :: accumulator, generator :: Callable({accumulator}, Stream.UnfoldStep(element, accumulator))) -> Stream.Unfold(accumulator, element) {
+    %Stream.Unfold(accumulator, element){seed: initial, generator: generator}
   }
 
   @doc = """
@@ -250,8 +250,8 @@ pub struct Stream {
         # => [{1, "a"}, {2, "b"}, {3, "c"}]
     """
 
-  pub fn zip(left :: unique Enumerable(a), right :: unique Enumerable(b)) -> Zip(a, b) {
-    %Zip(a, b){left: left, right: right}
+  pub fn zip(left :: unique Enumerable(a), right :: unique Enumerable(b)) -> Stream.Zip(a, b) {
+    %Stream.Zip(a, b){left: left, right: right}
   }
 
   @doc = """
@@ -269,14 +269,14 @@ pub struct Stream {
 
     ## Example
 
-        doubler = %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * value }}
-        big = %FilterStage(i64){predicate: fn(value :: i64) -> Bool { value > 4 }}
+        doubler = %Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value * value }}
+        big = %Stage.Filter(i64){predicate: fn(value :: i64) -> Bool { value > 4 }}
         Stream.transform([1, 2, 3, 4], Stream.compose(doubler, big)) |> Enum.to_list()
         # => [9, 16]
     """
 
-  pub fn compose(first :: unique Stage(a, b), second :: unique Stage(b, c)) -> ComposeStage(a, b, c) {
-    %ComposeStage(a, b, c){first: first, second: second, second_halted: false}
+  pub fn compose(first :: unique Stage(a, b), second :: unique Stage(b, c)) -> Stage.Compose(a, b, c) {
+    %Stage.Compose(a, b, c){first: first, second: second, second_halted: false}
   }
 
   fn check_chunk_size(count :: i64) -> i64 {
@@ -287,8 +287,8 @@ pub struct Stream {
     }
   }
 
-  fn empty_take(source :: unique Enumerable(element)) -> Transform(element, element) {
+  fn empty_take(source :: unique Enumerable(element)) -> Stream.Transform(element, element) {
     Enumerable.dispose(source)
-    %Transform(element, element){source: ([] :: [element]), stage: %EmptyStage(element, element){}, pending: ([] :: [element])}
+    %Stream.Transform(element, element){source: ([] :: [element]), stage: %Stage.Empty(element, element){}, pending: ([] :: [element])}
   }
 }

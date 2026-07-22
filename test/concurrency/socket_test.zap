@@ -73,28 +73,28 @@ pub struct Concurrency.SocketTest {
       assert(Socket.live_count() == base)
     }
 
-    test("set_options on a stale handle returns a typed SocketError (ownership gate), no crash") {
+    test("set_options on a stale handle returns a typed Socket.Error (ownership gate), no crash") {
       assert(Concurrency.SocketTest.set_options_on_closed_is_error())
     }
   }
 
   fn loopback_ok() -> Bool {
-    case Socket.listen(SocketAddress.loopback(0), 128) {
+    case Socket.listen(Socket.Address.loopback(0), 128) {
       Result.Error(_e) -> false
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           Concurrency.SocketTest.connect_close(listener, port)
         }
     }
   }
 
   fn connect_host_ok() -> Bool {
-    case Socket.listen(SocketAddress.loopback(0), 128) {
+    case Socket.listen(Socket.Address.loopback(0), 128) {
       Result.Error(_e) -> false
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           connected = case Socket.connect_host("localhost", port, 5000) {
             Result.Ok(client) ->
               {
@@ -103,17 +103,17 @@ pub struct Concurrency.SocketTest {
               }
             Result.Error(_e) -> false
           }
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           connected
         }
     }
   }
 
-  fn connect_close(listener :: SocketListener, port :: i64) -> Bool {
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn connect_close(listener :: Socket.Listener, port :: i64) -> Bool {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _c = SocketListener.close(listener)
+          _c = Socket.Listener.close(listener)
           false
         }
       Result.Ok(client) ->
@@ -121,7 +121,7 @@ pub struct Concurrency.SocketTest {
           was_open = Socket.open?(client)
           _c1 = Socket.close(client)
           gone = Socket.open?(client) == false
-          _c2 = SocketListener.close(listener)
+          _c2 = Socket.Listener.close(listener)
           was_open and gone
         }
     }
@@ -130,25 +130,25 @@ pub struct Concurrency.SocketTest {
   # Gate-ON read-back: connect a loopback client under the kernel, set nodelay
   # via the ownership-gated ABI, and confirm get_option(0) flipped 0 -> 1.
   fn nodelay_applied_under_kernel() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           result = Concurrency.SocketTest.nodelay_on_client(port)
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           result
         }
     }
   }
 
   fn nodelay_on_client(port :: i64) -> Atom {
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) -> :connect_failed
       Result.Ok(client) ->
         {
           before = Socket.get_option(client, 0)
-          case Socket.set_options(client, %SocketOptions{nodelay: true}) {
+          case Socket.set_options(client, %Socket.Options{nodelay: true}) {
             Result.Error(_e) ->
               {
                 _c = Socket.close(client)
@@ -170,25 +170,25 @@ pub struct Concurrency.SocketTest {
   }
 
   fn set_options_on_closed_is_error() -> Bool {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> false
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           result = Concurrency.SocketTest.set_options_after_close(port)
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           result
         }
     }
   }
 
   fn set_options_after_close(port :: i64) -> Bool {
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) -> false
       Result.Ok(client) ->
         {
           _closed = Socket.close(client)
-          case Socket.set_options(client, SocketOptions.default()) {
+          case Socket.set_options(client, Socket.Options.default()) {
             Result.Ok(_configured) -> false
             Result.Error(error) -> error.reason == :closed
           }
@@ -199,7 +199,7 @@ pub struct Concurrency.SocketTest {
   # Opens a listener and exits WITHOUT closing it — the drop-list sweep must
   # close its fd at teardown (normal exit path).
   pub fn leaky_worker() -> Nil {
-    _result = Socket.listen(SocketAddress.loopback(0), 1)
+    _result = Socket.listen(Socket.Address.loopback(0), 1)
     nil
   }
 
@@ -207,7 +207,7 @@ pub struct Concurrency.SocketTest {
   # the parent can KILL it and verify the drop-list closes its fd on the
   # kill path too.
   pub fn parked_worker() -> Nil {
-    _result = Socket.listen(SocketAddress.loopback(0), 1)
+    _result = Socket.listen(Socket.Address.loopback(0), 1)
     _sent = Process.send(:socket_kill_parent, :opened)
     _parked = receive Atom {
       _any -> :ok

@@ -13,7 +13,7 @@
   box-field extraction through the manager-adaptive clone-on-share (so the
   consumed value owns an independent inner and the parent's field is
   released exactly once). These structs deliberately mirror the Stream
-  stdlib `Transform` adapter but use only the language surface — no stdlib
+  stdlib `Stream.Transform` adapter but use only the language surface — no stdlib
   Stream name — so the coverage is general.
   """
 
@@ -37,7 +37,7 @@ pub impl Enumerable(i64) for ListSiblingAdapter {
   }
 }
 
-# (iii) Transform-like: TWO boxed existential fields + a bare List buffer.
+# (iii) Stream.Transform-like: TWO boxed existential fields + a bare List buffer.
 pub struct TransformLike {
   source :: Enumerable(i64)
   stage :: Enumerable(i64)
@@ -92,7 +92,7 @@ pub struct Zap.StreamPartialMoveTest {
     }
   }
 
-  describe("two boxed-existential fields + bare List buffer (Transform adapter shape)") {
+  describe("two boxed-existential fields + bare List buffer (Stream.Transform adapter shape)") {
     test("driven to :done carrying a second boxed existential and a List buffer") {
       transform = %TransformLike{source: [3, 4, 5], stage: [1, 2], pending: [0]}
       collected = Enum.to_list(transform)

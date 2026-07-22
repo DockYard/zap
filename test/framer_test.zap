@@ -1,9 +1,9 @@
 @doc = """
   Behavioural tests for the `Framer` stages — `Framer.length_prefixed/2` and
   `Framer.line/1` — driven through the pull driver (`Stream.transform`). Framers
-  are `Stage(String, Result(String, FramingError))` instances: they consume raw
+  are `Stage(String, Result(String, Framer.Error))` instances: they consume raw
   byte chunks (`String`) and emit complete frames as `Result.Ok(payload)`, a
-  protocol violation as `Result.Error(%FramingError{...})` followed by `:halt`,
+  protocol violation as `Result.Error(%Framer.Error{...})` followed by `:halt`,
   and the end-of-stream partial-frame policy on `flush`.
 
   Covers: frames split across arbitrary chunk boundaries, exact-fit and
@@ -45,7 +45,7 @@ pub struct FramerTest {
   }
 
   # Extract the `Ok` payload of a Result output, or "" for an error.
-  fn ok_payload(result :: Result(String, FramingError)) -> String {
+  fn ok_payload(result :: Result(String, Framer.Error)) -> String {
     case result {
       Result.Ok(payload) -> payload
       Result.Error(_error) -> ""
@@ -53,7 +53,7 @@ pub struct FramerTest {
   }
 
   # True when the Result output is an Error carrying the given reason atom.
-  fn error_reason?(result :: Result(String, FramingError), reason :: Atom) -> Bool {
+  fn error_reason?(result :: Result(String, Framer.Error), reason :: Atom) -> Bool {
     case result {
       Result.Ok(_payload) -> false
       Result.Error(framing_error) -> framing_error.reason == reason

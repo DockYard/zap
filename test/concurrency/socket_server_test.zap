@@ -2,7 +2,7 @@ pub struct Concurrency.SocketServerTest {
   use Zest.Case
 
   # Phase S3 Jobs 2+3 acceptance proof (gate-ON): the ACCEPTOR/HANDLER server
-  # pattern — bounded accept (Job 2) + the SocketServer policy module + the
+  # pattern — bounded accept (Job 2) + the Socket.Server policy module + the
   # canonical echo server under a real Supervisor (Job 3). What this pins, end
   # to end:
   #
@@ -18,12 +18,12 @@ pub struct Concurrency.SocketServerTest {
   #   * N clients connect CONCURRENTLY, each round-tripping a DISTINCT payload
   #     through its own handler — all N correct;
   #   * a handler that CRASHES mid-connection (a poison payload) is ISOLATED: the
-  #     acceptor traps the EXIT and reaps it (`SocketServer.reap_signals`) instead
+  #     acceptor traps the EXIT and reaps it (`Socket.Server.reap_signals`) instead
   #     of dying, the OTHER concurrent connections keep echoing correctly, the
   #     crashed connection's socket fd is reclaimed by the handler's teardown
   #     sweep, the listener still accepts a fresh connection (same port — the
   #     Supervisor did NOT restart the acceptor), and everything is leak-exact;
-  #   * teardown is graceful: `SocketServer.reap_signals` sees the Supervisor's
+  #   * teardown is graceful: `Socket.Server.reap_signals` sees the Supervisor's
   #     `:shutdown` (an exit from a non-handler) within one accept poll, the
   #     acceptor closes the listener and exits, and `Socket.live_count` returns to
   #     its baseline — every fd (listener + all connections) reclaimed EXACTLY
@@ -37,7 +37,7 @@ pub struct Concurrency.SocketServerTest {
   #
   # The kernel-level bounded-accept fd discipline (timeout leaks no fd; a kill
   # mid-bounded-accept reclaims) lives in `src/runtime/concurrency/socket_io.zig`
-  # and `.../abi.zig`; the pure `SocketServer` policy is `lib/socket/server.zap`.
+  # and `.../abi.zig`; the pure `Socket.Server` policy is `lib/socket/server.zap`.
 
   # ---- the supervised acceptor tree ----------------------------------------
 
@@ -67,39 +67,39 @@ pub struct Concurrency.SocketServerTest {
   }
 
   # The acceptor: bind a listener on an ephemeral port, report the port to the
-  # test coordinator by name, TRAP EXITS via `SocketServer.init`, and run the
+  # test coordinator by name, TRAP EXITS via `Socket.Server.init`, and run the
   # accept loop. It OWNS the listener for its whole life. The echo/crash tests
   # use the default policy (50 ms poll, NO connection cap, 5 s drain grace).
   pub fn acceptor_entry() -> Nil {
-    Concurrency.SocketServerTest.acceptor_boot(SocketServer.options(50, 0, 5000))
+    Concurrency.SocketServerTest.acceptor_boot(Socket.Server.options(50, 0, 5000))
   }
 
   # The DRAIN acceptor (Job 4): the same loop, but a SHORT 1200 ms drain grace so
   # the graceful-drain test can measure a stalling handler being force-killed at
   # the deadline without waiting five seconds. No connection cap.
   pub fn drain_acceptor_entry() -> Nil {
-    Concurrency.SocketServerTest.acceptor_boot(SocketServer.options(50, 0, 1200))
+    Concurrency.SocketServerTest.acceptor_boot(Socket.Server.options(50, 0, 1200))
   }
 
   # The CAPACITY acceptor (Job 5): a per-acceptor `max_connections` cap of 2, so
   # the load-shedding test can prove the acceptor STOPS ACCEPTING at the cap and
   # resumes when a slot frees. Default 5 s drain grace.
   pub fn capacity_acceptor_entry() -> Nil {
-    Concurrency.SocketServerTest.acceptor_boot(SocketServer.options(50, 2, 5000))
+    Concurrency.SocketServerTest.acceptor_boot(Socket.Server.options(50, 2, 5000))
   }
 
   # Shared acceptor boot: bind an ephemeral loopback listener, report the port to
-  # the coordinator, TRAP EXITS via `SocketServer.init(options)`, and run the
+  # the coordinator, TRAP EXITS via `Socket.Server.init(options)`, and run the
   # shared accept loop under the given policy. The ONLY thing that differs
-  # between the echo, drain, and capacity acceptors is their `SocketServerOptions`.
-  fn acceptor_boot(options :: SocketServerOptions) -> Nil {
-    case Socket.listen(SocketAddress.loopback(0), 128) {
+  # between the echo, drain, and capacity acceptors is their `Socket.ServerOptions`.
+  fn acceptor_boot(options :: Socket.ServerOptions) -> Nil {
+    case Socket.listen(Socket.Address.loopback(0), 128) {
       Result.Error(_e) -> nil
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           _reported = Process.send(:socket_echo_coordinator, port)
-          state = SocketServer.init(options)
+          state = Socket.Server.init(options)
           Concurrency.SocketServerTest.acceptor_loop(state, listener)
         }
     }
@@ -118,25 +118,25 @@ pub struct Concurrency.SocketServerTest {
   # long-lived acceptor would OVERFLOW its 256 KiB stack at high connection
   # counts (a latent DoS). Keeping the whole turn in one self-recursive function
   # is what makes the accept loop safe for an unbounded connection lifetime.
-  fn acceptor_loop(state :: SocketServerState, listener :: SocketListener) -> Nil {
-    reaped = SocketServer.reap_signals(state)
-    case SocketServer.draining?(reaped) {
+  fn acceptor_loop(state :: Socket.ServerState, listener :: Socket.Listener) -> Nil {
+    reaped = Socket.Server.reap_signals(state)
+    case Socket.Server.draining?(reaped) {
       true ->
         {
           # Graceful drain (Job 4): close the listener IMMEDIATELY so new connects
           # get ECONNREFUSED, then give the in-flight handlers up to
-          # `shutdown_timeout_ms` to finish (`SocketServer.drain`) and force-kill
+          # `shutdown_timeout_ms` to finish (`Socket.Server.drain`) and force-kill
           # any stragglers so every connection fd is reclaimed before we exit.
-          _closed = SocketListener.close(listener)
-          _drained = SocketServer.drain(reaped)
+          _closed = Socket.Listener.close(listener)
+          _drained = Socket.Server.drain(reaped)
           Process.exit_with(:normal)
         }
       false ->
         # Capacity gate (Job 5): at the `max_connections` cap, STOP ACCEPTING —
         # park (kill/drain-responsive) until a handler EXIT frees a slot, then
         # re-loop. The kernel backlog absorbs the wait; nothing is accepted-then-reset.
-        case SocketServer.at_capacity?(reaped) {
-          true -> Concurrency.SocketServerTest.acceptor_loop(SocketServer.wait_for_slot(reaped), listener)
+        case Socket.Server.at_capacity?(reaped) {
+          true -> Concurrency.SocketServerTest.acceptor_loop(Socket.Server.wait_for_slot(reaped), listener)
           false ->
             case Socket.accept(listener, reaped.options.accept_poll_ms) {
               # A connection arrived: hand it to a fresh, `spawn_link`ed handler by
@@ -145,7 +145,7 @@ pub struct Concurrency.SocketServerTest {
                 {
                   handler = Process.spawn_link(&Concurrency.SocketServerTest.handler_entry/0)
                   _moved = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
-                  Concurrency.SocketServerTest.acceptor_loop(SocketServer.admitted(reaped, handler), listener)
+                  Concurrency.SocketServerTest.acceptor_loop(Socket.Server.admitted(reaped, handler), listener)
                 }
               # `:etimedout` on a quiet poll (the common case) — just loop, re-reaping
               # and re-checking for shutdown. Any real accept error is transient here.
@@ -176,7 +176,7 @@ pub struct Concurrency.SocketServerTest {
   # teardown sweep (crash-safe fd lifetime), NOT an explicit close.
   fn echo_serve(conn :: Socket) -> Nil {
     case Socket.recv(conn, 0, 5000) {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         case bytes == "POISON" {
           true -> Process.exit_with(:poisoned)
           false ->
@@ -185,17 +185,17 @@ pub struct Concurrency.SocketServerTest {
               Concurrency.SocketServerTest.echo_serve(conn)
             }
         }
-      SocketRecv.Closed ->
+      Socket.Recv.Closed ->
         {
           _c = Socket.close(conn)
           nil
         }
-      SocketRecv.TimedOut(_partial) ->
+      Socket.Recv.TimedOut(_partial) ->
         {
           _c = Socket.close(conn)
           nil
         }
-      SocketRecv.Failed(_error) ->
+      Socket.Recv.Failed(_error) ->
         {
           _c = Socket.close(conn)
           nil
@@ -221,7 +221,7 @@ pub struct Concurrency.SocketServerTest {
 
   fn normal_client_run(port :: i64) -> Atom {
     payload = "echo-" <> Integer.to_string(Process.self())
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
           _r = Process.send(:socket_echo_coordinator, (0 :: i64))
@@ -234,14 +234,14 @@ pub struct Concurrency.SocketServerTest {
   fn normal_client_exchange(client :: Socket, payload :: String) -> Atom {
     _sent = Socket.send(client, payload)
     verdict = case Socket.recv(client, String.length(payload), 5000) {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         case bytes == payload {
           true -> (1 :: i64)
           false -> (0 :: i64)
         }
-      SocketRecv.TimedOut(_partial) -> (0 :: i64)
-      SocketRecv.Closed -> (0 :: i64)
-      SocketRecv.Failed(_error) -> (0 :: i64)
+      Socket.Recv.TimedOut(_partial) -> (0 :: i64)
+      Socket.Recv.Closed -> (0 :: i64)
+      Socket.Recv.Failed(_error) -> (0 :: i64)
     }
     # Half-close handshake: FIN to the handler, then wait for its FIN back (it
     # closes on our EOF) before we close — so both fds are closed before we report.
@@ -265,7 +265,7 @@ pub struct Concurrency.SocketServerTest {
   }
 
   fn poison_client_run(port :: i64) -> Atom {
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
           _r = Process.send(:socket_echo_coordinator, (0 :: i64))
@@ -275,10 +275,10 @@ pub struct Concurrency.SocketServerTest {
         {
           _sent = Socket.send(client, "POISON")
           verdict = case Socket.recv(client, 0, 3000) {
-            SocketRecv.Closed -> (1 :: i64)
-            SocketRecv.Failed(_error) -> (1 :: i64)
-            SocketRecv.Chunk(_bytes) -> (0 :: i64)
-            SocketRecv.TimedOut(_partial) -> (0 :: i64)
+            Socket.Recv.Closed -> (1 :: i64)
+            Socket.Recv.Failed(_error) -> (1 :: i64)
+            Socket.Recv.Chunk(_bytes) -> (0 :: i64)
+            Socket.Recv.TimedOut(_partial) -> (0 :: i64)
           }
           _closed = Socket.close(client)
           _reported = Process.send(:socket_echo_coordinator, verdict)
@@ -306,7 +306,7 @@ pub struct Concurrency.SocketServerTest {
 
   fn finisher_client_run(port :: i64) -> Atom {
     payload = "fin-" <> Integer.to_string(Process.self())
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
           _r = Process.send(:socket_echo_coordinator, (0 :: i64))
@@ -354,7 +354,7 @@ pub struct Concurrency.SocketServerTest {
 
   fn straggler_client_run(port :: i64) -> Atom {
     payload = "str-" <> Integer.to_string(Process.self())
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
           _r = Process.send(:socket_echo_coordinator, (0 :: i64))
@@ -391,7 +391,7 @@ pub struct Concurrency.SocketServerTest {
 
   fn held_client_run(port :: i64) -> Atom {
     payload = "held-" <> Integer.to_string(Process.self())
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
           _r = Process.send(:socket_echo_coordinator, (0 :: i64))
@@ -432,7 +432,7 @@ pub struct Concurrency.SocketServerTest {
 
   fn extra_client_run(port :: i64) -> Atom {
     payload = "extra-" <> Integer.to_string(Process.self())
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
           _r1 = Process.send(:socket_echo_coordinator, (0 :: i64))
@@ -447,10 +447,10 @@ pub struct Concurrency.SocketServerTest {
     _sent = Socket.send(client, payload)
     # Phase A: at capacity nobody serves us — the first recv MUST time out.
     unserved = case Socket.recv(client, 0, 700) {
-      SocketRecv.TimedOut(_p) -> (1 :: i64)
-      SocketRecv.Chunk(_b) -> (0 :: i64)
-      SocketRecv.Closed -> (0 :: i64)
-      SocketRecv.Failed(_e) -> (0 :: i64)
+      Socket.Recv.TimedOut(_p) -> (1 :: i64)
+      Socket.Recv.Chunk(_b) -> (0 :: i64)
+      Socket.Recv.Closed -> (0 :: i64)
+      Socket.Recv.Failed(_e) -> (0 :: i64)
     }
     _unserved_reported = Process.send(:socket_echo_coordinator, unserved)
     # Phase B: once a slot frees, the acceptor accepts us and the handler echoes
@@ -468,14 +468,14 @@ pub struct Concurrency.SocketServerTest {
       true -> (0 :: i64)
       false ->
         case Socket.recv(client, 0, 300) {
-          SocketRecv.Chunk(bytes) ->
+          Socket.Recv.Chunk(bytes) ->
             case bytes == payload {
               true -> (1 :: i64)
               false -> (0 :: i64)
             }
-          SocketRecv.TimedOut(_p) -> Concurrency.SocketServerTest.extra_retry(client, payload, deadline_ms)
-          SocketRecv.Closed -> (0 :: i64)
-          SocketRecv.Failed(_e) -> (0 :: i64)
+          Socket.Recv.TimedOut(_p) -> Concurrency.SocketServerTest.extra_retry(client, payload, deadline_ms)
+          Socket.Recv.Closed -> (0 :: i64)
+          Socket.Recv.Failed(_e) -> (0 :: i64)
         }
     }
   }
@@ -483,14 +483,14 @@ pub struct Concurrency.SocketServerTest {
   # Shared: read one echo and return `1` iff it matches `payload`, else `0`.
   fn echo_verdict(client :: Socket, payload :: String) -> i64 {
     case Socket.recv(client, String.length(payload), 5000) {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         case bytes == payload {
           true -> (1 :: i64)
           false -> (0 :: i64)
         }
-      SocketRecv.TimedOut(_p) -> (0 :: i64)
-      SocketRecv.Closed -> (0 :: i64)
-      SocketRecv.Failed(_e) -> (0 :: i64)
+      Socket.Recv.TimedOut(_p) -> (0 :: i64)
+      Socket.Recv.Closed -> (0 :: i64)
+      Socket.Recv.Failed(_e) -> (0 :: i64)
     }
   }
 
@@ -525,20 +525,20 @@ pub struct Concurrency.SocketServerTest {
   # acceptor (the live set stays bounded across the whole run). Returns `1` on a
   # correct echo, `0` otherwise.
   fn stress_one(port :: i64) -> i64 {
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) -> (0 :: i64)
       Result.Ok(client) ->
         {
           _sent = Socket.send(client, "s")
           verdict = case Socket.recv(client, 1, 5000) {
-            SocketRecv.Chunk(bytes) ->
+            Socket.Recv.Chunk(bytes) ->
               case bytes == "s" {
                 true -> (1 :: i64)
                 false -> (0 :: i64)
               }
-            SocketRecv.TimedOut(_p) -> (0 :: i64)
-            SocketRecv.Closed -> (0 :: i64)
-            SocketRecv.Failed(_e) -> (0 :: i64)
+            Socket.Recv.TimedOut(_p) -> (0 :: i64)
+            Socket.Recv.Closed -> (0 :: i64)
+            Socket.Recv.Failed(_e) -> (0 :: i64)
           }
           _shut = Socket.shutdown(client, :write)
           _drain = Socket.recv(client, 0, 5000)
@@ -785,7 +785,7 @@ pub struct Concurrency.SocketServerTest {
       assert(Socket.live_count() == base)
 
       # The listener was closed on drain: a fresh connect to the port is REFUSED.
-      refused = case Socket.connect(SocketAddress.loopback(port), 500) {
+      refused = case Socket.connect(Socket.Address.loopback(port), 500) {
         Result.Error(_e) -> (1 :: i64)
         Result.Ok(late) ->
           {
@@ -863,25 +863,25 @@ pub struct Concurrency.SocketServerTest {
       # the newest listener. CORRECTNESS (every connection served, drain,
       # crash-safety) holds on BOTH — only BALANCE is Linux-grade — so the pool
       # tests below assert TOTALS, never per-acceptor distribution.
-      probe = case Socket.listen(SocketAddress.loopback(0), 128, %SocketOptions{reuse_port: true}) {
+      probe = case Socket.listen(Socket.Address.loopback(0), 128, %Socket.Options{reuse_port: true}) {
         Result.Error(_e) -> (0 :: i64)
         Result.Ok(first) ->
           {
-            shared_port = SocketListener.local_port(first)
-            result = case Socket.listen(SocketAddress.loopback(shared_port), 128, %SocketOptions{reuse_port: true}) {
+            shared_port = Socket.Listener.local_port(first)
+            result = case Socket.listen(Socket.Address.loopback(shared_port), 128, %Socket.Options{reuse_port: true}) {
               Result.Error(_e2) -> (0 :: i64)
               Result.Ok(second) ->
                 {
                   # Both listeners are bound to the SAME port at the same instant.
-                  same = case SocketListener.local_port(second) == shared_port {
+                  same = case Socket.Listener.local_port(second) == shared_port {
                     true -> (1 :: i64)
                     false -> (0 :: i64)
                   }
-                  _c2 = SocketListener.close(second)
+                  _c2 = Socket.Listener.close(second)
                   same
                 }
             }
-            _c1 = SocketListener.close(first)
+            _c1 = Socket.Listener.close(first)
             result
           }
       }
@@ -891,11 +891,11 @@ pub struct Concurrency.SocketServerTest {
       # `per_acceptor_cap` is the Job 6 per-acceptor `max_connections` quota
       # (`max / N`) each pooled acceptor is given so the pool's aggregate served
       # concurrency stays near a global budget WITHOUT cross-acceptor coordination.
-      assert(SocketServer.per_acceptor_cap(9, 3) == 3)
-      assert(SocketServer.per_acceptor_cap(10, 3) == 3)
-      assert(SocketServer.per_acceptor_cap(2, 4) == 1)
-      assert(SocketServer.per_acceptor_cap(0, 4) == 0)
-      assert(SocketServer.per_acceptor_cap(7, 0) == 7)
+      assert(Socket.Server.per_acceptor_cap(9, 3) == 3)
+      assert(Socket.Server.per_acceptor_cap(10, 3) == 3)
+      assert(Socket.Server.per_acceptor_cap(2, 4) == 1)
+      assert(Socket.Server.per_acceptor_cap(0, 4) == 0)
+      assert(Socket.Server.per_acceptor_cap(7, 0) == 7)
     }
 
     test("N reuse_port acceptors on ONE port each own a listener; M clients spread across the pool are ALL served (totals); leak-exact") {
@@ -974,7 +974,7 @@ pub struct Concurrency.SocketServerTest {
 
       # EVERY acceptor's listener was closed on drain: a fresh connect to the shared
       # port is REFUSED (no listener remains anywhere in the pool).
-      refused = case Socket.connect(SocketAddress.loopback(port), 500) {
+      refused = case Socket.connect(Socket.Address.loopback(port), 500) {
         Result.Error(_e) -> (1 :: i64)
         Result.Ok(late) ->
           {
@@ -1026,13 +1026,13 @@ pub struct Concurrency.SocketServerTest {
   # assigned port to the coordinator, then run the shared accept loop on its own
   # listener (2 s drain grace).
   pub fn pool_first_acceptor_entry() -> Nil {
-    case Socket.listen(SocketAddress.loopback(0), 128, %SocketOptions{reuse_port: true}) {
+    case Socket.listen(Socket.Address.loopback(0), 128, %Socket.Options{reuse_port: true}) {
       Result.Error(_e) -> nil
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           _reported = Process.send(:socket_echo_coordinator, port)
-          state = SocketServer.init(SocketServer.options(50, 0, 2000))
+          state = Socket.Server.init(Socket.Server.options(50, 0, 2000))
           Concurrency.SocketServerTest.acceptor_loop(state, listener)
         }
     }
@@ -1045,11 +1045,11 @@ pub struct Concurrency.SocketServerTest {
     port = receive i64 {
       p -> p
     }
-    case Socket.listen(SocketAddress.loopback(port), 128, %SocketOptions{reuse_port: true}) {
+    case Socket.listen(Socket.Address.loopback(port), 128, %Socket.Options{reuse_port: true}) {
       Result.Error(_e) -> nil
       Result.Ok(listener) ->
         {
-          state = SocketServer.init(SocketServer.options(50, 0, 2000))
+          state = Socket.Server.init(Socket.Server.options(50, 0, 2000))
           Concurrency.SocketServerTest.acceptor_loop(state, listener)
         }
     }

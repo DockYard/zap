@@ -3308,13 +3308,24 @@ pub const HirBuilder = struct {
         const full_target_name = try self.internDottedStructName(impl_d.target_type);
         const full_target_text = self.interner.get(full_target_name);
 
-        if (self.isNativeTypeName(.list, target_name) and impl_d.type_params.len == 1) {
+        // The native `List`/`Map` shortcuts key on the target's SINGLE
+        // unqualified name — a NAMESPACED target whose last part merely
+        // spells the same word (`Stage.Map(input, output)`) is an ordinary
+        // user struct, never the native container. Without the parts-len
+        // gate, `impl Stage(...) for Stage.Map(input, output)` produced a
+        // native `.map{key, value}` target pattern that could never unify
+        // with the concrete `Stage.Map(i64, i64)` argument, so the
+        // protocol's type-args stayed unbound and the monomorph clone was
+        // skipped as generic — a dangling `call_direct` id at ZIR emission.
+        const target_is_unqualified = impl_d.target_type.parts.len == 1;
+
+        if (target_is_unqualified and self.isNativeTypeName(.list, target_name) and impl_d.type_params.len == 1) {
             const element_name = self.interner.get(impl_d.type_params[0]);
             const element_type = self.hir_type_var_scope.get(element_name) orelse types_mod.TypeStore.UNKNOWN;
             return try self.type_store.addType(.{ .list = .{ .element = element_type } });
         }
 
-        if (self.isNativeTypeName(.map, target_name) and impl_d.type_params.len == 2) {
+        if (target_is_unqualified and self.isNativeTypeName(.map, target_name) and impl_d.type_params.len == 2) {
             const key_name = self.interner.get(impl_d.type_params[0]);
             const value_name = self.interner.get(impl_d.type_params[1]);
             const key_type = self.hir_type_var_scope.get(key_name) orelse types_mod.TypeStore.UNKNOWN;
@@ -6522,12 +6533,20 @@ pub const HirBuilder = struct {
                 if (call.callee.* == .struct_ref and call.args.len >= 1) {
                     const parts = call.callee.struct_ref.name.parts;
                     const type_args = call.callee.struct_ref.type_args;
-                    if (parts.len == 2) {
-                        if (self.type_store.name_to_type.get(parts[0])) |tid| {
+                    // The union type is every part but the last (the
+                    // variant): `Result.Ok(x)` → `Result`;
+                    // `Socket.Recv.Chunk(bytes)` → the NAMESPACED union
+                    // `Socket.Recv`. `resolveStructRefVariantOwnerTypeId`
+                    // is the same owner resolution the nullary
+                    // `.struct_ref` arm below uses, so payload and
+                    // payload-free constructions cannot drift.
+                    if (parts.len >= 2) {
+                        const call_variant_name = parts[parts.len - 1];
+                        if (try self.resolveStructRefVariantOwnerTypeId(parts)) |tid| {
                             const typ = self.type_store.getType(tid);
                             if (typ == .tagged_union) {
                                 for (typ.tagged_union.variants) |v| {
-                                    if (v.name == parts[1] and v.type_id != null) {
+                                    if (v.name == call_variant_name and v.type_id != null) {
                                         const arg_expr = try self.buildExpr(call.args[0]);
                                         // Three sources for the
                                         // instantiation TypeId (mirrors
@@ -6577,7 +6596,7 @@ pub const HirBuilder = struct {
                                         return try self.create(Expr, .{
                                             .kind = .{ .union_init = .{
                                                 .union_type_id = literal_type_id,
-                                                .variant_name = parts[1],
+                                                .variant_name = call_variant_name,
                                                 .value = arg_expr,
                                             } },
                                             .type_id = literal_type_id,

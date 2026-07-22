@@ -2,12 +2,12 @@
   A `Stage` that batches items into consecutive groups of a fixed size,
   emitting each full group as a single `[element]` output.
 
-  `ChunkEveryStage(element)` is the stage behind `Stream.chunk_every/2`. It
+  `Stage.ChunkEvery(element)` is the stage behind `Stream.chunk_every/2`. It
   buffers items in explicit list state; a completed group is emitted and the
   buffer reset, and `flush` emits the final partial group (if any).
   """
 
-pub struct ChunkEveryStage(element) {
+pub struct Stage.ChunkEvery(element) {
   count :: i64
   buffer :: [element]
 }
@@ -17,14 +17,14 @@ pub struct ChunkEveryStage(element) {
   the buffer fills, and the final partial group on flush.
   """
 
-pub impl Stage(element, [element]) for ChunkEveryStage(element) {
+pub impl Stage(element, [element]) for Stage.ChunkEvery(element) {
   @doc = """
     Appends the item to the buffer; when the buffer reaches the chunk size,
     emits it as one group and resets, otherwise emits nothing.
     """
 
-  pub fn step(stage :: unique ChunkEveryStage(element), item :: element) -> {Atom, [[element]], ChunkEveryStage(element)} {
-    ChunkEveryStage.absorb(stage.count, stage.buffer, item)
+  pub fn step(stage :: unique Stage.ChunkEvery(element), item :: element) -> {Atom, [[element]], Stage.ChunkEvery(element)} {
+    Stage.ChunkEvery.absorb(stage.count, stage.buffer, item)
   }
 
   @doc = """
@@ -32,25 +32,25 @@ pub impl Stage(element, [element]) for ChunkEveryStage(element) {
     nothing.
     """
 
-  pub fn flush(stage :: unique ChunkEveryStage(element)) -> [[element]] {
-    ChunkEveryStage.drain(stage.count, stage.buffer)
+  pub fn flush(stage :: unique Stage.ChunkEvery(element)) -> [[element]] {
+    Stage.ChunkEvery.drain(stage.count, stage.buffer)
   }
 
-  fn absorb(count :: i64, buffer :: [element], item :: element) -> {Atom, [[element]], ChunkEveryStage(element)} {
+  fn absorb(count :: i64, buffer :: [element], item :: element) -> {Atom, [[element]], Stage.ChunkEvery(element)} {
     filled = List.concat(buffer, [item])
     if List.length(filled) >= count {
-      ChunkEveryStage.emit_group(count, filled)
+      Stage.ChunkEvery.emit_group(count, filled)
     } else {
-      ChunkEveryStage.keep(count, filled)
+      Stage.ChunkEvery.keep(count, filled)
     }
   }
 
-  fn emit_group(count :: i64, group :: [element]) -> {Atom, [[element]], ChunkEveryStage(element)} {
-    {:cont, [group], %ChunkEveryStage(element){count: count, buffer: ([] :: [element])}}
+  fn emit_group(count :: i64, group :: [element]) -> {Atom, [[element]], Stage.ChunkEvery(element)} {
+    {:cont, [group], %Stage.ChunkEvery(element){count: count, buffer: ([] :: [element])}}
   }
 
-  fn keep(count :: i64, buffer :: [element]) -> {Atom, [[element]], ChunkEveryStage(element)} {
-    {:cont, ([] :: [[element]]), %ChunkEveryStage(element){count: count, buffer: buffer}}
+  fn keep(count :: i64, buffer :: [element]) -> {Atom, [[element]], Stage.ChunkEvery(element)} {
+    {:cont, ([] :: [[element]]), %Stage.ChunkEvery(element){count: count, buffer: buffer}}
   }
 
   fn drain(_count :: i64, buffer :: [element]) -> [[element]] {

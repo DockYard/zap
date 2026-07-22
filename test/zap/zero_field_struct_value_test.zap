@@ -14,7 +14,7 @@
   structs alongside fields-only structs. This drives a field-less struct
   through construction, a by-value pass to a function, a struct-field
   round-trip, and a return, for BOTH a concrete and a parametric field-less
-  struct — the `EmptyStage` terminal-sentinel shape the Stream design uses.
+  struct — the `Stage.Empty` terminal-sentinel shape the Stream design uses.
   """
 
 pub struct ConcreteZero {

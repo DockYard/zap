@@ -1,7 +1,7 @@
 @doc = """
   Regression: the `Enum` higher-order functions that thread a USER callback
   over an `Enumerable` whose ELEMENT is a `Result(t, e)` union — the exact
-  shape of `Socket.chunks`' `Enumerable(Result(String, SocketError))`.
+  shape of `Socket.chunks`' `Enumerable(Result(String, Socket.Error))`.
 
   `reduce_next`/`each_next`/`reduce_while_next` (lib/enum.zap) pass the element
   materialized out of `Enumerable.next` straight into the fn-typed parameter
@@ -22,7 +22,7 @@
   crash on the streaming `Socket.chunks` flagship. The large-count cases below
   guard that constant-stack behaviour.
 
-  `StreamError` mirrors `SocketError` being a struct-shaped (non-primitive)
+  `StreamError` mirrors `Socket.Error` being a struct-shaped (non-primitive)
   error arm; the `Ok` payload is a heap-allocated `String`, so the ARC/Tracking
   leak surface matches the production element. Leak-cleanliness under the
   `-Dmemory`-selected `Memory.Tracking` manager (which Zest cannot set) is

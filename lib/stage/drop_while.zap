@@ -3,12 +3,12 @@
   subsequent item through — including the first item that failed the
   predicate.
 
-  `DropWhileStage(element)` is the stage behind `Stream.drop_while/2`. It
+  `Stage.DropWhile(element)` is the stage behind `Stream.drop_while/2`. It
   tracks whether it is still in the dropping phase as an explicit boolean and
   reconstructs a fresh stage each step.
   """
 
-pub struct DropWhileStage(element) {
+pub struct Stage.DropWhile(element) {
   predicate :: Callable({element}, Bool)
   dropping :: Bool
 }
@@ -18,34 +18,34 @@ pub struct DropWhileStage(element) {
   satisfy the predicate, then pass everything through.
   """
 
-pub impl Stage(element, element) for DropWhileStage(element) {
+pub impl Stage(element, element) for Stage.DropWhile(element) {
   @doc = """
     While still dropping, emits nothing for items that satisfy the predicate;
     the first item that fails it flips the stage out of the dropping phase and
     is emitted, as is every item thereafter.
     """
 
-  pub fn step(stage :: unique DropWhileStage(element), item :: element) -> {Atom, [element], DropWhileStage(element)} {
-    DropWhileStage.decide(stage.predicate, stage.dropping, item)
+  pub fn step(stage :: unique Stage.DropWhile(element), item :: element) -> {Atom, [element], Stage.DropWhile(element)} {
+    Stage.DropWhile.decide(stage.predicate, stage.dropping, item)
   }
 
   @doc = """
     Emits nothing on flush — a drop-while buffers no state.
     """
 
-  pub fn flush(_stage :: unique DropWhileStage(element)) -> [element] {
+  pub fn flush(_stage :: unique Stage.DropWhile(element)) -> [element] {
     ([] :: [element])
   }
 
-  fn decide(predicate :: Callable({element}, Bool), dropping :: Bool, item :: element) -> {Atom, [element], DropWhileStage(element)} {
+  fn decide(predicate :: Callable({element}, Bool), dropping :: Bool, item :: element) -> {Atom, [element], Stage.DropWhile(element)} {
     if dropping {
       if Callable.call(predicate, {item}) {
-        {:cont, ([] :: [element]), %DropWhileStage(element){predicate: predicate, dropping: true}}
+        {:cont, ([] :: [element]), %Stage.DropWhile(element){predicate: predicate, dropping: true}}
       } else {
-        {:cont, [item], %DropWhileStage(element){predicate: predicate, dropping: false}}
+        {:cont, [item], %Stage.DropWhile(element){predicate: predicate, dropping: false}}
       }
     } else {
-      {:cont, [item], %DropWhileStage(element){predicate: predicate, dropping: false}}
+      {:cont, [item], %Stage.DropWhile(element){predicate: predicate, dropping: false}}
     }
   }
 }

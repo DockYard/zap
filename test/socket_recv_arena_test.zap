@@ -36,43 +36,43 @@ pub struct SocketRecvArenaTest {
   # ---- reset FIRES: discarding scalar fold totals every byte ----------------
 
   fn discard_total() -> i64 {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> -1
       Result.Ok(listener) -> SocketRecvArenaTest.discard_after_listen(listener)
     }
   }
 
-  fn discard_after_listen(listener :: SocketListener) -> i64 {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn discard_after_listen(listener :: Socket.Listener) -> i64 {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           -1
         }
       Result.Ok(client) -> SocketRecvArenaTest.discard_after_connect(listener, client)
     }
   }
 
-  fn discard_after_connect(listener :: SocketListener, client :: Socket) -> i64 {
+  fn discard_after_connect(listener :: Socket.Listener, client :: Socket) -> i64 {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           -1
         }
       Result.Ok(server) -> SocketRecvArenaTest.discard_exchange(listener, client, server)
     }
   }
 
-  fn discard_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> i64 {
+  fn discard_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> i64 {
     _sent = Socket.send(server, SocketRecvArenaTest.payload())
     _shut = Socket.shutdown(server, :write)
     outcome = Socket.fold(client, 0, 5000, &SocketRecvArenaTest.count_bytes/2)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     case outcome {
       Result.Ok(total) -> total
       Result.Error(_e) -> -1
@@ -86,43 +86,43 @@ pub struct SocketRecvArenaTest {
   # ---- reset SUPPRESSED: retained tuple keeps the first chunk byte-exact -----
 
   fn retained_first_chunk() -> Atom {
-    case Socket.listen(SocketAddress.loopback(0), 8) {
+    case Socket.listen(Socket.Address.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
       Result.Ok(listener) -> SocketRecvArenaTest.retained_after_listen(listener)
     }
   }
 
-  fn retained_after_listen(listener :: SocketListener) -> Atom {
-    port = SocketListener.local_port(listener)
-    case Socket.connect(SocketAddress.loopback(port), 5000) {
+  fn retained_after_listen(listener :: Socket.Listener) -> Atom {
+    port = Socket.Listener.local_port(listener)
+    case Socket.connect(Socket.Address.loopback(port), 5000) {
       Result.Error(_e) ->
         {
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :connect_failed
         }
       Result.Ok(client) -> SocketRecvArenaTest.retained_after_connect(listener, client)
     }
   }
 
-  fn retained_after_connect(listener :: SocketListener, client :: Socket) -> Atom {
+  fn retained_after_connect(listener :: Socket.Listener, client :: Socket) -> Atom {
     case Socket.accept(listener) {
       Result.Error(_e) ->
         {
           _c = Socket.close(client)
-          _l = SocketListener.close(listener)
+          _l = Socket.Listener.close(listener)
           :accept_failed
         }
       Result.Ok(server) -> SocketRecvArenaTest.retained_exchange(listener, client, server)
     }
   }
 
-  fn retained_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
+  fn retained_exchange(listener :: Socket.Listener, client :: Socket, server :: Socket) -> Atom {
     _sent = Socket.send(server, SocketRecvArenaTest.payload())
     _shut = Socket.shutdown(server, :write)
     outcome = Socket.fold(client, {:pending, ""}, 5000, &SocketRecvArenaTest.keep_first/2)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
-    _c3 = SocketListener.close(listener)
+    _c3 = Socket.Listener.close(listener)
     case outcome {
       Result.Ok(pair) -> SocketRecvArenaTest.verify_first(pair)
       Result.Error(_e) -> :fold_error

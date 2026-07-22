@@ -281,7 +281,7 @@ pub struct Zap.StreamStep0ProbeTest {
     }
   }
 
-  describe("zero-field EmptyStage sentinel") {
+  describe("zero-field Stage.Empty sentinel") {
     test("step returns fresh sentinel + halt, flush returns empty") {
       assert_no_memory_faults {
         assert(probe_empty_stage_ok())

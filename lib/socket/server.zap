@@ -1,5 +1,5 @@
 @doc = """
-  Options for a `SocketServer` acceptor loop.
+  Options for a `Socket.Server` acceptor loop.
 
   - `accept_poll_ms` — the bounded-`accept` deadline the acceptor loops on
     (`Socket.accept(listener, accept_poll_ms)`). It is NOT a connection timeout:
@@ -9,59 +9,59 @@
     pending-kill), so the poll deadline is what makes shutdown responsive. Small
     values (25–100 ms) trade a little idle wakeup for prompt shutdown.
   - `max_connections` — the per-acceptor admission cap (`0` = unbounded). At the
-    cap the acceptor STOPS ACCEPTING (`SocketServer.at_capacity?` /
+    cap the acceptor STOPS ACCEPTING (`Socket.Server.at_capacity?` /
     `wait_for_slot`), resuming only when a handler EXIT frees a slot — the Job 5
     Ranch-style load-shedding, so a burst is absorbed by the kernel backlog
     rather than accepted-then-reset.
-  - `shutdown_timeout_ms` — the drain grace period (`SocketServer.drain`) an
+  - `shutdown_timeout_ms` — the drain grace period (`Socket.Server.drain`) an
     acceptor gives its in-flight handlers to finish before force-killing the
     stragglers — the Job 4 coordinated graceful drain.
 
-  Build with `SocketServer.options/3` or `SocketServer.default_options/0`.
+  Build with `Socket.Server.options/3` or `Socket.Server.default_options/0`.
   """
 
 @available_on(:network)
 
-pub struct SocketServerOptions {
+pub struct Socket.ServerOptions {
   accept_poll_ms :: i64
   max_connections :: i64
   shutdown_timeout_ms :: i64
 }
 
 @doc = """
-  The live state of a `SocketServer` acceptor loop, threaded through the user's
+  The live state of a `Socket.Server` acceptor loop, threaded through the user's
   loop as plain data (no function values — the same inverted-control constraint
   `Supervisor` lives under).
 
   - `live_pids` — the raw pid bits of the handlers currently serving a
-    connection. A handler is added by `SocketServer.admitted` when the acceptor
+    connection. A handler is added by `Socket.Server.admitted` when the acceptor
     `spawn_link`s + `send_move`s it a connection, and removed by
-    `SocketServer.reap_signals` when its EXIT signal is reaped. Its length is the
-    live connection count (`SocketServer.live_count`).
+    `Socket.Server.reap_signals` when its EXIT signal is reaped. Its length is the
+    live connection count (`Socket.Server.live_count`).
   - `draining` — set once `reap_signals` observes a shutdown order (an exit signal
     from a NON-handler — the supervisor or parent terminating the acceptor). The
-    user's loop reads it (`SocketServer.draining?`) to leave the accept loop.
-  - `options` — the fixed `SocketServerOptions`, carried so the loop can read
+    user's loop reads it (`Socket.Server.draining?`) to leave the accept loop.
+  - `options` — the fixed `Socket.ServerOptions`, carried so the loop can read
     `accept_poll_ms` from state and the Job 4/5 policies (drain, capacity) have a
     single source once they land.
 
-  Construct with `SocketServer.init`; evolve it only through
-  `SocketServer.admitted` and `SocketServer.reap_signals`.
+  Construct with `Socket.Server.init`; evolve it only through
+  `Socket.Server.admitted` and `Socket.Server.reap_signals`.
   """
 
 @available_on(:network)
 
-pub struct SocketServerState {
+pub struct Socket.ServerState {
   live_pids :: List(u64)
   draining :: Bool
-  options :: SocketServerOptions
+  options :: Socket.ServerOptions
 }
 
 @doc = """
-  `SocketServer` — the pure POLICY half of the acceptor/handler server pattern,
+  `Socket.Server` — the pure POLICY half of the acceptor/handler server pattern,
   written in Zap over the process signal intrinsics, mirroring `Supervisor`'s
   inverted-control style. It is NOT a runtime primitive and it does NOT own the
-  loop: a function value cannot be stored or threaded in Zap, so `SocketServer`
+  loop: a function value cannot be stored or threaded in Zap, so `Socket.Server`
   owns the data transforms (`init`, `admitted`, `reap_signals`, the accessors)
   and YOUR acceptor process owns the ~20-line loop that actually `accept`s,
   `spawn_link`s a handler, and `send_move`s it the connection.
@@ -71,24 +71,24 @@ pub struct SocketServerState {
   A supervised ACCEPTOR process OWNS the listener and TRAPS EXITS — it is the
   connection mini-supervisor. It loops:
 
-      state = SocketServer.reap_signals(state)          # reap dead handlers / see shutdown
-      case SocketServer.draining?(state) {
+      state = Socket.Server.reap_signals(state)          # reap dead handlers / see shutdown
+      case Socket.Server.draining?(state) {
         true  ->                                          # drain (Job 4): close the listener so
           {                                               # new connects are refused, then let the
-            _closed  = SocketListener.close(listener)     # in-flight handlers finish (grace) and
-            _drained = SocketServer.drain(state)          # force-kill any stragglers, then exit.
+            _closed  = Socket.Listener.close(listener)     # in-flight handlers finish (grace) and
+            _drained = Socket.Server.drain(state)          # force-kill any stragglers, then exit.
             Process.exit_with(:normal)
           }
         false ->
-          case SocketServer.at_capacity?(state) {         # capacity (Job 5): at the cap, STOP
-            true  -> loop(SocketServer.wait_for_slot(state))  # ACCEPTING — park until a slot frees.
+          case Socket.Server.at_capacity?(state) {         # capacity (Job 5): at the cap, STOP
+            true  -> loop(Socket.Server.wait_for_slot(state))  # ACCEPTING — park until a slot frees.
             false ->
               case Socket.accept(listener, state.options.accept_poll_ms) {
                 Result.Ok(conn) ->
                   {
                     handler = Process.spawn_link(&MyServer.handler_entry/0)
                     _moved  = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
-                    loop(SocketServer.admitted(state, handler))
+                    loop(Socket.Server.admitted(state, handler))
                   }
                 Result.Error(_e) -> loop(state)           # :etimedout on a quiet poll — just re-loop
               }
@@ -128,13 +128,13 @@ pub struct SocketServerState {
   Two policies extend the loop:
 
   - **Drain (Job 4)** — when the acceptor observes a shutdown order it CLOSES
-    the listener (new connects get `ECONNREFUSED`), then `SocketServer.drain`
+    the listener (new connects get `ECONNREFUSED`), then `Socket.Server.drain`
     gives the in-flight handlers up to `shutdown_timeout_ms`
     (`wait_for_handlers`) to finish and force-kills any stragglers
     (`force_close_stragglers`) so every connection fd is reclaimed before it
     exits.
   - **Capacity (Job 5)** — with a non-zero `max_connections`, the acceptor
-    checks `SocketServer.at_capacity?` before accepting; at the cap it parks in
+    checks `Socket.Server.at_capacity?` before accepting; at the cap it parks in
     `wait_for_slot` (STOP ACCEPTING) until a handler EXIT frees a slot, so served
     concurrency never exceeds the cap and bursts are absorbed by the kernel
     backlog rather than accepted-then-reset.
@@ -145,7 +145,7 @@ pub struct SocketServerState {
   cores WITHOUT a shared listener (which would need listener multi-ownership —
   deferred), run a POOL of N acceptors, each OWNING ITS OWN listener fd bound to
   the SAME port via `SO_REUSEPORT` (`Socket.listen(address, backlog,
-  %SocketOptions{reuse_port: true})`). Single-owner Decision B still holds — each
+  %Socket.Options{reuse_port: true})`). Single-owner Decision B still holds — each
   acceptor owns its own fd; nothing is shared, and no kernel change is needed.
 
   - **Port coordination** — the FIRST acceptor binds port `0` (an ephemeral port)
@@ -161,7 +161,7 @@ pub struct SocketServerState {
   - **Pool drain** — a pool-wide drain closes EVERY acceptor's listener: signal
     each acceptor and each runs its OWN Job-4 drain (close its listener, let its
     in-flight handlers finish, force-kill stragglers).
-  - **max_connections** — a per-acceptor quota (`SocketServer.per_acceptor_cap`,
+  - **max_connections** — a per-acceptor quota (`Socket.Server.per_acceptor_cap`,
     `max / N`); an exact GLOBAL cap is a future counter-process refinement.
 
   ### Platform balance caveat
@@ -176,15 +176,15 @@ pub struct SocketServerState {
 
 @available_on(:network)
 
-pub struct SocketServer {
+pub struct Socket.Server {
   @doc = """
-    A `SocketServerOptions` from all three fields.
+    A `Socket.ServerOptions` from all three fields.
     """
 
   @available_on(:network)
 
-  pub fn options(accept_poll_ms :: i64, max_connections :: i64, shutdown_timeout_ms :: i64) -> SocketServerOptions {
-    %SocketServerOptions{accept_poll_ms: accept_poll_ms, max_connections: max_connections, shutdown_timeout_ms: shutdown_timeout_ms}
+  pub fn options(accept_poll_ms :: i64, max_connections :: i64, shutdown_timeout_ms :: i64) -> Socket.ServerOptions {
+    %Socket.ServerOptions{accept_poll_ms: accept_poll_ms, max_connections: max_connections, shutdown_timeout_ms: shutdown_timeout_ms}
   }
 
   @doc = """
@@ -194,15 +194,15 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn default_options() -> SocketServerOptions {
-    SocketServer.options(50, 0, 5000)
+  pub fn default_options() -> Socket.ServerOptions {
+    Socket.Server.options(50, 0, 5000)
   }
 
   @doc = """
     The per-acceptor `max_connections` quota for a `SO_REUSEPORT` acceptor POOL
     (Job 6) of `pool_size` acceptors sharing a global `total_max` admission
     budget — the "each acceptor caps at `max / N`" policy. Give each acceptor's
-    `SocketServerOptions` this value (as its `max_connections`) so the pool's
+    `Socket.ServerOptions` this value (as its `max_connections`) so the pool's
     aggregate served concurrency stays near `total_max` WITHOUT any cross-acceptor
     coordination.
 
@@ -223,10 +223,10 @@ pub struct SocketServer {
 
     ## Examples
 
-        SocketServer.per_acceptor_cap(9, 3)    # => 3
-        SocketServer.per_acceptor_cap(10, 3)   # => 3   (floor)
-        SocketServer.per_acceptor_cap(2, 4)    # => 1   (never zero when max > 0)
-        SocketServer.per_acceptor_cap(0, 4)    # => 0   (unbounded)
+        Socket.Server.per_acceptor_cap(9, 3)    # => 3
+        Socket.Server.per_acceptor_cap(10, 3)   # => 3   (floor)
+        Socket.Server.per_acceptor_cap(2, 4)    # => 1   (never zero when max > 0)
+        Socket.Server.per_acceptor_cap(0, 4)    # => 0   (unbounded)
     """
 
   @available_on(:network)
@@ -252,17 +252,17 @@ pub struct SocketServer {
   @doc = """
     Begin an acceptor loop: TRAP EXITS (so a `spawn_link`ed handler's death
     arrives as a reap-able signal instead of cascading) and return the initial
-    `SocketServerState` — no live handlers, not draining. Call it at the top of
+    `Socket.ServerState` — no live handlers, not draining. Call it at the top of
     your acceptor entry, right after it binds/adopts the listener, then drive the
-    loop with `Socket.accept`, `SocketServer.admitted`, and
-    `SocketServer.reap_signals`.
+    loop with `Socket.accept`, `Socket.Server.admitted`, and
+    `Socket.Server.reap_signals`.
     """
 
   @available_on(:network)
 
-  pub fn init(options :: SocketServerOptions) -> SocketServerState {
+  pub fn init(options :: Socket.ServerOptions) -> Socket.ServerState {
     _trapped = Process.trap_exit(true)
-    %SocketServerState{live_pids: (List.new_empty(8) :: List(u64)), draining: false, options: options}
+    %Socket.ServerState{live_pids: (List.new_empty(8) :: List(u64)), draining: false, options: options}
   }
 
   @doc = """
@@ -274,8 +274,8 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn admitted(state :: SocketServerState, pid :: u64) -> SocketServerState {
-    %SocketServerState{live_pids: List.push(state.live_pids, pid), draining: state.draining, options: state.options}
+  pub fn admitted(state :: Socket.ServerState, pid :: u64) -> Socket.ServerState {
+    %Socket.ServerState{live_pids: List.push(state.live_pids, pid), draining: state.draining, options: state.options}
   }
 
   @doc = """
@@ -297,17 +297,17 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn reap_signals(state :: SocketServerState) -> SocketServerState {
+  pub fn reap_signals(state :: Socket.ServerState) -> Socket.ServerState {
     case :zig.ProcessRuntime.await_signal_timeout(0) {
       false -> state
       true ->
         {
           from = Process.last_signal_from()
-          next = case SocketServer.contains_pid(state.live_pids, from, 0, List.length(state.live_pids)) {
-            true -> SocketServer.retire(state, from)
-            false -> SocketServer.mark_draining(state)
+          next = case Socket.Server.contains_pid(state.live_pids, from, 0, List.length(state.live_pids)) {
+            true -> Socket.Server.retire(state, from)
+            false -> Socket.Server.mark_draining(state)
           }
-          SocketServer.reap_signals(next)
+          Socket.Server.reap_signals(next)
         }
     }
   }
@@ -320,7 +320,7 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn draining?(state :: SocketServerState) -> Bool {
+  pub fn draining?(state :: Socket.ServerState) -> Bool {
     state.draining
   }
 
@@ -332,7 +332,7 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn live_count(state :: SocketServerState) -> i64 {
+  pub fn live_count(state :: Socket.ServerState) -> i64 {
     List.length(state.live_pids)
   }
 
@@ -345,7 +345,7 @@ pub struct SocketServer {
 
     An acceptor that finds itself `at_capacity?` must NOT `accept` — accepting
     would admit a `(cap + 1)`th connection. Instead it parks in
-    `SocketServer.wait_for_slot` until a handler EXIT frees a slot. This is the
+    `Socket.Server.wait_for_slot` until a handler EXIT frees a slot. This is the
     Ranch "stop accepting at the cap" model: the kernel `listen` backlog absorbs
     inbound bursts and the OS refuses only what overflows the backlog, so a
     connection is never accepted-then-immediately-reset (no accept/RST churn).
@@ -353,10 +353,10 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn at_capacity?(state :: SocketServerState) -> Bool {
+  pub fn at_capacity?(state :: Socket.ServerState) -> Bool {
     case state.options.max_connections <= 0 {
       true -> false
-      false -> SocketServer.live_count(state) >= state.options.max_connections
+      false -> Socket.Server.live_count(state) >= state.options.max_connections
     }
   }
 
@@ -382,15 +382,15 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn wait_for_slot(state :: SocketServerState) -> SocketServerState {
+  pub fn wait_for_slot(state :: Socket.ServerState) -> Socket.ServerState {
     case :zig.ProcessRuntime.await_signal_timeout(state.options.accept_poll_ms) {
       false -> state
       true ->
         {
           from = Process.last_signal_from()
-          case SocketServer.contains_pid(state.live_pids, from, 0, List.length(state.live_pids)) {
-            true -> SocketServer.retire(state, from)
-            false -> SocketServer.mark_draining(state)
+          case Socket.Server.contains_pid(state.live_pids, from, 0, List.length(state.live_pids)) {
+            true -> Socket.Server.retire(state, from)
+            false -> Socket.Server.mark_draining(state)
           }
         }
     }
@@ -417,10 +417,10 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn drain(state :: SocketServerState) -> SocketServerState {
+  pub fn drain(state :: Socket.ServerState) -> Socket.ServerState {
     deadline = Process.monotonic_millis() + state.options.shutdown_timeout_ms
-    waited = SocketServer.wait_for_handlers(state, deadline)
-    SocketServer.force_close_stragglers(waited)
+    waited = Socket.Server.wait_for_handlers(state, deadline)
+    Socket.Server.force_close_stragglers(waited)
   }
 
   @doc = """
@@ -439,8 +439,8 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn wait_for_handlers(state :: SocketServerState, deadline_ms :: i64) -> SocketServerState {
-    case SocketServer.live_count(state) <= 0 {
+  pub fn wait_for_handlers(state :: Socket.ServerState, deadline_ms :: i64) -> Socket.ServerState {
+    case Socket.Server.live_count(state) <= 0 {
       true -> state
       false ->
         {
@@ -453,11 +453,11 @@ pub struct SocketServer {
                 true ->
                   {
                     from = Process.last_signal_from()
-                    next = case SocketServer.contains_pid(state.live_pids, from, 0, List.length(state.live_pids)) {
-                      true -> SocketServer.retire(state, from)
+                    next = case Socket.Server.contains_pid(state.live_pids, from, 0, List.length(state.live_pids)) {
+                      true -> Socket.Server.retire(state, from)
                       false -> state
                     }
-                    SocketServer.wait_for_handlers(next, deadline_ms)
+                    Socket.Server.wait_for_handlers(next, deadline_ms)
                   }
               }
           }
@@ -480,11 +480,11 @@ pub struct SocketServer {
 
   @available_on(:network)
 
-  pub fn force_close_stragglers(state :: SocketServerState) -> SocketServerState {
+  pub fn force_close_stragglers(state :: Socket.ServerState) -> Socket.ServerState {
     victims = state.live_pids
-    _killed = SocketServer.kill_all(victims, 0, List.length(victims))
-    _reaped = SocketServer.reap_all(victims)
-    %SocketServerState{live_pids: (List.new_empty(8) :: List(u64)), draining: state.draining, options: state.options}
+    _killed = Socket.Server.kill_all(victims, 0, List.length(victims))
+    _reaped = Socket.Server.reap_all(victims)
+    %Socket.ServerState{live_pids: (List.new_empty(8) :: List(u64)), draining: state.draining, options: state.options}
   }
 
   @doc = """
@@ -497,7 +497,7 @@ pub struct SocketServer {
       true ->
         {
           _k = Process.kill(List.at(pids, index))
-          SocketServer.kill_all(pids, index + 1, total)
+          Socket.Server.kill_all(pids, index + 1, total)
         }
       false -> true
     }
@@ -518,7 +518,7 @@ pub struct SocketServer {
         {
           _r = Process.await_signal()
           from = Process.last_signal_from()
-          SocketServer.reap_all(SocketServer.list_without(remaining, from, 0, List.length(remaining), (List.new_empty(List.length(remaining)) :: List(u64))))
+          Socket.Server.reap_all(Socket.Server.list_without(remaining, from, 0, List.length(remaining), (List.new_empty(List.length(remaining)) :: List(u64))))
         }
     }
   }
@@ -528,16 +528,16 @@ pub struct SocketServer {
     `reap_signals`.
     """
 
-  fn retire(state :: SocketServerState, pid :: u64) -> SocketServerState {
-    %SocketServerState{live_pids: SocketServer.list_without(state.live_pids, pid, 0, List.length(state.live_pids), (List.new_empty(List.length(state.live_pids)) :: List(u64))), draining: state.draining, options: state.options}
+  fn retire(state :: Socket.ServerState, pid :: u64) -> Socket.ServerState {
+    %Socket.ServerState{live_pids: Socket.Server.list_without(state.live_pids, pid, 0, List.length(state.live_pids), (List.new_empty(List.length(state.live_pids)) :: List(u64))), draining: state.draining, options: state.options}
   }
 
   @doc = """
     Return `state` with `draining` set. Internal to `reap_signals`.
     """
 
-  fn mark_draining(state :: SocketServerState) -> SocketServerState {
-    %SocketServerState{live_pids: state.live_pids, draining: true, options: state.options}
+  fn mark_draining(state :: Socket.ServerState) -> Socket.ServerState {
+    %Socket.ServerState{live_pids: state.live_pids, draining: true, options: state.options}
   }
 
   @doc = """
@@ -549,7 +549,7 @@ pub struct SocketServer {
       true ->
         case List.at(pids, index) == target {
           true -> true
-          false -> SocketServer.contains_pid(pids, target, index + 1, total)
+          false -> Socket.Server.contains_pid(pids, target, index + 1, total)
         }
       false -> false
     }
@@ -569,7 +569,7 @@ pub struct SocketServer {
             true -> collected
             false -> List.push(collected, pid)
           }
-          SocketServer.list_without(pids, target, index + 1, total, next_collected)
+          Socket.Server.list_without(pids, target, index + 1, total, next_collected)
         }
       false -> collected
     }

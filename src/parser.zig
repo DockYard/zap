@@ -3069,7 +3069,11 @@ pub const Parser = struct {
         receiver: *const ast.Expr,
     ) !?*const ast.Expr {
         if (receiver.* != .struct_ref) return null;
-        if (receiver.struct_ref.name.parts.len != 1) return null;
+        // The base may be a DOTTED union name (`Stream.UnfoldStep(e, a).Continue`,
+        // the lib namespacing convention) — any number of leading components is
+        // a valid union qualifier; the trailing component after the type-args
+        // is the variant.
+        if (receiver.struct_ref.name.parts.len < 1) return null;
         if (receiver.struct_ref.type_args.len != 0) return null;
         if (!self.check(.left_paren)) return null;
 
@@ -3118,10 +3122,10 @@ pub const Parser = struct {
         const variant_tok = try self.expect(.type_identifier);
         const variant_name = try self.internToken(variant_tok);
 
-        const base_part = receiver.struct_ref.name.parts[0];
-        const combined_parts = try self.allocator.alloc(ast.StringId, 2);
-        combined_parts[0] = base_part;
-        combined_parts[1] = variant_name;
+        const base_parts = receiver.struct_ref.name.parts;
+        const combined_parts = try self.allocator.alloc(ast.StringId, base_parts.len + 1);
+        @memcpy(combined_parts[0..base_parts.len], base_parts);
+        combined_parts[base_parts.len] = variant_name;
         const combined_span = ast.SourceSpan.merge(
             receiver.struct_ref.meta.span,
             ast.SourceSpan.from(variant_tok.loc),
@@ -5060,18 +5064,39 @@ pub const Parser = struct {
                 if (try self.tryParseInstantiatedVariantPattern(ast.SourceSpan.from(tok.loc), try self.internToken(tok))) |constructed| {
                     return constructed;
                 }
-                // Struct-qualified enum pattern: Color.Red
+                // Struct-qualified enum / union-variant pattern. The
+                // qualifier may itself be DOTTED (the lib namespacing
+                // convention declares unions as `pub union Socket.Recv`),
+                // so accumulate `A.B.…` components while every consumed
+                // component is followed by ANOTHER dot; the FINAL
+                // component is the variant and everything before it joins
+                // into the union's declared (possibly dotted) name,
+                // carried as ONE interned qualifier part so downstream
+                // union lookup sees exactly the declared name.
                 if (self.check(.dot)) {
-                    _ = self.advance(); // consume '.'
-                    if (self.check(.identifier) or self.check(.type_identifier)) {
-                        const variant_tok = self.advance();
+                    var dotted_base: std.ArrayListUnmanaged(u8) = .empty;
+                    defer dotted_base.deinit(self.allocator);
+                    try dotted_base.appendSlice(self.allocator, tok.slice(self.source));
+                    var matched_variant: ?Token = null;
+                    while (self.check(.dot)) {
+                        _ = self.advance(); // consume '.'
+                        if (!(self.check(.identifier) or self.check(.type_identifier))) break;
+                        const component_tok = self.advance();
+                        if (self.check(.dot)) {
+                            try dotted_base.append(self.allocator, '.');
+                            try dotted_base.appendSlice(self.allocator, component_tok.slice(self.source));
+                            continue;
+                        }
+                        matched_variant = component_tok;
+                        break;
+                    }
+                    if (matched_variant) |variant_tok| {
                         const variant_text = variant_tok.slice(self.source);
-                        // Same payload lookahead and case-arm routing
-                        // as the identifier branch.
+                        const base_name = try self.interner.intern(dotted_base.items);
                         if (self.check(.left_paren)) {
                             return try self.parseTaggedUnionVariantPatternPayload(
                                 ast.SourceSpan.from(tok.loc),
-                                try self.internToken(tok),
+                                base_name,
                                 try self.interner.intern(variant_text),
                                 &.{},
                             );
@@ -5079,7 +5104,7 @@ pub const Parser = struct {
                         if (self.case_arm_pattern_context) {
                             return try self.buildBareTaggedUnionVariantPattern(
                                 ast.SourceSpan.from(tok.loc),
-                                try self.internToken(tok),
+                                base_name,
                                 try self.interner.intern(variant_text),
                                 ast.SourceSpan.from(variant_tok.loc),
                             );
@@ -9436,6 +9461,52 @@ test "parse tagged-union variant pattern with single-bind payload" {
     try std.testing.expectEqualStrings("Option", parser.interner.get(arm1.qualifier.parts[0]));
     try std.testing.expectEqualStrings("None", parser.interner.get(arm1.qualifier.parts[1]));
     try std.testing.expectEqual(@as(usize, 0), arm1.type_args.len);
+    try std.testing.expect(arm1.payload == null);
+}
+
+test "parse DOTTED-union variant pattern (payload + bare): Socket.Recv.Chunk(bytes)" {
+    // A union DECLARED with a dotted name (`pub union Socket.Recv { ... }`,
+    // the lib namespacing convention) is matched with a THREE-component
+    // pattern: the final component is the variant, everything before it is
+    // the dotted union name, carried as ONE interned qualifier part so the
+    // downstream union lookup sees exactly the declared name.
+    const source =
+        \\pub struct Demo {
+        \\  pub fn drain(r :: Socket.Recv) -> String {
+        \\    case r {
+        \\      Socket.Recv.Chunk(bytes) -> bytes
+        \\      Socket.Recv.Closed -> ""
+        \\    }
+        \\  }
+        \\}
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = try Parser.init(arena.allocator(), source);
+    defer parser.deinit();
+    const program = try parser.parseProgram();
+    const body = program.structs[0].items[0].function.clauses[0].body.?;
+    const case_expr = body[0].expr;
+    try std.testing.expect(case_expr.* == .case_expr);
+    const clauses = case_expr.case_expr.clauses;
+    try std.testing.expectEqual(@as(usize, 2), clauses.len);
+
+    // Arm 0: Socket.Recv.Chunk(bytes) — payload form.
+    try std.testing.expect(clauses[0].pattern.* == .tagged_union_variant);
+    const arm0 = clauses[0].pattern.tagged_union_variant;
+    try std.testing.expectEqual(@as(usize, 2), arm0.qualifier.parts.len);
+    try std.testing.expectEqualStrings("Socket.Recv", parser.interner.get(arm0.qualifier.parts[0]));
+    try std.testing.expectEqualStrings("Chunk", parser.interner.get(arm0.qualifier.parts[1]));
+    try std.testing.expect(arm0.payload != null);
+    try std.testing.expect(arm0.payload.?.* == .bind);
+    try std.testing.expectEqualStrings("bytes", parser.interner.get(arm0.payload.?.bind.name));
+
+    // Arm 1: Socket.Recv.Closed — bare form.
+    try std.testing.expect(clauses[1].pattern.* == .tagged_union_variant);
+    const arm1 = clauses[1].pattern.tagged_union_variant;
+    try std.testing.expectEqual(@as(usize, 2), arm1.qualifier.parts.len);
+    try std.testing.expectEqualStrings("Socket.Recv", parser.interner.get(arm1.qualifier.parts[0]));
+    try std.testing.expectEqualStrings("Closed", parser.interner.get(arm1.qualifier.parts[1]));
     try std.testing.expect(arm1.payload == null);
 }
 

@@ -35,13 +35,13 @@ pub struct Concurrency.TlsServerTest {
 
   pub fn acceptor_entry() -> Nil {
     config = %TlsServerConfig{cert_pem: Concurrency.TlsServerTest.cert_pem(), key_pem: Concurrency.TlsServerTest.key_pem(), alpn: ["http/1.1"]}
-    case Tls.listen(SocketAddress.loopback(0), config, 128) {
+    case Tls.listen(Socket.Address.loopback(0), config, 128) {
       Result.Error(_e) -> nil
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           _reported = Process.send(:tls_echo_coordinator, port)
-          state = SocketServer.init(SocketServer.options(50, 0, 5000))
+          state = Socket.Server.init(Socket.Server.options(50, 0, 5000))
           Concurrency.TlsServerTest.acceptor_loop(state, listener)
         }
     }
@@ -51,13 +51,13 @@ pub struct Concurrency.TlsServerTest {
   # handshake the next connection. A SINGLE self-recursive function so the
   # compiler loopifies it into a constant-stack loop (an unbounded connection
   # lifetime never overflows the fiber stack).
-  fn acceptor_loop(state :: SocketServerState, listener :: SocketListener) -> Nil {
-    reaped = SocketServer.reap_signals(state)
-    case SocketServer.draining?(reaped) {
+  fn acceptor_loop(state :: Socket.ServerState, listener :: Socket.Listener) -> Nil {
+    reaped = Socket.Server.reap_signals(state)
+    case Socket.Server.draining?(reaped) {
       true ->
         {
-          _closed = SocketListener.close(listener)
-          _drained = SocketServer.drain(reaped)
+          _closed = Socket.Listener.close(listener)
+          _drained = Socket.Server.drain(reaped)
           Process.exit_with(:normal)
         }
       false ->
@@ -68,7 +68,7 @@ pub struct Concurrency.TlsServerTest {
             {
               handler = Process.spawn_link(&Concurrency.TlsServerTest.handler_entry/0)
               _moved = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
-              Concurrency.TlsServerTest.acceptor_loop(SocketServer.admitted(reaped, handler), listener)
+              Concurrency.TlsServerTest.acceptor_loop(Socket.Server.admitted(reaped, handler), listener)
             }
           # `:etimedout` on a quiet poll (the common case), or a handshake failure
           # from a hostile/aborted client — just loop, re-reaping.
@@ -92,22 +92,22 @@ pub struct Concurrency.TlsServerTest {
 
   fn echo_serve(conn :: Socket) -> Nil {
     case Socket.recv(conn, 0, 5000) {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         {
           _sent = Socket.send(conn, bytes)
           Concurrency.TlsServerTest.echo_serve(conn)
         }
-      SocketRecv.Closed ->
+      Socket.Recv.Closed ->
         {
           _c = Socket.close(conn)
           nil
         }
-      SocketRecv.TimedOut(_partial) ->
+      Socket.Recv.TimedOut(_partial) ->
         {
           _c = Socket.close(conn)
           nil
         }
-      SocketRecv.Failed(_error) ->
+      Socket.Recv.Failed(_error) ->
         {
           _c = Socket.close(conn)
           nil
@@ -140,14 +140,14 @@ pub struct Concurrency.TlsServerTest {
   fn client_exchange(client :: Socket, payload :: String) -> Atom {
     _sent = Socket.send(client, payload)
     verdict = case Socket.recv(client, String.length(payload), 5000) {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         case bytes == payload {
           true -> (1 :: i64)
           false -> (0 :: i64)
         }
-      SocketRecv.TimedOut(_partial) -> (0 :: i64)
-      SocketRecv.Closed -> (0 :: i64)
-      SocketRecv.Failed(_error) -> (0 :: i64)
+      Socket.Recv.TimedOut(_partial) -> (0 :: i64)
+      Socket.Recv.Closed -> (0 :: i64)
+      Socket.Recv.Failed(_error) -> (0 :: i64)
     }
     _closed = Socket.close(client)
     _reported = Process.send(:tls_echo_coordinator, verdict)
@@ -192,14 +192,14 @@ pub struct Concurrency.TlsServerTest {
           payload = "msg-" <> Integer.to_string(index)
           _sent = Socket.send(client, payload)
           case Socket.recv(client, String.length(payload), 5000) {
-            SocketRecv.Chunk(bytes) ->
+            Socket.Recv.Chunk(bytes) ->
               case bytes == payload {
                 true -> Concurrency.TlsServerTest.echo_n(client, remaining - 1, index + 1)
                 false -> (0 :: i64)
               }
-            SocketRecv.TimedOut(_p) -> (0 :: i64)
-            SocketRecv.Closed -> (0 :: i64)
-            SocketRecv.Failed(_e) -> (0 :: i64)
+            Socket.Recv.TimedOut(_p) -> (0 :: i64)
+            Socket.Recv.Closed -> (0 :: i64)
+            Socket.Recv.Failed(_e) -> (0 :: i64)
           }
         }
     }

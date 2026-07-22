@@ -2,8 +2,8 @@
   Regression tests for `Stream.with_index/1` over a source whose element type
   is itself a `List`. When `element = [i64]`, the stage's `output` is the
   tuple `{[i64], i64}` — a tuple that EMBEDS a list — and the demand-driven
-  `Transform` monomorphizes methods whose return type is
-  `{Atom, {[i64], i64}, Transform(...)}`: a tuple whose nested element is a
+  `Stream.Transform` monomorphizes methods whose return type is
+  `{Atom, {[i64], i64}, Stream.Transform(...)}`: a tuple whose nested element is a
   tuple embedding a list.
 
   Emitting that return type used to append the inner tuple's `tuple_decl`
@@ -11,7 +11,7 @@
   ret-ty body, so the fork's `Sema.resolveInst` found the `List(i64)` `typeof`
   unmapped and panicked on `inst_map.get(i).?` while resolving the generic
   return type. Driving the pipeline to completion (which also instantiates the
-  terminal `EmptyStage`) is what surfaced it, so every test here drives with
+  terminal `Stage.Empty`) is what surfaced it, so every test here drives with
   `Enum.to_list`.
 
   The nested `[i64]` payloads are heap-allocated flat buffers, so the

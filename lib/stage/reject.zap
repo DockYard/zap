@@ -1,11 +1,11 @@
 @doc = """
   A `Stage` that drops the items for which a predicate returns `true` — the
-  complement of `FilterStage`.
+  complement of `Stage.Filter`.
 
-  `RejectStage(element)` is the stage behind `Stream.reject/2`.
+  `Stage.Reject(element)` is the stage behind `Stream.reject/2`.
   """
 
-pub struct RejectStage(element) {
+pub struct Stage.Reject(element) {
   predicate :: Callable({element}, Bool)
 }
 
@@ -14,28 +14,28 @@ pub struct RejectStage(element) {
   `false`, otherwise emit nothing.
   """
 
-pub impl Stage(element, element) for RejectStage(element) {
+pub impl Stage(element, element) for Stage.Reject(element) {
   @doc = """
     Emits `[item]` when the predicate returns `false`, otherwise `[]`.
     """
 
-  pub fn step(stage :: unique RejectStage(element), item :: element) -> {Atom, [element], RejectStage(element)} {
-    RejectStage.decide(stage.predicate, item)
+  pub fn step(stage :: unique Stage.Reject(element), item :: element) -> {Atom, [element], Stage.Reject(element)} {
+    Stage.Reject.decide(stage.predicate, item)
   }
 
   @doc = """
     Emits nothing on flush — a reject buffers no state.
     """
 
-  pub fn flush(_stage :: unique RejectStage(element)) -> [element] {
+  pub fn flush(_stage :: unique Stage.Reject(element)) -> [element] {
     ([] :: [element])
   }
 
-  fn decide(predicate :: Callable({element}, Bool), item :: element) -> {Atom, [element], RejectStage(element)} {
+  fn decide(predicate :: Callable({element}, Bool), item :: element) -> {Atom, [element], Stage.Reject(element)} {
     if Callable.call(predicate, {item}) {
-      {:cont, ([] :: [element]), %RejectStage(element){predicate: predicate}}
+      {:cont, ([] :: [element]), %Stage.Reject(element){predicate: predicate}}
     } else {
-      {:cont, [item], %RejectStage(element){predicate: predicate}}
+      {:cont, [item], %Stage.Reject(element){predicate: predicate}}
     }
   }
 }

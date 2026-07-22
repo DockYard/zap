@@ -47,6 +47,10 @@ Zap is a general-purpose programming language. Features, behaviors, library func
 
 **All public Zap declarations MUST have `@doc` attributes.** Every `pub struct`, `pub union`, `pub protocol`, `pub fn`, and `pub macro` in `lib/*.zap` files must have an `@doc` heredoc describing what it does. No exceptions.
 
+## Naming and Namespacing
+
+**Stdlib type names are dotted namespaces that mirror the file path.** A declaration in `lib/<ns>/<name>.zap` is named `Ns.Name` — `lib/socket/server.zap` declares `Socket.Server`, `lib/stage/map.zap` declares `Stage.Map`, `lib/framer/error.zap` declares `Framer.Error`. Never concatenate the namespace into the identifier: `SocketServer`, `MapStage`, `FramingError`, and every other smashed-together form is WRONG. This applies to every declaration kind — structs, unions, protocols — and to every reference site (type annotations, constructors, patterns, docs, tests, examples). The namespace prefix does not have to be a struct; it may be a protocol (`Stage.Map` implements the `Stage` protocol) or a pure namespace. When adding a new stdlib type, pick the dotted name first, place the file at the matching path, and keep the two in lockstep — the compiler's `validateOneStructPerFile` enforces the path↔name correspondence.
+
 ## Zap Code Quality
 
 - **Blank line after every heredoc closing `"""`**. The `"""` must be followed by an empty line before the next declaration or attribute. No exceptions.

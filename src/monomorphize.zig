@@ -1443,10 +1443,16 @@ const MonomorphContext = struct {
             for (mod.functions) |*group| {
                 if (group.id != group_id) continue;
                 if (mod.name.parts.len == 0) return null;
+                // The FULL underscore-joined struct name — this is the
+                // defining struct's MODULE identity (`Stage.Map` →
+                // `Stage_Map`), consumed as `@import("<struct_name>")` by
+                // the vtable-instance renderer. The last part alone
+                // (`Map`) names no module for a namespaced struct.
+                const joined_module_name = mod.name.joinedWith(self.allocator, self.interner, "_") catch return null;
                 return .{
                     .group = group,
                     .struct_idx = mod_idx,
-                    .struct_name = self.interner.get(mod.name.parts[mod.name.parts.len - 1]),
+                    .struct_name = joined_module_name,
                 };
             }
         }

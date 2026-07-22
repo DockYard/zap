@@ -1,5 +1,5 @@
 @doc = """
-  `SocketRecv` — the EOF-safe result of a `Socket.recv` (Phase S1).
+  `Socket.Recv` — the EOF-safe result of a `Socket.recv` (Phase S1).
 
   The C `recv()` footgun is that a `0` return means end-of-stream, trivially
   confused with "no data yet" or an error — a bug that silently truncates
@@ -25,50 +25,50 @@
   ## Examples
 
       case Socket.recv(socket, 5000) {
-        SocketRecv.Chunk(bytes)     -> handle(bytes)
-        SocketRecv.TimedOut(partial) -> resume_with(partial)
-        SocketRecv.Closed           -> :eof
-        SocketRecv.Failed(error)    -> log(error)
+        Socket.Recv.Chunk(bytes)     -> handle(bytes)
+        Socket.Recv.TimedOut(partial) -> resume_with(partial)
+        Socket.Recv.Closed           -> :eof
+        Socket.Recv.Failed(error)    -> log(error)
       }
   """
 
 @available_on(:network)
 
-pub union SocketRecv {
+pub union Socket.Recv {
   Chunk :: String
   TimedOut :: String
   Closed
-  Failed :: SocketError
+  Failed :: Socket.Error
 }
 
 @doc = """
-  `SocketRecvDecoder` — the ONE shared decode core that turns a runtime `recv`
-  status code + bytes into the EOF-safe `SocketRecv` union.
+  `Socket.RecvDecoder` — the ONE shared decode core that turns a runtime `recv`
+  status code + bytes into the EOF-safe `Socket.Recv` union.
 
   It is a stateless namespace (no fields), the single point EVERY receive form
   routes its status → variant mapping through: `Socket.recv`/`recv_exact` (via
   `Socket.recv_from_handle`), `Socket.fold` (via its pull loop), and the
-  `SocketChunks` stream pull. Each form then maps the returned `SocketRecv` onto
+  `Socket.Chunks` stream pull. Each form then maps the returned `Socket.Recv` onto
   its own tail, so the mapping lives in ONE place and cannot drift between forms
   (the divergence that once made a `chunks` idle timeout a bare stream error
   while `recv` surfaced a resumable partial).
 
-  It lives on its OWN struct — depending on neither `Socket` nor `SocketChunks`
-  — precisely so BOTH can call it WITHOUT a `Socket ↔ SocketChunks` mutual
+  It lives on its OWN struct — depending on neither `Socket` nor `Socket.Chunks`
+  — precisely so BOTH can call it WITHOUT a `Socket ↔ Socket.Chunks` mutual
   struct cycle (the dependency the codegen cannot yet resolve). This is the same
-  neutral-home pattern `SocketError.reason_from_code` uses to keep `Socket` and
-  `SocketListener` decoupled.
+  neutral-home pattern `Socket.Error.reason_from_code` uses to keep `Socket` and
+  `Socket.Listener` decoupled.
 
   ## Examples
 
-      SocketRecvDecoder.decode(0, "hi")   # => SocketRecv.Chunk("hi")
+      Socket.RecvDecoder.decode(0, "hi")   # => Socket.Recv.Chunk("hi")
   """
 
 @available_on(:network)
 
-pub struct SocketRecvDecoder {
+pub struct Socket.RecvDecoder {
   @doc = """
-    Decodes a `recv` status code + `bytes` into the EOF-safe `SocketRecv` union.
+    Decodes a `recv` status code + `bytes` into the EOF-safe `Socket.Recv` union.
     `0` = a data `Chunk` (always ≥ 1 byte); a NEGATIVE status = clean `Closed`
     (EOF); status `2` = an idle `TimedOut(partial)` — `bytes` is the already-
     consumed prefix, EMPTY for a next-available pull that read nothing, surfaced
@@ -78,21 +78,21 @@ pub struct SocketRecvDecoder {
 
     ## Examples
 
-        SocketRecvDecoder.decode(2, "")   # => SocketRecv.TimedOut("")
+        Socket.RecvDecoder.decode(2, "")   # => Socket.Recv.TimedOut("")
     """
 
   @available_on(:network)
 
-  pub fn decode(status :: i64, bytes :: String) -> SocketRecv {
+  pub fn decode(status :: i64, bytes :: String) -> Socket.Recv {
     case status == 0 {
-      true -> SocketRecv.Chunk(bytes)
+      true -> Socket.Recv.Chunk(bytes)
       false ->
         case status < 0 {
-          true -> SocketRecv.Closed
+          true -> Socket.Recv.Closed
           false ->
             case status == 2 {
-              true -> SocketRecv.TimedOut(bytes)
-              false -> SocketRecv.Failed(SocketError.from_code(status))
+              true -> Socket.Recv.TimedOut(bytes)
+              false -> Socket.Recv.Failed(Socket.Error.from_code(status))
             }
         }
     }
@@ -101,7 +101,7 @@ pub struct SocketRecvDecoder {
 
 
 @doc = """
-  `SocketRecvBlob` — the `Blob`-carrying analogue of `SocketRecv` for the
+  `Socket.RecvBlob` — the `Blob`-carrying analogue of `Socket.Recv` for the
   zero-copy large-body path (`Socket.recv_blob`).
 
   Identical EOF-safe shape, but a `Chunk` carries a `Blob` (the shared,
@@ -115,18 +115,18 @@ pub struct SocketRecvDecoder {
   ## Examples
 
       case Socket.recv_blob(socket, 65536, 5000) {
-        SocketRecvBlob.Chunk(body)     -> forward(body)
-        SocketRecvBlob.TimedOut(partial) -> resume_with(partial)
-        SocketRecvBlob.Closed          -> :eof
-        SocketRecvBlob.Failed(error)   -> log(error)
+        Socket.RecvBlob.Chunk(body)     -> forward(body)
+        Socket.RecvBlob.TimedOut(partial) -> resume_with(partial)
+        Socket.RecvBlob.Closed          -> :eof
+        Socket.RecvBlob.Failed(error)   -> log(error)
       }
   """
 
 @available_on(:network)
 
-pub union SocketRecvBlob {
+pub union Socket.RecvBlob {
   Chunk :: Blob
   TimedOut :: Blob
   Closed
-  Failed :: SocketError
+  Failed :: Socket.Error
 }

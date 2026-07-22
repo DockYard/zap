@@ -2683,7 +2683,7 @@ test "CLI script: Socket.listen with an out-of-range backlog is rejected cleanly
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "socket_backlog.zap",
         \\fn main(_args :: [String]) -> u8 {
-        \\  _r = Socket.listen(SocketAddress.loopback(0), 999999999)
+        \\  _r = Socket.listen(Socket.Address.loopback(0), 999999999)
         \\  0
         \\}
     , &.{});
@@ -2700,7 +2700,7 @@ test "CLI script: Socket.listen with an out-of-range port is rejected cleanly (p
 
     var r = try runScriptInTmp(allocator, &tmp_dir, "socket_port.zap",
         \\fn main(_args :: [String]) -> u8 {
-        \\  _r = Socket.listen(SocketAddress.loopback(70000), 8)
+        \\  _r = Socket.listen(Socket.Address.loopback(70000), 8)
         \\  0
         \\}
     , &.{});
@@ -4154,7 +4154,7 @@ test "boxed-existential struct field: PARAMETRIC iterating adapter is leak-free 
     // drive) AND early-disposed (`Enum.take`, the partial path) — every boxed
     // field must be released exactly once on both paths:
     //   * a box-only parametric adapter (the misclassified shape), and
-    //   * a two-boxed-field parametric `Transform` adapter
+    //   * a two-boxed-field parametric `Stream.Transform` adapter
     //     (`source :: Enumerable(input)`, `stage :: Stage(input, output)`) with
     //     a bare `[output]` List buffer and String payloads, applying the stage
     //     per item.
@@ -4280,7 +4280,7 @@ test "boxed-existential struct field: PARAMETRIC iterating adapter is leak-free 
 test "boxed Result-element Enumerable: user-callback HOFs are leak-free under Memory.Tracking" {
     // Regression + leak guard for the union-element callback gap. A custom
     // `impl Enumerable(Result(String, StreamError))` (the EXACT shape of
-    // `Socket.chunks`' `Enumerable(Result(String, SocketError))`) driven through
+    // `Socket.chunks`' `Enumerable(Result(String, Socket.Error))`) driven through
     // the `Enum` HOFs that thread a USER callback over the materialized element
     // — `reduce`/`each`/`reduce_while` — was UNCOVERED: the box-only fixtures
     // above use `Enum.to_list`/`take` with NO user callback, and the boxed-
@@ -6864,7 +6864,7 @@ test "ZIR concurrency: Process.send_move of a Map consumes it too — use-after-
 }
 
 test "ZIR concurrency: a live Socket is MOVE-ONLY — a plain copy-Process.send is a compile error (Phase S1, Decision B)" {
-    // A `Socket`/`SocketListener` is a single-owner, move-only generational
+    // A `Socket`/`Socket.Listener` is a single-owner, move-only generational
     // handle (`docs/socket-implementation-plan.md`, Decision B): the reserved
     // `zap_socket_handle` field is recognized STRUCTURALLY (like `zap_blob_handle`)
     // and the type is rejected from the deep-copy send walker
@@ -6878,11 +6878,11 @@ test "ZIR concurrency: a live Socket is MOVE-ONLY — a plain copy-Process.send 
     try expectGatedCompileFailsWithDiagnostic(
         \\pub struct TestProg {
         \\  pub fn main() -> u8 {
-        \\    case Socket.listen(SocketAddress.loopback(0), 1) {
+        \\    case Socket.listen(Socket.Address.loopback(0), 1) {
         \\      Result.Ok(listener) -> {
-        \\        echo = (Pid.of(Process.self()) :: Pid(SocketListener))
+        \\        echo = (Pid.of(Process.self()) :: Pid(Socket.Listener))
         \\        _sent = Process.send(echo, listener)
-        \\        _closed = SocketListener.close(listener)
+        \\        _closed = Socket.Listener.close(listener)
         \\        0
         \\      }
         \\      Result.Error(_e) -> 0
@@ -6904,9 +6904,9 @@ test "ZIR concurrency: a Socket move-sends cleanly — Process.send_move of a so
     var result = try compileAndRunGatedConcurrency(
         \\pub struct TestProg {
         \\  pub fn main() -> u8 {
-        \\    case Socket.listen(SocketAddress.loopback(0), 1) {
+        \\    case Socket.listen(Socket.Address.loopback(0), 1) {
         \\      Result.Ok(listener) -> {
-        \\        echo = (Pid.of(Process.self()) :: Pid(SocketListener))
+        \\        echo = (Pid.of(Process.self()) :: Pid(Socket.Listener))
         \\        _sent = Process.send_move(echo, listener)
         \\        0
         \\      }
@@ -6920,7 +6920,7 @@ test "ZIR concurrency: a Socket move-sends cleanly — Process.send_move of a so
 }
 
 test "ZIR concurrency: Process.send_move consumes a Socket — a use after the handoff is a compile error (Phase S3)" {
-    // The cross-process handoff's compile-time TOOTH: a `Socket`/`SocketListener`
+    // The cross-process handoff's compile-time TOOTH: a `Socket`/`Socket.Listener`
     // is a single-owner MOVE-ONLY handle (`zap_socket_handle`, `.unique`
     // ownership), so `Process.send_move` CONSUMES it — Phase S3 re-parents the
     // kernel socket-ledger entry to the receiver, handing the underlying fd
@@ -6933,11 +6933,11 @@ test "ZIR concurrency: Process.send_move consumes a Socket — a use after the h
     try expectGatedCompileFailsWithDiagnostic(
         \\pub struct TestProg {
         \\  pub fn main() -> u8 {
-        \\    case Socket.listen(SocketAddress.loopback(0), 1) {
+        \\    case Socket.listen(Socket.Address.loopback(0), 1) {
         \\      Result.Ok(listener) -> {
-        \\        echo = (Pid.of(Process.self()) :: Pid(SocketListener))
+        \\        echo = (Pid.of(Process.self()) :: Pid(Socket.Listener))
         \\        _sent = Process.send_move(echo, listener)
-        \\        _reuse = SocketListener.close(listener)
+        \\        _reuse = Socket.Listener.close(listener)
         \\        0
         \\      }
         \\      Result.Error(_e) -> 0
@@ -7004,14 +7004,14 @@ test "ZIR concurrency: Socket.fold recv-arena back-edge gate is UAF-safe across 
         \\  }
         \\
         \\  fn run_shape(shape :: Atom) -> Atom {
-        \\    case Socket.listen(SocketAddress.loopback(0), 8) {
+        \\    case Socket.listen(Socket.Address.loopback(0), 8) {
         \\      Result.Ok(listener) -> TestProg.shape_after_listen(shape, listener)
         \\      Result.Error(_e) -> :listen_failed
         \\    }
         \\  }
         \\
-        \\  fn shape_after_listen(shape :: Atom, listener :: SocketListener) -> Atom {
-        \\    port = SocketListener.local_port(listener)
+        \\  fn shape_after_listen(shape :: Atom, listener :: Socket.Listener) -> Atom {
+        \\    port = Socket.Listener.local_port(listener)
         \\    feeder_bits = Process.spawn(&TestProg.feeder_entry/0)
         \\    _s = Process.send(Process.pid(i64, feeder_bits), port)
         \\    case Socket.accept(listener) {
@@ -7020,7 +7020,7 @@ test "ZIR concurrency: Socket.fold recv-arena back-edge gate is UAF-safe across 
         \\    }
         \\  }
         \\
-        \\  fn shape_fold(shape :: Atom, listener :: SocketListener, server :: Socket) -> Atom {
+        \\  fn shape_fold(shape :: Atom, listener :: Socket.Listener, server :: Socket) -> Atom {
         \\    verdict = case shape {
         \\      :alias -> TestProg.fold_alias(server)
         \\      :tuple -> TestProg.fold_tuple(server)
@@ -7028,7 +7028,7 @@ test "ZIR concurrency: Socket.fold recv-arena back-edge gate is UAF-safe across 
         \\      _ -> TestProg.fold_list(server)
         \\    }
         \\    _c = Socket.close(server)
-        \\    _l = SocketListener.close(listener)
+        \\    _l = Socket.Listener.close(listener)
         \\    verdict
         \\  }
         \\
@@ -7128,7 +7128,7 @@ test "ZIR concurrency: Socket.fold recv-arena back-edge gate is UAF-safe across 
         \\
         \\  fn feeder_entry() -> Nil {
         \\    port = Process.receive_raw(i64)
-        \\    case Socket.connect(SocketAddress.loopback(port), 5000) {
+        \\    case Socket.connect(Socket.Address.loopback(port), 5000) {
         \\      Result.Ok(client) -> TestProg.feed(client)
         \\      Result.Error(_e) -> nil
         \\    }

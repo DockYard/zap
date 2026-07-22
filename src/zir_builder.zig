@@ -76,11 +76,9 @@ extern "c" fn zir_builder_emit_func_ptr_type(handle: ?*ZirBuilderHandle, param_t
 extern "c" fn zir_builder_emit_if_else(handle: ?*ZirBuilderHandle, condition: u32, then_value: u32, else_value: u32) u32;
 extern "c" fn zir_builder_emit_struct_init_anon(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, values_ptr: [*]const u32, fields_len: u32) u32;
 extern "c" fn zir_builder_emit_union_init(handle: ?*ZirBuilderHandle, union_type: u32, field_name_ptr: [*]const u8, field_name_len: u32, init_value: u32) u32;
-extern "c" fn zir_builder_get_union_ret_type_ref(handle: ?*ZirBuilderHandle) u32;
 extern "c" fn zir_builder_emit_decl_ref(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) u32;
 extern "c" fn zir_builder_emit_decl_val(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) u32;
 // Union return type
-extern "c" fn zir_builder_set_union_return_type(handle: ?*ZirBuilderHandle, names_ptrs: [*]const [*]const u8, names_lens: [*]const u32, types_ptr: [*]const u32, fields_len: u32) i32;
 
 // Switch block for tagged unions (single-pass API)
 extern "c" fn zir_builder_add_switch_block(handle: ?*ZirBuilderHandle, operand: u32, prong_names_ptrs: [*]const [*]const u8, prong_names_lens: [*]const u32, prong_captures: [*]const u32, prong_body_lens: [*]const u32, prong_body_results: [*]const u32, prong_body_insts: [*]const u32, num_prongs: u32, has_else: u32, else_body_len: u32, else_body_result: u32, payload_capture_placeholder: u32, prong_noreturn_flags: [*]const u32, else_is_noreturn: u32) u64;
@@ -203,9 +201,7 @@ extern "c" fn zir_builder_end_named_struct_decl(handle: ?*ZirBuilderHandle) i32;
 /// lists it under the struct_decl's `decls`.
 extern "c" fn zir_builder_begin_const_decl(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_end_const_decl(handle: ?*ZirBuilderHandle, value_ref: u32) i32;
-extern "c" fn zir_builder_set_decl_val_return_type(handle: ?*ZirBuilderHandle, name_ptr: [*]const u8, name_len: u32) i32;
 extern "c" fn zir_builder_emit_param_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
-extern "c" fn zir_builder_emit_param_optional_decl_val_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32, type_name_ptr: [*]const u8, type_name_len: u32) u32;
 extern "c" fn zir_builder_emit_param_optional_this_type(handle: ?*ZirBuilderHandle, param_name_ptr: [*]const u8, param_name_len: u32) u32;
 
 // Emit a parameter whose type is the root struct of an imported file:
@@ -611,6 +607,19 @@ fn mapMainReturnType(zig_type: ir.ZigType) BuildError!u32 {
 /// function is a no-op for type_def kinds outside the supported
 /// `union_def`/`enum_def` set so callers can guard exhaustiveness
 /// at their own level.
+/// Append `name` with every `.` replaced by `_` — a namespaced (dotted)
+/// declaration's Zig-identifier form, matching its standalone module name
+/// (see `structToImportName`).
+fn appendDotSanitizedName(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+) !void {
+    for (name) |ch| {
+        try buf.append(allocator, if (ch == '.') '_' else ch);
+    }
+}
+
 fn renderSpecializationSourceFileBody(
     allocator: std.mem.Allocator,
     buf: *std.ArrayListUnmanaged(u8),
@@ -651,7 +660,7 @@ fn renderSpecializationSourceFileBody(
             }
 
             try buf.appendSlice(allocator, "pub const ");
-            try buf.appendSlice(allocator, type_def.name);
+            try appendDotSanitizedName(allocator, buf, type_def.name);
             try buf.appendSlice(allocator, " = union(enum) {\n");
             for (def.variants) |variant| {
                 try buf.appendSlice(allocator, "    ");
@@ -672,7 +681,7 @@ fn renderSpecializationSourceFileBody(
         },
         .enum_def => |def| {
             try buf.appendSlice(allocator, "pub const ");
-            try buf.appendSlice(allocator, type_def.name);
+            try appendDotSanitizedName(allocator, buf, type_def.name);
             try buf.appendSlice(allocator, " = enum {\n");
             for (def.variants) |variant_name| {
                 try buf.appendSlice(allocator, "    ");
@@ -796,21 +805,22 @@ fn appendZigTypeForVTable(
             // generic-union list literals actually emit (a `Stage` whose
             // `output` is a `Result`). Concrete (dotted) unions and
             // plain structs keep the bare file import.
-            const is_union_specialization = std.mem.indexOf(u8, name, ".") == null and
-                driver.findUnionDef(name) != null;
+            // Namespaced (dotted) names import their standalone
+            // dot-sanitized module — same layout rules as flat names.
+            const is_union_specialization = driver.findUnionDef(name) != null;
             try buf.appendSlice(allocator, "@import(\"");
-            try buf.appendSlice(allocator, name);
+            try appendDotSanitizedName(allocator, buf, name);
             try buf.appendSlice(allocator, "\")");
             if (is_union_specialization) {
                 try buf.appendSlice(allocator, ".");
-                try buf.appendSlice(allocator, name);
+                try appendDotSanitizedName(allocator, buf, name);
             }
         },
         .tagged_union => |name| {
             try buf.appendSlice(allocator, "@import(\"");
-            try buf.appendSlice(allocator, name);
+            try appendDotSanitizedName(allocator, buf, name);
             try buf.appendSlice(allocator, "\").");
-            try buf.appendSlice(allocator, name);
+            try appendDotSanitizedName(allocator, buf, name);
         },
         // A closure type renders as a Zig function-pointer type
         // `*const fn(P...) Ret` — the runtime representation of a
@@ -1117,15 +1127,13 @@ pub const ZirDriver = struct {
     /// with a `classifyTypeDef` string transform+compare each — O(structs ×
     /// type_defs), which blows up on whole-program builds (monomorphization
     /// multiplies both). This index precomputes, in one O(type_defs) pass
-    /// (`buildTypeDeclIndex`), the `.primary` type_def per struct name and the
-    /// ordered `.nested` type_defs per owner prefix, so each emission is O(1) +
-    /// O(its own nested). The arena owns every key string and list; the index is
+    /// (`buildTypeDeclIndex`), the `.primary` type_def per struct name, so
+    /// each emission is O(1). The arena owns every key string; the index is
     /// rebuilt whenever `program` is reassigned (namespace/recursive emission
     /// swaps it — tracked by `type_decl_index_built_for`).
     type_decl_index_arena: ?std.heap.ArenaAllocator = null,
     type_decl_index_built_for: ?[]const ir.TypeDef = null,
     type_decl_primary: std.StringHashMapUnmanaged(usize) = .empty,
-    type_decl_nested: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
     lib_mode: bool = false,
     /// Phase 2.b — set true once a root `main` entry point has been
     /// emitted (executable output). Gates the injection of the root
@@ -1188,7 +1196,6 @@ pub const ZirDriver = struct {
     current_ret_type: u32 = 0,
     /// Cached ret_type Ref for @unionInit. Emitted once at function start,
     /// reused for all union_init instructions. 0 means not a union return type.
-    cached_union_ret_type_ref: u32 = 0,
     /// Tracks how many tuple_init instructions have been emitted in the current function.
     tuple_init_count: u32 = 0,
     /// Nested tuple types in DFS post-order (inner-first), matching tuple_init emission order.
@@ -2480,17 +2487,12 @@ pub const ZirDriver = struct {
 
     /// Build (or rebuild) the per-struct type-decl classification index for the
     /// current `program`, in one O(type_defs) pass that replicates
-    /// `classifyTypeDef` EXACTLY. A type_def whose dotted name normalizes
+    /// `classifyTypeDef` EXACTLY. A type_def whose name normalizes
     /// (`.` → `_`) to `<owner>` is that owner's `.primary` (first occurrence
-    /// wins, mirroring the original `if (primary_def != null) continue`). A
-    /// dotted name is `.nested` under `<owner>` for every prefix `underscore[0..p]`
-    /// where `underscore[p] == '_'` with at least one char after it — the exact
-    /// set the original nested predicate accepts (`has_dot` and
-    /// `startsWith(owner)` and `underscore[owner.len] == '_'` and
-    /// `len > owner.len + 1`). Names longer than classifyTypeDef's 256-byte
-    /// scratch are skipped (they classified `.foreign`, owning/nesting nothing).
-    /// Nested lists keep type_def order so emission order matches the original
-    /// in-loop walk. The arena owns every key string and list.
+    /// wins, mirroring the original `if (primary_def != null) continue`).
+    /// Names longer than classifyTypeDef's 256-byte scratch are skipped
+    /// (they classified `.foreign`, owning nothing). The arena owns every
+    /// key string.
     fn buildTypeDeclIndex(self: *ZirDriver) !void {
         const prog = self.program orelse return;
 
@@ -2501,33 +2503,18 @@ pub const ZirDriver = struct {
         }
         // Old map storage lived in the arena just freed/reset — start fresh.
         self.type_decl_primary = .empty;
-        self.type_decl_nested = .empty;
         const arena = self.type_decl_index_arena.?.allocator();
 
         for (prog.type_defs, 0..) |type_def, index| {
             if (type_def.name.len > 256) continue;
 
             const underscore = try arena.dupe(u8, type_def.name);
-            var has_dot = false;
             for (underscore) |*ch| {
-                if (ch.* == '.') {
-                    ch.* = '_';
-                    has_dot = true;
-                }
+                if (ch.* == '.') ch.* = '_';
             }
 
             const primary_gop = try self.type_decl_primary.getOrPut(arena, underscore);
             if (!primary_gop.found_existing) primary_gop.value_ptr.* = index;
-
-            if (!has_dot) continue;
-            for (underscore, 0..) |ch, p| {
-                if (ch != '_') continue;
-                if (p == 0 or p + 1 >= underscore.len) continue;
-                const owner = underscore[0..p];
-                const nested_gop = try self.type_decl_nested.getOrPut(arena, owner);
-                if (!nested_gop.found_existing) nested_gop.value_ptr.* = .empty;
-                try nested_gop.value_ptr.append(arena, index);
-            }
         }
 
         self.type_decl_index_built_for = prog.type_defs;
@@ -2547,19 +2534,6 @@ pub const ZirDriver = struct {
             cached.?.len != prog.type_defs.len)
         {
             try self.buildTypeDeclIndex();
-        }
-
-        // Track emitted struct names to avoid duplicates
-        var emitted = std.StringHashMap(void).init(self.allocator);
-        defer emitted.deinit();
-
-        // Nested struct/enum/union decls of the primary — emitted as
-        // `pub const X = struct {...}` inside this file's struct_decl, in
-        // type_def order (preserved by `buildTypeDeclIndex`).
-        if (self.type_decl_nested.get(current_struct)) |nested_indices| {
-            for (nested_indices.items) |index| {
-                try self.emitNestedTypeDecl(prog.type_defs[index], &emitted);
-            }
         }
 
         try self.emitClosureEnvTypeDecls();
@@ -2795,54 +2769,41 @@ pub const ZirDriver = struct {
 
     /// Whether a type_def belongs to the current emission, and how:
     /// - `primary`  — the Zap struct that owns this emission (file IS this struct)
-    /// - `nested`   — a struct/enum/union declared *inside* the primary
     /// - `foreign`  — owned by another emission; reached via `@import`
-    const TypeDefClass = enum { primary, nested, foreign };
+    const TypeDefClass = enum { primary, foreign };
 
     /// Convert a type_def name to its emission-namespace form (dots →
     /// underscores) and classify against the current emission. Writes
     /// into `scratch` to avoid a heap allocation on the hot path.
     ///
-    /// Nesting is keyed on the ORIGINAL name carrying a dot. A dotted name
-    /// (`Owner.Child`) denotes a declaration that lives INSIDE its parent's
-    /// namespace — emitted as a `pub const Child = …` inside the parent's
-    /// ZIR (`.nested`). A dot-free name is always a TOP-LEVEL module: a
-    /// concrete struct or a monomorph specialization (`M2_i64_String`,
-    /// `Option_i64`), emitted as its own file by Steps 3 / 3.5 / 3.6 and
-    /// reached via `@import`. This mirrors the dot-based nested/top-level
-    /// split those emission steps already apply (`indexOf(name, ".")`).
+    /// EVERY type_def is a top-level module. A dot-free name is a concrete
+    /// struct or a monomorph specialization (`M2_i64_String`, `Option_i64`)
+    /// emitted as its own file by Steps 3 / 3.5 / 3.6; a DOTTED name is a
+    /// namespaced declaration (`Socket.Recv`) living in its own STANDALONE
+    /// dot-sanitized module (`Socket_Recv`) — never a member of the
+    /// namespace prefix's module (the prefix may not even be a struct:
+    /// `Stage` is a protocol). So the only distinction that matters is
+    /// whether the sanitized name IS the current emission (`.primary`,
+    /// reached via `@This()` — self-imports are rejected) or not
+    /// (`.foreign`, reached via `@import`).
     ///
-    /// Crucially, a dot-free sibling that merely shares the primary's
-    /// underscore prefix (`M2_i64_String` while emitting the parametric
-    /// head `M2`, which is a struct module because it publishes the
-    /// force-specialized impl method `M2_step__i64_String__2`) must NOT be
-    /// classified `.nested`: nesting it emits a DUPLICATE nominal type
-    /// (`M2.M2_i64_String`) distinct from the sibling's own top-level
-    /// module. A boxed parametric-target impl imports the top-level module
-    /// for its cell while the specialized method's receiver would bind to
-    /// the nested duplicate — a nominal `expected 'M2.M2_i64_String', found
+    /// A name that merely shares the primary's underscore prefix
+    /// (`M2_i64_String` while emitting the parametric head `M2`, or
+    /// `Socket.Recv` while emitting `Socket`) must NOT be treated as a
+    /// nested decl of the current emission: nesting emits a DUPLICATE
+    /// nominal type (`M2.M2_i64_String`) distinct from the module's own
+    /// top-level type — a nominal `expected 'M2.M2_i64_String', found
     /// 'M2_i64_String'` mismatch in the synthesized vtable adapter.
-    /// Treating such a sibling as `.foreign` routes both seams through the
-    /// single canonical `@import("M2_i64_String")` type.
+    /// `.foreign` routes every seam through the single canonical
+    /// `@import("M2_i64_String")` type.
     fn classifyTypeDef(name: []const u8, current_struct: []const u8, scratch: []u8) TypeDefClass {
         if (name.len > scratch.len) return .foreign;
         @memcpy(scratch[0..name.len], name);
-        var has_dot = false;
         for (scratch[0..name.len]) |*ch| {
-            if (ch.* == '.') {
-                ch.* = '_';
-                has_dot = true;
-            }
+            if (ch.* == '.') ch.* = '_';
         }
         const underscore = scratch[0..name.len];
         if (std.mem.eql(u8, underscore, current_struct)) return .primary;
-        if (has_dot and
-            underscore.len > current_struct.len + 1 and
-            std.mem.startsWith(u8, underscore, current_struct) and
-            underscore[current_struct.len] == '_')
-        {
-            return .nested;
-        }
         return .foreign;
     }
 
@@ -2871,7 +2832,13 @@ pub const ZirDriver = struct {
         try renderSpecializationSourceFileBody(self.allocator, &buf, type_def);
         if (buf.items.len == 0) return; // type_def kind not handled
 
+        // Module names are the dot-sanitized form of the type name — a
+        // namespaced declaration (`Socket.Recv`) registers its standalone
+        // module as `Socket_Recv` (see `structToImportName`).
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
+        for (name_z) |*name_ch| {
+            if (name_ch.* == '.') name_ch.* = '_';
+        }
         defer self.allocator.free(name_z);
 
         dumpSyntheticSourceIfRequested(name_z, buf.items.ptr, @intCast(buf.items.len));
@@ -3113,7 +3080,13 @@ pub const ZirDriver = struct {
             try buf.appendSlice(self.allocator, ");\n}\n\n");
         }
 
+        // Module names are the dot-sanitized form of the type name — a
+        // namespaced declaration (`Socket.Recv`) registers its standalone
+        // module as `Socket_Recv` (see `structToImportName`).
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
+        for (name_z) |*name_ch| {
+            if (name_ch.* == '.') name_ch.* = '_';
+        }
         defer self.allocator.free(name_z);
 
         dumpSyntheticSourceIfRequested(name_z, buf.items.ptr, @intCast(buf.items.len));
@@ -3582,7 +3555,13 @@ pub const ZirDriver = struct {
         try buf.appendSlice(self.allocator, ");\n");
         try buf.appendSlice(self.allocator, "}\n");
 
+        // Module names are the dot-sanitized form of the type name — a
+        // namespaced declaration (`Socket.Recv`) registers its standalone
+        // module as `Socket_Recv` (see `structToImportName`).
         const name_z = try self.allocator.dupeZ(u8, type_def.name);
+        for (name_z) |*name_ch| {
+            if (name_ch.* == '.') name_ch.* = '_';
+        }
         defer self.allocator.free(name_z);
 
         dumpSyntheticSourceIfRequested(name_z, buf.items.ptr, @intCast(buf.items.len));
@@ -3593,65 +3572,6 @@ pub const ZirDriver = struct {
             @intCast(buf.items.len),
         ) != 0) {
             return error.ZirInjectionFailed;
-        }
-    }
-
-    /// Emit one nested type-decl inside the primary struct. Mirrors
-    /// the original loop body — preserved verbatim for nested decls
-    /// only; the primary struct path goes through `emitRootFields`
-    /// instead.
-    fn emitNestedTypeDecl(self: *ZirDriver, type_def: ir.TypeDef, emitted: *std.StringHashMap(void)) !void {
-        switch (type_def.kind) {
-            .struct_def => |def| {
-                const short_name = if (std.mem.lastIndexOf(u8, type_def.name, ".")) |dot_idx|
-                    type_def.name[dot_idx + 1 ..]
-                else
-                    type_def.name;
-                if (emitted.contains(short_name)) return;
-                try emitted.put(short_name, {});
-
-                var field_name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
-                defer field_name_ptrs.deinit(self.allocator);
-                var field_name_lens: std.ArrayListUnmanaged(u32) = .empty;
-                defer field_name_lens.deinit(self.allocator);
-                var field_type_refs: std.ArrayListUnmanaged(u32) = .empty;
-                defer field_type_refs.deinit(self.allocator);
-
-                for (def.fields) |field| {
-                    try field_name_ptrs.append(self.allocator, field.name.ptr);
-                    try field_name_lens.append(self.allocator, @intCast(field.name.len));
-                    // Nested struct decls go through the older
-                    // `add_struct_type` C-ABI which only takes static
-                    // type Refs — primitives work, complex field
-                    // types still degrade. Lifting nested struct
-                    // emission onto the streaming root-field-body
-                    // API would require an analogous fork-side
-                    // change to `add_struct_type` (a separate
-                    // mini-feature; out of scope here). The dominant
-                    // case for non-primitive fields is the file's
-                    // root struct, which goes through
-                    // `emitRootFields` above.
-                    const simple = mapReturnType(field.type_expr);
-                    try field_type_refs.append(
-                        self.allocator,
-                        if (simple != 0) simple else 0,
-                    );
-                }
-
-                if (zir_builder_add_struct_type(
-                    self.handle,
-                    short_name.ptr,
-                    @intCast(short_name.len),
-                    field_name_ptrs.items.ptr,
-                    field_name_lens.items.ptr,
-                    field_type_refs.items.ptr,
-                    null,
-                    @intCast(def.fields.len),
-                ) != 0) {
-                    return error.EmitFailed;
-                }
-            },
-            else => {},
         }
     }
 
@@ -3905,111 +3825,81 @@ pub const ZirDriver = struct {
         return buf[0..prefix.len];
     }
 
-    /// Emit a ZIR ref to a struct type by name. Dispatches on whether
-    /// the struct is the primary of the current emission, nested
-    /// inside the primary, foreign top-level (own emission's root),
-    /// or foreign nested-in-other-emission. Each case maps to a
-    /// specific ZIR sequence:
+    /// Emit a ZIR ref to a struct type by name. Every type_def is a
+    /// top-level module (dotted names live standalone under their
+    /// dot-sanitized name), so the dispatch is two-way:
     ///
     /// - **Primary** (the file IS this struct): `@This()` — self
     ///   imports are rejected by Zig's module system, and `@This()`
     ///   is the canonical root struct type inside the current
     ///   emission.
-    /// - **Nested in primary**: `decl_val(short_name)` — the struct
-    ///   is emitted as a nested `pub const` decl by
-    ///   `emitNestedTypeDecl`.
-    /// - **Foreign top-level** (no dot): `@import(name)` — the
-    ///   foreign emission's file IS that struct, so its import is
-    ///   directly the type.
-    /// - **Foreign nested**: `@import(prefix_struct).short_name` —
-    ///   the foreign emission's file is the prefix struct, and the
-    ///   nested decl is reached as a field on it.
+    /// - **Foreign**: `@import(module)` — the foreign emission's file
+    ///   IS that struct for struct emissions; union/enum decls sit one
+    ///   `pub const` deeper (`@import(module).module`, Step 3.6 layout).
     fn emitStructTypeRef(self: *const ZirDriver, name: []const u8) BuildError!u32 {
-        const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-            name[dot_idx + 1 ..]
-        else
-            name;
+        // A DOTTED (namespaced) declaration follows the SAME layout rules as
+        // a flat one, just under its fully dot-sanitized module name — a
+        // standalone module (never a member of the namespace prefix's
+        // module; the prefix may be a protocol like `Stage` with no module
+        // at all). Sanitize once up front and apply the flat-name logic
+        // uniformly: file-IS-struct for struct emissions, `pub const`
+        // one-deeper for union/enum decls (Step 3.6 layout).
+        var sanitized_buf: [256]u8 = undefined;
+        const module_name = structToImportName(name, &sanitized_buf);
 
-        // Parametric union/enum specializations (Step 3.6) live as
-        // `pub const <Name> = union(enum) {...};` inside a synthetic
-        // top-level Zig source file. The file IS a struct (file-IS-
-        // struct convention), so `@import(name)` yields the struct
-        // and the actual union/enum type lives one field-access
-        // deeper. Detect this case once and reuse it across both the
-        // "no current emission" early return and the explicit
-        // foreign-top-level branch below — a parametric union must
-        // emit `@import(name).<name>` regardless of which path
-        // resolves the type ref.
-        const is_specialization_decl = std.mem.indexOf(u8, name, ".") == null and
-            (self.findUnionDef(name) != null or self.findEnumDef(name));
+        // Union/enum decls (parametric specializations AND namespaced
+        // declarations) live as `pub const <SanitizedName> = union(enum)
+        // {...};` inside their synthetic module, so the type is one
+        // field-access deeper than the import. Detection keys on the
+        // ORIGINAL name — the def tables index `type_def.name` verbatim.
+        const is_union_or_enum_decl =
+            self.findUnionDef(name) != null or self.findEnumDef(name);
 
         const current_struct = self.current_emit_struct orelse {
             // No current emission context (e.g. top-level program
-            // header) — fall back to import-by-name. Same behavior
-            // as a foreign top-level reference.
-            const import_ref = zir_builder_emit_import(self.handle, name.ptr, @intCast(name.len));
+            // header) — fall back to import-by-module-name.
+            const import_ref = zir_builder_emit_import(self.handle, module_name.ptr, @intCast(module_name.len));
             if (import_ref == error_ref) return error.EmitFailed;
-            if (is_specialization_decl) {
-                const ref = zir_builder_emit_field_val(self.handle, import_ref, name.ptr, @intCast(name.len));
+            if (is_union_or_enum_decl) {
+                const ref = zir_builder_emit_field_val(self.handle, import_ref, module_name.ptr, @intCast(module_name.len));
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
             }
             return import_ref;
         };
 
-        var buf: [256]u8 = undefined;
-        switch (classifyTypeDef(name, current_struct, &buf)) {
-            .primary => {
-                const ref = zir_builder_emit_this_type(self.handle);
-                if (ref == error_ref) return error.EmitFailed;
-                return ref;
-            },
-            .nested => {
-                const ref = zir_builder_emit_decl_val(self.handle, short_name.ptr, @intCast(short_name.len));
-                if (ref == error_ref) return error.EmitFailed;
-                return ref;
-            },
-            .foreign => {
-                if (std.mem.lastIndexOf(u8, name, ".")) |_| {
-                    // Foreign nested: `@import(prefix).short_name`
-                    var struct_name_buf: [256]u8 = undefined;
-                    const struct_name = structToImportName(name, &struct_name_buf);
-                    const import_ref = zir_builder_emit_import(self.handle, struct_name.ptr, @intCast(struct_name.len));
-                    if (import_ref == error_ref) return error.EmitFailed;
-                    const ref = zir_builder_emit_field_val(self.handle, import_ref, short_name.ptr, @intCast(short_name.len));
-                    if (ref == error_ref) return error.EmitFailed;
-                    return ref;
-                }
-                // Foreign top-level: `@import(name)`. For a plain
-                // struct emission the file IS the struct (Step 3 /
-                // Step 3.5), so the import directly yields the type.
-                // For a parametric union/enum specialization (Step 3.6)
-                // the file is the struct but the type is a `pub const`
-                // *inside* that file — reach it via
-                // `@import(name).<name>` (see `is_specialization_decl`
-                // computed above the dispatch).
-                const import_ref = zir_builder_emit_import(self.handle, name.ptr, @intCast(name.len));
-                if (import_ref == error_ref) return error.EmitFailed;
-                if (is_specialization_decl) {
-                    const ref = zir_builder_emit_field_val(self.handle, import_ref, name.ptr, @intCast(name.len));
-                    if (ref == error_ref) return error.EmitFailed;
-                    return ref;
-                }
-                return import_ref;
-            },
+        // Primary: the file IS this struct — `@This()` (self-imports are
+        // rejected by Zig's module system).
+        if (std.mem.eql(u8, module_name, current_struct)) {
+            const ref = zir_builder_emit_this_type(self.handle);
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
         }
+
+        // Foreign: `@import(module)` — plus the one-deeper field access
+        // for union/enum decls (see above).
+        const import_ref = zir_builder_emit_import(self.handle, module_name.ptr, @intCast(module_name.len));
+        if (import_ref == error_ref) return error.EmitFailed;
+        if (is_union_or_enum_decl) {
+            const ref = zir_builder_emit_field_val(self.handle, import_ref, module_name.ptr, @intCast(module_name.len));
+            if (ref == error_ref) return error.EmitFailed;
+            return ref;
+        }
+        return import_ref;
     }
 
-    /// Convert a struct_ref name to the ZIR struct name that defines it,
+    /// Convert a struct_ref name to the ZIR module name that defines it,
     /// writing the result into the caller-provided buffer.
-    /// "Range" → "Range", "Zap.Env" → "Zap_Env", "IO.Mode" → "IO".
-    /// Returns the borrowed slice into the buffer (or `type_name` itself
-    /// when the name is already a single segment).
+    /// "Range" → "Range", "Zap.Env" → "Zap_Env", "Socket.Recv" → "Socket_Recv".
+    /// A DOTTED (namespaced) declaration lives in its own STANDALONE module
+    /// under the fully dot-sanitized name — the same convention as parametric
+    /// specializations (`Option_i64`) — never as a member of its namespace
+    /// prefix's module (the prefix may not even be a struct: `Stage` is a
+    /// protocol). Returns the borrowed slice into the buffer (or `type_name`
+    /// itself when the name carries no dot).
     fn structToImportName(type_name: []const u8, buf: []u8) []const u8 {
-        if (std.mem.lastIndexOf(u8, type_name, ".")) |dot_idx| {
-            return dottedPrefixToImportName(type_name[0..dot_idx], buf) orelse type_name;
-        }
-        return type_name;
+        if (std.mem.indexOfScalar(u8, type_name, '.') == null) return type_name;
+        return dottedPrefixToImportName(type_name, buf) orelse type_name;
     }
 
     /// Map a Zig type name string to a ZIR type Ref for union variant types.
@@ -4420,16 +4310,30 @@ pub const ZirDriver = struct {
         // Register empty stub structs for any namespace name we've seen but
         // that has no functions in this program (typically namespace parents
         // whose only purpose is to host children via re-export). This lets
-        // `@import("...")` resolve them later.
+        // `@import("...")` resolve them later. Namespaced (dotted) structs
+        // get their stub EVEN under selective emission: a function-less
+        // marker struct (`Memory.ARC`) can still be an impl TARGET whose
+        // vtable module imports `@import("Memory_ARC")` — the standalone
+        // module must exist whenever the reference does.
         if (self.progress) |progress| progress.stage("ZIR: registering modules", .{});
-        if (!self.selectiveEmissionEnabled()) {
+        {
+            const selective = self.selectiveEmissionEnabled();
             if (ctx) |c| {
                 var name_iter2 = all_struct_names.iterator();
                 while (name_iter2.next()) |entry| {
                     const mod_name = entry.key_ptr.*;
+                    if (selective and std.mem.indexOfScalar(u8, mod_name, '.') == null) continue;
                     if (!struct_funcs.contains(mod_name)) {
+                        // Module keys are the dot-sanitized form of the struct
+                        // name (a namespaced `Memory.ARC` registers as
+                        // `Memory_ARC`) — matching every reference renderer
+                        // and the function-bearing leaf modules, whose keys
+                        // arrive pre-underscored from the IR naming.
                         const mod_name_z = try self.allocator.dupeZ(u8, mod_name);
                         defer self.allocator.free(mod_name_z);
+                        for (mod_name_z) |*name_ch| {
+                            if (name_ch.* == '.') name_ch.* = '_';
+                        }
                         const stub = "comptime {}\n";
                         dumpSyntheticSourceIfRequested(mod_name_z, stub.ptr, @intCast(stub.len));
                         if (zir_compilation_add_struct_source(c, mod_name_z, stub.ptr, @intCast(stub.len)) != 0) {
@@ -4523,14 +4427,23 @@ pub const ZirDriver = struct {
                 // Both fields-only AND field-less structs are emitted here
                 // (see the block comment above): a constructed field-less
                 // struct needs a real empty `struct_decl` module.
-                // Skip nested types (dotted names) — they're emitted
-                // inside their parent's ZIR by `emitNestedTypeDecl`.
-                if (std.mem.indexOf(u8, type_def.name, ".") != null) continue;
-                // Skip any struct already covered by Step 3.
-                if (struct_funcs.contains(type_def.name)) continue;
-                if (!self.shouldEmitStruct(type_def.name)) continue;
+                // A namespaced (dotted) struct is a STANDALONE module under
+                // its dot-sanitized name — the same rule as a flat one, so
+                // sanitize once and run the identical emission.
+                var module_name_buf: [256]u8 = undefined;
+                const module_name = structToImportName(type_def.name, &module_name_buf);
+                // Skip any struct already covered by Step 3 (function-
+                // bearing leaf modules key on the same sanitized form).
+                if (struct_funcs.contains(module_name)) continue;
+                // Dotted names bypass the selective-emission gate (the
+                // same rule as the Step-2.5 stub registration): reference
+                // tracking for namespaced modules isn't wired into
+                // incremental selection, and the standalone module must
+                // exist whenever a reference does.
+                if (std.mem.indexOfScalar(u8, type_def.name, '.') == null and
+                    !self.shouldEmitStruct(type_def.name)) continue;
 
-                const struct_name_z = try self.allocator.dupeZ(u8, type_def.name);
+                const struct_name_z = try self.allocator.dupeZ(u8, module_name);
                 defer self.allocator.free(struct_name_z);
                 const stub = "comptime {}\n";
                 dumpSyntheticSourceIfRequested(struct_name_z, stub.ptr, @intCast(stub.len));
@@ -4540,7 +4453,7 @@ pub const ZirDriver = struct {
 
                 const struct_handle = zir_builder_create() orelse return error.ZirCreateFailed;
                 {
-                    var struct_scope = StructEmissionScope.enter(self, struct_handle, type_def.name);
+                    var struct_scope = StructEmissionScope.enter(self, struct_handle, module_name);
                     defer struct_scope.deinit();
 
                     try self.emitStructTypeDecls();
@@ -4577,29 +4490,30 @@ pub const ZirDriver = struct {
             // return-position context, removing the previous
             // `cached_union_ret_type_ref` fallback to `struct_init_anon`.
             //
-            // Concrete non-parametric tagged unions (`Color { Red, Blue }`)
-            // also land in `prog.type_defs` as `union_def`/`enum_def`, but
-            // their TypeDef name carries a dot (`Color` lives inside its
-            // owner struct, e.g. `MyMod.Color`) — those are emitted as
-            // nested decls inside the owner's primary emission and we
-            // skip them here.
+            // Namespaced (dotted) tagged unions/enums (`Socket.Recv`,
+            // `Framer.Error`) are STANDALONE modules under their
+            // dot-sanitized name (`Socket_Recv`) — the same Step 3.6
+            // layout as a flat specialization, consumed as
+            // `@import("Socket_Recv").Socket_Recv`.
             if (self.progress) |progress| progress.stage("ZIR: emitting parametric union/enum specializations", .{});
             for (self.program.?.type_defs) |type_def| {
                 switch (type_def.kind) {
                     .union_def, .enum_def => {},
                     else => continue,
                 }
-                // Nested decls (`Owner.Color`) are emitted inside the
-                // owner's primary emission via `emitNestedTypeDecl` — skip.
-                if (std.mem.indexOf(u8, type_def.name, ".") != null) continue;
-                // A non-parametric top-level tagged-union doesn't need
-                // a synthetic file when it shares a name with a struct
-                // emission that already exists (e.g. a user `pub union
-                // Top {…}` registered alongside `pub struct Top {…}` —
-                // Blocker B's namespace merge handles this case at the
-                // resolution layer).
-                if (struct_funcs.contains(type_def.name)) continue;
-                if (!self.shouldEmitStruct(type_def.name)) continue;
+                var module_name_buf: [256]u8 = undefined;
+                const module_name = structToImportName(type_def.name, &module_name_buf);
+                // A tagged-union doesn't get a synthetic file when it
+                // shares a (sanitized) name with a struct emission that
+                // already exists (e.g. a user `pub union Top {…}`
+                // registered alongside `pub struct Top {…}` — Blocker B's
+                // namespace merge handles this case at the resolution
+                // layer).
+                if (struct_funcs.contains(module_name)) continue;
+                // Dotted names bypass the selective-emission gate — the
+                // same rule (and reason) as Step 3.5 above.
+                if (std.mem.indexOfScalar(u8, type_def.name, '.') == null and
+                    !self.shouldEmitStruct(type_def.name)) continue;
                 try self.emitSpecializationSourceFile(c, type_def);
             }
 
@@ -5207,10 +5121,6 @@ pub const ZirDriver = struct {
 
         var buf: [256]u8 = undefined;
         const cls = classifyTypeDef(sname, current_struct, &buf);
-        const short_name = if (std.mem.lastIndexOf(u8, sname, ".")) |dot_idx|
-            sname[dot_idx + 1 ..]
-        else
-            sname;
 
         switch (cls) {
             .primary => {
@@ -5218,17 +5128,6 @@ pub const ZirDriver = struct {
                     self.handle,
                     param.name.ptr,
                     @intCast(param.name.len),
-                );
-                if (ref == error_ref) return error.EmitFailed;
-                return ref;
-            },
-            .nested => {
-                const ref = zir_builder_emit_param_optional_decl_val_type(
-                    self.handle,
-                    param.name.ptr,
-                    @intCast(param.name.len),
-                    short_name.ptr,
-                    @intCast(short_name.len),
                 );
                 if (ref == error_ref) return error.EmitFailed;
                 return ref;
@@ -5617,10 +5516,6 @@ pub const ZirDriver = struct {
                 if (self.current_emit_struct) |current| {
                     var buf: [256]u8 = undefined;
                     const cls = classifyTypeDef(name, current, &buf);
-                    const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                        name[dot_idx + 1 ..]
-                    else
-                        name;
                     switch (cls) {
                         .primary => {
                             // The file IS this struct — emit
@@ -5640,52 +5535,39 @@ pub const ZirDriver = struct {
                             if (ref == error_ref) return error.EmitFailed;
                             return ref;
                         },
-                        .nested => {
-                            // Nested inside the primary — reachable
-                            // by name in the current emission via
-                            // decl_val. The fork's
-                            // `addParamDeclValType` emits the
-                            // decl_val + break inside the param body.
-                            const ref = zir_builder_emit_param_decl_val_type(
-                                self.handle,
-                                param.name.ptr,
-                                @intCast(param.name.len),
-                                short_name.ptr,
-                                @intCast(short_name.len),
-                            );
-                            if (ref == error_ref) return error.EmitFailed;
-                            return ref;
-                        },
                         .foreign => {
-                            if (std.mem.lastIndexOf(u8, name, ".")) |_| {
-                                // Foreign nested:
-                                // `@import(prefix).short_name`.
-                                var struct_name_buf: [256]u8 = undefined;
-                                const struct_name = structToImportName(name, &struct_name_buf);
+                            // A namespaced (dotted) declaration lives in its
+                            // own STANDALONE dot-sanitized module — the same
+                            // layout rules as a flat name: union/enum decls
+                            // sit one `pub const` deeper (member = the
+                            // sanitized name itself), struct emissions ARE
+                            // their file (root import).
+                            var struct_name_buf: [256]u8 = undefined;
+                            const struct_name = structToImportName(name, &struct_name_buf);
+                            const is_union_or_enum_decl =
+                                self.findUnionDef(name) != null or self.findEnumDef(name);
+                            if (is_union_or_enum_decl) {
                                 const ref = zir_builder_emit_param_imported_type(
                                     self.handle,
                                     param.name.ptr,
                                     @intCast(param.name.len),
                                     struct_name.ptr,
                                     @intCast(struct_name.len),
-                                    short_name.ptr,
-                                    @intCast(short_name.len),
-                                );
-                                if (ref == error_ref) return error.EmitFailed;
-                                return ref;
-                            } else {
-                                // Foreign top-level — file IS the
-                                // struct: `@import(name)`.
-                                const ref = zir_builder_emit_param_imported_root_type(
-                                    self.handle,
-                                    param.name.ptr,
-                                    @intCast(param.name.len),
-                                    name.ptr,
-                                    @intCast(name.len),
+                                    struct_name.ptr,
+                                    @intCast(struct_name.len),
                                 );
                                 if (ref == error_ref) return error.EmitFailed;
                                 return ref;
                             }
+                            const ref = zir_builder_emit_param_imported_root_type(
+                                self.handle,
+                                param.name.ptr,
+                                @intCast(param.name.len),
+                                struct_name.ptr,
+                                @intCast(struct_name.len),
+                            );
+                            if (ref == error_ref) return error.EmitFailed;
+                            return ref;
                         },
                     }
                 }
@@ -5985,98 +5867,49 @@ pub const ZirDriver = struct {
                 self.current_ret_type = 1;
             },
             .struct_ref => |name| {
-                if (self.findUnionDef(name)) |union_def| {
-                    // Per-instantiation parametric union specializations
-                    // (`Option_i64`, `Result_i64_String`) live as
-                    // `pub const <Name> = union(enum) {...};` inside a
-                    // synthetic top-level Zig file emitted by Step 3.6.
-                    // Callers reach them via `@import(name).<name>`. A
-                    // function `pub fn maybe() -> Option(i64)` MUST
-                    // declare its return type as exactly that imported
-                    // nominal type — re-declaring the union inline via
-                    // `set_union_return_type` creates a structurally
-                    // identical but nominally distinct anonymous union
-                    // per call site, which Sema flags ("expected
-                    // 'Option_i64.Option_i64', found ...") as a type
-                    // mismatch the first time anyone tries to USE the
-                    // function's return value as the synthetic-file
-                    // union.
-                    //
-                    // The rule for distinguishing the two shapes is the
-                    // exact same `is_specialization_decl` predicate
-                    // `emitStructTypeRef` uses: no dot in the name AND
-                    // the name resolves to a `union_def`/`enum_def`.
-                    // Concrete dotted unions (`IO.Mode`, `Color`) stay
-                    // on the legacy `set_union_return_type` path —
-                    // their declaration lives in the owning struct's
-                    // emission, not as a separate top-level synthetic
-                    // file, so an inline `union(enum)` decl is the
-                    // only way to surface the type at the function's
-                    // return position.
-                    const is_specialization_decl = std.mem.indexOf(u8, name, ".") == null;
-                    if (is_specialization_decl) {
-                        var support: std.ArrayListUnmanaged(u32) = .empty;
-                        defer support.deinit(self.allocator);
-                        const before = zir_builder_get_body_inst_count(self.handle);
-                        const type_ref = try self.emitStructTypeRef(name);
-                        try self.captureBodyInsts(before, &support);
-                        const result_inst = zir_builder_ref_to_inst_index(self.handle, type_ref);
-                        if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
-                        if (zir_builder_set_custom_return_type(
-                            self.handle,
-                            support.items.ptr,
-                            @intCast(support.items.len),
-                            result_inst,
-                        ) != 0) return error.EmitFailed;
-                        self.current_ret_type = 1;
-                        // `cached_union_ret_type_ref` is the
-                        // construction-side cache used by `union_init`
-                        // to materialise return-position literals
-                        // against the inline anonymous union. Since
-                        // we're returning the imported nominal type
-                        // now, leave it at its sentinel zero — the
-                        // construction path always calls
-                        // `emitStructTypeRef(name)` from
-                        // `union_init`'s ZIR handler regardless, which
-                        // is the right ref for `@unionInit`.
-                        return;
-                    }
-
-                    var name_ptrs: std.ArrayListUnmanaged([*]const u8) = .empty;
-                    defer name_ptrs.deinit(self.allocator);
-                    var name_lens: std.ArrayListUnmanaged(u32) = .empty;
-                    defer name_lens.deinit(self.allocator);
-                    var type_refs: std.ArrayListUnmanaged(u32) = .empty;
-                    defer type_refs.deinit(self.allocator);
-
-                    for (union_def.variants) |variant| {
-                        try name_ptrs.append(self.allocator, variant.name.ptr);
-                        try name_lens.append(self.allocator, @intCast(variant.name.len));
-                        const type_ref = if (variant.type_name) |tn|
-                            self.mapTypeNameToRef(tn)
-                        else
-                            0;
-                        try type_refs.append(self.allocator, type_ref);
-                    }
-
-                    if (zir_builder_set_union_return_type(
+                if (self.findUnionDef(name) != null) {
+                    // EVERY named union — parametric specializations
+                    // (`Option_i64`, `Result_i64_String`) AND namespaced
+                    // declarations (`Socket.Recv`, `Framer.Error`) — lives
+                    // as `pub const <SanitizedName> = union(enum) {...};`
+                    // inside its own synthetic top-level Zig file emitted
+                    // by Step 3.6. Callers reach it via
+                    // `@import(module).<module>`. A function returning the
+                    // union MUST declare its return type as exactly that
+                    // imported nominal type — re-declaring the union
+                    // inline via `set_union_return_type` creates a
+                    // structurally identical but nominally distinct
+                    // anonymous union per call site, which Sema flags
+                    // ("expected 'Option_i64.Option_i64', found ...") as
+                    // a type mismatch the first time anyone tries to USE
+                    // the function's return value as the synthetic-file
+                    // union. `emitStructTypeRef` resolves the imported
+                    // nominal type for both shapes.
+                    var support: std.ArrayListUnmanaged(u32) = .empty;
+                    defer support.deinit(self.allocator);
+                    const before = zir_builder_get_body_inst_count(self.handle);
+                    const type_ref = try self.emitStructTypeRef(name);
+                    try self.captureBodyInsts(before, &support);
+                    const result_inst = zir_builder_ref_to_inst_index(self.handle, type_ref);
+                    if (result_inst == 0xFFFFFFFF) return error.EmitFailed;
+                    if (zir_builder_set_custom_return_type(
                         self.handle,
-                        name_ptrs.items.ptr,
-                        name_lens.items.ptr,
-                        type_refs.items.ptr,
-                        @intCast(union_def.variants.len),
-                    ) != 0) {
-                        return error.EmitFailed;
-                    }
+                        support.items.ptr,
+                        @intCast(support.items.len),
+                        result_inst,
+                    ) != 0) return error.EmitFailed;
                     self.current_ret_type = 1;
-                    self.cached_union_ret_type_ref = zir_builder_get_union_ret_type_ref(self.handle);
+                    // The construction path (`union_init`'s ZIR
+                    // handler) always calls `emitStructTypeRef(name)`
+                    // itself, which resolves the same imported nominal
+                    // type — the right ref for `@unionInit`.
+                    return;
                 } else if (self.findStructDef(name) != null) {
                     // Struct return type. Dispatch by classification
                     // against the current emission so the matching
                     // ZIR primitive lands inside the ret_ty body:
                     //
                     //   .primary  →  @This()       (self-typed return)
-                    //   .nested   →  decl_val(X)   (inner struct of the primary)
                     //   .foreign  →  @import(...)  (peer / cross-emission)
                     //
                     // A single switch keeps the param-side
@@ -6091,27 +5924,26 @@ pub const ZirDriver = struct {
                     if (self.current_emit_struct) |current| {
                         var buf: [256]u8 = undefined;
                         const cls = classifyTypeDef(name, current, &buf);
-                        const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                            name[dot_idx + 1 ..]
-                        else
-                            name;
                         switch (cls) {
                             .primary => {
                                 if (zir_builder_set_this_return_type(self.handle) != 0)
                                     return error.EmitFailed;
                             },
-                            .nested => {
-                                if (zir_builder_set_decl_val_return_type(self.handle, short_name.ptr, @intCast(short_name.len)) != 0)
-                                    return error.EmitFailed;
-                            },
                             .foreign => {
-                                if (std.mem.lastIndexOf(u8, name, ".")) |_| {
-                                    var struct_name_buf: [256]u8 = undefined;
-                                    const struct_name = structToImportName(name, &struct_name_buf);
-                                    if (zir_builder_set_imported_return_type(self.handle, struct_name.ptr, @intCast(struct_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
+                                // Standalone dot-sanitized module, flat
+                                // layout rules: union/enum decls sit one
+                                // `pub const` deeper (member = the sanitized
+                                // name itself), struct emissions ARE their
+                                // file (root import).
+                                var struct_name_buf: [256]u8 = undefined;
+                                const struct_name = structToImportName(name, &struct_name_buf);
+                                const is_union_or_enum_decl =
+                                    self.findUnionDef(name) != null or self.findEnumDef(name);
+                                if (is_union_or_enum_decl) {
+                                    if (zir_builder_set_imported_return_type(self.handle, struct_name.ptr, @intCast(struct_name.len), struct_name.ptr, @intCast(struct_name.len)) != 0)
                                         return error.EmitFailed;
                                 } else {
-                                    if (zir_builder_set_imported_root_return_type(self.handle, name.ptr, @intCast(name.len)) != 0)
+                                    if (zir_builder_set_imported_root_return_type(self.handle, struct_name.ptr, @intCast(struct_name.len)) != 0)
                                         return error.EmitFailed;
                                 }
                             },
@@ -6119,15 +5951,19 @@ pub const ZirDriver = struct {
                         self.current_ret_type = 1;
                     } else {
                         // No current emission — top-level / root-program
-                        // function. Fall back to the legacy path.
+                        // function. Same standalone-module rule, without
+                        // a `.primary` case to consider.
                         var struct_name_buf: [256]u8 = undefined;
                         const struct_name = structToImportName(name, &struct_name_buf);
-                        const short_name = if (std.mem.lastIndexOf(u8, name, ".")) |dot_idx|
-                            name[dot_idx + 1 ..]
-                        else
-                            name;
-                        if (zir_builder_set_imported_return_type(self.handle, struct_name.ptr, @intCast(struct_name.len), short_name.ptr, @intCast(short_name.len)) != 0)
-                            return error.EmitFailed;
+                        const is_union_or_enum_decl =
+                            self.findUnionDef(name) != null or self.findEnumDef(name);
+                        if (is_union_or_enum_decl) {
+                            if (zir_builder_set_imported_return_type(self.handle, struct_name.ptr, @intCast(struct_name.len), struct_name.ptr, @intCast(struct_name.len)) != 0)
+                                return error.EmitFailed;
+                        } else {
+                            if (zir_builder_set_imported_root_return_type(self.handle, struct_name.ptr, @intCast(struct_name.len)) != 0)
+                                return error.EmitFailed;
+                        }
                         self.current_ret_type = 1;
                     }
                 } else {
@@ -9692,16 +9528,16 @@ pub const ZirDriver = struct {
                 // every struct construction uses (`emitStructTypeRef`),
                 // then emit `@unionInit(UnionType, ".Variant", value)`.
                 //
-                // Step 3.6 ensures every parametric union/enum
-                // specialization has a synthetic Zig source file, so
+                // Step 3.6 ensures every named union/enum — parametric
+                // specializations AND namespaced (dotted) declarations —
+                // has a synthetic Zig source file, so
                 // `emitStructTypeRef` resolves regardless of whether
-                // the enclosing function returns the union. Concrete
-                // dotted unions (`Owner.Color`) and the
-                // `cached_union_ret_type_ref` route stay as fallbacks
-                // for the narrow cases the structural pipeline doesn't
-                // cover yet (closures that lose the emission context;
-                // unit-only enums that flow through enum_literal
-                // instead of union_init).
+                // the enclosing function returns the union. Anonymous
+                // construction stays as the fallback for the narrow
+                // cases the structural pipeline doesn't cover yet
+                // (closures that lose the emission context; unit-only
+                // enums that flow through enum_literal instead of
+                // union_init).
                 //
                 // Unit-payload variants (e.g. `Option(i64).None`) carry
                 // a `const_nil` value local from HIR. Sema expects the
@@ -9786,26 +9622,9 @@ pub const ZirDriver = struct {
                         }
                     }
 
-                    // Fallback 1: function declared a union return type
-                    // and Sema can reuse that ref. Preserved for the
-                    // narrow case where `findUnionDef` doesn't see the
-                    // type (closures, partial emissions).
-                    if (self.cached_union_ret_type_ref != 0) {
-                        const ref = zir_builder_emit_union_init(
-                            self.handle,
-                            self.cached_union_ret_type_ref,
-                            ui.variant_name.ptr,
-                            @intCast(ui.variant_name.len),
-                            val_ref,
-                        );
-                        if (ref == error_ref) return error.EmitFailed;
-                        try self.setLocal(ui.dest, ref);
-                        return;
-                    }
-
-                    // Fallback 2: anonymous construction. This is only for
+                    // Fallback: anonymous construction. This is only for
                     // emission contexts that do not have a nominal union
-                    // definition or reusable nominal return-type ref.
+                    // definition.
                     const ref = zir_builder_emit_struct_init_anon(self.handle, &names, &lens, &vals, 1);
                     if (ref == error_ref) return error.EmitFailed;
                     try self.setLocal(ui.dest, ref);
@@ -10015,6 +9834,11 @@ pub const ZirDriver = struct {
                     .{ bu.protocol_name, bu.target_type_name },
                 );
                 defer self.allocator.free(instance_name);
+                // IR carries ORIGINAL (dotted) names; the instance module
+                // is registered under the dot-sanitized form.
+                for (instance_name) |*instance_name_char| {
+                    if (instance_name_char.* == '.') instance_name_char.* = '_';
+                }
 
                 const instance_import = zir_builder_emit_import(
                     self.handle,
@@ -10063,6 +9887,11 @@ pub const ZirDriver = struct {
                     .{ ve.protocol_name, ve.target_type_name },
                 );
                 defer self.allocator.free(instance_name);
+                // IR carries ORIGINAL (dotted) names; the instance module
+                // is registered under the dot-sanitized form.
+                for (instance_name) |*instance_name_char| {
+                    if (instance_name_char.* == '.') instance_name_char.* = '_';
+                }
 
                 const instance_import = zir_builder_emit_import(
                     self.handle,
@@ -13532,17 +13361,6 @@ test "ZirDriver local ref materialization propagates emission failures" {
     }
 }
 
-test "ZirDriver nested type emission propagates emitted-name allocation failure at source level" {
-    const source = @embedFile("zir_builder.zig");
-    const start = std.mem.indexOf(u8, source, "fn emitNestedTypeDecl") orelse return error.TestUnexpectedResult;
-    const end = std.mem.indexOfPos(u8, source, start, "fn emitRootFields") orelse return error.TestUnexpectedResult;
-    const nested_source = source[start..end];
-
-    try std.testing.expect(std.mem.indexOf(u8, nested_source, "fn emitNestedTypeDecl(self: *ZirDriver, type_def: ir.TypeDef, emitted: *std.StringHashMap(void)) !void") != null);
-    try std.testing.expect(std.mem.indexOf(u8, nested_source, "try emitted.put(short_name, {});") != null);
-    try std.testing.expect(std.mem.indexOf(u8, nested_source, "emitted.put(short_name, {}) catch return") == null);
-}
-
 test "ZirDriver monomorphized impl lookup distinguishes allocation failure from semantic absence" {
     const matching_function = ir.Function{
         .id = 1,
@@ -14452,7 +14270,6 @@ test "ZirDriver P4J2 residual error_ref paths fail instead of falling through" {
 
     try std.testing.expect(std.mem.indexOf(u8, param_source, "if (ref != error_ref) return ref;") == null);
     try std.testing.expect(std.mem.indexOf(u8, param_source, "zir_builder_emit_param_this_type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, param_source, "zir_builder_emit_param_decl_val_type") != null);
     try std.testing.expect(std.mem.indexOf(u8, param_source, "zir_builder_emit_param_imported_type") != null);
     try std.testing.expect(std.mem.indexOf(u8, param_source, "zir_builder_emit_param_imported_root_type") != null);
     try std.testing.expect(std.mem.indexOf(u8, param_source, "if (ref == error_ref) return error.EmitFailed;") != null);

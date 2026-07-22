@@ -143,7 +143,7 @@ pub struct HttpClient {
     Performs one `GET` request for the parsed URL: connect (TLS-verified for
     `:https`), send the request, drain the response to EOF, close, and parse.
     Failures carry a human-readable reason built from the typed
-    `SocketError` (`:econnrefused`, `:nxdomain`, `:tls_cert_invalid`, ...).
+    `Socket.Error` (`:econnrefused`, `:nxdomain`, `:tls_cert_invalid`, ...).
     """
 
   pub fn fetch(url :: HttpUrl) -> Result(HttpResponse, String) {
@@ -235,7 +235,7 @@ pub struct HttpClient {
 
   # `:https` connects through the VERIFIED TLS client (hostname + CA chain
   # checked against the system trust store); `:http` is a plain TCP connect.
-  fn open_connection(url :: HttpUrl) -> Result(Socket, SocketError) {
+  fn open_connection(url :: HttpUrl) -> Result(Socket, Socket.Error) {
     case url.scheme {
       :https -> Tls.connect_host(url.host, url.port, 15000)
       _ -> Socket.connect_host(url.host, url.port, 15000)

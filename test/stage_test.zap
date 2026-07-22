@@ -3,7 +3,7 @@
   exercised both directly (`Stage.step`/`Stage.flush`) and through the pull
   driver (`Stream.transform`). Covers the protocol contract points: output
   ordering, empty-output normalcy, exactly-once flush on both the natural-end
-  and early-halt paths, halt-after-emit ordering, the terminal `EmptyStage`
+  and early-halt paths, halt-after-emit ordering, the terminal `Stage.Empty`
   sentinel, and errors-as-values carried by `:halt`.
   """
 
@@ -120,39 +120,39 @@ pub struct StageTest {
 
   describe("built-in stages through the pull driver") {
     test("map applies the callback to every item") {
-      result = Enum.to_list(Stream.transform([1, 2, 3], %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 100 }}))
+      result = Enum.to_list(Stream.transform([1, 2, 3], %Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value + 100 }}))
       assert(List.length(result) == 3)
       assert(List.head(result) == 101)
       assert(List.last(result) == 103)
     }
 
     test("filter keeps matching items, emitting empty for the rest") {
-      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], %FilterStage(i64){predicate: fn(value :: i64) -> Bool { value > 3 }}))
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], %Stage.Filter(i64){predicate: fn(value :: i64) -> Bool { value > 3 }}))
       assert(List.length(result) == 2)
       assert(List.head(result) == 4)
       assert(List.last(result) == 5)
     }
 
     test("reject drops matching items") {
-      result = Enum.to_list(Stream.transform([1, 2, 3, 4], %RejectStage(i64){predicate: fn(value :: i64) -> Bool { value > 2 }}))
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4], %Stage.Reject(i64){predicate: fn(value :: i64) -> Bool { value > 2 }}))
       assert(List.length(result) == 2)
       assert(List.last(result) == 2)
     }
 
     test("take halts after the requested count") {
-      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], %TakeStage(i64){count: 3}))
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], %Stage.Take(i64){count: 3}))
       assert(List.length(result) == 3)
       assert(List.last(result) == 3)
     }
 
     test("drop discards the leading count") {
-      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], %DropStage(i64){count: 2}))
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], %Stage.Drop(i64){count: 2}))
       assert(List.length(result) == 3)
       assert(List.head(result) == 3)
     }
 
     test("scan emits the running accumulator") {
-      result = Enum.to_list(Stream.transform([1, 2, 3, 4], %ScanStage(i64, i64){state: 0, reducer: fn(accumulator :: i64, value :: i64) -> i64 { accumulator + value }}))
+      result = Enum.to_list(Stream.transform([1, 2, 3, 4], %Stage.Scan(i64, i64){state: 0, reducer: fn(accumulator :: i64, value :: i64) -> i64 { accumulator + value }}))
       assert(List.length(result) == 4)
       assert(List.head(result) == 1)
       assert(List.last(result) == 10)
@@ -218,9 +218,9 @@ pub struct StageTest {
     }
   }
 
-  describe("EmptyStage terminal sentinel") {
+  describe("Stage.Empty terminal sentinel") {
     test("step halts emitting nothing and flush is empty") {
-      case Stage.step(%EmptyStage(i64, i64){}, 42) {
+      case Stage.step(%Stage.Empty(i64, i64){}, 42) {
         {decision, outs, next_stage} -> assert(empty_stage_ok(decision, outs, next_stage))
       }
     }
@@ -228,19 +228,19 @@ pub struct StageTest {
 
   describe("stages exercised directly via Stage.step") {
     test("map step yields one output and continues") {
-      case Stage.step(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * 2 }}, 21) {
+      case Stage.step(%Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value * 2 }}, 21) {
         {decision, outs, _next} -> assert(decision == :cont and List.head(outs) == 42)
       }
     }
 
     test("take step halts on the final item") {
-      case Stage.step(%TakeStage(i64){count: 1}, 7) {
+      case Stage.step(%Stage.Take(i64){count: 1}, 7) {
         {decision, outs, _next} -> assert(decision == :halt and List.head(outs) == 7)
       }
     }
 
     test("filter step emits empty for a non-match") {
-      case Stage.step(%FilterStage(i64){predicate: fn(value :: i64) -> Bool { value > 100 }}, 5) {
+      case Stage.step(%Stage.Filter(i64){predicate: fn(value :: i64) -> Bool { value > 100 }}, 5) {
         {decision, outs, _next} -> assert(decision == :cont and List.length(outs) == 0)
       }
     }
@@ -248,7 +248,7 @@ pub struct StageTest {
 
   describe("Stream.compose fuses two stages") {
     test("compose(map, filter) equals filter after map") {
-      composed = Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * value }}, %FilterStage(i64){predicate: fn(value :: i64) -> Bool { value > 4 }})
+      composed = Stream.compose(%Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value * value }}, %Stage.Filter(i64){predicate: fn(value :: i64) -> Bool { value > 4 }})
       result = Enum.to_list(Stream.transform([1, 2, 3, 4], composed))
       assert(List.length(result) == 2)
       assert(List.head(result) == 9)
@@ -256,7 +256,7 @@ pub struct StageTest {
     }
 
     test("compose drains a buffering first (chunk_every) into second on flush") {
-      composed = Stream.compose(%ChunkEveryStage(i64){count: 2, buffer: ([] :: [i64])}, %MapStage([i64], i64){callback: fn(chunk :: [i64]) -> i64 { List.length(chunk) }})
+      composed = Stream.compose(%Stage.ChunkEvery(i64){count: 2, buffer: ([] :: [i64])}, %Stage.Map([i64], i64){callback: fn(chunk :: [i64]) -> i64 { List.length(chunk) }})
       result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], composed))
       assert(List.length(result) == 3)
       assert(List.head(result) == 2)
@@ -264,7 +264,7 @@ pub struct StageTest {
     }
 
     test("compose a length-prefixed framer with a decoder stage") {
-      decoder = %MapStage(Result(String, FramingError), i64){callback: fn(frame :: Result(String, FramingError)) -> i64 { StageTest.decode_frame_length(frame) }}
+      decoder = %Stage.Map(Result(String, Framer.Error), i64){callback: fn(frame :: Result(String, Framer.Error)) -> i64 { StageTest.decode_frame_length(frame) }}
       composed = Stream.compose(Framer.length_prefixed(2, 1024), decoder)
       wire = length_prefixed_frame("abc") <> length_prefixed_frame("de")
       result = Enum.to_list(Stream.transform([wire], composed))
@@ -274,7 +274,7 @@ pub struct StageTest {
     }
 
     test("a halt in the first stage propagates through the composite") {
-      composed = Stream.compose(%TakeStage(i64){count: 2}, %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 100 }})
+      composed = Stream.compose(%Stage.Take(i64){count: 2}, %Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value + 100 }})
       result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], composed))
       assert(List.length(result) == 2)
       assert(List.head(result) == 101)
@@ -282,7 +282,7 @@ pub struct StageTest {
     }
 
     test("a halt in the second stage propagates through the composite") {
-      composed = Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 100 }}, %TakeStage(i64){count: 2})
+      composed = Stream.compose(%Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value + 100 }}, %Stage.Take(i64){count: 2})
       result = Enum.to_list(Stream.transform([1, 2, 3, 4, 5], composed))
       assert(List.length(result) == 2)
       assert(List.head(result) == 101)
@@ -290,8 +290,8 @@ pub struct StageTest {
     }
 
     test("compose is associative on a three-stage pipeline") {
-      left_nested = Stream.compose(Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 1 }}, %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * 2 }}), %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value - 3 }})
-      right_nested = Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value + 1 }}, Stream.compose(%MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value * 2 }}, %MapStage(i64, i64){callback: fn(value :: i64) -> i64 { value - 3 }}))
+      left_nested = Stream.compose(Stream.compose(%Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value + 1 }}, %Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value * 2 }}), %Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value - 3 }})
+      right_nested = Stream.compose(%Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value + 1 }}, Stream.compose(%Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value * 2 }}, %Stage.Map(i64, i64){callback: fn(value :: i64) -> i64 { value - 3 }}))
       result_left = Enum.to_list(Stream.transform([1, 2, 3], left_nested))
       result_right = Enum.to_list(Stream.transform([1, 2, 3], right_nested))
       assert(List.length(result_left) == 3)
@@ -304,7 +304,7 @@ pub struct StageTest {
 
     test("a composed String pipeline halted early is leak-free") {
       assert_no_leaks {
-        composed = Stream.compose(%MapStage(String, String){callback: fn(value :: String) -> String { value <> "!" }}, %TakeStage(String){count: 2})
+        composed = Stream.compose(%Stage.Map(String, String){callback: fn(value :: String) -> String { value <> "!" }}, %Stage.Take(String){count: 2})
         result = Enum.to_list(Stream.transform(["a", "b", "c", "d"], composed))
         assert(List.length(result) == 2)
         assert(List.head(result) == "a!")
@@ -320,7 +320,7 @@ pub struct StageTest {
   }
 
   # Decode a framed Result into its payload length, or -1 on a framing error.
-  fn decode_frame_length(frame :: Result(String, FramingError)) -> i64 {
+  fn decode_frame_length(frame :: Result(String, Framer.Error)) -> i64 {
     case frame {
       Result.Ok(payload) -> String.length(payload)
       Result.Error(_error) -> -1

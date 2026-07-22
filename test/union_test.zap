@@ -474,7 +474,7 @@ pub struct UnionTest {
   # `u32` that failed to unify with the union type (`incompatible types: 'U' and
   # 'u32'`) — both as a function's direct return and as one arm of a `case`
   # whose OTHER arm builds a payload variant. This is the exact shape
-  # `SocketRecv.Closed` (payload-free EOF) needs. The exhaustive-match guarantee
+  # `Socket.Recv.Closed` (payload-free EOF) needs. The exhaustive-match guarantee
   # is unaffected: every variant, payload-free included, must still be covered.
   pub union Mixed3 {
     Chunk :: String

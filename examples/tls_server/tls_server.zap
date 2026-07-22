@@ -39,23 +39,23 @@ pub struct TlsServer {
   # exit-code contribution (0 on success).
   fn echo_once(conn :: Socket) -> u8 {
     case Socket.recv(conn, 0, 15000) {
-      SocketRecv.Chunk(bytes) ->
+      Socket.Recv.Chunk(bytes) ->
         {
           _sent = Socket.send(conn, bytes)
           _c = Socket.close(conn)
           (0 :: u8)
         }
-      SocketRecv.Closed ->
+      Socket.Recv.Closed ->
         {
           _c = Socket.close(conn)
           (0 :: u8)
         }
-      SocketRecv.TimedOut(_p) ->
+      Socket.Recv.TimedOut(_p) ->
         {
           _c = Socket.close(conn)
           (0 :: u8)
         }
-      SocketRecv.Failed(_e) ->
+      Socket.Recv.Failed(_e) ->
         {
           _c = Socket.close(conn)
           (0 :: u8)
@@ -65,7 +65,7 @@ pub struct TlsServer {
 
   pub fn main(_args :: [String]) -> u8 {
     config = %TlsServerConfig{cert_pem: TlsServer.cert_pem(), key_pem: TlsServer.key_pem(), alpn: ["http/1.1"]}
-    case Tls.listen(SocketAddress.loopback(44330), config, 16) {
+    case Tls.listen(Socket.Address.loopback(44330), config, 16) {
       Result.Error(_e) ->
         {
           _p = IO.puts("LISTEN_FAILED")
@@ -73,13 +73,13 @@ pub struct TlsServer {
         }
       Result.Ok(listener) ->
         {
-          port = SocketListener.local_port(listener)
+          port = Socket.Listener.local_port(listener)
           _p = IO.puts("LISTENING " <> Integer.to_string(port))
           result = case Tls.accept(listener, 180000) {
             Result.Ok(conn) -> TlsServer.echo_once(conn)
             Result.Error(_e) -> (2 :: u8)
           }
-          _closed = SocketListener.close(listener)
+          _closed = Socket.Listener.close(listener)
           result
         }
     }

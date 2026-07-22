@@ -2,9 +2,9 @@
   The error a `Framer` stage emits — as a value, never a raise — when the byte
   stream violates the framing contract.
 
-  A framer is a `Stage(String, Result(String, FramingError))`: a complete frame
+  A framer is a `Stage(String, Result(String, Framer.Error))`: a complete frame
   flows out as `Result.Ok(payload)`, and a protocol violation flows out as
-  `Result.Error(%FramingError{reason: ...})` immediately followed by `:halt`.
+  `Result.Error(%Framer.Error{reason: ...})` immediately followed by `:halt`.
   Errors are ordinary stream elements — they are never raised.
 
   ## Reasons
@@ -21,6 +21,6 @@
   """
 
 @code Z1005
-pub error FramingError {
+pub error Framer.Error {
   reason :: Atom = :unknown
 }

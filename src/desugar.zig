@@ -431,7 +431,8 @@ pub const Desugarer = struct {
             if (field.name == cause_name) has_cause_field = true;
         }
         if (!has_message_field) {
-            const default_msg_text = interner_mut.get(err_decl.name.parts[err_decl.name.parts.len - 1]);
+            const default_msg_text = try err_decl.name.joinedWith(self.allocator, self.interner, ".");
+            defer self.allocator.free(default_msg_text);
             const default_msg_id = try interner_mut.intern(default_msg_text);
             const default_expr = try self.create(ast.Expr, .{
                 .string_literal = .{
@@ -695,7 +696,14 @@ pub const Desugarer = struct {
             });
             try args.append(self.allocator, arg);
         }
-        const type_name = err_decl.name.parts[err_decl.name.parts.len - 1];
+        // The FULL (possibly dotted) error name — `Framer.Error` must
+        // reference `Framer.Error`, never its bare last part: for a
+        // namespaced error the last part alone can resolve to an UNRELATED
+        // declaration (`Framer.Error`'s last part is the `Error` PROTOCOL,
+        // which silently shadowed the generated impl's self type).
+        const joined_name_text = try err_decl.name.joinedWith(self.allocator, self.interner, ".");
+        defer self.allocator.free(joined_name_text);
+        const type_name = try self.interner.intern(joined_name_text);
         return try self.create(ast.TypeExpr, .{
             .name = .{
                 .meta = .{ .span = meta.span },
