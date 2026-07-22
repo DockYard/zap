@@ -664,6 +664,14 @@ pub fn getArgv() []const [*:0]const u8 {
 }
 
 /// Write formatted output to stdout through the buffered writer.
+///
+/// BOUNDED-OUTPUT ONLY: the 4 KiB scratch covers every numeric / enum /
+/// diagnostic format the runtime emits, and an overflowing format is
+/// dropped (`bufPrint` → `NoSpaceLeft` → return). UNBOUNDED user data —
+/// a Zap `String` being printed — must NOT route through here: `println`
+/// / `print_str` write string payloads directly via `stdoutBufferedWrite`,
+/// which has no size ceiling (a 123 KiB HTTP body once vanished through a
+/// `stdoutPrint("{s}", …)` on this path).
 fn stdoutPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
@@ -20320,7 +20328,10 @@ pub const Zest = struct {
 
             stdoutPrint("   ", .{});
             if (line_end > line_start) {
-                stdoutPrint("{s}", .{message[line_start..line_end]});
+                // A failure-message LINE is unbounded user data (a long assert
+                // diff easily exceeds the 4 KiB format scratch, which would
+                // silently drop it) — write the bytes directly.
+                stdoutBufferedWrite(message[line_start..line_end]);
             }
 
             if (line_end == message.len) break;
@@ -26664,7 +26675,13 @@ pub const IO = struct {
         const T = @TypeOf(value);
         const info = @typeInfo(T);
         if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
-            stdoutPrint("{s}\n", .{value});
+            // Strings are UNBOUNDED user data — write the bytes straight
+            // through the buffered writer instead of `stdoutPrint`, whose
+            // 4 KiB format scratch would silently DROP any longer value
+            // (`bufPrint` fails with `NoSpaceLeft` and the message is lost —
+            // an `IO.puts` of a fetched HTTP body printed nothing).
+            stdoutBufferedWrite(value);
+            stdoutBufferedWriteByte('\n');
         } else if (info == .int or info == .comptime_int) {
             stdoutPrint("{d}\n", .{value});
         } else if (info == .float or info == .comptime_float) {
@@ -26695,7 +26712,9 @@ pub const IO = struct {
         const T = @TypeOf(value);
         const info = @typeInfo(T);
         if (T == []const u8 or (info == .pointer and @typeInfo(std.meta.Child(T)) == .array)) {
-            stdoutPrint("{s}", .{value});
+            // See `println`: strings bypass the bounded format scratch so a
+            // large value is never silently dropped.
+            stdoutBufferedWrite(value);
         } else {
             stdoutPrint("{any}", .{value});
         }
