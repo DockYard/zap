@@ -324,6 +324,14 @@ pub fn analyzeProgramFull(
         try in_worklist.put(allocator, func.id, {});
     }
 
+    // Pass-scoped fresh-allocator-wrapper memo shared by every per-function
+    // analysis in this fixpoint (see `uniqueness.Analyzer.fresh_wrapper_memo`):
+    // the worklist re-analyzes functions across rounds, so the decision cost
+    // is paid once per unique callee name instead of once per call site per
+    // round (the merged-suite compile-time grind).
+    var fresh_wrapper_memo: std.StringHashMapUnmanaged(bool) = .empty;
+    defer fresh_wrapper_memo.deinit(allocator);
+
     while (worklist.pop()) |func_id| {
         _ = in_worklist.remove(func_id);
         const caller = lookupFunction(program, func_id) orelse continue;
@@ -339,7 +347,7 @@ pub fn analyzeProgramFull(
             if (ownerships) |program_ownership| break :blk program_ownership.get(caller.id);
             break :blk null;
         };
-        var caller_uniqueness = try uniqueness.analyzeUniquenessFullEx(
+        var caller_uniqueness = try uniqueness.analyzeUniquenessFullExMemo(
             allocator,
             caller,
             program,
@@ -347,6 +355,7 @@ pub fn analyzeProgramFull(
             signatures,
             fn_ownership,
             true,
+            &fresh_wrapper_memo,
         );
         defer caller_uniqueness.deinit(allocator);
 

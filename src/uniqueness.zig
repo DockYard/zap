@@ -244,6 +244,24 @@ pub fn analyzeUniquenessFullEx(
     ownership: ?*const arc_liveness.ArcOwnership,
     record_arg_sites: bool,
 ) !Uniqueness {
+    return analyzeUniquenessFullExMemo(allocator, function, program, fixpoint, signatures, ownership, record_arg_sites, null);
+}
+
+/// `analyzeUniquenessFullEx` with a caller-owned pass-scoped memo for the
+/// fresh-allocator-wrapper decision (see `Analyzer.fresh_wrapper_memo`).
+/// The interprocedural fixpoint passes one memo across every per-function
+/// analysis of a program so the whole-program decision cost is paid once
+/// per unique callee name, not once per call site.
+pub fn analyzeUniquenessFullExMemo(
+    allocator: std.mem.Allocator,
+    function: *const ir.Function,
+    program: ?*const ir.Program,
+    fixpoint: ?*const uniqueness_interprocedural.ProgramUniqueness,
+    signatures: ?*const uniqueness_signature.ProgramSignatures,
+    ownership: ?*const arc_liveness.ArcOwnership,
+    record_arg_sites: bool,
+    fresh_wrapper_memo: ?*std.StringHashMapUnmanaged(bool),
+) !Uniqueness {
     var analyzer = Analyzer{
         .allocator = allocator,
         .function = function,
@@ -252,6 +270,7 @@ pub fn analyzeUniquenessFullEx(
         .signatures = signatures,
         .ownership = ownership,
         .record_arg_sites = record_arg_sites,
+        .fresh_wrapper_memo = fresh_wrapper_memo,
         .unique = .empty,
         .tuple_pending = .empty,
         .extracted = .empty,
@@ -340,6 +359,21 @@ const Analyzer = struct {
     allocator: std.mem.Allocator,
     function: *const ir.Function,
     program: ?*const ir.Program,
+    /// Per-callee-name memo for `calleeIsFreshAllocatorWrapper`,
+    /// BORROWED from the pass driver. The decision is a pure function of
+    /// (program, name), and the dataflow queries it once per call SITE —
+    /// on a merged whole-program analysis that is
+    /// O(call sites × program functions) without a memo, because every
+    /// un-memoized query rebuilds the
+    /// `uniqueness_decision.ProgramFunctionIndex` from scratch (the
+    /// compile-time grind the merged test suite surfaced). The memo MUST
+    /// be pass-scoped, not per-analyzer: the interprocedural fixpoint
+    /// constructs one analyzer per function per round, so a per-instance
+    /// map would start empty thousands of times over. Keys are
+    /// callee-name slices borrowed from the IR (stable for the pass's
+    /// lifetime); the owning driver frees the map. Null in single-function
+    /// entry points (no sharing to win).
+    fresh_wrapper_memo: ?*std.StringHashMapUnmanaged(bool) = null,
     /// Optional whole-program uniqueness fixpoint. When non-null, the
     /// `param_get` handler consults this for the function's parameter
     /// slots: a slot proven unique-on-entry by the fixpoint causes
@@ -1766,9 +1800,16 @@ const Analyzer = struct {
     /// reference is absent (test scaffolding) or the name doesn't
     /// match. Propagates recognition OOM through the dataflow walk.
     /// Delegates to the shared `uniqueness_decision` authority.
-    fn calleeIsFreshAllocatorWrapper(self: *const Analyzer, name: []const u8) std.mem.Allocator.Error!bool {
+    fn calleeIsFreshAllocatorWrapper(self: *Analyzer, name: []const u8) std.mem.Allocator.Error!bool {
         const program = self.program orelse return false;
-        return try uniqueness_decision.isFreshAllocatorWrapperByName(self.allocator, program, name);
+        if (self.fresh_wrapper_memo) |memo| {
+            if (memo.get(name)) |cached| return cached;
+        }
+        const fresh = try uniqueness_decision.isFreshAllocatorWrapperByName(self.allocator, program, name);
+        if (self.fresh_wrapper_memo) |memo| {
+            try memo.put(self.allocator, name, fresh);
+        }
+        return fresh;
     }
 };
 

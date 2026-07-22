@@ -1729,6 +1729,16 @@ fn analyzeProgramTentative(
         try result.by_function.put(allocator, func.id, slots);
     }
 
+    // Per-callee-name memo for the fresh-allocator-wrapper decision,
+    // shared by every per-function tentative analyzer in this pass. The
+    // decision is a pure function of (program, name), and the dataflow
+    // queries it once per call SITE — without the memo each query rebuilds
+    // `uniqueness_decision.ProgramFunctionIndex` from scratch, an
+    // O(call sites × program functions) compile-time grind on the merged
+    // whole-program analysis (mirrors `uniqueness.Analyzer`'s memo).
+    var fresh_wrapper_memo: std.StringHashMapUnmanaged(bool) = .empty;
+    defer fresh_wrapper_memo.deinit(allocator);
+
     // Build name → id lookup.
     var name_to_id: std.StringHashMapUnmanaged(ir.FunctionId) = .empty;
     defer name_to_id.deinit(allocator);
@@ -1789,6 +1799,7 @@ fn analyzeProgramTentative(
             &rewritten,
             signatures,
             function_ownership,
+            &fresh_wrapper_memo,
         );
         defer caller_uniqueness.deinit(allocator);
 
@@ -1964,6 +1975,7 @@ fn analyzeFunctionTentative(
     rewritten: *const RewrittenShareSet,
     signatures: *const uniqueness_signature.ProgramSignatures,
     ownership: ?*const arc_liveness.ArcOwnership,
+    fresh_wrapper_memo: ?*std.StringHashMapUnmanaged(bool),
 ) !TentativeFunctionUniqueness {
     var analyzer = TentativeAnalyzer{
         .allocator = allocator,
@@ -1973,6 +1985,7 @@ fn analyzeFunctionTentative(
         .rewritten = rewritten,
         .signatures = signatures,
         .ownership = ownership,
+        .fresh_wrapper_memo = fresh_wrapper_memo,
         .unique = .empty,
         .tuple_pending = .empty,
         .extracted = .empty,
@@ -2034,6 +2047,11 @@ const TentativeAnalyzer = struct {
     program: *const ir.Program,
     fixpoint: *const uniqueness_interprocedural.ProgramUniqueness,
     rewritten: *const RewrittenShareSet,
+    /// Pass-scoped fresh-allocator-wrapper memo shared across every
+    /// per-function analyzer of one `analyzeProgramTentative` run (see
+    /// its declaration for the O(call sites × functions) rationale), or
+    /// null in single-function test scaffolding (no sharing to win).
+    fresh_wrapper_memo: ?*std.StringHashMapUnmanaged(bool) = null,
     /// Phase 2.6.2 — whole-program signatures. Used to synthesize
     /// per-component `tuple_pending` entries on call dests when the
     /// callee's `return_components` table records per-slot witnesses.
@@ -3408,7 +3426,14 @@ const TentativeAnalyzer = struct {
     }
 
     fn calleeIsFreshAllocatorWrapper(self: *const TentativeAnalyzer, name: []const u8) std.mem.Allocator.Error!bool {
-        return try uniqueness_decision.isFreshAllocatorWrapperByName(self.allocator, self.program, name);
+        if (self.fresh_wrapper_memo) |memo| {
+            if (memo.get(name)) |cached| return cached;
+        }
+        const fresh = try uniqueness_decision.isFreshAllocatorWrapperByName(self.allocator, self.program, name);
+        if (self.fresh_wrapper_memo) |memo| {
+            try memo.put(self.allocator, name, fresh);
+        }
+        return fresh;
     }
 
     fn snapshot(self: *TentativeAnalyzer) error{OutOfMemory}!TentativeSnapshot {
@@ -7214,6 +7239,7 @@ fn runTentativeForTest(
         &fixpoint,
         &rewritten,
         signatures,
+        null,
         null,
     );
 }

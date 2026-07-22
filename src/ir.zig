@@ -9176,9 +9176,30 @@ pub const IrBuilder = struct {
                     if (result.items.len > 0 and r.value != null) {
                         var probe: usize = result.items.len;
                         while (probe > 0 and isTailMappableTrailingInstr(result.items[probe - 1])) : (probe -= 1) {}
-                        if (probe > 0 and result.items[probe - 1] == .call_named) {
-                            const cn = result.items[probe - 1].call_named;
-                            if (std.mem.eql(u8, cn.name, func_name) and r.value.? == cn.dest) {
+                        // Raises-ABI tolerance (mirrors `rewriteTailCallsInBody`):
+                        // step past a trailing `unwrap_error_union(.propagate)` —
+                        // the `try self(...)` materialization — and match the call
+                        // underneath. The unwrap is DROPPED on rewrite: a self-
+                        // call's propagate-unwrap is an unwrap→rewrap identity
+                        // (shared raises row), and the tail_call terminator makes
+                        // no call at this site for the loopified back-edge, so no
+                        // error union ever materializes here.
+                        var linear_raises_unwrap: ?UnwrapErrorUnion = null;
+                        var call_slot = probe;
+                        if (probe > 1 and result.items[probe - 1] == .unwrap_error_union) {
+                            const unwrap = result.items[probe - 1].unwrap_error_union;
+                            if (unwrap.mode == .propagate) {
+                                linear_raises_unwrap = unwrap;
+                                call_slot = probe - 1;
+                            }
+                        }
+                        const linear_expected_dest: ?LocalId = if (linear_raises_unwrap) |unwrap|
+                            (if (unwrap.dest == r.value.?) unwrap.source else null)
+                        else
+                            r.value.?;
+                        if (call_slot > 0 and linear_expected_dest != null and result.items[call_slot - 1] == .call_named) {
+                            const cn = result.items[call_slot - 1].call_named;
+                            if (std.mem.eql(u8, cn.name, func_name) and linear_expected_dest.? == cn.dest) {
                                 // Phase E.8 orphan-share fix: scan
                                 // the trailing arg-cleanup releases
                                 // and find their matching prelude
@@ -9196,7 +9217,7 @@ pub const IrBuilder = struct {
                                 var arg_substitutions = std.AutoHashMap(LocalId, LocalId).init(self.allocator);
                                 defer arg_substitutions.deinit();
                                 try collectOrphanShareRewrites(
-                                    result.items[0 .. probe - 1],
+                                    result.items[0 .. call_slot - 1],
                                     result.items[probe..],
                                     cn.args,
                                     &dropped_share_dests,
@@ -9230,7 +9251,7 @@ pub const IrBuilder = struct {
                                 // a temp slice keeps the code clear.
                                 var rebuilt_prelude: std.ArrayList(Instruction) = .empty;
                                 defer rebuilt_prelude.deinit(self.allocator);
-                                for (result.items[0 .. probe - 1]) |prelude_instr| {
+                                for (result.items[0 .. call_slot - 1]) |prelude_instr| {
                                     switch (prelude_instr) {
                                         .share_value => |sv| {
                                             if (dropped_share_dests.contains(sv.dest)) continue;
@@ -9373,6 +9394,30 @@ pub const IrBuilder = struct {
         var call_index: usize = body.len;
         while (call_index > 0 and isTailMappableTrailingInstr(body[call_index - 1])) : (call_index -= 1) {}
         if (call_index == 0) return .{ .instrs = body, .rewritten = false };
+
+        // Raises-ABI tolerance: under inferred-total raises, `try self(...)`
+        // in an arm's tail position materializes as
+        // `call → unwrap_error_union(.propagate) → (arm value)`. The
+        // propagate-unwrap of a SELF-call's error union is an unwrap→rewrap
+        // identity — the caller and callee share the raises row by definition
+        // — so it is transparent to tail classification: step past it, match
+        // the call underneath (requiring `unwrap.source == call.dest` and the
+        // arm value == `unwrap.dest`), and DROP it on rewrite. The dropped
+        // unwrap loses nothing: the loopified/musttail back-edge makes no
+        // call at this site, so no error union ever materializes here; a
+        // raise inside the next iteration propagates through the enclosing
+        // function's own raise path exactly as the recursive propagate chain
+        // would have. `route_to_handler` / `abort_unhandled` unwraps sit
+        // under a rescue landing pad / the entry shim — genuinely NOT tail
+        // positions — and are left alone.
+        var raises_unwrap: ?UnwrapErrorUnion = null;
+        if (call_index > 1 and body[call_index - 1] == .unwrap_error_union) {
+            const unwrap = body[call_index - 1].unwrap_error_union;
+            if (unwrap.mode == .propagate) {
+                raises_unwrap = unwrap;
+                call_index -= 1;
+            }
+        }
         const call_instr = body[call_index - 1];
 
         // Phase E.7b: NESTED structural tail position. When the arm's
@@ -9416,7 +9461,20 @@ pub const IrBuilder = struct {
             }
         }
 
-        const trailing = body[call_index..];
+        // The pure tail-mappable trailing run. When a raises unwrap was
+        // stepped past it sits at `body[call_index]` and is EXCLUDED — it is
+        // dropped by the rewrite, not preserved (see the tolerance note).
+        const trailing = if (raises_unwrap != null) body[call_index + 1 ..] else body[call_index..];
+
+        // The dest the CALL must produce for the recursion to be in tail
+        // position: normally the arm value itself; through a raises unwrap,
+        // the unwrap's source — with the arm value required to be the
+        // unwrap's dest (the unwrapped payload IS what the arm yields).
+        const expected_call_dest: ?LocalId = if (raises_unwrap) |unwrap|
+            (if (unwrap.dest == return_value.?) unwrap.source else null)
+        else
+            return_value.?;
+        if (expected_call_dest == null) return .{ .instrs = body, .rewritten = false };
 
         const TailCallShape = struct {
             args: []const LocalId,
@@ -9439,12 +9497,12 @@ pub const IrBuilder = struct {
                     // whose result becomes the arm's value satisfies
                     // it, regardless of which function was actually
                     // invoked.
-                    .dest_matches = cd.function == enclosing_function_id and cd.dest == return_value.?,
+                    .dest_matches = cd.function == enclosing_function_id and cd.dest == expected_call_dest.?,
                 },
                 .call_named => |cn| break :blk .{
                     .args = cn.args,
                     .tail_name = cn.name,
-                    .dest_matches = std.mem.eql(u8, cn.name, func_name) and cn.dest == return_value.?,
+                    .dest_matches = std.mem.eql(u8, cn.name, func_name) and cn.dest == expected_call_dest.?,
                 },
                 else => break :blk null,
             }
@@ -21821,6 +21879,92 @@ test "rewriteTailCalls collapses a case_block case_break leaf into tail_call (Ph
     // self-terminating case_block.
     try std.testing.expectEqual(@as(usize, 1), rewritten.len);
     try std.testing.expect(rewritten[0] == .case_block);
+}
+
+test "rewriteTailCalls steps past a propagate unwrap on a raises-ABI self tail call" {
+    // The Zest aggregate runner shape (the deep-ordinal stack-overflow bug):
+    // under inferred-total raises, a raising self-recursion materializes as
+    // `call_named(self) → unwrap_error_union(.propagate) → case_break` — the
+    // propagate-unwrap of a SELF-call's error union in tail position is an
+    // unwrap→rewrap identity (caller and callee share the raises row by
+    // definition), so the rewriter must treat it as transparent: collapse the
+    // triple into a `tail_call`, dropping the unwrap. Without this, the
+    // recursion stays a plain call and every test position burns ~1KB of the
+    // root fiber stack (the merged-suite TLS/Kyber guard-page faults).
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    const done_body = try alloc.alloc(Instruction, 2);
+    done_body[0] = .{ .local_get = .{ .dest = 50, .source = 1 } };
+    done_body[1] = .{ .case_break = .{ .value = 50 } };
+
+    // The raising recursive arm: call(self) → propagate-unwrap (IN-PLACE,
+    // dest == source, exactly as the raises lowering emits it) → case_break.
+    const cont_body = try alloc.alloc(Instruction, 3);
+    cont_body[0] = .{ .call_named = .{ .dest = 60, .name = "step", .args = &.{}, .arg_modes = &.{} } };
+    cont_body[1] = .{ .unwrap_error_union = .{ .dest = 60, .source = 60, .mode = .propagate } };
+    cont_body[2] = .{ .case_break = .{ .value = 60 } };
+
+    const pre = try alloc.alloc(Instruction, 3);
+    pre[0] = .{ .guard_block = .{ .condition = 10, .body = done_body } };
+    pre[1] = .{ .guard_block = .{ .condition = 11, .body = cont_body } };
+    pre[2] = .{ .match_fail = .{ .message = "no matching case clause" } };
+
+    const instrs = try alloc.alloc(Instruction, 2);
+    instrs[0] = .{ .case_block = .{ .dest = 100, .pre_instrs = pre, .arms = &.{}, .default_instrs = &.{}, .default_result = null } };
+    instrs[1] = .{ .ret = .{ .value = 100 } };
+
+    const params = try alloc.alloc(Param, 0);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "step", 0, params, .void);
+
+    var scan = TailCallScanForTest{ .self_name = "step" };
+    scan.scan(rewritten);
+
+    // The raising leaf collapsed to a tail_call; the unwrap is gone with it.
+    try std.testing.expectEqual(@as(usize, 1), scan.tail_calls);
+    try std.testing.expectEqual(@as(usize, 0), scan.self_call_named);
+    // The base leaf's case_break became `ret 50` (exactly one ret).
+    try std.testing.expectEqual(@as(usize, 1), scan.rets);
+    try std.testing.expectEqual(@as(usize, 1), rewritten.len);
+    try std.testing.expect(rewritten[0] == .case_block);
+}
+
+test "rewriteTailCalls steps past a propagate unwrap in the linear call+ret shape" {
+    // The single-clause variant of the raises-ABI tail shape:
+    // `call_named(self) → unwrap_error_union(.propagate, dest≠source) → ret` at
+    // the top level of the function stream (no branch construct). The rewriter
+    // must match through the RE-TARGETING unwrap (ret.value == unwrap.dest,
+    // unwrap.source == call.dest) and collapse to a terminator `tail_call`.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var interner = ast.StringInterner.init(alloc);
+    defer interner.deinit();
+    var ir_builder = IrBuilder.init(alloc, &interner);
+    defer ir_builder.deinit();
+
+    const instrs = try alloc.alloc(Instruction, 3);
+    instrs[0] = .{ .call_named = .{ .dest = 60, .name = "spin", .args = &.{}, .arg_modes = &.{} } };
+    instrs[1] = .{ .unwrap_error_union = .{ .dest = 61, .source = 60, .mode = .propagate } };
+    instrs[2] = .{ .ret = .{ .value = 61 } };
+
+    const params = try alloc.alloc(Param, 0);
+    const rewritten = try ir_builder.rewriteTailCalls(instrs, "spin", 0, params, .void);
+
+    var scan = TailCallScanForTest{ .self_name = "spin" };
+    scan.scan(rewritten);
+
+    try std.testing.expectEqual(@as(usize, 1), scan.tail_calls);
+    try std.testing.expectEqual(@as(usize, 0), scan.self_call_named);
+    // The tail_call is the terminator — the ret (and the unwrap) are gone.
+    try std.testing.expectEqual(@as(usize, 0), scan.rets);
 }
 
 test "rewriteTailCalls collapses a nested case-of-case tail call (Phase E.7c)" {
