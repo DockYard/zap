@@ -2322,13 +2322,35 @@ fn zestCrashedOrdinal(stderr_bytes: []const u8) ?i64 {
     return pending;
 }
 
+/// The NAME of the test the child was running when it died: the last
+/// `##ZEST-CASE <name>` marker in a shard's captured stderr. The child emits
+/// one CASE line per started test (from `begin_named_test`, which — unlike the
+/// position-scoped `##ZEST-BEGIN` — knows the selected case), so on an
+/// abnormal exit the final CASE line names the in-flight test. `null` when the
+/// shard died before any case started (or ran to completion, in which case
+/// the caller has no unterminated BEGIN and never asks).
+fn zestCrashedCaseName(stderr_bytes: []const u8) ?[]const u8 {
+    var last_case: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, stderr_bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "##ZEST-CASE ")) {
+            const name = std.mem.trim(u8, line["##ZEST-CASE ".len..], " \r\t");
+            if (name.len > 0) last_case = name;
+        }
+    }
+    return last_case;
+}
+
 /// Forward a shard's captured stderr to the real stderr, dropping the internal
-/// `##ZEST-BEGIN`/`##ZEST-END` marker lines so the user sees crash reports and
-/// any genuine diagnostics but not the supervisor's bookkeeping.
+/// `##ZEST-BEGIN`/`##ZEST-END`/`##ZEST-CASE` marker lines so the user sees
+/// crash reports and any genuine diagnostics but not the supervisor's
+/// bookkeeping.
 fn reemitShardStderr(stderr_bytes: []const u8) void {
     var lines = std.mem.splitScalar(u8, stderr_bytes, '\n');
     while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "##ZEST-BEGIN ") or std.mem.startsWith(u8, line, "##ZEST-END ")) continue;
+        if (std.mem.startsWith(u8, line, "##ZEST-BEGIN ") or
+            std.mem.startsWith(u8, line, "##ZEST-END ") or
+            std.mem.startsWith(u8, line, "##ZEST-CASE ")) continue;
         if (line.len == 0) continue;
         std.debug.print("{s}\n", .{line});
     }
@@ -2452,10 +2474,19 @@ fn superviseTestRun(
 
         const crashed_ordinal = crashed.?;
         hard_failures += 1;
-        std.debug.print(
-            "\n\x1b[1;31m⚡ test #{d} crashed ({any}) — isolated as a hard failure, resuming\x1b[0m\n",
-            .{ crashed_ordinal, term },
-        );
+        // Name the in-flight test from the shard's last `##ZEST-CASE` marker
+        // so the notice identifies the culprit, not just its shuffle position.
+        if (zestCrashedCaseName(stderr_bytes)) |case_name| {
+            std.debug.print(
+                "\n\x1b[1;31m⚡ test #{d} ({s}) crashed ({any}) — isolated as a hard failure, resuming\x1b[0m\n",
+                .{ crashed_ordinal, case_name, term },
+            );
+        } else {
+            std.debug.print(
+                "\n\x1b[1;31m⚡ test #{d} crashed ({any}) — isolated as a hard failure, resuming\x1b[0m\n",
+                .{ crashed_ordinal, term },
+            );
+        }
         resume_after = crashed_ordinal;
         worst_exit = 1;
     }
@@ -2490,6 +2521,19 @@ test "Phase B: zestCrashedOrdinal returns the unterminated BEGIN ordinal" {
     // A trailing crash report after the begin must not disturb the result.
     try std.testing.expectEqual(@as(?i64, 2), zestCrashedOrdinal(
         "##ZEST-BEGIN 2\n** (runtime_error) boom\n  Foo.bar/0 at x.zap:1\n",
+    ));
+}
+
+test "Phase B: zestCrashedCaseName returns the last CASE marker's test name" {
+    // The crashed test is the LAST case started — earlier completed cases'
+    // markers must not win.
+    try std.testing.expectEqualStrings("Concurrency.CallTest.call round-trips", zestCrashedCaseName(
+        "##ZEST-BEGIN 0\n##ZEST-CASE ListTest.head yields first\n##ZEST-END 0\n" ++
+            "##ZEST-BEGIN 1\n##ZEST-CASE Concurrency.CallTest.call round-trips\n",
+    ).?);
+    // No case started before the death (harness-level crash): no name.
+    try std.testing.expectEqual(@as(?[]const u8, null), zestCrashedCaseName(
+        "##ZEST-BEGIN 0\n** (runtime_error) boom\n",
     ));
 }
 

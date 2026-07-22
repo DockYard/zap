@@ -10164,22 +10164,33 @@ pub const ArcRuntime = struct {
         );
     }
 
-    /// Byte size to request from the manager's `core.allocate` /
-    /// `core.deallocate` for a non-refcounted (header-less) cell of type `T`.
+    /// Byte size to request from the manager for a HEADER-LESS cell of type
+    /// `T` — both families of cell whose request size is the raw payload size:
+    ///
+    ///   * the non-refcounted cell (`BULK_OR_NEVER` / `INDIVIDUAL_NO_REFCOUNT`
+    ///     `core.allocate` / `core.deallocate`), and
+    ///   * the SIZED side-table refcounted cell (`allocate_refcounted` /
+    ///     `retain_sized` / `release_sized` / `refcount_sized` — the v1.2
+    ///     extension, where the refcount lives in the slab's side table and
+    ///     the request size is exactly the payload).
     ///
     /// A zero-size `T` — an empty closure environment (a non-capturing
-    /// closure's boxed inner), an empty struct, `void`-shaped payload — has
-    /// `@sizeOf(T) == 0`. The refcounted path never sees a zero-size cell (the
-    /// inline `ArcHeader` / side-table slab adds a header so the cell is always
-    /// > 0), but the BULK_OR_NEVER / INDIVIDUAL_NO_REFCOUNT path routes the
-    /// raw `@sizeOf(T)` straight to `core.allocate`, and the spec (§4.2) makes
-    /// `size > 0` the runtime's responsibility — Zig's allocators (and hence
-    /// every manager built on `std.mem.Allocator`, e.g. the Arena manager's
-    /// `ArenaAllocator`) `assert(n > 0)`. Clamp to a minimum of one byte so a
-    /// zero-size type still receives a unique, valid, properly-aligned cell
-    /// pointer (the subsequent `slot.* = value` is a zero-byte store, and the
-    /// matching free passes the SAME clamped size to `core.deallocate`).
-    inline fn nonRefcountedCellSize(comptime T: type) usize {
+    /// closure's boxed inner), an `%EmptyStage{}`-style empty struct boxed
+    /// into an existential, `void`-shaped payload — has `@sizeOf(T) == 0`.
+    /// The spec (§4.2) makes `size > 0` the runtime's responsibility: Zig's
+    /// allocators (and hence every manager built on `std.mem.Allocator`)
+    /// `assert(n > 0)`, and the ARC manager's sized entry points reject
+    /// `size == 0` outright (`arcAllocateRefcounted`), which the alloc
+    /// dispatcher would surface as a bogus out-of-memory panic. Clamp to a
+    /// minimum of one byte so a zero-size type still receives a unique,
+    /// valid, properly-aligned cell pointer with a live side-table refcount
+    /// slot (the subsequent `slot.* = value` is a zero-byte store, and every
+    /// matching retain/release/refcount/free dispatch passes the SAME clamped
+    /// size, so slab-class lookups and tracking managers stay paired).
+    ///
+    /// The v1.0 legacy INLINE-HEADER layout needs no clamp: its request is
+    /// `value_offset + @sizeOf(T)`, never zero (`LegacyArcInnerLayout`).
+    inline fn headerlessCellSize(comptime T: type) usize {
         return @max(@sizeOf(T), 1);
     }
 
@@ -10259,8 +10270,8 @@ pub const ArcRuntime = struct {
             const ctx = currentManagerContext() orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
             // Header-less cell: clamp zero-size types to one byte (see
-            // `nonRefcountedCellSize`). `core.allocate` asserts `size > 0`.
-            const size = nonRefcountedCellSize(T);
+            // `headerlessCellSize`). `core.allocate` asserts `size > 0`.
+            const size = headerlessCellSize(T);
             const alignment_bytes = @alignOf(T);
             const raw = blk: {
                 if (comptime !active_manager_source_available) {
@@ -10334,7 +10345,11 @@ pub const ArcRuntime = struct {
         if (has_sized_extension) {
             const ctx = currentManagerContext() orelse
                 @panic("zap runtime: allocAny dispatched with null manager context");
-            const size = @sizeOf(T);
+            // Side-table cell: the request size is the raw payload size, so a
+            // zero-sized `T` (empty closure env, empty struct behind an
+            // existential) must clamp to one byte (see `headerlessCellSize`) —
+            // `allocate_refcounted` rejects `size == 0` by ABI contract.
+            const size = headerlessCellSize(T);
             const alignment_bytes = @alignOf(T);
             const raw = blk: {
                 // Multi-manager: allocate the refcounted cell from the RUNNING
@@ -10387,7 +10402,10 @@ pub const ArcRuntime = struct {
         if (comptime !@hasDecl(active_manager, "retainSizedClass")) return null;
         if (comptime !@hasDecl(active_manager, "releaseSizedClass")) return null;
         if (comptime !@hasDecl(active_manager, "refcountSizedClass")) return null;
-        return active_manager.refcountSlabClassIndex(@sizeOf(T), @intCast(@alignOf(T)));
+        // Same clamped size the sized dispatch sites request (see
+        // `headerlessCellSize`) so a zero-sized `T` resolves the smallest
+        // class instead of the class-less large path.
+        return active_manager.refcountSlabClassIndex(headerlessCellSize(T), @intCast(@alignOf(T)));
     }
 
     /// Legacy v1.0 fallback for generic `Arc(T)` allocation: when the
@@ -11096,10 +11114,10 @@ pub const ArcRuntime = struct {
         const ctx = currentManagerContext() orelse
             @panic("zap runtime: freeAnyConsumedCell dispatched with null manager context");
         // Header-less cell: pass the SAME clamped size the matching
-        // `allocAny` requested (see `nonRefcountedCellSize`) so a tracking
+        // `allocAny` requested (see `headerlessCellSize`) so a tracking
         // manager pairs alloc/free exactly and `core.deallocate` never sees
         // a zero size.
-        const size = nonRefcountedCellSize(T);
+        const size = headerlessCellSize(T);
         const alignment_bytes = @alignOf(T);
         const raw: [*]u8 = @ptrCast(@constCast(ptr));
         if (comptime !active_manager_source_available) {
@@ -11192,9 +11210,9 @@ pub const ArcRuntime = struct {
         const ctx = currentManagerContext() orelse
             @panic("zap runtime: freeAny dispatched with null manager context");
         // Header-less cell: pass the SAME clamped size the matching `allocAny`
-        // requested (see `nonRefcountedCellSize`) so a tracking manager pairs
+        // requested (see `headerlessCellSize`) so a tracking manager pairs
         // alloc/free exactly and `core.deallocate` never sees a zero size.
-        const size = nonRefcountedCellSize(T);
+        const size = headerlessCellSize(T);
         const alignment_bytes = @alignOf(T);
         const raw: [*]u8 = @ptrCast(@constCast(ptr));
         if (comptime !active_manager_source_available) {
@@ -11801,7 +11819,9 @@ pub const ArcRuntime = struct {
         deep_walk: ?AbiV1.ZapDeepWalkFn,
         comptime dispatch_name: []const u8,
     ) void {
-        const size = @sizeOf(T);
+        // Same clamped request the sized alloc made (see `headerlessCellSize`)
+        // so slab-class resolution pairs for zero-sized cells.
+        const size = headerlessCellSize(T);
         const alignment_bytes = @alignOf(T);
         // Erase the typed cell pointer to the ABI's `object: *anyopaque` slot
         // shape. For a value-typed `T` the implicit `*T` -> `*anyopaque`
@@ -12507,7 +12527,9 @@ pub const ArcRuntime = struct {
         slot_ptr: *T,
         comptime dispatch_name: []const u8,
     ) void {
-        const size = @sizeOf(T);
+        // Same clamped request the sized alloc made (see `headerlessCellSize`)
+        // so slab-class resolution pairs for zero-sized cells.
+        const size = headerlessCellSize(T);
         const alignment_bytes = @alignOf(T);
         // Erase the typed cell pointer to the ABI's `object: *anyopaque` slot
         // shape (see `releaseArcSideTableSized`): an indirect-storage cell whose
@@ -12767,7 +12789,9 @@ pub const ArcRuntime = struct {
             const header_ptr = legacyArcInnerHeaderFromValuePtr(T, @constCast(ptr));
             return header_ptr.count();
         }
-        const size = @sizeOf(T);
+        // Same clamped request the sized alloc made (see `headerlessCellSize`)
+        // so slab-class resolution pairs for zero-sized cells.
+        const size = headerlessCellSize(T);
         const alignment_bytes = @alignOf(T);
         const slot_ptr: *const T = ptr;
         // Multi-manager: read the refcount from the RUNNING process's OWN manager
@@ -12867,10 +12891,10 @@ pub const ArcRuntime = struct {
         }
         if (comptime !refcount_v1_active) {
             // INDIVIDUAL_NO_REFCOUNT: header-less cell sized via
-            // `nonRefcountedCellSize`; the payload pointer IS the cell base.
+            // `headerlessCellSize`; the payload pointer IS the cell base.
             return .{
                 .base = @ptrCast(@alignCast(value_ptr)),
-                .size = nonRefcountedCellSize(O),
+                .size = headerlessCellSize(O),
                 .alignment = @alignOf(O),
             };
         }
@@ -12880,10 +12904,13 @@ pub const ArcRuntime = struct {
             comptime refcount_sized_extension_active;
         if (has_sized_extension) {
             // Side-table layout: the slot is 100% payload, so the payload
-            // pointer is the cell base and the request was `@sizeOf(O)`.
+            // pointer is the cell base and the request was the clamped
+            // `headerlessCellSize(O)` (one byte minimum for a zero-sized
+            // payload) — report the same size so the reuse-decline free
+            // (`freeRawCell`) pairs with the allocation.
             return .{
                 .base = @ptrCast(@alignCast(value_ptr)),
-                .size = @sizeOf(O),
+                .size = headerlessCellSize(O),
                 .alignment = @alignOf(O),
             };
         }
@@ -15225,6 +15252,42 @@ test "ArcRuntime.reuseAllocByType still reuses a cell large enough for the new t
     try testing.expect(@intFromPtr(reused) == @intFromPtr(big_ptr));
 
     ArcRuntime.releaseArcAny(SmallerFit, allocator, reused);
+}
+
+test "ArcRuntime: zero-sized side-table cell survives the full alloc/retain/refcount/release round trip" {
+    // zero-size-cell--01: a ZERO-SIZED type — an empty (zero-capture) closure
+    // environment boxed into a `Callable`, an `%EmptyStage{}` boxed into a
+    // `Stage`, any empty struct behind an existential — must still receive a
+    // real heap cell from the SIZED side-table path: a unique address plus a
+    // live side-table refcount slot. Before the fix, the sized dispatch passed
+    // the raw `@sizeOf(T) == 0` to `allocate_refcounted`, which managers
+    // reject by ABI contract (`size > 0`), so boxing any zero-capture closure
+    // under a sized-extension binary aborted with a bogus
+    // "out of memory: manager.allocate_refcounted returned null" panic (the
+    // post-merge `zap test` OOM-crash storm). The header-less cell request
+    // must clamp to one byte — exactly the pre-existing
+    // `headerlessCellSize` discipline the non-refcounted path already uses.
+    const allocator = testing.allocator;
+
+    const EmptyClosureEnv = struct {};
+    comptime std.debug.assert(@sizeOf(EmptyClosureEnv) == 0);
+
+    const cell = ArcRuntime.allocAny(EmptyClosureEnv, allocator, .{});
+    // The cell is a genuine unique allocation with a working refcount.
+    try testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(cell));
+    ArcRuntime.retainAny(cell);
+    try testing.expectEqual(@as(u32, 2), ArcRuntime.refCountAny(cell));
+    ArcRuntime.releaseArcAny(EmptyClosureEnv, allocator, cell);
+    try testing.expectEqual(@as(u32, 1), ArcRuntime.refCountAny(cell));
+    ArcRuntime.releaseArcAny(EmptyClosureEnv, allocator, cell);
+
+    // Two distinct zero-sized cells must not alias (each owner's release
+    // must free exactly its own slot).
+    const first = ArcRuntime.allocAny(EmptyClosureEnv, allocator, .{});
+    const second = ArcRuntime.allocAny(EmptyClosureEnv, allocator, .{});
+    try testing.expect(@intFromPtr(first) != @intFromPtr(second));
+    ArcRuntime.releaseArcAny(EmptyClosureEnv, allocator, first);
+    ArcRuntime.releaseArcAny(EmptyClosureEnv, allocator, second);
 }
 
 test "String.compare orders bytes lexicographically" {
@@ -19831,7 +19894,12 @@ pub const Zest = struct {
     var shuffle_suite_offset: i64 = 0;
     var shuffle_suite_selected_index: i64 = -1;
     var shuffle_suite_claimed: bool = false;
-    var timeout_ms: i64 = 0; // per-test timeout in milliseconds (0 = no timeout)
+    // Per-test timeout in milliseconds. DEFAULT-ON at 60s — the ExUnit-aligned
+    // convention (Elixir's per-test default is 60_000 ms) — so a hung test
+    // becomes an isolated failure (SIGALRM under the supervisor, a recorded
+    // timeout otherwise) instead of stalling the whole run indefinitely.
+    // `--timeout 0` opts out (no timeout); `--timeout <ms>` overrides.
+    var timeout_ms: i64 = 60_000;
     var test_start_ns: u64 = 0; // timestamp when current test started
     var timeout_count: i64 = 0; // number of tests that timed out
     // Phase B supervisor isolation (docs/phase-b-test-isolation-design.md):
@@ -20009,6 +20077,23 @@ pub const Zest = struct {
         current_test_name = duplicateFailureString(name) orelse name;
         test_count += 1;
         test_start_ns = if (timeout_ms > 0 or record_timings) nowNs() else 0;
+        // Under the supervisor, also flush the running case's NAME as a
+        // `##ZEST-CASE <name>` marker: the `##ZEST-BEGIN <ordinal>` wrapping
+        // this test was emitted by `begin_shuffle_pass` BEFORE the seeded
+        // scan selected a case, so the ordinal alone cannot name it. When the
+        // child dies mid-test (panic/fault/SIGALRM hang-kill), the supervisor
+        // pairs the last unterminated BEGIN with the last CASE line so the
+        // crash notice names the exact test instead of a bare position.
+        if (supervised) {
+            var case_buf: [512]u8 = undefined;
+            if (std.fmt.bufPrint(&case_buf, "##ZEST-CASE {s}\n", .{name})) |case_line| {
+                stderrWriteFlushed(case_line);
+            } else |_| {
+                // Name longer than the buffer: fall back to the marker alone
+                // so the supervisor still sees a case boundary.
+                stderrWriteFlushed("##ZEST-CASE <name-too-long>\n");
+            }
+        }
         // Under the supervisor, arm a hard per-test timeout so a hung
         // (non-returning) test triggers SIGALRM and dies, letting the
         // supervisor isolate it. `alarm` is whole-second granularity, so round
@@ -20267,7 +20352,7 @@ pub const Zest = struct {
         shuffle_suite_offset = 0;
         shuffle_suite_selected_index = -1;
         shuffle_suite_claimed = false;
-        timeout_ms = 0;
+        timeout_ms = 60_000; // the default-on per-test timeout (see decl)
         test_start_ns = 0;
         timeout_count = 0;
     }
