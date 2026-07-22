@@ -34,6 +34,27 @@ pub struct IO {
   }
 
   @doc = """
+    Flushes buffered standard output immediately.
+
+    Output written with `IO.puts` / `IO.print_str` / `IO.write_byte` is
+    buffered (about 64 KiB) and normally drains at process exit, before a
+    `IO.gets()` read, or whenever the buffer fills. A long-running program —
+    a server printing its listening banner, a progress indicator mid-loop —
+    must flush explicitly for that output to become visible right away.
+
+    ## Examples
+
+        IO.puts("Listening on http://127.0.0.1:8080")
+        IO.flush()
+        # => the banner is visible even though the server never exits
+    """
+
+  pub fn flush() -> Nil {
+    :zig.IO.flush()
+    nil
+  }
+
+  @doc = """
     Prints a value to standard output without a trailing newline.
 
     Useful for building output incrementally, such as progress

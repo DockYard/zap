@@ -26708,6 +26708,16 @@ pub const IO = struct {
         }
     }
 
+    /// Flush the buffered stdout writer NOW. The 64 KiB user-space stdout
+    /// buffer otherwise drains only at process exit (atexit), before a
+    /// `gets()`, or when it fills — so a long-lived program (a server
+    /// printing its listening banner, a progress indicator) must flush
+    /// explicitly for its output to become visible. Exposed to Zap as
+    /// `IO.flush()`.
+    pub fn flush() void {
+        flushStdoutBuf();
+    }
+
     pub fn print_str(value: anytype) void {
         const T = @TypeOf(value);
         const info = @typeInfo(T);
