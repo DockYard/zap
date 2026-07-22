@@ -1,4 +1,4 @@
-pub struct TestConcurrency.PerProcessRefcountDispatchTest {
+pub struct Concurrency.PerProcessRefcountDispatchTest {
   use Zest.Case
 
   # P3-R1a acceptance: per-process retain/release/*Sized dispatch. Every refcount
@@ -42,7 +42,7 @@ pub struct TestConcurrency.PerProcessRefcountDispatchTest {
 
   describe("per-process refcount dispatch: each process's refcount ops reach its own manager") {
     test("an ORC worker's allocating higher-order-function refcount workload runs on its OWN ORC context") {
-      orc_bits = Process.spawn(&TestConcurrency.PerProcessRefcountDispatchTest.orc_hof_worker/0, Memory.ORC)
+      orc_bits = Process.spawn(&Concurrency.PerProcessRefcountDispatchTest.orc_hof_worker/0, Memory.ORC)
       orc_pid = Process.pid(u64, orc_bits)
       _ready = Process.send(orc_pid, Process.self())
       checksum = Process.receive_raw(i64)
@@ -52,7 +52,7 @@ pub struct TestConcurrency.PerProcessRefcountDispatchTest {
     }
 
     test("an Arena worker calling an allocating higher-order function (cold edge) runs correctly") {
-      arena_bits = Process.spawn(&TestConcurrency.PerProcessRefcountDispatchTest.arena_hof_worker/0, Memory.Arena)
+      arena_bits = Process.spawn(&Concurrency.PerProcessRefcountDispatchTest.arena_hof_worker/0, Memory.Arena)
       arena_pid = Process.pid(u64, arena_bits)
       _ready = Process.send(arena_pid, Process.self())
       checksum = Process.receive_raw(i64)
@@ -66,13 +66,13 @@ pub struct TestConcurrency.PerProcessRefcountDispatchTest {
 
   pub fn orc_hof_worker() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
-    _sent = Process.send(parent, TestConcurrency.PerProcessRefcountDispatchTest.hof_checksum())
+    _sent = Process.send(parent, Concurrency.PerProcessRefcountDispatchTest.hof_checksum())
     nil
   }
 
   pub fn arena_hof_worker() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
-    _sent = Process.send(parent, TestConcurrency.PerProcessRefcountDispatchTest.hof_checksum())
+    _sent = Process.send(parent, Concurrency.PerProcessRefcountDispatchTest.hof_checksum())
     nil
   }
 

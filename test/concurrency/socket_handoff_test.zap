@@ -1,4 +1,4 @@
-pub struct TestConcurrency.SocketHandoffTest {
+pub struct Concurrency.SocketHandoffTest {
   use Zest.Case
 
   # Phase S3 Job 1 acceptance proof (gate-ON): CROSS-PROCESS SOCKET HANDLE
@@ -28,7 +28,7 @@ pub struct TestConcurrency.SocketHandoffTest {
   describe("Socket cross-process handoff (send_move, Phase S3)") {
     test("send_move hands a connected socket to a child; the child echoes on it and closes; leak-exact") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketHandoffTest.handoff_echo() == :ok)
+      assert(Concurrency.SocketHandoffTest.handoff_echo() == :ok)
       assert(Socket.live_count() == base)
     }
   }
@@ -36,7 +36,7 @@ pub struct TestConcurrency.SocketHandoffTest {
   fn handoff_echo() -> Atom {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
-      Result.Ok(listener) -> TestConcurrency.SocketHandoffTest.after_listen(listener)
+      Result.Ok(listener) -> Concurrency.SocketHandoffTest.after_listen(listener)
     }
   }
 
@@ -48,7 +48,7 @@ pub struct TestConcurrency.SocketHandoffTest {
           _l = SocketListener.close(listener)
           :connect_failed
         }
-      Result.Ok(client) -> TestConcurrency.SocketHandoffTest.after_connect(listener, client)
+      Result.Ok(client) -> Concurrency.SocketHandoffTest.after_connect(listener, client)
     }
   }
 
@@ -60,12 +60,12 @@ pub struct TestConcurrency.SocketHandoffTest {
           _l = SocketListener.close(listener)
           :accept_failed
         }
-      Result.Ok(server) -> TestConcurrency.SocketHandoffTest.hand_off(listener, client, server)
+      Result.Ok(server) -> Concurrency.SocketHandoffTest.hand_off(listener, client, server)
     }
   }
 
   fn hand_off(listener :: SocketListener, client :: Socket, server :: Socket) -> Atom {
-    child = Process.spawn(&TestConcurrency.SocketHandoffTest.echo_child_entry/0)
+    child = Process.spawn(&Concurrency.SocketHandoffTest.echo_child_entry/0)
     _monitor_ref = Process.monitor(child)
     # Hand the ACCEPTED server socket to the child. `server` is CONSUMED here —
     # a use after this move is a compile error (the S3 exactly-one-owner tooth).

@@ -22,7 +22,7 @@
   budget exhaustion forces the yield lives in the kernel suite.
   """
 
-pub struct TestConcurrency.SafepointTest {
+pub struct Concurrency.SafepointTest {
   use Zest.Case
 
   describe("layer 2 — bare back-edge poll (alloc-free loops)") {
@@ -30,13 +30,13 @@ pub struct TestConcurrency.SafepointTest {
       # `sum_loop` loopifies and is alloc-free, so it carries the emitted
       # layer-2 counter decrement at its back-edge. The result must be
       # bit-exact: 1 + 2 + ... + 100000 = 5000050000.
-      total = TestConcurrency.SafepointTest.sum_loop(0, 100000)
+      total = Concurrency.SafepointTest.sum_loop(0, 100000)
       assert(total == 5000050000)
     }
 
     test("a pure CPU-bound process cannot starve a co-runnable process, computation intact") {
-      slow = Process.pid(u64, Process.spawn(&TestConcurrency.SafepointTest.slow_pure_reply_entry/0))
-      quick = Process.pid(u64, Process.spawn(&TestConcurrency.SafepointTest.quick_reply_entry/0))
+      slow = Process.pid(u64, Process.spawn(&Concurrency.SafepointTest.slow_pure_reply_entry/0))
+      quick = Process.pid(u64, Process.spawn(&Concurrency.SafepointTest.quick_reply_entry/0))
       _slow_channel = Process.send(slow, Process.self())
       _quick_channel = Process.send(quick, Process.self())
       first = Process.receive_raw(i64)
@@ -60,12 +60,12 @@ pub struct TestConcurrency.SafepointTest {
       # large count that is NOT a multiple of K and crosses many reduction
       # reseeds — must all stay bit-exact (the base case exits from any
       # unrolled copy; there is no "remainder" iteration to mishandle).
-      assert(TestConcurrency.SafepointTest.sum_loop(0, 0) == 0)
-      assert(TestConcurrency.SafepointTest.sum_loop(0, 1) == 1)
-      assert(TestConcurrency.SafepointTest.sum_loop(0, 7) == 28)
-      assert(TestConcurrency.SafepointTest.sum_loop(0, 8) == 36)
-      assert(TestConcurrency.SafepointTest.sum_loop(0, 9) == 45)
-      assert(TestConcurrency.SafepointTest.sum_loop(0, 100003) == 5000350006)
+      assert(Concurrency.SafepointTest.sum_loop(0, 0) == 0)
+      assert(Concurrency.SafepointTest.sum_loop(0, 1) == 1)
+      assert(Concurrency.SafepointTest.sum_loop(0, 7) == 28)
+      assert(Concurrency.SafepointTest.sum_loop(0, 8) == 36)
+      assert(Concurrency.SafepointTest.sum_loop(0, 9) == 45)
+      assert(Concurrency.SafepointTest.sum_loop(0, 100003) == 5000350006)
     }
 
     test("a K-unrolled byref reversal loop is exact at every group-boundary length") {
@@ -75,15 +75,15 @@ pub struct TestConcurrency.SafepointTest {
       # Lengths chosen so the swap count (length / 2) lands before, on, and
       # after the K = 8 group boundary, plus the empty and single-element
       # degenerate spans.
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(0))
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(1))
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(2))
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(3))
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(15))
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(16))
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(17))
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(32))
-      assert(TestConcurrency.SafepointTest.reversal_roundtrip_ok(33))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(0))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(1))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(2))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(3))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(15))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(16))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(17))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(32))
+      assert(Concurrency.SafepointTest.reversal_roundtrip_ok(33))
     }
 
     test("a CPU-bound tight unrolled loop still cannot starve a co-runnable process") {
@@ -93,8 +93,8 @@ pub struct TestConcurrency.SafepointTest {
       # iterations (>> the 4000-reduction budget) through the K-amortized
       # back-edge tick, its round trip stays element-exact (marker 1 only
       # on an exact reversal), and the co-runnable process still replies.
-      slow = Process.pid(u64, Process.spawn(&TestConcurrency.SafepointTest.slow_reverse_reply_entry/0))
-      quick = Process.pid(u64, Process.spawn(&TestConcurrency.SafepointTest.quick_reply_entry/0))
+      slow = Process.pid(u64, Process.spawn(&Concurrency.SafepointTest.slow_reverse_reply_entry/0))
+      quick = Process.pid(u64, Process.spawn(&Concurrency.SafepointTest.quick_reply_entry/0))
       _slow_channel = Process.send(slow, Process.self())
       _quick_channel = Process.send(quick, Process.self())
       first = Process.receive_raw(i64)
@@ -110,13 +110,13 @@ pub struct TestConcurrency.SafepointTest {
       # `build_list` conses one cell per iteration (an allocation), so it is
       # covered by the layer-1 piggyback rather than a back-edge poll. The
       # list must be built intact.
-      built = TestConcurrency.SafepointTest.build_list([], 5000)
+      built = Concurrency.SafepointTest.build_list([], 5000)
       assert(List.length(built) == 5000)
     }
 
     test("an allocating CPU-bound process cannot starve a co-runnable process, list intact") {
-      slow = Process.pid(u64, Process.spawn(&TestConcurrency.SafepointTest.slow_alloc_reply_entry/0))
-      quick = Process.pid(u64, Process.spawn(&TestConcurrency.SafepointTest.quick_reply_entry/0))
+      slow = Process.pid(u64, Process.spawn(&Concurrency.SafepointTest.slow_alloc_reply_entry/0))
+      quick = Process.pid(u64, Process.spawn(&Concurrency.SafepointTest.quick_reply_entry/0))
       _slow_channel = Process.send(slow, Process.self())
       _quick_channel = Process.send(quick, Process.self())
       first = Process.receive_raw(i64)
@@ -145,7 +145,7 @@ pub struct TestConcurrency.SafepointTest {
   }
 
   pub fn sum_loop(acc :: i64, n :: i64) -> i64 {
-    TestConcurrency.SafepointTest.sum_loop(acc + n, n - 1)
+    Concurrency.SafepointTest.sum_loop(acc + n, n - 1)
   }
 
   @doc = """
@@ -159,7 +159,7 @@ pub struct TestConcurrency.SafepointTest {
   }
 
   pub fn build_list(acc :: [i64], n :: i64) -> [i64] {
-    TestConcurrency.SafepointTest.build_list([n | acc], n - 1)
+    Concurrency.SafepointTest.build_list([n | acc], n - 1)
   }
 
   @doc = """
@@ -174,7 +174,7 @@ pub struct TestConcurrency.SafepointTest {
     } else {
       one = 1 :: i64
       arr = List.set(arr, index, index)
-      TestConcurrency.SafepointTest.fill_identity(arr, index + one, length)
+      Concurrency.SafepointTest.fill_identity(arr, index + one, length)
     }
   }
 
@@ -194,7 +194,7 @@ pub struct TestConcurrency.SafepointTest {
       b = List.get(arr, hi)
       arr = List.set(arr, lo, b)
       arr = List.set(arr, hi, a)
-      TestConcurrency.SafepointTest.reverse_span(arr, lo + one, hi - one)
+      Concurrency.SafepointTest.reverse_span(arr, lo + one, hi - one)
     }
   }
 
@@ -211,7 +211,7 @@ pub struct TestConcurrency.SafepointTest {
       one = 1 :: i64
       expected = length - one - index
       if List.get(arr, index) == expected {
-        TestConcurrency.SafepointTest.reversed_prefix_intact(arr, index + one, length)
+        Concurrency.SafepointTest.reversed_prefix_intact(arr, index + one, length)
       } else {
         false
       }
@@ -227,9 +227,9 @@ pub struct TestConcurrency.SafepointTest {
 
   pub fn reversal_roundtrip_ok(n :: i64) -> Bool {
     arr = List.new_filled(n, 0 :: i64)
-    arr = TestConcurrency.SafepointTest.fill_identity(arr, 0 :: i64, n)
-    arr = TestConcurrency.SafepointTest.reverse_span(arr, 0 :: i64, n - (1 :: i64))
-    TestConcurrency.SafepointTest.reversed_prefix_intact(arr, 0 :: i64, n)
+    arr = Concurrency.SafepointTest.fill_identity(arr, 0 :: i64, n)
+    arr = Concurrency.SafepointTest.reverse_span(arr, 0 :: i64, n - (1 :: i64))
+    Concurrency.SafepointTest.reversed_prefix_intact(arr, 0 :: i64, n)
   }
 
   # -- child process entries (each first receives the parent's raw pid) -------
@@ -256,7 +256,7 @@ pub struct TestConcurrency.SafepointTest {
 
   pub fn slow_pure_reply_entry() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
-    computed = TestConcurrency.SafepointTest.sum_loop(0, 300000)
+    computed = Concurrency.SafepointTest.sum_loop(0, 300000)
     _sent = Process.send(parent, computed - 45000150000 + 1)
     nil
   }
@@ -270,7 +270,7 @@ pub struct TestConcurrency.SafepointTest {
 
   pub fn slow_alloc_reply_entry() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
-    built = TestConcurrency.SafepointTest.build_list([], 60000)
+    built = Concurrency.SafepointTest.build_list([], 60000)
     _sent = Process.send(parent, List.length(built) - 60000 + 1)
     nil
   }
@@ -290,9 +290,9 @@ pub struct TestConcurrency.SafepointTest {
     parent = Process.pid(i64, Process.receive_raw(u64))
     n = 600000 :: i64
     arr = List.new_filled(n, 0 :: i64)
-    arr = TestConcurrency.SafepointTest.fill_identity(arr, 0 :: i64, n)
-    arr = TestConcurrency.SafepointTest.reverse_span(arr, 0 :: i64, n - (1 :: i64))
-    checked = TestConcurrency.SafepointTest.reversed_prefix_intact(arr, 0 :: i64, n)
+    arr = Concurrency.SafepointTest.fill_identity(arr, 0 :: i64, n)
+    arr = Concurrency.SafepointTest.reverse_span(arr, 0 :: i64, n - (1 :: i64))
+    checked = Concurrency.SafepointTest.reversed_prefix_intact(arr, 0 :: i64, n)
     _sent = case checked {
       true -> Process.send(parent, 1)
       false -> Process.send(parent, -1)

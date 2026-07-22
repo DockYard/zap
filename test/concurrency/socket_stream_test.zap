@@ -1,4 +1,4 @@
-pub struct TestConcurrency.SocketStreamTest {
+pub struct Concurrency.SocketStreamTest {
   use Zest.Case
 
   # Phase S1 exit-gate acceptance (gate-ON): the Tier-1 stream surface under
@@ -20,7 +20,7 @@ pub struct TestConcurrency.SocketStreamTest {
   fn echo_binary_safe() -> Atom {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
-      Result.Ok(listener) -> TestConcurrency.SocketStreamTest.echo_after_listen(listener)
+      Result.Ok(listener) -> Concurrency.SocketStreamTest.echo_after_listen(listener)
     }
   }
 
@@ -32,7 +32,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _l = SocketListener.close(listener)
           :connect_failed
         }
-      Result.Ok(client) -> TestConcurrency.SocketStreamTest.echo_after_connect(listener, client)
+      Result.Ok(client) -> Concurrency.SocketStreamTest.echo_after_connect(listener, client)
     }
   }
 
@@ -44,7 +44,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _l = SocketListener.close(listener)
           :accept_failed
         }
-      Result.Ok(server) -> TestConcurrency.SocketStreamTest.echo_exchange(listener, client, server)
+      Result.Ok(server) -> Concurrency.SocketStreamTest.echo_exchange(listener, client, server)
     }
   }
 
@@ -71,7 +71,7 @@ pub struct TestConcurrency.SocketStreamTest {
   fn stream_total() -> i64 {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> -1
-      Result.Ok(listener) -> TestConcurrency.SocketStreamTest.stream_after_listen(listener)
+      Result.Ok(listener) -> Concurrency.SocketStreamTest.stream_after_listen(listener)
     }
   }
 
@@ -83,7 +83,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _l = SocketListener.close(listener)
           -1
         }
-      Result.Ok(client) -> TestConcurrency.SocketStreamTest.stream_after_connect(listener, client)
+      Result.Ok(client) -> Concurrency.SocketStreamTest.stream_after_connect(listener, client)
     }
   }
 
@@ -95,7 +95,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _l = SocketListener.close(listener)
           -1
         }
-      Result.Ok(server) -> TestConcurrency.SocketStreamTest.stream_exchange(listener, client, server)
+      Result.Ok(server) -> Concurrency.SocketStreamTest.stream_exchange(listener, client, server)
     }
   }
 
@@ -105,7 +105,7 @@ pub struct TestConcurrency.SocketStreamTest {
     # A `for` comprehension folds the live stream to EOF under the kernel (the
     # fiber PARKS between chunks; the core runs peers). Sizes sum to 10.
     sizes = for chunk <- Socket.chunks(client, 5000) {
-      TestConcurrency.SocketStreamTest.chunk_size(chunk)
+      Concurrency.SocketStreamTest.chunk_size(chunk)
     }
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
@@ -123,7 +123,7 @@ pub struct TestConcurrency.SocketStreamTest {
   fn timeout_usable() -> Atom {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> :listen_failed
-      Result.Ok(listener) -> TestConcurrency.SocketStreamTest.timeout_after_listen(listener)
+      Result.Ok(listener) -> Concurrency.SocketStreamTest.timeout_after_listen(listener)
     }
   }
 
@@ -135,7 +135,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _l = SocketListener.close(listener)
           :connect_failed
         }
-      Result.Ok(client) -> TestConcurrency.SocketStreamTest.timeout_after_connect(listener, client)
+      Result.Ok(client) -> Concurrency.SocketStreamTest.timeout_after_connect(listener, client)
     }
   }
 
@@ -147,7 +147,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _l = SocketListener.close(listener)
           :accept_failed
         }
-      Result.Ok(server) -> TestConcurrency.SocketStreamTest.timeout_exchange(listener, client, server)
+      Result.Ok(server) -> Concurrency.SocketStreamTest.timeout_exchange(listener, client, server)
     }
   }
 
@@ -196,7 +196,7 @@ pub struct TestConcurrency.SocketStreamTest {
   fn many_recvs() -> i64 {
     case Socket.listen(SocketAddress.loopback(0), 8) {
       Result.Error(_e) -> -1
-      Result.Ok(listener) -> TestConcurrency.SocketStreamTest.many_after_listen(listener)
+      Result.Ok(listener) -> Concurrency.SocketStreamTest.many_after_listen(listener)
     }
   }
 
@@ -208,7 +208,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _l = SocketListener.close(listener)
           -1
         }
-      Result.Ok(client) -> TestConcurrency.SocketStreamTest.many_after_connect(listener, client)
+      Result.Ok(client) -> Concurrency.SocketStreamTest.many_after_connect(listener, client)
     }
   }
 
@@ -220,13 +220,13 @@ pub struct TestConcurrency.SocketStreamTest {
           _l = SocketListener.close(listener)
           -1
         }
-      Result.Ok(server) -> TestConcurrency.SocketStreamTest.many_exchange(listener, client, server)
+      Result.Ok(server) -> Concurrency.SocketStreamTest.many_exchange(listener, client, server)
     }
   }
 
   fn many_exchange(listener :: SocketListener, client :: Socket, server :: Socket) -> i64 {
-    _pumped = TestConcurrency.SocketStreamTest.pump_chunks(client, 32)
-    total = TestConcurrency.SocketStreamTest.drain_chunks(server, 32, 0)
+    _pumped = Concurrency.SocketStreamTest.pump_chunks(client, 32)
+    total = Concurrency.SocketStreamTest.drain_chunks(server, 32, 0)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
     _c3 = SocketListener.close(listener)
@@ -239,7 +239,7 @@ pub struct TestConcurrency.SocketStreamTest {
       false ->
         {
           _sent = Socket.send(client, "wxyz")
-          TestConcurrency.SocketStreamTest.pump_chunks(client, remaining - 1)
+          Concurrency.SocketStreamTest.pump_chunks(client, remaining - 1)
         }
     }
   }
@@ -249,7 +249,7 @@ pub struct TestConcurrency.SocketStreamTest {
       true -> acc
       false ->
         case Socket.recv(server, 4, 5000) {
-          SocketRecv.Chunk(bytes) -> TestConcurrency.SocketStreamTest.drain_chunks(server, remaining - 1, acc + String.length(bytes))
+          SocketRecv.Chunk(bytes) -> Concurrency.SocketStreamTest.drain_chunks(server, remaining - 1, acc + String.length(bytes))
           SocketRecv.TimedOut(_partial) -> acc
           SocketRecv.Closed -> acc
           SocketRecv.Failed(_e) -> acc
@@ -269,7 +269,7 @@ pub struct TestConcurrency.SocketStreamTest {
     # spawn entry discards it and returns Nil. A `case` with a bare `nil` in one
     # arm and a concrete-Nil helper call in another does not type-unify (the
     # `nil` literal is `@TypeOf(null)`), so the helpers thread an Atom instead.
-    _result = TestConcurrency.SocketStreamTest.stalled_sender_run()
+    _result = Concurrency.SocketStreamTest.stalled_sender_run()
     nil
   }
 
@@ -280,7 +280,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _n = Process.send(:socket_send_kill_parent, :stalled)
           :listen_failed
         }
-      Result.Ok(listener) -> TestConcurrency.SocketStreamTest.stalled_sender_connect(listener)
+      Result.Ok(listener) -> Concurrency.SocketStreamTest.stalled_sender_connect(listener)
     }
   }
 
@@ -292,7 +292,7 @@ pub struct TestConcurrency.SocketStreamTest {
           _n = Process.send(:socket_send_kill_parent, :stalled)
           :connect_failed
         }
-      Result.Ok(client) -> TestConcurrency.SocketStreamTest.stalled_sender_accept(listener, client)
+      Result.Ok(client) -> Concurrency.SocketStreamTest.stalled_sender_accept(listener, client)
     }
   }
 
@@ -336,7 +336,7 @@ pub struct TestConcurrency.SocketStreamTest {
   # the parent's `await_signal`. The listener fd is reclaimed on the kill path
   # by the drop-list sweep (live_count returns to baseline).
   pub fn stalled_acceptor_entry() -> Nil {
-    _result = TestConcurrency.SocketStreamTest.stalled_acceptor_run()
+    _result = Concurrency.SocketStreamTest.stalled_acceptor_run()
     nil
   }
 
@@ -358,9 +358,9 @@ pub struct TestConcurrency.SocketStreamTest {
 
   describe("Socket Tier-1 streams under the concurrency kernel (gate-ON)") {
     test("a process stalled in a slowloris send is KILLABLE (send is kill-responsive off-core)") {
-      _named = Process.register(:socket_send_kill_parent)
+      assert(Process.register(:socket_send_kill_parent))
       base = Socket.live_count()
-      pair = Process.spawn_monitor(&TestConcurrency.SocketStreamTest.stalled_sender_entry/0)
+      pair = Process.spawn_monitor(&Concurrency.SocketStreamTest.stalled_sender_entry/0)
       _ack = receive Atom {
         _stalled -> :ok
       }
@@ -375,9 +375,9 @@ pub struct TestConcurrency.SocketStreamTest {
     }
 
     test("a process stalled in a black-hole connect is KILLABLE (connect is kill-responsive off-core)") {
-      _named = Process.register(:socket_connect_kill_parent)
+      assert(Process.register(:socket_connect_kill_parent))
       base = Socket.live_count()
-      pair = Process.spawn_monitor(&TestConcurrency.SocketStreamTest.stalled_connector_entry/0)
+      pair = Process.spawn_monitor(&Concurrency.SocketStreamTest.stalled_connector_entry/0)
       _ack = receive Atom {
         _stalled -> :ok
       }
@@ -388,9 +388,9 @@ pub struct TestConcurrency.SocketStreamTest {
     }
 
     test("a process blocked in accept with no connection is KILLABLE (accept is kill-responsive off-core)") {
-      _named = Process.register(:socket_accept_kill_parent)
+      assert(Process.register(:socket_accept_kill_parent))
       base = Socket.live_count()
-      pair = Process.spawn_monitor(&TestConcurrency.SocketStreamTest.stalled_acceptor_entry/0)
+      pair = Process.spawn_monitor(&Concurrency.SocketStreamTest.stalled_acceptor_entry/0)
       _ack = receive Atom {
         _stalled -> :ok
       }
@@ -406,25 +406,25 @@ pub struct TestConcurrency.SocketStreamTest {
 
     test("binary-safe echo roundtrip offloaded off-core, leak-exact") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketStreamTest.echo_binary_safe() == :ok)
+      assert(Concurrency.SocketStreamTest.echo_binary_safe() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("a multi-recv loop is leak-exact (recv Strings reclaimed; no per-recv leak)") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketStreamTest.many_recvs() == 128)
+      assert(Concurrency.SocketStreamTest.many_recvs() == 128)
       assert(Socket.live_count() == base)
     }
 
     test("a for comprehension folds a live Socket.chunks stream to EOF (fiber parks)") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketStreamTest.stream_total() == 10)
+      assert(Concurrency.SocketStreamTest.stream_total() == 10)
       assert(Socket.live_count() == base)
     }
 
     test("idle recv timeout yields :etimedout off-core; socket stays usable") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketStreamTest.timeout_usable() == :ok)
+      assert(Concurrency.SocketStreamTest.timeout_usable() == :ok)
       assert(Socket.live_count() == base)
     }
   }

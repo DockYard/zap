@@ -1,4 +1,4 @@
-pub struct TestConcurrency.OrcMoveTest {
+pub struct Concurrency.OrcMoveTest {
   use Zest.Case
 
   # P6-J1 (plan item 6.1a follow-on): the same-model O(1) region-move send for
@@ -17,22 +17,22 @@ pub struct TestConcurrency.OrcMoveTest {
       # (~16 KB cell → the page-backed large path), DETACHES it through ORC's
       # relocate slot, and the ARC parent ADOPTS it — exhaustive lookups prove
       # the cell crossed intact with no rebuild.
-      producer = Process.pid(u64, Process.spawn(&TestConcurrency.OrcMoveTest.orc_map_producer/0, Memory.ORC))
+      producer = Process.pid(u64, Process.spawn(&Concurrency.OrcMoveTest.orc_map_producer/0, Memory.ORC))
       _channel = Process.send(producer, Process.self())
       received = receive %{i64 => i64} {
         got -> got
       }
       assert(Map.size(received) == 400)
-      assert(TestConcurrency.OrcMoveTest.verify_map(received, 400))
+      assert(Concurrency.OrcMoveTest.verify_map(received, 400))
     }
 
     test("ARC→ORC: the ARC parent move-sends a LARGE flat Map to an ORC receiver — verified exhaustively") {
       # The reverse direction: ARC detach, ORC adopt (the block joins the ORC
       # child's SlabHeap large list, so the child's release reclaims it on its
       # own heap). The child verifies all 400 entries and reports the verdict.
-      child = Process.pid(u64, Process.spawn(&TestConcurrency.OrcMoveTest.orc_map_verifier/0, Memory.ORC))
+      child = Process.pid(u64, Process.spawn(&Concurrency.OrcMoveTest.orc_map_verifier/0, Memory.ORC))
       _channel = Process.send(child, Process.self())
-      big = TestConcurrency.OrcMoveTest.build_map(%{}, 400)
+      big = Concurrency.OrcMoveTest.build_map(%{}, 400)
       _sent = Process.send_move((Pid.of(child.raw) :: Pid(%{i64 => i64})), big)
       verified = receive Bool {
         ok -> ok
@@ -44,13 +44,13 @@ pub struct TestConcurrency.OrcMoveTest {
       # Both heaps are ORC SlabHeaps: ORC detach + ORC adopt. The receiver is
       # spawned first and acknowledges readiness BEFORE the producer exists,
       # so its typed receives can never interleave with the moved payload.
-      receiver = Process.pid(u64, Process.spawn(&TestConcurrency.OrcMoveTest.orc_list_receiver/0, Memory.ORC))
+      receiver = Process.pid(u64, Process.spawn(&Concurrency.OrcMoveTest.orc_list_receiver/0, Memory.ORC))
       _channel = Process.send(receiver, Process.self())
       ready = receive Bool {
         ok -> ok
       }
       assert(ready)
-      producer = Process.pid(u64, Process.spawn(&TestConcurrency.OrcMoveTest.orc_list_producer/0, Memory.ORC))
+      producer = Process.pid(u64, Process.spawn(&Concurrency.OrcMoveTest.orc_list_producer/0, Memory.ORC))
       _target = Process.send(producer, receiver.raw)
       total = receive i64 {
         n -> n
@@ -72,7 +72,7 @@ pub struct TestConcurrency.OrcMoveTest {
   }
 
   pub fn build_map(acc :: %{i64 => i64}, count :: i64) -> %{i64 => i64} {
-    TestConcurrency.OrcMoveTest.build_map(Map.put(acc, count, count * 3), count - 1)
+    Concurrency.OrcMoveTest.build_map(Map.put(acc, count, count * 3), count - 1)
   }
 
   @doc = """
@@ -85,7 +85,7 @@ pub struct TestConcurrency.OrcMoveTest {
   }
 
   pub fn verify_map(map :: %{i64 => i64}, count :: i64) -> Bool {
-    Map.get(map, count, -1) == count * 3 and TestConcurrency.OrcMoveTest.verify_map(map, count - 1)
+    Map.get(map, count, -1) == count * 3 and Concurrency.OrcMoveTest.verify_map(map, count - 1)
   }
 
   @doc = """
@@ -97,7 +97,7 @@ pub struct TestConcurrency.OrcMoveTest {
   }
 
   pub fn sum_list(list :: [i64], index :: i64, acc :: i64) -> i64 {
-    TestConcurrency.OrcMoveTest.sum_list(list, index - 1, acc + List.get(list, index - 1))
+    Concurrency.OrcMoveTest.sum_list(list, index - 1, acc + List.get(list, index - 1))
   }
 
   @doc = """
@@ -107,7 +107,7 @@ pub struct TestConcurrency.OrcMoveTest {
 
   pub fn orc_map_producer() -> Nil {
     parent = Process.pid(u64, Process.receive_raw(u64))
-    data = TestConcurrency.OrcMoveTest.build_map(%{}, 400)
+    data = Concurrency.OrcMoveTest.build_map(%{}, 400)
     _sent = Process.send_move((Pid.of(parent.raw) :: Pid(%{i64 => i64})), data)
     nil
   }
@@ -122,7 +122,7 @@ pub struct TestConcurrency.OrcMoveTest {
     got = receive %{i64 => i64} {
       m -> m
     }
-    ok = Map.size(got) == 400 and TestConcurrency.OrcMoveTest.verify_map(got, 400)
+    ok = Map.size(got) == 400 and Concurrency.OrcMoveTest.verify_map(got, 400)
     _sent = Process.send((Pid.of(parent.raw) :: Pid(Bool)), ok)
     nil
   }
@@ -138,7 +138,7 @@ pub struct TestConcurrency.OrcMoveTest {
     values = receive [i64] {
       got -> got
     }
-    total = TestConcurrency.OrcMoveTest.sum_list(values, List.length(values), 0)
+    total = Concurrency.OrcMoveTest.sum_list(values, List.length(values), 0)
     _sent = Process.send((Pid.of(parent.raw) :: Pid(i64)), total)
     nil
   }

@@ -1,4 +1,4 @@
-pub struct TestConcurrency.SignalTest {
+pub struct Concurrency.SignalTest {
   use Zest.Case
 
   # Erlang-fidelity semantics for the kernel signal primitives (P5-J1): links,
@@ -11,7 +11,7 @@ pub struct TestConcurrency.SignalTest {
 
   describe("links and trap_exit") {
     test("trap_exit converts a linked abnormal exit into an EXIT message with the reason") {
-      target = Process.spawn(&TestConcurrency.SignalTest.blocker_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -28,12 +28,12 @@ pub struct TestConcurrency.SignalTest {
     }
 
     test("a non-trapping linked process DIES with the propagated reason (cascade)") {
-      victim = Process.spawn(&TestConcurrency.SignalTest.blocker_entry/0)
+      victim = Process.spawn(&Concurrency.SignalTest.blocker_entry/0)
       _victim_self = Process.send(Process.pid(u64, victim), Process.self())
       _victim_ready = receive Atom { :ready -> :ready }
 
       # A worker that links the victim (non-trapping) and then blocks.
-      worker = Process.spawn(&TestConcurrency.SignalTest.linker_entry/0)
+      worker = Process.spawn(&Concurrency.SignalTest.linker_entry/0)
       _worker_self = Process.send(Process.pid(u64, worker), Process.self())
       _worker_victim = Process.send(Process.pid(u64, worker), victim)
       _worker_ready = receive Atom { :ready -> :ready }
@@ -53,11 +53,11 @@ pub struct TestConcurrency.SignalTest {
     test("a NORMAL exit does not kill a non-trapping linked process") {
       # The worker links a victim that will exit NORMALLY; the worker must
       # survive (normal exits do not propagate a kill).
-      victim = Process.spawn(&TestConcurrency.SignalTest.normal_exit_after_go_entry/0)
+      victim = Process.spawn(&Concurrency.SignalTest.normal_exit_after_go_entry/0)
       _victim_self = Process.send(Process.pid(u64, victim), Process.self())
       _victim_ready = receive Atom { :ready -> :ready }
 
-      worker = Process.spawn(&TestConcurrency.SignalTest.ping_linker_entry/0)
+      worker = Process.spawn(&Concurrency.SignalTest.ping_linker_entry/0)
       _worker_self = Process.send(Process.pid(u64, worker), Process.self())
       _worker_victim = Process.send(Process.pid(u64, worker), victim)
       _worker_ready = receive Atom { :ready -> :ready }
@@ -72,7 +72,7 @@ pub struct TestConcurrency.SignalTest {
     }
 
     test("link is idempotent — a linked abnormal exit delivers exactly one EXIT") {
-      target = Process.spawn(&TestConcurrency.SignalTest.blocker_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -96,7 +96,7 @@ pub struct TestConcurrency.SignalTest {
     }
 
     test("unlink stops link propagation (the monitor DOWN still fires)") {
-      target = Process.spawn(&TestConcurrency.SignalTest.blocker_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -117,7 +117,7 @@ pub struct TestConcurrency.SignalTest {
 
   describe("monitors") {
     test("monitor delivers a DOWN with the exit reason") {
-      target = Process.spawn(&TestConcurrency.SignalTest.normal_exit_after_go_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.normal_exit_after_go_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -131,7 +131,7 @@ pub struct TestConcurrency.SignalTest {
     }
 
     test("monitors are stackable — two monitors deliver two distinct DOWNs") {
-      target = Process.spawn(&TestConcurrency.SignalTest.normal_exit_after_go_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.normal_exit_after_go_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -151,7 +151,7 @@ pub struct TestConcurrency.SignalTest {
     }
 
     test("monitoring an already-dead process fires noproc immediately") {
-      target = Process.spawn(&TestConcurrency.SignalTest.normal_exit_after_go_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.normal_exit_after_go_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -170,7 +170,7 @@ pub struct TestConcurrency.SignalTest {
     }
 
     test("demonitor drops a monitor so no DOWN arrives (a live monitor still fires)") {
-      target = Process.spawn(&TestConcurrency.SignalTest.normal_exit_after_go_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.normal_exit_after_go_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -187,7 +187,7 @@ pub struct TestConcurrency.SignalTest {
 
   describe("kill and reason rules") {
     test("kill is untrappable — a trapping process still dies, reason killed") {
-      target = Process.spawn(&TestConcurrency.SignalTest.trap_blocker_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.trap_blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -204,7 +204,7 @@ pub struct TestConcurrency.SignalTest {
       # Erlang `exit(Pid, kill)`: reason `:kill` through exit/2 is the
       # UNTRAPPABLE kill, not a trappable `:kill` message — the trapping
       # target dies with reason `:killed` (P5-R1 S3).
-      target = Process.spawn(&TestConcurrency.SignalTest.trap_blocker_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.trap_blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -221,7 +221,7 @@ pub struct TestConcurrency.SignalTest {
       # The killed process dies with reason `:killed` (not `:kill`), so its
       # LINKED peers receive the ordinary trappable `:killed` — a trapping
       # peer observes `{'EXIT', target, :killed}` and survives (P5-R1 N3).
-      target = Process.spawn(&TestConcurrency.SignalTest.blocker_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -243,7 +243,7 @@ pub struct TestConcurrency.SignalTest {
       # were the signal dropped (the pre-fix bug), it would fall through to
       # the abnormal `exit_with(:fell_through)` and the DOWN reason would
       # betray it.
-      target = Process.spawn(&TestConcurrency.SignalTest.self_normal_exit_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.self_normal_exit_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -257,7 +257,7 @@ pub struct TestConcurrency.SignalTest {
     }
 
     test("exit_with self-terminates abnormally, delivering the reason to a monitor") {
-      target = Process.spawn(&TestConcurrency.SignalTest.self_exit_after_go_entry/0)
+      target = Process.spawn(&Concurrency.SignalTest.self_exit_after_go_entry/0)
       _self_to_child = Process.send(Process.pid(u64, target), Process.self())
       _ready = receive Atom { :ready -> :ready }
 
@@ -325,7 +325,7 @@ pub struct TestConcurrency.SignalTest {
       # trap and are linked, its exit arrives as an {'EXIT', …} MERGED after its
       # two messages in strict per-sender FIFO order.
       _trap = Process.trap_exit(true)
-      sender = Process.spawn(&TestConcurrency.SignalTest.fifo_sender_entry/0)
+      sender = Process.spawn(&Concurrency.SignalTest.fifo_sender_entry/0)
       _linked = Process.link(sender)
       _self_to_child = Process.send(Process.pid(u64, sender), Process.self())
 

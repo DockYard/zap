@@ -1,20 +1,20 @@
-pub struct TestConcurrency.TaskTest {
+pub struct Concurrency.TaskTest {
   use Zest.Case
 
   describe("Task.async/await round trips") {
     test("round-trips a typed i64 result") {
-      task = Task.async(&TestConcurrency.TaskTest.compute_seven/0)
+      task = Task.async(&Concurrency.TaskTest.compute_seven/0)
       assert(Task.await(task) == 7)
     }
 
     test("round-trips a rich String result through the correlated decode") {
-      task = Task.async(&TestConcurrency.TaskTest.compute_greeting/0)
+      task = Task.async(&Concurrency.TaskTest.compute_greeting/0)
       assert(Task.await(task) == "hello from the worker")
     }
 
     test("two overlapping tasks resolve independently (mark fallback stays sound)") {
-      first = Task.async(&TestConcurrency.TaskTest.compute_seven/0)
-      second = Task.async(&TestConcurrency.TaskTest.compute_eleven/0)
+      first = Task.async(&Concurrency.TaskTest.compute_seven/0)
+      second = Task.async(&Concurrency.TaskTest.compute_eleven/0)
       # Await in reverse creation order: only the SECOND task's mark is
       # still bound (one mark slot, the Erlang recv_mark limitation), so
       # the first await exercises the sound head-scan fallback.
@@ -23,7 +23,7 @@ pub struct TestConcurrency.TaskTest {
     }
 
     test("the owner's mailbox stays clean after await (demonitor+flush leaves no stale DOWN)") {
-      task = Task.async(&TestConcurrency.TaskTest.compute_seven/0)
+      task = Task.async(&Concurrency.TaskTest.compute_seven/0)
       _value = Task.await(task)
       # If the worker's :normal DOWN lingered, this steady-state receive
       # would hit it first and dead-letter the process.
@@ -35,24 +35,24 @@ pub struct TestConcurrency.TaskTest {
 
   describe("Task.await failure surface (Elixir-aligned exits)") {
     test("await propagates a worker crash as an exit with the worker's reason") {
-      _observer = Process.spawn_monitor(&TestConcurrency.TaskTest.awaits_crashing_task_entry/0)
+      _observer = Process.spawn_monitor(&Concurrency.TaskTest.awaits_crashing_task_entry/0)
       reason = Process.await_signal()
       assert(reason == :task_boom)
       assert(Process.last_signal_kind() == 2)
     }
 
     test("await exits with :timeout when the worker never replies") {
-      _observer = Process.spawn_monitor(&TestConcurrency.TaskTest.awaits_stuck_task_entry/0)
+      _observer = Process.spawn_monitor(&Concurrency.TaskTest.awaits_stuck_task_entry/0)
       reason = Process.await_signal()
       assert(reason == :timeout)
     }
 
     test("await by a non-owner exits with :not_owner") {
-      task = Task.async(&TestConcurrency.TaskTest.compute_seven/0)
+      task = Task.async(&Concurrency.TaskTest.compute_seven/0)
       # The owner (this test) consumes the result first, so the task's
       # reply cannot sit at OUR mailbox head when we await the signal.
       assert(Task.await(task) == 7)
-      {helper, _helper_ref} = Process.spawn_monitor(&TestConcurrency.TaskTest.non_owner_await_entry/0)
+      {helper, _helper_ref} = Process.spawn_monitor(&Concurrency.TaskTest.non_owner_await_entry/0)
       _task_sent = Process.send((Pid.of(helper) :: Pid(Task(i64))), task)
       reason = Process.await_signal()
       assert(reason == :not_owner)
@@ -86,13 +86,13 @@ pub struct TestConcurrency.TaskTest {
   # -- assertion surface for await's Elixir-aligned exits) ---------------------
 
   pub fn awaits_crashing_task_entry() -> Nil {
-    task = Task.async(&TestConcurrency.TaskTest.crashing_worker/0)
+    task = Task.async(&Concurrency.TaskTest.crashing_worker/0)
     _never = Task.await(task)
     nil
   }
 
   pub fn awaits_stuck_task_entry() -> Nil {
-    task = Task.async(&TestConcurrency.TaskTest.stuck_worker/0)
+    task = Task.async(&Concurrency.TaskTest.stuck_worker/0)
     _never = Task.await(task, 30)
     nil
   }

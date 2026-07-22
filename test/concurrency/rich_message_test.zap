@@ -1,4 +1,4 @@
-pub struct TestConcurrency.RichMessageTest {
+pub struct Concurrency.RichMessageTest {
   use Zest.Case
 
   # A message struct spanning every sendable field kind — the "struct
@@ -111,7 +111,7 @@ pub struct TestConcurrency.RichMessageTest {
       # in the CHILD's own heap — no cell is shared across the process
       # boundary. The child confirms it received every element by reporting the
       # copy's length back over a scalar reply channel.
-      child = Process.pid(u64, Process.spawn(&TestConcurrency.RichMessageTest.list_length_reporter/0))
+      child = Process.pid(u64, Process.spawn(&Concurrency.RichMessageTest.list_length_reporter/0))
       _channel = Process.send(child, Process.self())
       _payload = Process.send((Pid.of(child.raw) :: Pid([i64])), [100, 200, 300, 400])
       reported_length = receive i64 {

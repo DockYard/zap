@@ -1,4 +1,4 @@
-pub struct TestConcurrency.TlsServerTest {
+pub struct Concurrency.TlsServerTest {
   use Zest.Case
 
   # Phase S5d acceptance proof (gate-ON): the HERMETIC Zap TLS client <-> Zap TLS
@@ -34,7 +34,7 @@ pub struct TestConcurrency.TlsServerTest {
   # ---- the acceptor (owns the TLS listener, traps exits) -------------------
 
   pub fn acceptor_entry() -> Nil {
-    config = %TlsServerConfig{cert_pem: TestConcurrency.TlsServerTest.cert_pem(), key_pem: TestConcurrency.TlsServerTest.key_pem(), alpn: ["http/1.1"]}
+    config = %TlsServerConfig{cert_pem: Concurrency.TlsServerTest.cert_pem(), key_pem: Concurrency.TlsServerTest.key_pem(), alpn: ["http/1.1"]}
     case Tls.listen(SocketAddress.loopback(0), config, 128) {
       Result.Error(_e) -> nil
       Result.Ok(listener) ->
@@ -42,7 +42,7 @@ pub struct TestConcurrency.TlsServerTest {
           port = SocketListener.local_port(listener)
           _reported = Process.send(:tls_echo_coordinator, port)
           state = SocketServer.init(SocketServer.options(50, 0, 5000))
-          TestConcurrency.TlsServerTest.acceptor_loop(state, listener)
+          Concurrency.TlsServerTest.acceptor_loop(state, listener)
         }
     }
   }
@@ -66,13 +66,13 @@ pub struct TestConcurrency.TlsServerTest {
           # `Socket` to a fresh handler by MOVE (the session travels with it).
           Result.Ok(conn) ->
             {
-              handler = Process.spawn_link(&TestConcurrency.TlsServerTest.handler_entry/0)
+              handler = Process.spawn_link(&Concurrency.TlsServerTest.handler_entry/0)
               _moved = Process.send_move((Pid.of(handler) :: Pid(Socket)), conn)
-              TestConcurrency.TlsServerTest.acceptor_loop(SocketServer.admitted(reaped, handler), listener)
+              Concurrency.TlsServerTest.acceptor_loop(SocketServer.admitted(reaped, handler), listener)
             }
           # `:etimedout` on a quiet poll (the common case), or a handshake failure
           # from a hostile/aborted client — just loop, re-reaping.
-          Result.Error(_e) -> TestConcurrency.TlsServerTest.acceptor_loop(reaped, listener)
+          Result.Error(_e) -> Concurrency.TlsServerTest.acceptor_loop(reaped, listener)
         }
     }
   }
@@ -87,7 +87,7 @@ pub struct TestConcurrency.TlsServerTest {
     conn = receive Socket {
       s -> s
     }
-    TestConcurrency.TlsServerTest.echo_serve(conn)
+    Concurrency.TlsServerTest.echo_serve(conn)
   }
 
   fn echo_serve(conn :: Socket) -> Nil {
@@ -95,7 +95,7 @@ pub struct TestConcurrency.TlsServerTest {
       SocketRecv.Chunk(bytes) ->
         {
           _sent = Socket.send(conn, bytes)
-          TestConcurrency.TlsServerTest.echo_serve(conn)
+          Concurrency.TlsServerTest.echo_serve(conn)
         }
       SocketRecv.Closed ->
         {
@@ -121,7 +121,7 @@ pub struct TestConcurrency.TlsServerTest {
     port = receive i64 {
       p -> p
     }
-    _result = TestConcurrency.TlsServerTest.client_run(port)
+    _result = Concurrency.TlsServerTest.client_run(port)
     nil
   }
 
@@ -133,7 +133,7 @@ pub struct TestConcurrency.TlsServerTest {
           _r = Process.send(:tls_echo_coordinator, (0 :: i64))
           :connect_failed
         }
-      Result.Ok(client) -> TestConcurrency.TlsServerTest.client_exchange(client, payload)
+      Result.Ok(client) -> Concurrency.TlsServerTest.client_exchange(client, payload)
     }
   }
 
@@ -161,7 +161,7 @@ pub struct TestConcurrency.TlsServerTest {
     port = receive i64 {
       p -> p
     }
-    _result = TestConcurrency.TlsServerTest.multi_client_run(port)
+    _result = Concurrency.TlsServerTest.multi_client_run(port)
     nil
   }
 
@@ -174,7 +174,7 @@ pub struct TestConcurrency.TlsServerTest {
         }
       Result.Ok(client) ->
         {
-          ok = TestConcurrency.TlsServerTest.echo_n(client, 3, 0)
+          ok = Concurrency.TlsServerTest.echo_n(client, 3, 0)
           _closed = Socket.close(client)
           _reported = Process.send(:tls_echo_coordinator, ok)
           :done
@@ -194,7 +194,7 @@ pub struct TestConcurrency.TlsServerTest {
           case Socket.recv(client, String.length(payload), 5000) {
             SocketRecv.Chunk(bytes) ->
               case bytes == payload {
-                true -> TestConcurrency.TlsServerTest.echo_n(client, remaining - 1, index + 1)
+                true -> Concurrency.TlsServerTest.echo_n(client, remaining - 1, index + 1)
                 false -> (0 :: i64)
               }
             SocketRecv.TimedOut(_p) -> (0 :: i64)
@@ -212,9 +212,9 @@ pub struct TestConcurrency.TlsServerTest {
       true -> nil
       false ->
         {
-          client = Process.spawn(&TestConcurrency.TlsServerTest.client_entry/0)
+          client = Process.spawn(&Concurrency.TlsServerTest.client_entry/0)
           _sent = Process.send((Pid.of(client) :: Pid(i64)), port)
-          TestConcurrency.TlsServerTest.spawn_clients(remaining - 1, port)
+          Concurrency.TlsServerTest.spawn_clients(remaining - 1, port)
         }
     }
   }
@@ -230,7 +230,7 @@ pub struct TestConcurrency.TlsServerTest {
           }
           case verdict < 0 {
             true -> acc
-            false -> TestConcurrency.TlsServerTest.collect_verdicts(remaining - 1, acc + verdict)
+            false -> Concurrency.TlsServerTest.collect_verdicts(remaining - 1, acc + verdict)
           }
         }
     }
@@ -245,7 +245,7 @@ pub struct TestConcurrency.TlsServerTest {
           false ->
             {
               _napped = :zig.ProcessRuntime.await_signal_timeout(5)
-              TestConcurrency.TlsServerTest.await_live_count(target, deadline_ms)
+              Concurrency.TlsServerTest.await_live_count(target, deadline_ms)
             }
         }
     }
@@ -255,53 +255,53 @@ pub struct TestConcurrency.TlsServerTest {
 
   describe("Hermetic Zap TLS client <-> Zap TLS server loopback (Phase S5d)") {
     test("N clients each complete a TLS 1.3 handshake and round-trip a distinct payload through a send_move'd handler; leak-exact") {
-      _named = Process.register(:tls_echo_coordinator)
+      assert(Process.register(:tls_echo_coordinator))
       base = Socket.live_count()
-      acceptor = Process.spawn(&TestConcurrency.TlsServerTest.acceptor_entry/0)
+      acceptor = Process.spawn(&Concurrency.TlsServerTest.acceptor_entry/0)
       _mon = Process.monitor(acceptor)
       port = receive i64 {
         p -> p
       }
       # The TLS listener is now the one live socket above baseline.
-      assert(TestConcurrency.TlsServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
+      assert(Concurrency.TlsServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
 
       client_count = 4
-      _spawned = TestConcurrency.TlsServerTest.spawn_clients(client_count, port)
-      total = TestConcurrency.TlsServerTest.collect_verdicts(client_count, 0)
+      _spawned = Concurrency.TlsServerTest.spawn_clients(client_count, port)
+      total = Concurrency.TlsServerTest.collect_verdicts(client_count, 0)
       # Every one of the concurrent TLS connections handshook + echoed its payload.
       assert(total == client_count)
 
       # All TLS connection fds reclaimed; only the listener remains.
-      assert(TestConcurrency.TlsServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
+      assert(Concurrency.TlsServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
 
       # Graceful teardown: the acceptor sees `:shutdown`, closes the listener
       # (scrubbing + freeing the stored private key), drains, and exits.
       _shutdown = Process.exit_signal(acceptor, :shutdown)
       _down = Process.await_signal()
-      assert(TestConcurrency.TlsServerTest.await_live_count(base, Process.monotonic_millis() + 5000))
+      assert(Concurrency.TlsServerTest.await_live_count(base, Process.monotonic_millis() + 5000))
       assert(Socket.live_count() == base)
       _unreg = Process.unregister(:tls_echo_coordinator)
     }
 
     test("one TLS connection round-trips MULTIPLE messages through its send_move'd handler (the moved session keeps decrypting record after record); leak-exact") {
-      _named = Process.register(:tls_echo_coordinator)
+      assert(Process.register(:tls_echo_coordinator))
       base = Socket.live_count()
-      acceptor = Process.spawn(&TestConcurrency.TlsServerTest.acceptor_entry/0)
+      acceptor = Process.spawn(&Concurrency.TlsServerTest.acceptor_entry/0)
       _mon = Process.monitor(acceptor)
       port = receive i64 {
         p -> p
       }
-      assert(TestConcurrency.TlsServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
+      assert(Concurrency.TlsServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
 
-      client = Process.spawn(&TestConcurrency.TlsServerTest.multi_client_entry/0)
+      client = Process.spawn(&Concurrency.TlsServerTest.multi_client_entry/0)
       _sent = Process.send((Pid.of(client) :: Pid(i64)), port)
-      total = TestConcurrency.TlsServerTest.collect_verdicts(1, 0)
+      total = Concurrency.TlsServerTest.collect_verdicts(1, 0)
       assert(total == 1)
 
-      assert(TestConcurrency.TlsServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
+      assert(Concurrency.TlsServerTest.await_live_count(base + 1, Process.monotonic_millis() + 5000))
       _shutdown = Process.exit_signal(acceptor, :shutdown)
       _down = Process.await_signal()
-      assert(TestConcurrency.TlsServerTest.await_live_count(base, Process.monotonic_millis() + 5000))
+      assert(Concurrency.TlsServerTest.await_live_count(base, Process.monotonic_millis() + 5000))
       assert(Socket.live_count() == base)
       _unreg = Process.unregister(:tls_echo_coordinator)
     }

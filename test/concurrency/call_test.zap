@@ -1,9 +1,9 @@
-pub struct TestConcurrency.CallTest {
+pub struct Concurrency.CallTest {
   use Zest.Case
 
   describe("Process.call round trips") {
     test("calls a server and gets the typed reply, twice through one loop") {
-      server = TestConcurrency.CallTest.start_adder(2)
+      server = Concurrency.CallTest.start_adder(2)
       first = (Process.call(server, 41) :: i64)
       assert(first == 42)
       second = (Process.call(server, 8) :: i64)
@@ -11,7 +11,7 @@ pub struct TestConcurrency.CallTest {
     }
 
     test("round-trips a rich String request and reply") {
-      server_bits = Process.spawn(&TestConcurrency.CallTest.echo_string_server_entry/0)
+      server_bits = Process.spawn(&Concurrency.CallTest.echo_string_server_entry/0)
       server = (Pid.of(server_bits) :: Pid(Call(String)))
       greeting = (Process.call(server, "hello") :: String)
       assert(greeting == "pong: hello")
@@ -22,19 +22,19 @@ pub struct TestConcurrency.CallTest {
     test("a call to a dead server exits :noproc immediately (monitor, not timeout)") {
       # The caller uses a 60 s timeout: only the monitor's immediate
       # :noproc DOWN can end this test promptly.
-      _observer = Process.spawn_monitor(&TestConcurrency.CallTest.calls_dead_server_entry/0)
+      _observer = Process.spawn_monitor(&Concurrency.CallTest.calls_dead_server_entry/0)
       reason = Process.await_signal()
       assert(reason == :noproc)
     }
 
     test("a server dying mid-call exits the caller with the server's reason, not :timeout") {
-      _observer = Process.spawn_monitor(&TestConcurrency.CallTest.calls_crashing_server_entry/0)
+      _observer = Process.spawn_monitor(&Concurrency.CallTest.calls_crashing_server_entry/0)
       reason = Process.await_signal()
       assert(reason == :server_boom)
     }
 
     test("a silent-but-alive server exits the caller with :timeout") {
-      _observer = Process.spawn_monitor(&TestConcurrency.CallTest.calls_silent_server_entry/0)
+      _observer = Process.spawn_monitor(&Concurrency.CallTest.calls_silent_server_entry/0)
       reason = Process.await_signal()
       assert(reason == :timeout)
     }
@@ -42,8 +42,8 @@ pub struct TestConcurrency.CallTest {
 
   describe("the ref-trick O(1) correlation skip (research R8)") {
     test("a 10k-message backlog is skipped in O(1) from the mark and preserved in order") {
-      server = TestConcurrency.CallTest.start_adder(1)
-      _flooded = TestConcurrency.CallTest.flood_self(0, 10000)
+      server = Concurrency.CallTest.start_adder(1)
+      _flooded = Concurrency.CallTest.flood_self(0, 10000)
 
       visits_before = Process.correlated_receive_visits()
       started_millis = Process.monotonic_millis()
@@ -61,7 +61,7 @@ pub struct TestConcurrency.CallTest {
 
       # No loss, no reorder: the skipped backlog drains in send order
       # through the steady-state receive.
-      drained = TestConcurrency.CallTest.drain_in_order(0, 10000)
+      drained = Concurrency.CallTest.drain_in_order(0, 10000)
       assert(drained == 10000)
     }
   }
@@ -69,14 +69,14 @@ pub struct TestConcurrency.CallTest {
   # -- servers ------------------------------------------------------------------
 
   pub fn start_adder(calls_to_serve :: i64) -> Pid(Call(i64)) {
-    server_bits = Process.spawn(&TestConcurrency.CallTest.adder_server_entry/0)
+    server_bits = Process.spawn(&Concurrency.CallTest.adder_server_entry/0)
     _count_sent = Process.send(Process.pid(i64, server_bits), calls_to_serve)
     (Pid.of(server_bits) :: Pid(Call(i64)))
   }
 
   pub fn adder_server_entry() -> Nil {
     calls_to_serve = receive i64 { n -> n }
-    TestConcurrency.CallTest.adder_loop(calls_to_serve)
+    Concurrency.CallTest.adder_loop(calls_to_serve)
   }
 
   pub fn adder_loop(remaining :: i64) -> Nil {
@@ -86,7 +86,7 @@ pub struct TestConcurrency.CallTest {
         {
           call = receive Call(i64) { c -> c }
           _replied = Process.reply(call, call.request + 1)
-          TestConcurrency.CallTest.adder_loop(remaining - 1)
+          Concurrency.CallTest.adder_loop(remaining - 1)
         }
     }
   }
@@ -117,7 +117,7 @@ pub struct TestConcurrency.CallTest {
   # -- observer entries (their exit reason is the assertion surface) -----------
 
   pub fn calls_dead_server_entry() -> Nil {
-    {dead_bits, _dead_ref} = Process.spawn_monitor(&TestConcurrency.CallTest.immediate_exit_entry/0)
+    {dead_bits, _dead_ref} = Process.spawn_monitor(&Concurrency.CallTest.immediate_exit_entry/0)
     # Consume the DOWN so the server is PROVABLY dead before the call.
     _down = Process.await_signal()
     server = (Pid.of(dead_bits) :: Pid(Call(i64)))
@@ -126,14 +126,14 @@ pub struct TestConcurrency.CallTest {
   }
 
   pub fn calls_crashing_server_entry() -> Nil {
-    server_bits = Process.spawn(&TestConcurrency.CallTest.crashing_server_entry/0)
+    server_bits = Process.spawn(&Concurrency.CallTest.crashing_server_entry/0)
     server = (Pid.of(server_bits) :: Pid(Call(i64)))
     _never = (Process.call(server, 1, 60000) :: i64)
     nil
   }
 
   pub fn calls_silent_server_entry() -> Nil {
-    server_bits = Process.spawn(&TestConcurrency.CallTest.silent_server_entry/0)
+    server_bits = Process.spawn(&Concurrency.CallTest.silent_server_entry/0)
     server = (Pid.of(server_bits) :: Pid(Call(i64)))
     _never = (Process.call(server, 1, 30) :: i64)
     nil
@@ -147,7 +147,7 @@ pub struct TestConcurrency.CallTest {
       false ->
         {
           _sent = Process.send(Process.pid(i64, Process.self()), index)
-          TestConcurrency.CallTest.flood_self(index + 1, count)
+          Concurrency.CallTest.flood_self(index + 1, count)
         }
     }
   }
@@ -159,7 +159,7 @@ pub struct TestConcurrency.CallTest {
         {
           got = receive i64 { n -> n }
           case got == expected {
-            true -> TestConcurrency.CallTest.drain_in_order(expected + 1, count)
+            true -> Concurrency.CallTest.drain_in_order(expected + 1, count)
             false -> -1
           }
         }

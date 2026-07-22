@@ -14,12 +14,12 @@
   hibernators woken concurrently on the M:N pool all answer correctly.
   """
 
-pub struct TestConcurrency.HibernateTest {
+pub struct Concurrency.HibernateTest {
   use Zest.Case
 
   describe("hibernate wake semantics") {
     test("hibernate parks until a message arrives; the following receive consumes it") {
-      child = Process.spawn(&TestConcurrency.HibernateTest.hibernating_echo_entry/0)
+      child = Process.spawn(&Concurrency.HibernateTest.hibernating_echo_entry/0)
       _channel = Process.send(Process.pid(u64, child), Process.self())
       _work = Process.send(Process.pid(i64, child), 41)
       echoed = receive i64 {
@@ -30,16 +30,16 @@ pub struct TestConcurrency.HibernateTest {
     }
 
     test("a hibernating server survives many hibernate→receive→reply rounds") {
-      child = Process.spawn(&TestConcurrency.HibernateTest.hibernating_echo_entry/0)
+      child = Process.spawn(&Concurrency.HibernateTest.hibernating_echo_entry/0)
       _channel = Process.send(Process.pid(u64, child), Process.self())
-      total = TestConcurrency.HibernateTest.round_trip_many(child, 1, 50, 0)
+      total = Concurrency.HibernateTest.round_trip_many(child, 1, 50, 0)
       # sum of (n + 1) for n in 1..50 = sum(2..51) = 1_325.
       assert(total == 1325)
       _stop = Process.send(Process.pid(i64, child), -1)
     }
 
     test("deep call chains recompute identically after the hibernate wake (stack recommits)") {
-      child = Process.spawn(&TestConcurrency.HibernateTest.deep_stack_entry/0)
+      child = Process.spawn(&Concurrency.HibernateTest.deep_stack_entry/0)
       _channel = Process.send(Process.pid(u64, child), Process.self())
       before = receive i64 {
         n -> n
@@ -51,11 +51,11 @@ pub struct TestConcurrency.HibernateTest {
       # The same 64-frame recursion, before hibernating and after waking,
       # computes the same checksum — the released pages recommitted cleanly.
       assert(before == after_wake)
-      assert(before == TestConcurrency.HibernateTest.deep_checksum(64, 0))
+      assert(before == Concurrency.HibernateTest.deep_checksum(64, 0))
     }
 
     test("hibernate returns immediately when a message is already queued") {
-      child = Process.spawn(&TestConcurrency.HibernateTest.pre_queued_entry/0)
+      child = Process.spawn(&Concurrency.HibernateTest.pre_queued_entry/0)
       _channel = Process.send(Process.pid(u64, child), Process.self())
       # The child replies :ready only AFTER both work messages are queued —
       # its two hibernates then return without ever parking.
@@ -71,7 +71,7 @@ pub struct TestConcurrency.HibernateTest {
 
   describe("hibernate under the M:N pool") {
     test("a fleet of hibernators woken concurrently all answer") {
-      fleet_total = TestConcurrency.HibernateTest.spawn_fleet(16, 0)
+      fleet_total = Concurrency.HibernateTest.spawn_fleet(16, 0)
       # Each of the 16 echoes (n + 1) for its index n in 1..16:
       # sum(2..17) = 152.
       assert(fleet_total == 152)
@@ -84,7 +84,7 @@ pub struct TestConcurrency.HibernateTest {
   # exits on -1.
   pub fn hibernating_echo_entry() -> Nil {
     parent = Process.receive_raw(u64)
-    TestConcurrency.HibernateTest.hibernate_echo_loop(parent)
+    Concurrency.HibernateTest.hibernate_echo_loop(parent)
   }
 
   pub fn hibernate_echo_loop(parent :: u64) -> Nil {
@@ -97,7 +97,7 @@ pub struct TestConcurrency.HibernateTest {
       false ->
         {
           _sent = Process.send(Process.pid(i64, parent), n + 1)
-          TestConcurrency.HibernateTest.hibernate_echo_loop(parent)
+          Concurrency.HibernateTest.hibernate_echo_loop(parent)
         }
     }
   }
@@ -108,13 +108,13 @@ pub struct TestConcurrency.HibernateTest {
   # again.
   pub fn deep_stack_entry() -> Nil {
     parent = Process.receive_raw(u64)
-    before = TestConcurrency.HibernateTest.deep_checksum(64, 0)
+    before = Concurrency.HibernateTest.deep_checksum(64, 0)
     _first = Process.send(Process.pid(i64, parent), before)
     _waiting = Process.hibernate()
     _wake = receive i64 {
       value -> value
     }
-    after_wake = TestConcurrency.HibernateTest.deep_checksum(64, 0)
+    after_wake = Concurrency.HibernateTest.deep_checksum(64, 0)
     _second = Process.send(Process.pid(i64, parent), after_wake)
     nil
   }
@@ -124,7 +124,7 @@ pub struct TestConcurrency.HibernateTest {
   pub fn deep_checksum(depth :: i64, seed :: i64) -> i64 {
     case depth == 0 {
       true -> seed
-      false -> depth * 7 + TestConcurrency.HibernateTest.deep_checksum(depth - 1, seed + depth)
+      false -> depth * 7 + Concurrency.HibernateTest.deep_checksum(depth - 1, seed + depth)
     }
   }
 
@@ -162,7 +162,7 @@ pub struct TestConcurrency.HibernateTest {
           echoed = receive i64 {
             n -> n
           }
-          TestConcurrency.HibernateTest.round_trip_many(child, next + 1, remaining - 1, acc + echoed)
+          Concurrency.HibernateTest.round_trip_many(child, next + 1, remaining - 1, acc + echoed)
         }
     }
   }
@@ -174,14 +174,14 @@ pub struct TestConcurrency.HibernateTest {
       true -> acc
       false ->
         {
-          child = Process.spawn(&TestConcurrency.HibernateTest.hibernating_echo_entry/0)
+          child = Process.spawn(&Concurrency.HibernateTest.hibernating_echo_entry/0)
           _channel = Process.send(Process.pid(u64, child), Process.self())
           _work = Process.send(Process.pid(i64, child), count)
           echoed = receive i64 {
             n -> n
           }
           _stop = Process.send(Process.pid(i64, child), -1)
-          TestConcurrency.HibernateTest.spawn_fleet(count - 1, acc + echoed)
+          Concurrency.HibernateTest.spawn_fleet(count - 1, acc + echoed)
         }
     }
   }

@@ -1,4 +1,4 @@
-pub struct TestConcurrency.CrossModelSendTest {
+pub struct Concurrency.CrossModelSendTest {
   use Zest.Case
 
   # P3-J4 acceptance proof: cross-MODEL message copy. A process running one
@@ -34,7 +34,7 @@ pub struct TestConcurrency.CrossModelSendTest {
       # a checksum over EVERY field, proving fidelity of the cross-model copy.
       # If reconstruction routed cells to the wrong heap or corrupted a field,
       # the checksum would differ or the child would crash.
-      child = Process.pid(u64, Process.spawn(&TestConcurrency.CrossModelSendTest.arena_payload_reporter/0, Memory.Arena))
+      child = Process.pid(u64, Process.spawn(&Concurrency.CrossModelSendTest.arena_payload_reporter/0, Memory.Arena))
       _channel = Process.send(child, Process.self())
       payload = %Payload{
         count: 3,
@@ -64,7 +64,7 @@ pub struct TestConcurrency.CrossModelSendTest {
       # RECEIVER, not the sender: an Arena PRODUCER builds a rich payload in its
       # own Arena heap and sends it to the ARC parent, which reconstructs the
       # graph as rc=1 cells in ITS ARC heap.
-      producer = Process.pid(u64, Process.spawn(&TestConcurrency.CrossModelSendTest.arena_payload_producer/0, Memory.Arena))
+      producer = Process.pid(u64, Process.spawn(&Concurrency.CrossModelSendTest.arena_payload_producer/0, Memory.Arena))
       _channel = Process.send(producer, Process.self())
       got = receive Payload {
         p -> p
@@ -81,7 +81,7 @@ pub struct TestConcurrency.CrossModelSendTest {
     test("same-model ARC→ARC rich send still round-trips (cross-model-work regression)") {
       # The same-model path (both processes manifest ARC) is unchanged by the
       # cross-model work: a List reconstructs faithfully in the ARC child.
-      child = Process.pid(u64, Process.spawn(&TestConcurrency.CrossModelSendTest.arc_list_reporter/0))
+      child = Process.pid(u64, Process.spawn(&Concurrency.CrossModelSendTest.arc_list_reporter/0))
       _channel = Process.send(child, Process.self())
       _sent = Process.send((Pid.of(child.raw) :: Pid([i64])), [5, 15, 25])
       total = receive i64 {

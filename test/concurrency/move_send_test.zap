@@ -1,4 +1,4 @@
-pub struct TestConcurrency.MoveSendTest {
+pub struct Concurrency.MoveSendTest {
   use Zest.Case
 
   # P3-J5 (plan item 6.1): the same-model O(1) region-move send
@@ -72,7 +72,7 @@ pub struct TestConcurrency.MoveSendTest {
       # rebuild — the 2.19 ms/MB reconstruct E6 measured is gone. Lookups are
       # verified EXHAUSTIVELY (all 400 keys), the correctness crux: a moved
       # map whose buckets/hashes went stale would fail these probes.
-      data = TestConcurrency.MoveSendTest.build_map(%{}, 400)
+      data = Concurrency.MoveSendTest.build_map(%{}, 400)
       self_pid = (Pid.of(Process.self()) :: Pid(%{i64 => i64}))
       moves_before = RuntimeInfo.region_move_send_count()
       _sent = Process.send_move(self_pid, data)
@@ -80,7 +80,7 @@ pub struct TestConcurrency.MoveSendTest {
         got -> got
       }
       assert(Map.size(received) == 400)
-      assert(TestConcurrency.MoveSendTest.verify_map(received, 400))
+      assert(Concurrency.MoveSendTest.verify_map(received, 400))
       # The Map rode the MOVE path (not the 2.19 ms/MB copy rebuild): the
       # region-move send counter incremented across this send.
       assert(RuntimeInfo.region_move_send_count() == moves_before + 1)
@@ -117,7 +117,7 @@ pub struct TestConcurrency.MoveSendTest {
     test("a moved Map is a fresh value the receiver solely owns — rc == 1, in-place mutation works") {
       # The receiver owns the moved cell outright (the sender was consumed),
       # so a put takes the rc-1 in-place fast path and the map stays coherent.
-      payload = TestConcurrency.MoveSendTest.build_map(%{}, 300)
+      payload = Concurrency.MoveSendTest.build_map(%{}, 300)
       self_pid = (Pid.of(Process.self()) :: Pid(%{i64 => i64}))
       _sent = Process.send_move(self_pid, payload)
       owned = receive %{i64 => i64} {
@@ -134,9 +134,9 @@ pub struct TestConcurrency.MoveSendTest {
       # gate declines the move BEFORE detaching and the send degrades to the
       # cross-model deep copy (P3-J4): the Arena child reconstructs the map
       # into its own bulk heap and reports an exhaustive verdict.
-      child = Process.pid(u64, Process.spawn(&TestConcurrency.MoveSendTest.arena_map_reporter/0, Memory.Arena))
+      child = Process.pid(u64, Process.spawn(&Concurrency.MoveSendTest.arena_map_reporter/0, Memory.Arena))
       _channel = Process.send(child, Process.self())
-      big = TestConcurrency.MoveSendTest.build_map(%{}, 400)
+      big = Concurrency.MoveSendTest.build_map(%{}, 400)
       _sent = Process.send_move((Pid.of(child.raw) :: Pid(%{i64 => i64})), big)
       verified = receive Bool {
         ok -> ok
@@ -157,7 +157,7 @@ pub struct TestConcurrency.MoveSendTest {
   }
 
   pub fn build_map(acc :: %{i64 => i64}, count :: i64) -> %{i64 => i64} {
-    TestConcurrency.MoveSendTest.build_map(Map.put(acc, count, count * 3), count - 1)
+    Concurrency.MoveSendTest.build_map(Map.put(acc, count, count * 3), count - 1)
   }
 
   @doc = """
@@ -170,7 +170,7 @@ pub struct TestConcurrency.MoveSendTest {
   }
 
   pub fn verify_map(map :: %{i64 => i64}, count :: i64) -> Bool {
-    Map.get(map, count, -1) == count * 3 and TestConcurrency.MoveSendTest.verify_map(map, count - 1)
+    Map.get(map, count, -1) == count * 3 and Concurrency.MoveSendTest.verify_map(map, count - 1)
   }
 
   @doc = """
@@ -184,7 +184,7 @@ pub struct TestConcurrency.MoveSendTest {
     got = receive %{i64 => i64} {
       m -> m
     }
-    ok = Map.size(got) == 400 and TestConcurrency.MoveSendTest.verify_map(got, 400)
+    ok = Map.size(got) == 400 and Concurrency.MoveSendTest.verify_map(got, 400)
     _sent = Process.send((Pid.of(parent.raw) :: Pid(Bool)), ok)
     nil
   }

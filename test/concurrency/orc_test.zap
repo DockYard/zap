@@ -1,4 +1,4 @@
-pub struct TestConcurrency.OrcTest {
+pub struct Concurrency.OrcTest {
   use Zest.Case
 
   # P3-J6 acceptance proof: the ORC-over-ARC cyclic manager as a per-spawn
@@ -22,8 +22,8 @@ pub struct TestConcurrency.OrcTest {
       # per-spawn Memory.ORC, in the same binary. Linking both proves the ORC
       # backend (src/memory/orc/manager.zig) resolved and registered as a
       # per-spawn manager module.
-      arc_child_bits = Process.spawn(&TestConcurrency.OrcTest.arc_worker/0)
-      orc_child_bits = Process.spawn(&TestConcurrency.OrcTest.orc_worker/0, Memory.ORC)
+      arc_child_bits = Process.spawn(&Concurrency.OrcTest.arc_worker/0)
+      orc_child_bits = Process.spawn(&Concurrency.OrcTest.orc_worker/0, Memory.ORC)
 
       # Every pid carries a 2-bit reclamation-model field at bits 54..55, stamped
       # at spawn from the SELECTED manager's declared capabilities. ARC declares
@@ -67,13 +67,13 @@ pub struct TestConcurrency.OrcTest {
 
   pub fn arc_worker() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
-    _sent = Process.send(parent, TestConcurrency.OrcTest.process_heap_checksum())
+    _sent = Process.send(parent, Concurrency.OrcTest.process_heap_checksum())
     nil
   }
 
   pub fn orc_worker() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
-    _sent = Process.send(parent, TestConcurrency.OrcTest.process_heap_checksum())
+    _sent = Process.send(parent, Concurrency.OrcTest.process_heap_checksum())
     nil
   }
 

@@ -8,14 +8,14 @@
   (`test_concurrency_traced/`).
   """
 
-pub struct TestConcurrency.RuntimeInfoTest {
+pub struct Concurrency.RuntimeInfoTest {
   use Zest.Case
 
   describe("process listing") {
     test("capture names the calling process with its live state") {
       count = RuntimeInfo.capture_processes()
       assert(count >= 1)
-      self_index = TestConcurrency.RuntimeInfoTest.find_pid_index(Process.self(), 0, count)
+      self_index = Concurrency.RuntimeInfoTest.find_pid_index(Process.self(), 0, count)
       assert(self_index < count)
       # The observer is on a CPU taking the snapshot: running.
       state = RuntimeInfo.process_state(self_index)
@@ -26,7 +26,7 @@ pub struct TestConcurrency.RuntimeInfoTest {
       _first = Process.send(Process.pid(i64, Process.self()), 7)
       _second = Process.send(Process.pid(i64, Process.self()), 8)
       count = RuntimeInfo.capture_processes()
-      self_index = TestConcurrency.RuntimeInfoTest.find_pid_index(Process.self(), 0, count)
+      self_index = Concurrency.RuntimeInfoTest.find_pid_index(Process.self(), 0, count)
       assert(self_index < count)
       # At least the two just-queued messages (≥, not ==: the suite's
       # root process may carry unrelated queued messages).
@@ -43,7 +43,7 @@ pub struct TestConcurrency.RuntimeInfoTest {
     }
 
     test("a waiting child is listed with its pid and a quiescent mailbox") {
-      child = Process.spawn(&TestConcurrency.RuntimeInfoTest.parked_echo_entry/0)
+      child = Process.spawn(&Concurrency.RuntimeInfoTest.parked_echo_entry/0)
       _channel = Process.send(Process.pid(u64, child), Process.self())
       ready = receive i64 {
         n -> n
@@ -51,7 +51,7 @@ pub struct TestConcurrency.RuntimeInfoTest {
       assert(ready == 1)
       count = RuntimeInfo.capture_processes()
       assert(count >= 2)
-      child_index = TestConcurrency.RuntimeInfoTest.find_pid_index(child, 0, count)
+      child_index = Concurrency.RuntimeInfoTest.find_pid_index(child, 0, count)
       assert(child_index < count)
       # The child acked and parked on its next receive: waiting (or
       # momentarily runnable/running if the snapshot straddles its park —
@@ -77,7 +77,7 @@ pub struct TestConcurrency.RuntimeInfoTest {
       cores = RuntimeInfo.scheduler_count()
       assert(cores >= 1)
       # The core running THIS test has a live utilization window.
-      busy_total = TestConcurrency.RuntimeInfoTest.sum_busy(0, cores, 0)
+      busy_total = Concurrency.RuntimeInfoTest.sum_busy(0, cores, 0)
       assert(busy_total > 0)
       # Every per-core ratio is a valid permille; out-of-range cores are 0.
       assert(RuntimeInfo.scheduler_utilization_permille(0) <= 1000)
@@ -112,7 +112,7 @@ pub struct TestConcurrency.RuntimeInfoTest {
       if RuntimeInfo.process_pid_bits(index) == pid {
         index
       } else {
-        TestConcurrency.RuntimeInfoTest.find_pid_index(pid, index + 1, count)
+        Concurrency.RuntimeInfoTest.find_pid_index(pid, index + 1, count)
       }
     }
   }
@@ -125,7 +125,7 @@ pub struct TestConcurrency.RuntimeInfoTest {
     if index >= cores {
       total
     } else {
-      TestConcurrency.RuntimeInfoTest.sum_busy(index + 1, cores, total + RuntimeInfo.scheduler_busy_nanos(index))
+      Concurrency.RuntimeInfoTest.sum_busy(index + 1, cores, total + RuntimeInfo.scheduler_busy_nanos(index))
     }
   }
 

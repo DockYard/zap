@@ -1,4 +1,4 @@
-pub struct TestConcurrency.TwoManagerProofTest {
+pub struct Concurrency.TwoManagerProofTest {
   use Zest.Case
 
   # P3-J3 acceptance proof: TWO memory managers active in ONE running binary.
@@ -16,8 +16,8 @@ pub struct TestConcurrency.TwoManagerProofTest {
     test("each process carries its own manager's reclamation model, and each runs on its own heap") {
       # Spawn under the manifest default (Memory.ARC) and under an explicit
       # per-spawn Memory.Arena, in the same binary.
-      arc_child_bits = Process.spawn(&TestConcurrency.TwoManagerProofTest.arc_worker/0)
-      arena_child_bits = Process.spawn(&TestConcurrency.TwoManagerProofTest.arena_worker/0, Memory.Arena)
+      arc_child_bits = Process.spawn(&Concurrency.TwoManagerProofTest.arc_worker/0)
+      arena_child_bits = Process.spawn(&Concurrency.TwoManagerProofTest.arena_worker/0, Memory.Arena)
 
       # Every pid carries a 2-bit reclamation-model field, stamped at spawn from
       # the SELECTED manager's declared capabilities (pid layout: model occupies
@@ -70,13 +70,13 @@ pub struct TestConcurrency.TwoManagerProofTest {
 
   pub fn arc_worker() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
-    _sent = Process.send(parent, TestConcurrency.TwoManagerProofTest.process_heap_checksum())
+    _sent = Process.send(parent, Concurrency.TwoManagerProofTest.process_heap_checksum())
     nil
   }
 
   pub fn arena_worker() -> Nil {
     parent = Process.pid(i64, Process.receive_raw(u64))
-    _sent = Process.send(parent, TestConcurrency.TwoManagerProofTest.process_heap_checksum())
+    _sent = Process.send(parent, Concurrency.TwoManagerProofTest.process_heap_checksum())
     nil
   }
 

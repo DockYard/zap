@@ -1,4 +1,4 @@
-pub struct TestConcurrency.SocketDatagramTest {
+pub struct Concurrency.SocketDatagramTest {
   use Zest.Case
 
   # Phase S2 exit-gate acceptance (gate-ON): the datagram (UDP) + Unix-domain
@@ -37,7 +37,7 @@ pub struct TestConcurrency.SocketDatagramTest {
   fn udp_roundtrip() -> Atom {
     case SocketDatagram.bind(SocketAddress.loopback(0)) {
       Result.Error(_e) -> :bind_failed
-      Result.Ok(receiver) -> TestConcurrency.SocketDatagramTest.udp_after_receiver(receiver)
+      Result.Ok(receiver) -> Concurrency.SocketDatagramTest.udp_after_receiver(receiver)
     }
   }
 
@@ -49,7 +49,7 @@ pub struct TestConcurrency.SocketDatagramTest {
           _c = SocketDatagram.close(receiver)
           :bind_failed
         }
-      Result.Ok(sender) -> TestConcurrency.SocketDatagramTest.udp_exchange(receiver, sender, port)
+      Result.Ok(sender) -> Concurrency.SocketDatagramTest.udp_exchange(receiver, sender, port)
     }
   }
 
@@ -79,7 +79,7 @@ pub struct TestConcurrency.SocketDatagramTest {
   fn udp_truncation() -> Atom {
     case SocketDatagram.bind(SocketAddress.loopback(0)) {
       Result.Error(_e) -> :bind_failed
-      Result.Ok(receiver) -> TestConcurrency.SocketDatagramTest.truncation_after_receiver(receiver)
+      Result.Ok(receiver) -> Concurrency.SocketDatagramTest.truncation_after_receiver(receiver)
     }
   }
 
@@ -91,7 +91,7 @@ pub struct TestConcurrency.SocketDatagramTest {
           _c = SocketDatagram.close(receiver)
           :bind_failed
         }
-      Result.Ok(sender) -> TestConcurrency.SocketDatagramTest.truncation_exchange(receiver, sender, port)
+      Result.Ok(sender) -> Concurrency.SocketDatagramTest.truncation_exchange(receiver, sender, port)
     }
   }
 
@@ -121,7 +121,7 @@ pub struct TestConcurrency.SocketDatagramTest {
   fn connected_udp() -> Atom {
     case SocketDatagram.bind(SocketAddress.loopback(0)) {
       Result.Error(_e) -> :bind_failed
-      Result.Ok(peer) -> TestConcurrency.SocketDatagramTest.connected_after_peer(peer)
+      Result.Ok(peer) -> Concurrency.SocketDatagramTest.connected_after_peer(peer)
     }
   }
 
@@ -133,13 +133,13 @@ pub struct TestConcurrency.SocketDatagramTest {
           _c = SocketDatagram.close(peer)
           :connect_failed
         }
-      Result.Ok(connected) -> TestConcurrency.SocketDatagramTest.connected_filter(peer, connected)
+      Result.Ok(connected) -> Concurrency.SocketDatagramTest.connected_filter(peer, connected)
     }
   }
 
   fn connected_filter(peer :: SocketDatagram, connected :: SocketDatagram) -> Atom {
     connected_port = SocketDatagram.local_port(connected)
-    filtered = TestConcurrency.SocketDatagramTest.impostor_dropped(connected_port, connected)
+    filtered = Concurrency.SocketDatagramTest.impostor_dropped(connected_port, connected)
     _sent = SocketDatagram.send_to(peer, SocketAddress.loopback(connected_port), "from-peer")
     delivered = case SocketDatagram.recv(connected, 65536, 5000) {
       SocketDatagramRecv.Datagram(d) ->
@@ -180,18 +180,18 @@ pub struct TestConcurrency.SocketDatagramTest {
   # ---- Unix-domain STREAM echo via Socket + :unix address ------------------
 
   fn unix_stream_echo() -> Atom {
-    path = TestConcurrency.SocketDatagramTest.unique_unix_path("zap-s2-stream-gon")
+    path = Concurrency.SocketDatagramTest.unique_unix_path("zap-s2-stream-gon")
     _rm = File.rm(path)
     case Socket.listen(SocketAddress.unix(path), 8) {
       Result.Error(_e) -> :listen_failed
-      Result.Ok(listener) -> TestConcurrency.SocketDatagramTest.unix_after_listen(listener, path)
+      Result.Ok(listener) -> Concurrency.SocketDatagramTest.unix_after_listen(listener, path)
     }
   }
 
   fn unix_after_listen(listener :: SocketListener, path :: String) -> Atom {
     result = case Socket.connect(SocketAddress.unix(path), 5000) {
       Result.Error(_e) -> :connect_failed
-      Result.Ok(client) -> TestConcurrency.SocketDatagramTest.unix_after_connect(listener, client)
+      Result.Ok(client) -> Concurrency.SocketDatagramTest.unix_after_connect(listener, client)
     }
     _rm = File.rm(path)
     result
@@ -205,7 +205,7 @@ pub struct TestConcurrency.SocketDatagramTest {
           _l = SocketListener.close(listener)
           :accept_failed
         }
-      Result.Ok(server) -> TestConcurrency.SocketDatagramTest.unix_echo_exchange(listener, client, server)
+      Result.Ok(server) -> Concurrency.SocketDatagramTest.unix_echo_exchange(listener, client, server)
     }
   }
 
@@ -245,20 +245,20 @@ pub struct TestConcurrency.SocketDatagramTest {
   # ---- Unix-domain DATAGRAM roundtrip --------------------------------------
 
   fn unix_dgram_roundtrip() -> Atom {
-    receiver_path = TestConcurrency.SocketDatagramTest.unique_unix_path("zap-s2-dgram-gon")
+    receiver_path = Concurrency.SocketDatagramTest.unique_unix_path("zap-s2-dgram-gon")
     _rm = File.rm(receiver_path)
     case SocketDatagram.bind(SocketAddress.unix(receiver_path)) {
       Result.Error(_e) -> :bind_failed
-      Result.Ok(receiver) -> TestConcurrency.SocketDatagramTest.unix_dgram_after_bind(receiver, receiver_path)
+      Result.Ok(receiver) -> Concurrency.SocketDatagramTest.unix_dgram_after_bind(receiver, receiver_path)
     }
   }
 
   fn unix_dgram_after_bind(receiver :: SocketDatagram, receiver_path :: String) -> Atom {
-    sender_path = TestConcurrency.SocketDatagramTest.unique_unix_path("zap-s2-dgtx-gon")
+    sender_path = Concurrency.SocketDatagramTest.unique_unix_path("zap-s2-dgtx-gon")
     _rm = File.rm(sender_path)
     result = case SocketDatagram.bind(SocketAddress.unix(sender_path)) {
       Result.Error(_e) -> :sender_bind_failed
-      Result.Ok(sender) -> TestConcurrency.SocketDatagramTest.unix_dgram_exchange(receiver, sender, receiver_path)
+      Result.Ok(sender) -> Concurrency.SocketDatagramTest.unix_dgram_exchange(receiver, sender, receiver_path)
     }
     _c = SocketDatagram.close(receiver)
     _r1 = File.rm(receiver_path)
@@ -287,8 +287,8 @@ pub struct TestConcurrency.SocketDatagramTest {
 
   pub fn parked_recv_from_worker() -> Nil {
     case SocketDatagram.bind(SocketAddress.loopback(0)) {
-      Result.Ok(sock) -> TestConcurrency.SocketDatagramTest.park_on(sock)
-      Result.Error(_e) -> TestConcurrency.SocketDatagramTest.park_fail()
+      Result.Ok(sock) -> Concurrency.SocketDatagramTest.park_on(sock)
+      Result.Error(_e) -> Concurrency.SocketDatagramTest.park_fail()
     }
   }
 
@@ -311,7 +311,7 @@ pub struct TestConcurrency.SocketDatagramTest {
   fn udp6_roundtrip() -> Atom {
     case SocketDatagram.bind(SocketAddress.ip6_loopback(0)) {
       Result.Error(_e) -> :bind_failed
-      Result.Ok(receiver) -> TestConcurrency.SocketDatagramTest.udp6_after_receiver(receiver)
+      Result.Ok(receiver) -> Concurrency.SocketDatagramTest.udp6_after_receiver(receiver)
     }
   }
 
@@ -323,7 +323,7 @@ pub struct TestConcurrency.SocketDatagramTest {
           _c = SocketDatagram.close(receiver)
           :sender_bind_failed
         }
-      Result.Ok(sender) -> TestConcurrency.SocketDatagramTest.udp6_exchange(receiver, sender, port)
+      Result.Ok(sender) -> Concurrency.SocketDatagramTest.udp6_exchange(receiver, sender, port)
     }
   }
 
@@ -331,7 +331,7 @@ pub struct TestConcurrency.SocketDatagramTest {
     payload = "v6\x00\xfed"
     _sent = SocketDatagram.send_to(sender, SocketAddress.ip6_loopback(port), payload)
     result = case SocketDatagram.recv_from(receiver, 65536, 5000) {
-      SocketDatagramRecv.Datagram(d) -> TestConcurrency.SocketDatagramTest.check_v6_peer(d, payload)
+      SocketDatagramRecv.Datagram(d) -> Concurrency.SocketDatagramTest.check_v6_peer(d, payload)
       SocketDatagramRecv.Truncated(_d) -> :unexpected_truncated
       SocketDatagramRecv.TimedOut -> :unexpected_timeout
       SocketDatagramRecv.Failed(_e) -> :recv_failed
@@ -365,7 +365,7 @@ pub struct TestConcurrency.SocketDatagramTest {
   fn connected_udp6() -> Atom {
     case SocketDatagram.bind(SocketAddress.ip6_loopback(0)) {
       Result.Error(_e) -> :bind_failed
-      Result.Ok(peer) -> TestConcurrency.SocketDatagramTest.connected6_after_peer(peer)
+      Result.Ok(peer) -> Concurrency.SocketDatagramTest.connected6_after_peer(peer)
     }
   }
 
@@ -377,7 +377,7 @@ pub struct TestConcurrency.SocketDatagramTest {
           _c = SocketDatagram.close(peer)
           :connect_failed
         }
-      Result.Ok(connected) -> TestConcurrency.SocketDatagramTest.connected6_exchange(peer, connected)
+      Result.Ok(connected) -> Concurrency.SocketDatagramTest.connected6_exchange(peer, connected)
     }
   }
 
@@ -402,20 +402,20 @@ pub struct TestConcurrency.SocketDatagramTest {
   # ---- Unix DATAGRAM reply-to-sender: recv_from surfaces the sender PATH ----
 
   fn unix_dgram_reply() -> Atom {
-    server_path = TestConcurrency.SocketDatagramTest.unique_unix_path("zap-s2-reply-srv-gon")
+    server_path = Concurrency.SocketDatagramTest.unique_unix_path("zap-s2-reply-srv-gon")
     _rm = File.rm(server_path)
     case SocketDatagram.bind(SocketAddress.unix(server_path)) {
       Result.Error(_e) -> :server_bind_failed
-      Result.Ok(server) -> TestConcurrency.SocketDatagramTest.reply_after_server(server, server_path)
+      Result.Ok(server) -> Concurrency.SocketDatagramTest.reply_after_server(server, server_path)
     }
   }
 
   fn reply_after_server(server :: SocketDatagram, server_path :: String) -> Atom {
-    client_path = TestConcurrency.SocketDatagramTest.unique_unix_path("zap-s2-reply-cli-gon")
+    client_path = Concurrency.SocketDatagramTest.unique_unix_path("zap-s2-reply-cli-gon")
     _rm = File.rm(client_path)
     result = case SocketDatagram.bind(SocketAddress.unix(client_path)) {
       Result.Error(_e) -> :client_bind_failed
-      Result.Ok(client) -> TestConcurrency.SocketDatagramTest.reply_exchange(server, client, server_path, client_path)
+      Result.Ok(client) -> Concurrency.SocketDatagramTest.reply_exchange(server, client, server_path, client_path)
     }
     _c = SocketDatagram.close(server)
     _r1 = File.rm(server_path)
@@ -426,7 +426,7 @@ pub struct TestConcurrency.SocketDatagramTest {
   fn reply_exchange(server :: SocketDatagram, client :: SocketDatagram, server_path :: String, client_path :: String) -> Atom {
     _sent = SocketDatagram.send_to(client, SocketAddress.unix(server_path), "ping")
     result = case SocketDatagram.recv_from(server, 65536, 5000) {
-      SocketDatagramRecv.Datagram(d) -> TestConcurrency.SocketDatagramTest.reply_to_peer(server, d, client, client_path)
+      SocketDatagramRecv.Datagram(d) -> Concurrency.SocketDatagramTest.reply_to_peer(server, d, client, client_path)
       SocketDatagramRecv.Truncated(_d) -> :unexpected_truncated
       SocketDatagramRecv.TimedOut -> :unexpected_timeout
       SocketDatagramRecv.Failed(_e) -> :recv_failed
@@ -441,7 +441,7 @@ pub struct TestConcurrency.SocketDatagramTest {
       true ->
         case d.peer.path == client_path {
           false -> :peer_path_wrong
-          true -> TestConcurrency.SocketDatagramTest.deliver_reply(server, d.peer, client)
+          true -> Concurrency.SocketDatagramTest.deliver_reply(server, d.peer, client)
         }
     }
   }
@@ -463,18 +463,18 @@ pub struct TestConcurrency.SocketDatagramTest {
   # ---- Unix STREAM local/peer address surface the bound PATH ----------------
 
   fn unix_stream_paths() -> Atom {
-    path = TestConcurrency.SocketDatagramTest.unique_unix_path("zap-s2-spath-gon")
+    path = Concurrency.SocketDatagramTest.unique_unix_path("zap-s2-spath-gon")
     _rm = File.rm(path)
     case Socket.listen(SocketAddress.unix(path), 8) {
       Result.Error(_e) -> :listen_failed
-      Result.Ok(listener) -> TestConcurrency.SocketDatagramTest.spath_after_listen(listener, path)
+      Result.Ok(listener) -> Concurrency.SocketDatagramTest.spath_after_listen(listener, path)
     }
   }
 
   fn spath_after_listen(listener :: SocketListener, path :: String) -> Atom {
     result = case Socket.connect(SocketAddress.unix(path), 5000) {
       Result.Error(_e) -> :connect_failed
-      Result.Ok(client) -> TestConcurrency.SocketDatagramTest.spath_after_connect(listener, client, path)
+      Result.Ok(client) -> Concurrency.SocketDatagramTest.spath_after_connect(listener, client, path)
     }
     _rm = File.rm(path)
     result
@@ -488,14 +488,14 @@ pub struct TestConcurrency.SocketDatagramTest {
           _l = SocketListener.close(listener)
           :accept_failed
         }
-      Result.Ok(server) -> TestConcurrency.SocketDatagramTest.spath_check(listener, client, server, path)
+      Result.Ok(server) -> Concurrency.SocketDatagramTest.spath_check(listener, client, server, path)
     }
   }
 
   fn spath_check(listener :: SocketListener, client :: Socket, server :: Socket, path :: String) -> Atom {
     client_peer = Socket.peer_address(client)
     server_local = Socket.local_address(server)
-    result = TestConcurrency.SocketDatagramTest.spath_verdict(client_peer, server_local, path)
+    result = Concurrency.SocketDatagramTest.spath_verdict(client_peer, server_local, path)
     _c1 = Socket.close(server)
     _c2 = Socket.close(client)
     _c3 = SocketListener.close(listener)
@@ -526,38 +526,38 @@ pub struct TestConcurrency.SocketDatagramTest {
   describe("Socket datagram + Unix-domain under the concurrency kernel (gate-ON)") {
     test("UDP loopback roundtrip is binary-safe, surfaces the peer, and is leak-exact") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.udp_roundtrip() == :ok)
+      assert(Concurrency.SocketDatagramTest.udp_roundtrip() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("a datagram larger than the buffer surfaces Truncated with the prefix and true size") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.udp_truncation() == :ok)
+      assert(Concurrency.SocketDatagramTest.udp_truncation() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("a connected UDP socket filters to its peer (impostor dropped, peer delivered)") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.connected_udp() == :ok)
+      assert(Concurrency.SocketDatagramTest.connected_udp() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("Unix-domain stream echo via Socket + :unix address offloaded off-core, leak-exact") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.unix_stream_echo() == :ok)
+      assert(Concurrency.SocketDatagramTest.unix_stream_echo() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("Unix-domain datagram roundtrip offloaded off-core, leak-exact") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.unix_dgram_roundtrip() == :ok)
+      assert(Concurrency.SocketDatagramTest.unix_dgram_roundtrip() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("a process blocked in recv_from is KILLABLE off-core and its datagram fd is reclaimed") {
-      _named = Process.register(:s2_dgram_kill_parent)
+      assert(Process.register(:s2_dgram_kill_parent))
       base = Socket.live_count()
-      pair = Process.spawn_monitor(&TestConcurrency.SocketDatagramTest.parked_recv_from_worker/0)
+      pair = Process.spawn_monitor(&Concurrency.SocketDatagramTest.parked_recv_from_worker/0)
       _ack = receive Atom {
         _opened -> :ok
       }
@@ -567,29 +567,33 @@ pub struct TestConcurrency.SocketDatagramTest {
       _down = Process.await_signal()
       # The kill teardown ran the drop-list sweep — the datagram fd is reclaimed.
       assert(Socket.live_count() == base)
+      # Cross-test hygiene: release the root process's one registered name
+      # (see the socket_test kill-parent note — a leak here poisons every
+      # later root-process registration in the shared root process).
+      _unreg = Process.unregister(:s2_dgram_kill_parent)
     }
 
     test("IPv6 UDP loopback (::1) roundtrip offloaded off-core surfaces a :ip6 peer, leak-exact") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.udp6_roundtrip() == :ok)
+      assert(Concurrency.SocketDatagramTest.udp6_roundtrip() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("a connected IPv6 UDP socket delivers its connected v6 peer off-core, leak-exact") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.connected_udp6() == :ok)
+      assert(Concurrency.SocketDatagramTest.connected_udp6() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("a Unix datagram server recv_from surfaces the sender PATH and can reply to it, off-core") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.unix_dgram_reply() == :ok)
+      assert(Concurrency.SocketDatagramTest.unix_dgram_reply() == :ok)
       assert(Socket.live_count() == base)
     }
 
     test("Unix stream local/peer_address surface the bound PATH, off-core") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketDatagramTest.unix_stream_paths() == :ok)
+      assert(Concurrency.SocketDatagramTest.unix_stream_paths() == :ok)
       assert(Socket.live_count() == base)
     }
   }

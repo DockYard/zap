@@ -57,12 +57,12 @@
   the only way forward, so it fires.
   """
 
-pub struct TestConcurrency.ConcurrencyScenariosTest {
+pub struct Concurrency.ConcurrencyScenariosTest {
   use Zest.Case
 
   describe("ping-pong across multiple rounds") {
     test("a two-process exchange increments a value across four rounds") {
-      ponger = Process.pid(u64, Process.spawn(&TestConcurrency.ConcurrencyScenariosTest.incrementing_ponger_entry/0))
+      ponger = Process.pid(u64, Process.spawn(&Concurrency.ConcurrencyScenariosTest.incrementing_ponger_entry/0))
       _channel = Process.send(ponger, Process.self())
       typed_ponger = Process.pid(i64, ponger.raw)
       # Send 10; the ponger replies 11; carry 11 forward; ... four rounds:
@@ -74,7 +74,7 @@ pub struct TestConcurrency.ConcurrencyScenariosTest {
 
   describe("pairwise FIFO ordering") {
     test("a six-message sequence from one sender arrives in send order") {
-      sender = Process.pid(u64, Process.spawn(&TestConcurrency.ConcurrencyScenariosTest.ordered_sequence_sender_entry/0))
+      sender = Process.pid(u64, Process.spawn(&Concurrency.ConcurrencyScenariosTest.ordered_sequence_sender_entry/0))
       _channel = Process.send(sender, Process.self())
       # The sender pushes 0,1,2,3,4,5 in order. FIFO delivery means we
       # receive them in exactly that order; the helper returns false the
@@ -87,10 +87,10 @@ pub struct TestConcurrency.ConcurrencyScenariosTest {
       # Sender A tags its messages 100..104, sender B tags them 200..204.
       # However the scheduler interleaves the two streams, EACH sender's
       # own subsequence must arrive monotonically (pairwise FIFO).
-      sender_a = Process.pid(u64, Process.spawn(&TestConcurrency.ConcurrencyScenariosTest.tagged_sequence_sender_entry/0))
+      sender_a = Process.pid(u64, Process.spawn(&Concurrency.ConcurrencyScenariosTest.tagged_sequence_sender_entry/0))
       _channel_a = Process.send(sender_a, parent_bits)
       _base_a = Process.send(Process.pid(i64, sender_a.raw), 100)
-      sender_b = Process.pid(u64, Process.spawn(&TestConcurrency.ConcurrencyScenariosTest.tagged_sequence_sender_entry/0))
+      sender_b = Process.pid(u64, Process.spawn(&Concurrency.ConcurrencyScenariosTest.tagged_sequence_sender_entry/0))
       _channel_b = Process.send(sender_b, parent_bits)
       _base_b = Process.send(Process.pid(i64, sender_b.raw), 200)
       # Drain all ten; last-seen starts one below each base so the first
@@ -101,7 +101,7 @@ pub struct TestConcurrency.ConcurrencyScenariosTest {
 
   describe("crash-teardown (observable accounting; links are Phase 5)") {
     test("a send to an exited child's pid dead-letters — teardown recycled the slot") {
-      exiting_child = Process.pid(u64, Process.spawn(&TestConcurrency.ConcurrencyScenariosTest.ack_then_exit_entry/0))
+      exiting_child = Process.pid(u64, Process.spawn(&Concurrency.ConcurrencyScenariosTest.ack_then_exit_entry/0))
       _channel = Process.send(exiting_child, Process.self())
       acknowledgement = Process.receive_raw(i64)
       assert(acknowledgement == 1)
@@ -124,7 +124,7 @@ pub struct TestConcurrency.ConcurrencyScenariosTest {
       completed_cycles = run_exit_cycles(50, 0)
       assert(completed_cycles == 50)
       # A brand-new child round-trips after all the teardown churn.
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ConcurrencyScenariosTest.increment_once_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ConcurrencyScenariosTest.increment_once_entry/0))
       _echo_channel = Process.send(echo_child, Process.self())
       _ping = Process.send(Process.pid(i64, echo_child.raw), 41)
       final_echo = Process.receive_raw(i64)
@@ -221,7 +221,7 @@ pub struct TestConcurrency.ConcurrencyScenariosTest {
   }
 
   fn run_exit_cycles(remaining :: i64, accumulated :: i64) -> i64 {
-    child = Process.pid(u64, Process.spawn(&TestConcurrency.ConcurrencyScenariosTest.ack_then_exit_entry/0))
+    child = Process.pid(u64, Process.spawn(&Concurrency.ConcurrencyScenariosTest.ack_then_exit_entry/0))
     _channel = Process.send(child, Process.self())
     acknowledgement = Process.receive_raw(i64)
     run_exit_cycles(remaining - 1, accumulated + acknowledgement)

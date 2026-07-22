@@ -1,4 +1,4 @@
-pub struct TestConcurrency.OptionStructTest {
+pub struct Concurrency.OptionStructTest {
   use Zest.Case
 
   # Regression pin for the pre-existing `Option(<user struct>)` gate-ON

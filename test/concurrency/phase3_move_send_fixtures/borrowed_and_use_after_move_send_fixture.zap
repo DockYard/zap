@@ -3,7 +3,7 @@
 # verifier passes (`src/concurrency_verifier.zig`, invariants C2 + C3).
 #
 # WRITTEN, NOT RUN. This file lives under `phase3_move_send_fixtures/`
-# and is named `*_fixture.zap`, so the `test_concurrency/**/*_test.zap`
+# and is named `*_fixture.zap`, so the `test/concurrency/**/*_test.zap`
 # runner glob NEVER compiles or runs it. It is a reference fixture that
 # captures the exact source shapes Phase 3 will reject, so Phase 3's
 # move-send job (plan item 3.3 — the O(1) region-move send) wires them
@@ -47,7 +47,7 @@
 # syntactically sound even though no build target compiles it.
 # =====================================================================
 
-pub struct TestConcurrency.Phase3MoveSendFixture {
+pub struct Concurrency.Phase3MoveSendFixture {
   # C2 case — a BORROWED parameter forwarded into a send. Sound under
   # the Phase-2 copy-send (accepted by `send_ownership_test.zap`);
   # rejected by C2 once `Process.send` of a last-use value lowers to the

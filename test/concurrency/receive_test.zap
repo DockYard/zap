@@ -1,9 +1,9 @@
-pub struct TestConcurrency.ReceiveTest {
+pub struct Concurrency.ReceiveTest {
   use Zest.Case
 
   describe("receive pattern dispatch") {
     test("matches the arm for a sent i64 and binds the value") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ReceiveTest.echo_receive_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ReceiveTest.echo_receive_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       _sent = Process.send(Process.pid(i64, echo_child.raw), 41)
       result = receive i64 {
@@ -14,7 +14,7 @@ pub struct TestConcurrency.ReceiveTest {
     }
 
     test("binds a non-literal message through a bare pattern") {
-      value_child = Process.pid(u64, Process.spawn(&TestConcurrency.ReceiveTest.send_seven_entry/0))
+      value_child = Process.pid(u64, Process.spawn(&Concurrency.ReceiveTest.send_seven_entry/0))
       _delivered = Process.send(value_child, Process.self())
       doubled = receive i64 {
         n -> n + n
@@ -23,7 +23,7 @@ pub struct TestConcurrency.ReceiveTest {
     }
 
     test("dispatches an Atom message to the matching arm") {
-      atom_child = Process.pid(u64, Process.spawn(&TestConcurrency.ReceiveTest.send_ready_atom_entry/0))
+      atom_child = Process.pid(u64, Process.spawn(&Concurrency.ReceiveTest.send_ready_atom_entry/0))
       _delivered = Process.send(atom_child, Process.self())
       label = receive Atom {
         :ready -> "is ready"
@@ -35,7 +35,7 @@ pub struct TestConcurrency.ReceiveTest {
 
   describe("receive ping-pong (replacing receive_raw)") {
     test("round-trips a value between two processes via receive") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ReceiveTest.echo_receive_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ReceiveTest.echo_receive_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       _sent = Process.send(Process.pid(i64, echo_child.raw), 41)
       echoed = receive i64 {
@@ -47,7 +47,7 @@ pub struct TestConcurrency.ReceiveTest {
 
   describe("receive at nested call depth") {
     test("a receive two calls deep suspends the whole fiber stack") {
-      sender_child = Process.pid(u64, Process.spawn(&TestConcurrency.ReceiveTest.send_twenty_one_entry/0))
+      sender_child = Process.pid(u64, Process.spawn(&Concurrency.ReceiveTest.send_twenty_one_entry/0))
       _delivered = Process.send(sender_child, Process.self())
       result = nested_receiver()
       assert(result == 42)
@@ -84,7 +84,7 @@ pub struct TestConcurrency.ReceiveTest {
     }
 
     test("a message that arrives before the deadline wins over the timeout") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ReceiveTest.echo_receive_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ReceiveTest.echo_receive_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       _sent = Process.send(Process.pid(i64, echo_child.raw), 41)
       result = receive i64 {
@@ -101,10 +101,10 @@ pub struct TestConcurrency.ReceiveTest {
       # This child's receive only matches 99, so a 7 matches no arm and is
       # dead-lettered (the child terminates cleanly). The program stays
       # alive, which we prove with a normal round-trip afterward.
-      unmatched_child = Process.pid(u64, Process.spawn(&TestConcurrency.ReceiveTest.only_matches_99_entry/0))
+      unmatched_child = Process.pid(u64, Process.spawn(&Concurrency.ReceiveTest.only_matches_99_entry/0))
       _sent = Process.send(Process.pid(i64, unmatched_child.raw), 7)
 
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ReceiveTest.echo_receive_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ReceiveTest.echo_receive_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       _ping = Process.send(Process.pid(i64, echo_child.raw), 41)
       still_alive = receive i64 {

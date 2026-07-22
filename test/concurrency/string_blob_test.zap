@@ -1,4 +1,4 @@
-pub struct TestConcurrency.StringBlobTest {
+pub struct Concurrency.StringBlobTest {
   use Zest.Case
 
   # P6-J3 acceptance proof: Blob-backed large Strings (plan item 6.3,
@@ -40,7 +40,7 @@ pub struct TestConcurrency.StringBlobTest {
   describe("threshold gating and local-only strings") {
     test("a small string send stays off the blob tier entirely") {
       base = Blob.live_count()
-      child = Process.spawn(&TestConcurrency.StringBlobTest.echo_length_entry/0)
+      child = Process.spawn(&Concurrency.StringBlobTest.echo_length_entry/0)
       _monitor_ref = Process.monitor(child)
       _channel = Process.send(Process.pid(u64, child), Process.self())
 
@@ -70,11 +70,11 @@ pub struct TestConcurrency.StringBlobTest {
   describe("zero-copy large-string sends") {
     test("a large string send promotes exactly one blob and adopts zero-copy") {
       base = Blob.live_count()
-      child = Process.spawn(&TestConcurrency.StringBlobTest.reader_entry/0)
+      child = Process.spawn(&Concurrency.StringBlobTest.reader_entry/0)
       _monitor_ref = Process.monitor(child)
       _channel = Process.send(Process.pid(u64, child), Process.self())
 
-      payload = TestConcurrency.StringBlobTest.large_payload()
+      payload = Concurrency.StringBlobTest.large_payload()
       _sent = Process.send((Pid.of(child) :: Pid(String)), payload)
 
       child_length = Process.receive_raw(i64)
@@ -98,16 +98,16 @@ pub struct TestConcurrency.StringBlobTest {
 
     test("forwarding a received large string is a zero-copy share — same identity, no new blob") {
       base = Blob.live_count()
-      final_reader = Process.spawn(&TestConcurrency.StringBlobTest.identity_check_entry/0)
+      final_reader = Process.spawn(&Concurrency.StringBlobTest.identity_check_entry/0)
       _final_monitor = Process.monitor(final_reader)
-      forwarder = Process.spawn(&TestConcurrency.StringBlobTest.forwarder_entry/0)
+      forwarder = Process.spawn(&Concurrency.StringBlobTest.forwarder_entry/0)
       _forwarder_monitor = Process.monitor(forwarder)
 
       _reply_channel = Process.send(Process.pid(u64, forwarder), Process.self())
       _target_channel = Process.send(Process.pid(u64, forwarder), final_reader)
       _check_channel = Process.send(Process.pid(u64, final_reader), Process.self())
 
-      payload = TestConcurrency.StringBlobTest.large_payload()
+      payload = Concurrency.StringBlobTest.large_payload()
       _sent = Process.send((Pid.of(forwarder) :: Pid(String)), payload)
 
       # The forwarder reports the identity it held; the final reader
@@ -131,20 +131,20 @@ pub struct TestConcurrency.StringBlobTest {
 
     test("cross-model: an Arena child reads the promoted string zero-copy and forwards it onward") {
       base = Blob.live_count()
-      final_reader = Process.spawn(&TestConcurrency.StringBlobTest.identity_check_entry/0)
+      final_reader = Process.spawn(&Concurrency.StringBlobTest.identity_check_entry/0)
       _final_monitor = Process.monitor(final_reader)
       # The forwarder runs under an explicit per-spawn Memory.Arena — the
       # blob payload lives in its OWN domain, so the share is
       # model-independent (no copy stub, no walker, no adoption
       # discipline), ARC → Arena → ARC.
-      forwarder = Process.spawn(&TestConcurrency.StringBlobTest.forwarder_entry/0, Memory.Arena)
+      forwarder = Process.spawn(&Concurrency.StringBlobTest.forwarder_entry/0, Memory.Arena)
       _forwarder_monitor = Process.monitor(forwarder)
 
       _reply_channel = Process.send(Process.pid(u64, forwarder), Process.self())
       _target_channel = Process.send(Process.pid(u64, forwarder), final_reader)
       _check_channel = Process.send(Process.pid(u64, final_reader), Process.self())
 
-      payload = TestConcurrency.StringBlobTest.large_payload()
+      payload = Concurrency.StringBlobTest.large_payload()
       _sent = Process.send((Pid.of(forwarder) :: Pid(String)), payload)
 
       forwarder_identity = Process.receive_raw(u64)
@@ -165,9 +165,9 @@ pub struct TestConcurrency.StringBlobTest {
   describe("lifetime across process death") {
     test("the sender dies; the receiver's large string survives byte-identical") {
       base = Blob.live_count()
-      consumer = Process.spawn(&TestConcurrency.StringBlobTest.survivor_consumer_entry/0)
+      consumer = Process.spawn(&Concurrency.StringBlobTest.survivor_consumer_entry/0)
       _consumer_monitor = Process.monitor(consumer)
-      producer = Process.spawn(&TestConcurrency.StringBlobTest.producer_entry/0)
+      producer = Process.spawn(&Concurrency.StringBlobTest.producer_entry/0)
 
       _consumer_channel = Process.send(Process.pid(u64, consumer), Process.self())
       _producer_pid = Process.send(Process.pid(u64, consumer), producer)
@@ -187,11 +187,11 @@ pub struct TestConcurrency.StringBlobTest {
   describe("slices copy out — the pin pathology defeated") {
     test("a small slice of a huge received string never pins the huge payload") {
       base = Blob.live_count()
-      slicer = Process.spawn(&TestConcurrency.StringBlobTest.slicer_entry/0)
+      slicer = Process.spawn(&Concurrency.StringBlobTest.slicer_entry/0)
       _slicer_monitor = Process.monitor(slicer)
       _channel = Process.send(Process.pid(u64, slicer), Process.self())
 
-      huge = TestConcurrency.StringBlobTest.large_payload()
+      huge = Concurrency.StringBlobTest.large_payload()
       _sent = Process.send((Pid.of(slicer) :: Pid(String)), huge)
 
       # The slicer sends back a 16-byte slice (below the threshold → a
@@ -214,16 +214,16 @@ pub struct TestConcurrency.StringBlobTest {
 
     test("a large sub-slice crossing the boundary is a fresh copy, never the parent's buffer") {
       base = Blob.live_count()
-      final_reader = Process.spawn(&TestConcurrency.StringBlobTest.identity_check_entry/0)
+      final_reader = Process.spawn(&Concurrency.StringBlobTest.identity_check_entry/0)
       _final_monitor = Process.monitor(final_reader)
-      slicer = Process.spawn(&TestConcurrency.StringBlobTest.large_slice_forwarder_entry/0)
+      slicer = Process.spawn(&Concurrency.StringBlobTest.large_slice_forwarder_entry/0)
       _slicer_monitor = Process.monitor(slicer)
 
       _reply_channel = Process.send(Process.pid(u64, slicer), Process.self())
       _target_channel = Process.send(Process.pid(u64, slicer), final_reader)
       _check_channel = Process.send(Process.pid(u64, final_reader), Process.self())
 
-      huge = TestConcurrency.StringBlobTest.large_payload()
+      huge = Concurrency.StringBlobTest.large_payload()
       _sent = Process.send((Pid.of(slicer) :: Pid(String)), huge)
 
       # The slicer forwards a LARGE sub-slice (still above the threshold,
@@ -251,11 +251,11 @@ pub struct TestConcurrency.StringBlobTest {
   describe("rc==1 in-place append vs copy-on-shared") {
     test("appending to an unshared received string extends in place — same buffer, no new blob") {
       base = Blob.live_count()
-      appender = Process.spawn(&TestConcurrency.StringBlobTest.appender_entry/0)
+      appender = Process.spawn(&Concurrency.StringBlobTest.appender_entry/0)
       _appender_monitor = Process.monitor(appender)
       _channel = Process.send(Process.pid(u64, appender), Process.self())
 
-      payload = TestConcurrency.StringBlobTest.large_payload()
+      payload = Concurrency.StringBlobTest.large_payload()
       _sent = Process.send((Pid.of(appender) :: Pid(String)), payload)
 
       appended_in_place = Process.receive_raw(i64)
@@ -275,16 +275,16 @@ pub struct TestConcurrency.StringBlobTest {
 
     test("appending to a shared string copies — the other holder's view stays frozen") {
       base = Blob.live_count()
-      frozen_reader = Process.spawn(&TestConcurrency.StringBlobTest.frozen_view_entry/0)
+      frozen_reader = Process.spawn(&Concurrency.StringBlobTest.frozen_view_entry/0)
       _reader_monitor = Process.monitor(frozen_reader)
-      sharer = Process.spawn(&TestConcurrency.StringBlobTest.share_then_append_entry/0)
+      sharer = Process.spawn(&Concurrency.StringBlobTest.share_then_append_entry/0)
       _sharer_monitor = Process.monitor(sharer)
 
       _reply_channel = Process.send(Process.pid(u64, sharer), Process.self())
       _target_channel = Process.send(Process.pid(u64, sharer), frozen_reader)
       _check_channel = Process.send(Process.pid(u64, frozen_reader), Process.self())
 
-      payload = TestConcurrency.StringBlobTest.large_payload()
+      payload = Concurrency.StringBlobTest.large_payload()
       _sent = Process.send((Pid.of(sharer) :: Pid(String)), payload)
 
       # The sharer forwarded its string, THEN appended: the append must
@@ -307,11 +307,11 @@ pub struct TestConcurrency.StringBlobTest {
 
     test("an append loop over a received string grows amortized — in-place runs, then geometric re-promotion") {
       base = Blob.live_count()
-      grower = Process.spawn(&TestConcurrency.StringBlobTest.growth_loop_entry/0)
+      grower = Process.spawn(&Concurrency.StringBlobTest.growth_loop_entry/0)
       _grower_monitor = Process.monitor(grower)
       _channel = Process.send(Process.pid(u64, grower), Process.self())
 
-      payload = TestConcurrency.StringBlobTest.large_payload()
+      payload = Concurrency.StringBlobTest.large_payload()
       _sent = Process.send((Pid.of(grower) :: Pid(String)), payload)
 
       in_place_count = Process.receive_raw(i64)
@@ -335,12 +335,12 @@ pub struct TestConcurrency.StringBlobTest {
   describe("large-string send storm leak-exactness") {
     test("50 large-string sends to a consuming child return the domain to baseline") {
       base = Blob.live_count()
-      consumer = Process.spawn(&TestConcurrency.StringBlobTest.storm_consumer_entry/0)
+      consumer = Process.spawn(&Concurrency.StringBlobTest.storm_consumer_entry/0)
       _consumer_monitor = Process.monitor(consumer)
       _channel = Process.send(Process.pid(u64, consumer), Process.self())
       _count = Process.send(Process.pid(i64, consumer), 50)
 
-      _sent = TestConcurrency.StringBlobTest.send_storm(consumer, 50)
+      _sent = Concurrency.StringBlobTest.send_storm(consumer, 50)
 
       total = Process.receive_raw(i64)
       assert(total == 50 * 131072)
@@ -442,7 +442,7 @@ pub struct TestConcurrency.StringBlobTest {
       s -> s
     }
     upstream_identity = Process.receive_raw(u64)
-    matched = TestConcurrency.StringBlobTest.flag(String.identity(message) == upstream_identity)
+    matched = Concurrency.StringBlobTest.flag(String.identity(message) == upstream_identity)
     _match_sent = Process.send(Process.pid(i64, parent), matched)
     _live_sent = Process.send(Process.pid(i64, parent), Blob.live_count())
     _length_sent = Process.send(Process.pid(i64, parent), String.length(message))
@@ -458,7 +458,7 @@ pub struct TestConcurrency.StringBlobTest {
 
   pub fn producer_entry() -> Nil {
     target = Process.receive_raw(u64)
-    payload = TestConcurrency.StringBlobTest.large_payload()
+    payload = Concurrency.StringBlobTest.large_payload()
     _sent = Process.send((Pid.of(target) :: Pid(String)), payload)
     nil
   }
@@ -482,7 +482,7 @@ pub struct TestConcurrency.StringBlobTest {
     length_ok = String.length(message) == 131072
     first_ok = String.byte_at(message, 0) == "a"
     last_ok = String.byte_at(message, 131071) == "h"
-    survived = TestConcurrency.StringBlobTest.flag(length_ok and first_ok and last_ok)
+    survived = Concurrency.StringBlobTest.flag(length_ok and first_ok and last_ok)
     _reported = Process.send(Process.pid(i64, parent), survived)
     nil
   }
@@ -547,9 +547,9 @@ pub struct TestConcurrency.StringBlobTest {
     }
     identity_before = String.identity(message)
     appended = message <> "-tail"
-    in_place = TestConcurrency.StringBlobTest.flag(String.identity(appended) == identity_before)
+    in_place = Concurrency.StringBlobTest.flag(String.identity(appended) == identity_before)
     tail = String.slice(appended, String.length(appended) - 5, String.length(appended))
-    tail_ok = TestConcurrency.StringBlobTest.flag(tail == "-tail")
+    tail_ok = Concurrency.StringBlobTest.flag(tail == "-tail")
     _in_place_sent = Process.send(Process.pid(i64, parent), in_place)
     _length_sent = Process.send(Process.pid(i64, parent), String.length(appended))
     _tail_sent = Process.send(Process.pid(i64, parent), tail_ok)
@@ -576,7 +576,7 @@ pub struct TestConcurrency.StringBlobTest {
     _forwarded = Process.send((Pid.of(target) :: Pid(String)), message)
     identity_before = String.identity(message)
     appended = message <> "-mine"
-    copied = TestConcurrency.StringBlobTest.flag(String.identity(appended) != identity_before)
+    copied = Concurrency.StringBlobTest.flag(String.identity(appended) != identity_before)
     _copied_sent = Process.send(Process.pid(i64, parent), copied)
     _length_sent = Process.send(Process.pid(i64, parent), String.length(appended))
     _go_sent = Process.send(Process.pid(i64, target), 1)
@@ -599,7 +599,7 @@ pub struct TestConcurrency.StringBlobTest {
     _go = Process.receive_raw(i64)
     frozen_length = String.length(message)
     edges_intact = String.byte_at(message, 0) == "a" and String.byte_at(message, 131071) == "h"
-    bytes_ok = TestConcurrency.StringBlobTest.flag(edges_intact)
+    bytes_ok = Concurrency.StringBlobTest.flag(edges_intact)
     _length_sent = Process.send(Process.pid(i64, parent), frozen_length)
     _bytes_sent = Process.send(Process.pid(i64, parent), bytes_ok)
     nil
@@ -619,7 +619,7 @@ pub struct TestConcurrency.StringBlobTest {
       s -> s
     }
     chunk = String.repeat("k", 1024)
-    _reported = TestConcurrency.StringBlobTest.append_loop(parent, message, chunk, 40, 0, 0)
+    _reported = Concurrency.StringBlobTest.append_loop(parent, message, chunk, 40, 0, 0)
     nil
   }
 
@@ -634,7 +634,7 @@ pub struct TestConcurrency.StringBlobTest {
     _in_place_sent = Process.send(Process.pid(i64, parent), in_place)
     _promoted_sent = Process.send(Process.pid(i64, parent), promoted)
     _length_sent = Process.send(Process.pid(i64, parent), String.length(acc))
-    tail_ok = TestConcurrency.StringBlobTest.flag(String.byte_at(acc, String.length(acc) - 1) == "k")
+    tail_ok = Concurrency.StringBlobTest.flag(String.byte_at(acc, String.length(acc) - 1) == "k")
     _tail_sent = Process.send(Process.pid(i64, parent), tail_ok)
     true
   }
@@ -643,8 +643,8 @@ pub struct TestConcurrency.StringBlobTest {
     identity_before = String.identity(acc)
     extended = acc <> chunk
     case String.identity(extended) == identity_before {
-      true -> TestConcurrency.StringBlobTest.append_loop(parent, extended, chunk, remaining - 1, in_place + 1, promoted)
-      false -> TestConcurrency.StringBlobTest.append_loop(parent, extended, chunk, remaining - 1, in_place, promoted + 1)
+      true -> Concurrency.StringBlobTest.append_loop(parent, extended, chunk, remaining - 1, in_place + 1, promoted)
+      false -> Concurrency.StringBlobTest.append_loop(parent, extended, chunk, remaining - 1, in_place, promoted + 1)
     }
   }
 
@@ -659,9 +659,9 @@ pub struct TestConcurrency.StringBlobTest {
   }
 
   pub fn send_storm(target :: u64, remaining :: i64) -> Bool {
-    payload = TestConcurrency.StringBlobTest.large_payload()
+    payload = Concurrency.StringBlobTest.large_payload()
     _sent = Process.send((Pid.of(target) :: Pid(String)), payload)
-    TestConcurrency.StringBlobTest.send_storm(target, remaining - 1)
+    Concurrency.StringBlobTest.send_storm(target, remaining - 1)
   }
 
   @doc = """
@@ -673,7 +673,7 @@ pub struct TestConcurrency.StringBlobTest {
   pub fn storm_consumer_entry() -> Nil {
     parent = Process.receive_raw(u64)
     expected = Process.receive_raw(i64)
-    total = TestConcurrency.StringBlobTest.consume_storm(expected, 0)
+    total = Concurrency.StringBlobTest.consume_storm(expected, 0)
     _reported = Process.send(Process.pid(i64, parent), total)
     nil
   }
@@ -690,6 +690,6 @@ pub struct TestConcurrency.StringBlobTest {
     message = receive String {
       s -> s
     }
-    TestConcurrency.StringBlobTest.consume_storm(remaining - 1, total + String.length(message))
+    Concurrency.StringBlobTest.consume_storm(remaining - 1, total + String.length(message))
   }
 }

@@ -1,4 +1,4 @@
-pub struct TestConcurrency.SocketTest {
+pub struct Concurrency.SocketTest {
   use Zest.Case
 
   # Phase S0 acceptance proof (gate-ON): the socket layer under the live
@@ -21,13 +21,13 @@ pub struct TestConcurrency.SocketTest {
   describe("Socket under the concurrency kernel (gate-ON)") {
     test("a green process opens a loopback socket and closes it leak-exactly") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketTest.loopback_ok())
+      assert(Concurrency.SocketTest.loopback_ok())
       assert(Socket.live_count() == base)
     }
 
     test("connect_host (Happy Eyeballs) resolves localhost and connects under the kernel, leak-exactly") {
       base = Socket.live_count()
-      assert(TestConcurrency.SocketTest.connect_host_ok())
+      assert(Concurrency.SocketTest.connect_host_ok())
       # Every attempt fd (winner closed, any resolved loser reclaimed by the
       # racing driver) is accounted for — back to baseline under the kernel.
       assert(Socket.live_count() == base)
@@ -35,7 +35,7 @@ pub struct TestConcurrency.SocketTest {
 
     test("fd is reclaimed by the drop-list when the owning process EXITS without closing") {
       base = Socket.live_count()
-      _monitored = Process.spawn_monitor(&TestConcurrency.SocketTest.leaky_worker/0)
+      _monitored = Process.spawn_monitor(&Concurrency.SocketTest.leaky_worker/0)
       _down = Process.await_signal()
       # The worker exited having opened a socket it never closed; its
       # socket-sweep drop destructor closed the fd at teardown.
@@ -43,9 +43,9 @@ pub struct TestConcurrency.SocketTest {
     }
 
     test("fd is reclaimed by the drop-list when the owning process is KILLED") {
-      _named = Process.register(:socket_kill_parent)
+      assert(Process.register(:socket_kill_parent))
       base = Socket.live_count()
-      pair = Process.spawn_monitor(&TestConcurrency.SocketTest.parked_worker/0)
+      pair = Process.spawn_monitor(&Concurrency.SocketTest.parked_worker/0)
       _ack = receive Atom {
         _opened -> :ok
       }
@@ -55,6 +55,12 @@ pub struct TestConcurrency.SocketTest {
       _down = Process.await_signal()
       # The kill teardown path ran the same drop-list sweep.
       assert(Socket.live_count() == base)
+      # Release the root process's registered name — the shared root process
+      # holds at most ONE name and never exits, so a leaked registration here
+      # makes every later root-process `Process.register` in the run silently
+      # fail and hang its name-routed receives (cross-test hygiene; see
+      # SupervisorTest.cleanup for the same discipline).
+      _unreg = Process.unregister(:socket_kill_parent)
     }
   }
 
@@ -63,12 +69,12 @@ pub struct TestConcurrency.SocketTest {
       base = Socket.live_count()
       # The full gate-ON path: the ownership-gated zap_socket_set_option ABI
       # over the per-process ledger, applying setsockopt inline on the owned fd.
-      assert(TestConcurrency.SocketTest.nodelay_applied_under_kernel() == :applied)
+      assert(Concurrency.SocketTest.nodelay_applied_under_kernel() == :applied)
       assert(Socket.live_count() == base)
     }
 
     test("set_options on a stale handle returns a typed SocketError (ownership gate), no crash") {
-      assert(TestConcurrency.SocketTest.set_options_on_closed_is_error())
+      assert(Concurrency.SocketTest.set_options_on_closed_is_error())
     }
   }
 
@@ -78,7 +84,7 @@ pub struct TestConcurrency.SocketTest {
       Result.Ok(listener) ->
         {
           port = SocketListener.local_port(listener)
-          TestConcurrency.SocketTest.connect_close(listener, port)
+          Concurrency.SocketTest.connect_close(listener, port)
         }
     }
   }
@@ -129,7 +135,7 @@ pub struct TestConcurrency.SocketTest {
       Result.Ok(listener) ->
         {
           port = SocketListener.local_port(listener)
-          result = TestConcurrency.SocketTest.nodelay_on_client(port)
+          result = Concurrency.SocketTest.nodelay_on_client(port)
           _closed = SocketListener.close(listener)
           result
         }
@@ -169,7 +175,7 @@ pub struct TestConcurrency.SocketTest {
       Result.Ok(listener) ->
         {
           port = SocketListener.local_port(listener)
-          result = TestConcurrency.SocketTest.set_options_after_close(port)
+          result = Concurrency.SocketTest.set_options_after_close(port)
           _closed = SocketListener.close(listener)
           result
         }

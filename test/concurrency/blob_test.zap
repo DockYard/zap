@@ -1,4 +1,4 @@
-pub struct TestConcurrency.BlobTest {
+pub struct Concurrency.BlobTest {
   use Zest.Case
 
   # P6-J2 acceptance proof: `Blob` — THE one sanctioned share tier of the
@@ -101,7 +101,7 @@ pub struct TestConcurrency.BlobTest {
   describe("Blob zero-copy share across processes") {
     test("a sent blob arrives with the SAME payload identity and the count reflects both holders") {
       base = Blob.live_count()
-      child = Process.spawn(&TestConcurrency.BlobTest.blob_reader_entry/0)
+      child = Process.spawn(&Concurrency.BlobTest.blob_reader_entry/0)
       _monitor_ref = Process.monitor(child)
       _channel = Process.send(Process.pid(u64, child), Process.self())
 
@@ -144,7 +144,7 @@ pub struct TestConcurrency.BlobTest {
       # discipline. The `:test_concurrency` manifest default is ARC; the
       # child runs under an explicit per-spawn Memory.Arena.
       base = Blob.live_count()
-      child = Process.spawn(&TestConcurrency.BlobTest.blob_reader_entry/0, Memory.Arena)
+      child = Process.spawn(&Concurrency.BlobTest.blob_reader_entry/0, Memory.Arena)
       _monitor_ref = Process.monitor(child)
       _channel = Process.send(Process.pid(u64, child), Process.self())
 
@@ -170,7 +170,7 @@ pub struct TestConcurrency.BlobTest {
 
     test("send_move shares the blob and relinquishes the sender's reference") {
       base = Blob.live_count()
-      child = Process.spawn(&TestConcurrency.BlobTest.move_reader_entry/0)
+      child = Process.spawn(&Concurrency.BlobTest.move_reader_entry/0)
       _monitor_ref = Process.monitor(child)
       _channel = Process.send(Process.pid(u64, child), Process.self())
 
@@ -188,7 +188,7 @@ pub struct TestConcurrency.BlobTest {
 
     test("a send to a dead process dead-letters without leaking the flight reference") {
       base = Blob.live_count()
-      victim = Process.spawn(&TestConcurrency.BlobTest.noop_entry/0)
+      victim = Process.spawn(&Concurrency.BlobTest.noop_entry/0)
       _monitor_ref = Process.monitor(victim)
       _down = Process.await_signal()   # the victim is fully dead
 
@@ -207,7 +207,7 @@ pub struct TestConcurrency.BlobTest {
   describe("Blob lifetime across process death") {
     test("the sender dies; the receiver's blob survives, byte-identical — THE point of the tier") {
       base = Blob.live_count()
-      producer = Process.spawn(&TestConcurrency.BlobTest.blob_producer_entry/0)
+      producer = Process.spawn(&Concurrency.BlobTest.blob_producer_entry/0)
       _monitor_ref = Process.monitor(producer)
       _channel = Process.send(Process.pid(u64, producer), Process.self())
 
@@ -279,7 +279,7 @@ pub struct TestConcurrency.BlobTest {
 
     test("put/get round-trips; the value survives the publisher's death") {
       base = Blob.live_count()
-      publisher = Process.spawn(&TestConcurrency.BlobTest.registry_publisher_entry/0)
+      publisher = Process.spawn(&Concurrency.BlobTest.registry_publisher_entry/0)
       _monitor_ref = Process.monitor(publisher)
       _down = Process.await_signal()   # the publisher is fully dead
 
@@ -343,9 +343,9 @@ pub struct TestConcurrency.BlobTest {
       # — a torn or dangling observation would panic or fail the check.
       reader_count = 4
       reads_per_reader = 50
-      _spawned = TestConcurrency.BlobTest.spawn_registry_readers(reader_count, reads_per_reader)
-      _replaced = TestConcurrency.BlobTest.replace_storm(25)
-      successful_reads = TestConcurrency.BlobTest.collect_reader_totals(reader_count, 0)
+      _spawned = Concurrency.BlobTest.spawn_registry_readers(reader_count, reads_per_reader)
+      _replaced = Concurrency.BlobTest.replace_storm(25)
+      successful_reads = Concurrency.BlobTest.collect_reader_totals(reader_count, 0)
       assert(successful_reads == reader_count * reads_per_reader)
 
       # Every superseded value died with its last reader; only the final
@@ -358,12 +358,12 @@ pub struct TestConcurrency.BlobTest {
     test("200 blob shares to a consuming child return the domain to baseline") {
       base = Blob.live_count()
       storm_size = 200
-      consumer = Process.spawn(&TestConcurrency.BlobTest.storm_consumer_entry/0)
+      consumer = Process.spawn(&Concurrency.BlobTest.storm_consumer_entry/0)
       _monitor_ref = Process.monitor(consumer)
       _channel = Process.send(Process.pid(u64, consumer), Process.self())
       _count = Process.send(Process.pid(i64, consumer), storm_size)
 
-      _sent = TestConcurrency.BlobTest.send_storm(consumer, storm_size)
+      _sent = Concurrency.BlobTest.send_storm(consumer, storm_size)
 
       # The consumer verified and released every blob; its total is the
       # sum of all sizes ("storm payload bytes" = 19 bytes each).
@@ -454,7 +454,7 @@ pub struct TestConcurrency.BlobTest {
     parent = Process.receive_raw(u64)
     reads = Process.receive_raw(i64)
     sentinel = Blob.new("x sentinel")
-    successes = TestConcurrency.BlobTest.read_registry_loop(reads, sentinel, 0)
+    successes = Concurrency.BlobTest.read_registry_loop(reads, sentinel, 0)
     _sentinel_released = Blob.release(sentinel)
     _reported = Process.send(Process.pid(i64, parent), successes)
     nil
@@ -476,10 +476,10 @@ pub struct TestConcurrency.BlobTest {
   pub fn read_registry_loop(remaining :: i64, sentinel :: Blob, successes :: i64) -> i64 {
     got = Blob.get_global(:blob_test_storm_key, sentinel)
     step = case Blob.identity(got) == Blob.identity(sentinel) {
-      true -> TestConcurrency.BlobTest.absent_read_step()
-      false -> TestConcurrency.BlobTest.verify_and_release(got)
+      true -> Concurrency.BlobTest.absent_read_step()
+      false -> Concurrency.BlobTest.verify_and_release(got)
     }
-    TestConcurrency.BlobTest.read_registry_loop(remaining - 1, sentinel, successes + step)
+    Concurrency.BlobTest.read_registry_loop(remaining - 1, sentinel, successes + step)
   }
 
   @doc = """
@@ -491,7 +491,7 @@ pub struct TestConcurrency.BlobTest {
   pub fn verify_and_release(blob :: Blob) -> i64 {
     first_byte = Blob.at(blob, 0)
     _released = Blob.release(blob)
-    TestConcurrency.BlobTest.score_read(first_byte)
+    Concurrency.BlobTest.score_read(first_byte)
   }
 
   @doc = """
@@ -525,10 +525,10 @@ pub struct TestConcurrency.BlobTest {
   }
 
   pub fn spawn_registry_readers(count :: i64, reads :: i64) -> Bool {
-    reader = Process.spawn(&TestConcurrency.BlobTest.registry_reader_entry/0)
+    reader = Process.spawn(&Concurrency.BlobTest.registry_reader_entry/0)
     _channel = Process.send(Process.pid(u64, reader), Process.self())
     _budget = Process.send(Process.pid(i64, reader), reads)
-    TestConcurrency.BlobTest.spawn_registry_readers(count - 1, reads)
+    Concurrency.BlobTest.spawn_registry_readers(count - 1, reads)
   }
 
   @doc = """
@@ -545,7 +545,7 @@ pub struct TestConcurrency.BlobTest {
     replacement = Blob.new("r replacement")
     _put = Blob.put_global(:blob_test_storm_key, replacement)
     _dropped = Blob.release(replacement)
-    TestConcurrency.BlobTest.replace_storm(rounds - 1)
+    Concurrency.BlobTest.replace_storm(rounds - 1)
   }
 
   @doc = """
@@ -558,7 +558,7 @@ pub struct TestConcurrency.BlobTest {
 
   pub fn collect_reader_totals(remaining :: i64, total :: i64) -> i64 {
     reported = Process.receive_raw(i64)
-    TestConcurrency.BlobTest.collect_reader_totals(remaining - 1, total + reported)
+    Concurrency.BlobTest.collect_reader_totals(remaining - 1, total + reported)
   }
 
   @doc = """
@@ -576,7 +576,7 @@ pub struct TestConcurrency.BlobTest {
     blob = Blob.new("storm payload bytes")
     _sent = Process.send((Pid.of(target) :: Pid(Blob)), blob)
     _released = Blob.release(blob)
-    TestConcurrency.BlobTest.send_storm(target, remaining - 1)
+    Concurrency.BlobTest.send_storm(target, remaining - 1)
   }
 
   @doc = """
@@ -587,7 +587,7 @@ pub struct TestConcurrency.BlobTest {
   pub fn storm_consumer_entry() -> Nil {
     parent = Process.receive_raw(u64)
     expected = Process.receive_raw(i64)
-    total = TestConcurrency.BlobTest.consume_storm(expected, 0)
+    total = Concurrency.BlobTest.consume_storm(expected, 0)
     _reported = Process.send(Process.pid(i64, parent), total)
     nil
   }
@@ -606,6 +606,6 @@ pub struct TestConcurrency.BlobTest {
     }
     observed = Blob.size(blob)
     _released = Blob.release(blob)
-    TestConcurrency.BlobTest.consume_storm(remaining - 1, total + observed)
+    Concurrency.BlobTest.consume_storm(remaining - 1, total + observed)
   }
 }

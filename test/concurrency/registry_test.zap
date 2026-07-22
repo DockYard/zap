@@ -1,4 +1,4 @@
-pub struct TestConcurrency.RegistryTest {
+pub struct Concurrency.RegistryTest {
   use Zest.Case
 
   # The local process registry + spawn_link/spawn_monitor + send-by-name (P5-J2):
@@ -13,7 +13,7 @@ pub struct TestConcurrency.RegistryTest {
 
   describe("register / whereis / unregister") {
     test("a registered process is found by whereis under its name") {
-      server = Process.spawn(&TestConcurrency.RegistryTest.registering_blocker_entry/0)
+      server = Process.spawn(&Concurrency.RegistryTest.registering_blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, server), Process.self())
       _name_to_child = Process.send(Process.pid(Atom, server), :find_me_server)
       _ready = receive Atom { :ready -> :ready }
@@ -32,7 +32,7 @@ pub struct TestConcurrency.RegistryTest {
     }
 
     test("registering a name held by a live process fails") {
-      server = Process.spawn(&TestConcurrency.RegistryTest.registering_blocker_entry/0)
+      server = Process.spawn(&Concurrency.RegistryTest.registering_blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, server), Process.self())
       _name_to_child = Process.send(Process.pid(Atom, server), :taken_name)
       _ready = receive Atom { :ready -> :ready }
@@ -57,7 +57,7 @@ pub struct TestConcurrency.RegistryTest {
 
   describe("register-then-crash") {
     test("a crashed registered process auto-unregisters its name") {
-      server = Process.spawn(&TestConcurrency.RegistryTest.registering_blocker_entry/0)
+      server = Process.spawn(&Concurrency.RegistryTest.registering_blocker_entry/0)
       _self_to_child = Process.send(Process.pid(u64, server), Process.self())
       _name_to_child = Process.send(Process.pid(Atom, server), :crash_and_free)
       _ready = receive Atom { :ready -> :ready }
@@ -74,7 +74,7 @@ pub struct TestConcurrency.RegistryTest {
       assert(Process.whereis(:crash_and_free) == 0)
       # And it is genuinely re-registrable (the entry was physically released, not
       # merely liveness-masked) — a fresh server claims the same name.
-      successor = Process.spawn(&TestConcurrency.RegistryTest.registering_blocker_entry/0)
+      successor = Process.spawn(&Concurrency.RegistryTest.registering_blocker_entry/0)
       _self_to_successor = Process.send(Process.pid(u64, successor), Process.self())
       _name_to_successor = Process.send(Process.pid(Atom, successor), :crash_and_free)
       _successor_ready = receive Atom { :ready -> :ready }
@@ -92,7 +92,7 @@ pub struct TestConcurrency.RegistryTest {
       # The child exits abnormally the instant it runs — no ack handshake. Only an
       # atomic spawn_link (link established BEFORE the child can run) delivers the
       # child's REAL reason; a racy link-after-spawn would see :noproc.
-      child = Process.spawn_link(&TestConcurrency.RegistryTest.immediate_crash_entry/0)
+      child = Process.spawn_link(&Concurrency.RegistryTest.immediate_crash_entry/0)
 
       reason = Process.await_signal()
       assert(reason == :immediate_boom)                    # the real reason, not :noproc
@@ -104,7 +104,7 @@ pub struct TestConcurrency.RegistryTest {
       # The child exits NORMALLY the instant it runs. An atomic spawn_monitor
       # still delivers a DOWN carrying :normal (a racy monitor-after-spawn would
       # fire :noproc for a child that already exited).
-      {child, ref} = Process.spawn_monitor(&TestConcurrency.RegistryTest.immediate_normal_exit_entry/0)
+      {child, ref} = Process.spawn_monitor(&Concurrency.RegistryTest.immediate_normal_exit_entry/0)
 
       reason = Process.await_signal()
       assert(reason == :normal)                            # the real reason, not :noproc
@@ -116,7 +116,7 @@ pub struct TestConcurrency.RegistryTest {
 
   describe("send-by-name") {
     test("send-by-name reaches a live registered process") {
-      server = Process.spawn(&TestConcurrency.RegistryTest.echo_by_name_entry/0)
+      server = Process.spawn(&Concurrency.RegistryTest.echo_by_name_entry/0)
       _self_to_child = Process.send(Process.pid(u64, server), Process.self())
       _name_to_child = Process.send(Process.pid(Atom, server), :echo_by_name)
       _ready = receive Atom { :ready -> :ready }
@@ -139,17 +139,17 @@ pub struct TestConcurrency.RegistryTest {
     test("concurrent self-registering children resolve, then free their names on teardown") {
       # Three children register three distinct names on (up to) three cores —
       # cross-core registrations the root's whereis (also cross-core) must see.
-      first = Process.spawn(&TestConcurrency.RegistryTest.registering_blocker_entry/0)
+      first = Process.spawn(&Concurrency.RegistryTest.registering_blocker_entry/0)
       _first_self = Process.send(Process.pid(u64, first), Process.self())
       _first_name = Process.send(Process.pid(Atom, first), :core_race_one)
       _first_ready = receive Atom { :ready -> :ready }
 
-      second = Process.spawn(&TestConcurrency.RegistryTest.registering_blocker_entry/0)
+      second = Process.spawn(&Concurrency.RegistryTest.registering_blocker_entry/0)
       _second_self = Process.send(Process.pid(u64, second), Process.self())
       _second_name = Process.send(Process.pid(Atom, second), :core_race_two)
       _second_ready = receive Atom { :ready -> :ready }
 
-      third = Process.spawn(&TestConcurrency.RegistryTest.registering_blocker_entry/0)
+      third = Process.spawn(&Concurrency.RegistryTest.registering_blocker_entry/0)
       _third_self = Process.send(Process.pid(u64, third), Process.self())
       _third_name = Process.send(Process.pid(Atom, third), :core_race_three)
       _third_ready = receive Atom { :ready -> :ready }

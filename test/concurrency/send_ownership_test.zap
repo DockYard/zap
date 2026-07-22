@@ -1,4 +1,4 @@
-pub struct TestConcurrency.SendOwnershipTest {
+pub struct Concurrency.SendOwnershipTest {
   use Zest.Case
 
   # P2-J7 (plan item 2.6): positive coverage for the send-boundary
@@ -65,7 +65,7 @@ pub struct TestConcurrency.SendOwnershipTest {
       # the verifier correctly accepts it (borrowed-at-send is a
       # Phase-3 MOVE-send concern, not a copy-send one).
       caller_owned = [100, 200, 300]
-      measured = TestConcurrency.SendOwnershipTest.forward_and_measure(caller_owned)
+      measured = Concurrency.SendOwnershipTest.forward_and_measure(caller_owned)
       assert(measured == 3)
       # The caller still owns `caller_owned` after lending it to the
       # helper that sent it.

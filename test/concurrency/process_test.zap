@@ -1,4 +1,4 @@
-pub struct TestConcurrency.ProcessTest {
+pub struct Concurrency.ProcessTest {
   use Zest.Case
 
   describe("Process.self") {
@@ -12,14 +12,14 @@ pub struct TestConcurrency.ProcessTest {
 
   describe("Process.spawn") {
     test("runs a named zero-parameter function to completion") {
-      completion_child = Process.pid(u64, Process.spawn(&TestConcurrency.ProcessTest.completion_entry/0))
+      completion_child = Process.pid(u64, Process.spawn(&Concurrency.ProcessTest.completion_entry/0))
       _delivered = Process.send(completion_child, Process.self())
       completion_value = Process.receive_raw(i64)
       assert(completion_value == 7777)
     }
 
     test("spawned process observes its own pid as the one spawn returned") {
-      child_bits = Process.spawn(&TestConcurrency.ProcessTest.self_reporting_entry/0)
+      child_bits = Process.spawn(&Concurrency.ProcessTest.self_reporting_entry/0)
       identity_child = Process.pid(u64, child_bits)
       _delivered = Process.send(identity_child, Process.self())
       reported_bits = Process.receive_raw(u64)
@@ -30,7 +30,7 @@ pub struct TestConcurrency.ProcessTest {
 
   describe("Process.send and Process.receive_raw") {
     test("i64 ping-pong round-trips values between two processes") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ProcessTest.echo_i64_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ProcessTest.echo_i64_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       _sent = Process.send(Process.pid(i64, echo_child.raw), 41)
       echoed = Process.receive_raw(i64)
@@ -38,7 +38,7 @@ pub struct TestConcurrency.ProcessTest {
     }
 
     test("f64 payloads round-trip") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ProcessTest.echo_f64_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ProcessTest.echo_f64_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       _sent = Process.send(Process.pid(f64, echo_child.raw), 1.5)
       echoed = Process.receive_raw(f64)
@@ -46,7 +46,7 @@ pub struct TestConcurrency.ProcessTest {
     }
 
     test("Bool payloads round-trip") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ProcessTest.negate_bool_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ProcessTest.negate_bool_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       _sent = Process.send(Process.pid(Bool, echo_child.raw), true)
       echoed = Process.receive_raw(Bool)
@@ -54,7 +54,7 @@ pub struct TestConcurrency.ProcessTest {
     }
 
     test("Atom payloads round-trip") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ProcessTest.echo_atom_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ProcessTest.echo_atom_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       _sent = Process.send(Process.pid(Atom, echo_child.raw), :ping)
       echoed = Process.receive_raw(Atom)
@@ -62,7 +62,7 @@ pub struct TestConcurrency.ProcessTest {
     }
 
     test("pairwise message ordering is FIFO") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ProcessTest.echo_three_i64_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ProcessTest.echo_three_i64_entry/0))
       _delivered = Process.send(echo_child, Process.self())
       typed_child = Process.pid(i64, echo_child.raw)
       _first = Process.send(typed_child, 1)
@@ -77,7 +77,7 @@ pub struct TestConcurrency.ProcessTest {
     }
 
     test("send returns true for a live target") {
-      echo_child = Process.pid(u64, Process.spawn(&TestConcurrency.ProcessTest.echo_i64_entry/0))
+      echo_child = Process.pid(u64, Process.spawn(&Concurrency.ProcessTest.echo_i64_entry/0))
       delivered = Process.send(echo_child, Process.self())
       assert(delivered == true)
       _sent = Process.send(Process.pid(i64, echo_child.raw), 0)
@@ -93,7 +93,7 @@ pub struct TestConcurrency.ProcessTest {
 
   describe("Process.exit") {
     test("a child that exits explicitly still delivers messages sent before the exit") {
-      exiting_child = Process.pid(u64, Process.spawn(&TestConcurrency.ProcessTest.exit_after_reply_entry/0))
+      exiting_child = Process.pid(u64, Process.spawn(&Concurrency.ProcessTest.exit_after_reply_entry/0))
       _delivered = Process.send(exiting_child, Process.self())
       reply = Process.receive_raw(i64)
       assert(reply == 55)

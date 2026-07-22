@@ -10,19 +10,6 @@ pub struct Zap.Builder {
           paths: ["test/**/*_test.zap"],
           deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}],
           optimize: :debug,
-          pipeline: %Zap.Build.Pipeline{
-            steps: [%Zap.Build.Step{compile: %Zap.Build.Compile{}}, %Zap.Build.Step{run: %Zap.Build.Run{forward_args: true}}]
-          }
-        }
-      :test_concurrency ->
-        %Zap.Manifest{
-          name: "zap_test_concurrency",
-          version: "0.1.0",
-          kind: :bin,
-          root: &TestConcurrency.TestRunner.main/1,
-          paths: ["test_concurrency/**/*_test.zap"],
-          deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}],
-          optimize: :debug,
           runtime_concurrency: true,
           pipeline: %Zap.Build.Pipeline{
             steps: [%Zap.Build.Step{compile: %Zap.Build.Compile{}}, %Zap.Build.Step{run: %Zap.Build.Run{forward_args: true}}]
@@ -55,7 +42,7 @@ pub struct Zap.Builder {
           deps: [%Zap.Dep{name: "zap_stdlib", path: "lib"}]
         }
       _ ->
-        panic("Unknown target: use 'test', 'test_concurrency', 'test_concurrency_traced', or 'doc'")
+        panic("Unknown target: use 'test', 'test_concurrency_traced', or 'doc'")
     }
   }
 }
