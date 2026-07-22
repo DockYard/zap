@@ -3451,6 +3451,20 @@ pub const TlsSession = struct {
         };
     }
 
+    /// The record-layer detail the established endpoint stashed for its last
+    /// `ReadFailed` (`tls.Client`/`tls.Server` `read_err`), erased to
+    /// `anyerror` so the role-symmetric recv driver can inspect it (the two
+    /// endpoints declare DISTINCT `ReadError` sets). Null when the endpoint
+    /// recorded no detail. Callable only after a successful handshake, like
+    /// `establishedReader`.
+    pub fn establishedReadErr(session: *TlsSession) ?anyerror {
+        return switch (session.role) {
+            .client => |*client_endpoint| if (client_endpoint.read_err) |record_layer_err| record_layer_err else null,
+            .server => |*server_endpoint| if (server_endpoint.read_err) |record_layer_err| record_layer_err else null,
+            .unestablished => unreachable,
+        };
+    }
+
     /// The encrypt-outbound `Writer` of the established endpoint (client OR
     /// server arm) — the role-symmetric write surface `tlsSend` drives. Callable
     /// ONLY after a successful handshake.
@@ -3665,6 +3679,26 @@ pub fn tlsRecv(
             // the raw recv's mid-frame-EOF contract).
             error.EndOfStream => return try shrinkRecv(allocator, buffer, recv_status_closed, filled),
             error.ReadFailed => {
+                // The ALLOWED-truncation EOF (see the `EndOfStream` arm's
+                // contract): a peer that closes the connection at a record
+                // boundary WITHOUT sending `close_notify`. Real-world HTTP
+                // servers (google.com prominently) do this routinely after
+                // `Connection: close` — the application protocol's own framing
+                // (Content-Length / chunked terminator) carries completeness,
+                // which is why every mainstream HTTP client tolerates the
+                // missing alert. The fork's `tls.Client` surfaces it as
+                // `ReadFailed` with `error.TlsConnectionTruncated` stashed in
+                // the endpoint's `read_err` (NOT as `EndOfStream`), so map it
+                // to the same CLOSED outcome here; every OTHER record-layer
+                // failure (bad MAC, fatal alert, malformed record) keeps the
+                // typed error below.
+                if (session.stream.read_reason == .ok) {
+                    if (session.establishedReadErr()) |record_layer_err| {
+                        if (record_layer_err == error.TlsConnectionTruncated) {
+                            return try shrinkRecv(allocator, buffer, recv_status_closed, filled);
+                        }
+                    }
+                }
                 // A TRANSPORT failure stashed its reason in the adapter; a TLS
                 // record-layer failure (bad MAC, fatal alert, malformed record)
                 // left it `.ok` (the Client stashed detail in `client.read_err`).
